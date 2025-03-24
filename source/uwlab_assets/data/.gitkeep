@@ -1,4 +1,4 @@
-For Octi Lab, we primarily store assets on the Omniverse Nucleus server. However, at times, it may be
+For UW Lab, we primarily store assets on the Omniverse Nucleus server. However, at times, it may be
 needed to store the assets locally (for debugging purposes). In such cases, this directory can be
 used for temporary hosting of assets.
 
