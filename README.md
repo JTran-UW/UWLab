@@ -14,6 +14,46 @@
 [![License](https://img.shields.io/badge/license-BSD--3-yellow.svg)](https://opensource.org/licenses/BSD-3-Clause)
 [![License](https://img.shields.io/badge/license-Apache--2.0-yellow.svg)](https://opensource.org/license/apache-2-0)
 
+### Dextrous Manipulation Tasks
+[`source/uwlab_tasks/uwlab_tasks/manager_based/manipulation`](https://github.com/UW-Lab/UWLab/tree/main/source/uwlab_tasks/uwlab_tasks/manager_based/manipulation)
+
+<table>
+    <tbody>
+        <tr>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/manipulation/track_goal/config/ur5/track_goal_ur5_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/ur5_track_goal.jpg"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/manipulation/track_goal/config/tycho/tycho_track_goal.py"><img src="https://uw-lab.github.io/UWLab/main/_images/tycho_track_goal.jpg"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/manipulation/track_goal/config/xarm_leap/track_goal_xarm_leap.py"><img src="https://uw-lab.github.io/UWLab/main/_images/xarm_leap_track_goal.jpg"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/manipulation/factory_extension/gearmesh_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/gear_mesh_ext.jpg"></a></td>
+        </tr>
+        <tr>
+            <td align="center">Ur5 w/ Robotiq Hand</td>
+            <td align="center">Tycho Dextrous Chopsticks Manipulator</td>
+            <td align="center">X-arm w/ Leap Hand</td>
+            <td align="center">Franka with NIST gear mesh task</td>
+        </tr>
+</table>
+
+### Advanced Locomotion Skills
+[`source/uwlab_tasks/uwlab_tasks/manager_based/locomotion`](https://github.com/UW-Lab/UWLab/tree/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion)
+
+> _Note:_ We focus solely on Boston Dynamics Spot as this is the hardware we currently have set up for sim2real testing.
+
+<table>
+    <tbody>
+        <tr>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/advance_skills/config/spot/spot_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/spot_gap.jpg"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/advance_skills/config/spot/spot_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/spot_pit.jpg"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/risky_terrains/config/spot/spot_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/spot_stepping_stone.jpg"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/advance_skills/config/spot/spot_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/spot_slope.jpg"></a></td>
+        </tr>
+        <tr>
+            <td align="center">Jumping Gaps</td>
+            <td align="center">Climbing Cliffs</td>
+            <td align="center">Precision Stepping Stones</td>
+            <td align="center">Escaping Sloped Pits</td>
+        </tr>
+</table>
+
 ## Overview
 
 **UW Lab**, open source projects built upon the robust foundation established by Isaac Lab, organized by UW(University of Washington) Robotic Students, aims to creates accelerated, unified, organized research in the field of robotics simulation in Isaac Ecosystem. This repo is designed and structured to reuse toolkit of ongoing IsaacLab development, track IsaacLab version, and extend the components from novelty and engineers from UW.
