@@ -1,8 +1,9 @@
-<p align="center">
+<!-- <p align="center">
   <img src="docs/source/_static/uwlab.png" alt="Isaac Lab">
 </p>
----
 
+---
+-->
 # UW Lab
 
 [![IsaacSim](https://img.shields.io/badge/IsaacSim-4.5.0-silver.svg)](https://docs.isaacsim.omniverse.nvidia.com/latest/index.html)
