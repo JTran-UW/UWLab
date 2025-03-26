@@ -42,10 +42,10 @@
 <table>
     <tbody>
         <tr>
-            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/advance_skills/config/spot/spot_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/spot_gap.jpg"></a></td>
-            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/advance_skills/config/spot/spot_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/spot_pit.jpg"></a></td>
-            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/risky_terrains/config/spot/spot_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/spot_stepping_stone.jpg"></a></td>
-            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/advance_skills/config/spot/spot_env_cfg.py"><img src="https://uw-lab.github.io/UWLab/main/_images/spot_slope.jpg"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/advance_skills/config/spot/spot_env_cfg.py"><img src="https://github.com/UW-Lab/UWLab/blob/main/docs/source/_static/tasks/locomotion/spot_gap.gif"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/advance_skills/config/spot/spot_env_cfg.py"><img src="https://github.com/UW-Lab/UWLab/blob/main/docs/source/_static/tasks/locomotion/spot_pit.gif"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/risky_terrains/config/spot/spot_env_cfg.py"><img src="https://github.com/UW-Lab/UWLab/blob/main/docs/source/_static/tasks/locomotion/spot_stepping_stone.gif"></a></td>
+            <td><a href="https://github.com/UW-Lab/UWLab/blob/main/source/uwlab_tasks/uwlab_tasks/manager_based/locomotion/advance_skills/config/spot/spot_env_cfg.py"><img src="https://github.com/UW-Lab/UWLab/blob/main/docs/source/_static/tasks/locomotion/spot_inv_slope.gif"></a></td>
         </tr>
         <tr>
             <td align="center">Jumping Gaps</td>
