@@ -57,14 +57,14 @@
 
 ## Overview
 
-**UW Lab**, open source projects built upon the robust foundation established by Isaac Lab, organized by UW(University of Washington) Robotic Students, aims to creates accelerated, unified, organized research in the field of robotics simulation in Isaac Ecosystem. This repo is designed and structured to reuse toolkit of ongoing IsaacLab development, track IsaacLab version, and extend the components from novelty and engineers from UW.
+**UW Lab**, is our open source project that builds upon the robust foundation established by Isaac Lab. This effort is organized by the UW (University of Washington) Robotic Students, across labs, and aims to create an centralized repository for high-quality, tested research ready for publication that resides in the IsaacLab Ecosystem. This repo is designed and structured to reuse the toolkit of ongoing IsaacLab development, track a strictly maintained IsaacLab version, and the relevant extensions required for our research on hardware here at UW.
 
 ## Key Features
 
 In addition to what IsaacLab provides, UW Lab brings:
 
-- **Environments**: Cleaned Implementation of reputable environments in Manager-Based format
-- **Sim to Real**: Providing robots and configuration that has been tested in UW Robotic Lab amd deliver the Simulation Setup that can directly transfer to reals
+- **Environments**: Clean Implementation of tested environments in the ManagerBased format. We both implement our own novel settings and reproduce results from our favorite papers.
+- **Sim to Real**: Providing robots and configurations that have been tested in the UW Robotics Labs, demonstrating effective sim2real transfer.
 
 
 ## Getting Started
@@ -83,10 +83,10 @@ Please refer to Isaac Lab
 
 ## Troubleshooting
 
-Please for bug and troubleshooting [submit an issue](https://github.com/UW-Lab/UWLab/issues).
-
 For issues related to Isaac Sim, we recommend checking its [documentation](https://docs.omniverse.nvidia.com/app_isaacsim/app_isaacsim/overview.html)
 or opening a question on its [forums](https://forums.developer.nvidia.com/c/agx-autonomous-machines/isaac/67).
+
+or bugs and troubleshooting specific to the UWLab environments, please [submit an issue](https://github.com/UW-Lab/UWLab/issues).
 
 ## Support
 
@@ -99,16 +99,16 @@ UW Lab is released under [BSD-3 License](LICENSE). The Isaac Lab framework is re
 
 ## Acknowledgement
 
-If you found UW Lab useful, we appreciate if you cite it in academic publications:
+If you found UWLab useful, we appreciate if you cite it in academic publications:
 ```
 @software{zhang2025uwlab,
   author={Zhang, Zhengyu and Yu, Feng and Castro, Mateo and Yin, Patrick and Peng, Quanquan and Scalise, Rosario},
-  title={{UWLab}: A Simulation Platform for Robot Learning Environment},
+  title={{UWLab}: Environments for robotics research at the edge of reinforcement learning, imitation learning, and sim2real,
   year={2025},
   url={https://github.com/UW-Lab/UWLab}
 }
 ```
-UW Lab development initialed from the Isaac Lab, and closely track the development of Isaac Lab. As gratitude we also appreciate if you cite Isaac Lab in academic publications:
+UW Lab originated thanks to the ongoing community effort of Isaac Lab. Our repository tracks it closely. As a gratitude we also appreciate if you cite Isaac Lab in academic publications:
 ```
 @article{mittal2023orbit,
    author={Mittal, Mayank and Yu, Calvin and Yu, Qinxi and Liu, Jingzhou and Rudin, Nikita and Hoeller, David and Yuan, Jia Lin and Singh, Ritvik and Guo, Yunrong and Mazhar, Hammad and Mandlekar, Ajay and Babich, Buck and State, Gavriel and Hutter, Marco and Garg, Animesh},
