@@ -179,14 +179,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     obs = env.get_observations()
     timestep = 0
     # simulate environment
+    import csv
+    file = open('joint_log.csv', 'w', newline='')
+    writer = csv.writer(file)
+    writer.writerow(["shoulder","upper_arm","forearm","wrist_1","wrist_2","wrist_3","robotiq_gripper","g1","g2","g3","g4","g5","g6","g7","ins_x","ins_y","ins_z","ins_xr","ins_yr","ins_zr","rec_x","rec_y","rec_z","rec_xr","rec_yr","rec_zr"])
+    from isaaclab.utils.math import euler_xyz_from_quat
+
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
+            # actions = torch.zeros((env.num_envs, env.num_actions), device=env.device)
             # env stepping
             obs, _, dones, _ = env.step(actions)
+            # print(env.unwrapped.observation_manager._latest_group_obs["joint_pos"].cpu().numpy().flatten().tolist())
+            joint_pos = env.unwrapped.observation_manager._latest_group_obs["joint_pos"].cpu().numpy().flatten().tolist()
+            insertive_asset_pos = env.unwrapped.scene.rigid_objects["insertive_object"].data.root_link_pos_w.cpu().numpy().flatten().tolist()
+            insertive_asset_rot = [elem.item() for elem in euler_xyz_from_quat(env.unwrapped.scene.rigid_objects["insertive_object"].data.root_link_quat_w)]
+            insertive_asset_pose = insertive_asset_pos + insertive_asset_rot
+            receptive_asset_pos = env.unwrapped.scene.rigid_objects["receptive_object"].data.root_link_pos_w.cpu().numpy().flatten().tolist()
+            receptive_asset_rot = [elem.item() for elem in euler_xyz_from_quat(env.unwrapped.scene.rigid_objects["receptive_object"].data.root_link_quat_w)]
+            receptive_asset_pose = receptive_asset_pos + receptive_asset_rot
+            writer.writerow(joint_pos + insertive_asset_pose + receptive_asset_pose)
+            
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
         if args_cli.video:
@@ -201,6 +218,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             time.sleep(sleep_time)
 
     # close the simulator
+    file.close()
     env.close()
 
 
