@@ -195,14 +195,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             obs, _, dones, _ = env.step(actions)
             # print(env.unwrapped.observation_manager._latest_group_obs["joint_pos"].cpu().numpy().flatten().tolist())
-            joint_pos = env.unwrapped.observation_manager._latest_group_obs["joint_pos"].cpu().numpy().flatten().tolist()
-            insertive_asset_pos = env.unwrapped.scene.rigid_objects["insertive_object"].data.root_link_pos_w.cpu().numpy().flatten().tolist()
-            insertive_asset_rot = [elem.item() for elem in euler_xyz_from_quat(env.unwrapped.scene.rigid_objects["insertive_object"].data.root_link_quat_w)]
-            insertive_asset_pose = insertive_asset_pos + insertive_asset_rot
-            receptive_asset_pos = env.unwrapped.scene.rigid_objects["receptive_object"].data.root_link_pos_w.cpu().numpy().flatten().tolist()
-            receptive_asset_rot = [elem.item() for elem in euler_xyz_from_quat(env.unwrapped.scene.rigid_objects["receptive_object"].data.root_link_quat_w)]
-            receptive_asset_pose = receptive_asset_pos + receptive_asset_rot
-            writer.writerow(joint_pos + insertive_asset_pose + receptive_asset_pose)
+            # joint_pos = env.unwrapped.observation_manager._latest_group_obs["joint_pos"].cpu().numpy().flatten().tolist()
+            # insertive_asset_pos = env.unwrapped.scene.rigid_objects["insertive_object"].data.root_link_pos_w.cpu().numpy().flatten().tolist()
+            # insertive_asset_rot = [elem.item() for elem in euler_xyz_from_quat(env.unwrapped.scene.rigid_objects["insertive_object"].data.root_link_quat_w)]
+            # insertive_asset_pose = insertive_asset_pos + insertive_asset_rot
+            # receptive_asset_pos = env.unwrapped.scene.rigid_objects["receptive_object"].data.root_link_pos_w.cpu().numpy().flatten().tolist()
+            # receptive_asset_rot = [elem.item() for elem in euler_xyz_from_quat(env.unwrapped.scene.rigid_objects["receptive_object"].data.root_link_quat_w)]
+            # receptive_asset_pose = receptive_asset_pos + receptive_asset_rot
+            # writer.writerow(joint_pos + insertive_asset_pose + receptive_asset_pose)
             
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
