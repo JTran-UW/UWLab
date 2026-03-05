@@ -41,8 +41,7 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
-if args_cli.video:
-    args_cli.enable_cameras = True
+args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -54,6 +53,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import imageio
 import os
 import time
 import torch
@@ -175,30 +175,59 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
+    # HD video recording setup
+    hd_camera = env.unwrapped.scene.sensors.get("hd_camera", None)
+    hd_video_writer = None
+    if hd_camera is not None:
+        video_dir = os.path.join(log_dir, "videos", "play")
+        os.makedirs(video_dir, exist_ok=True)
+        hd_video_path = os.path.join(video_dir, "hd_video.mp4")
+        hd_video_writer = imageio.get_writer(
+            hd_video_path, fps=30, codec="libx264", quality=10, pixelformat="yuv420p", macro_block_size=1
+        )
+        capture_interval = max(1, int(round(1.0 / (30.0 * env.unwrapped.physics_dt))))
+        physics_step_count = 0
+        print(f"[INFO] HD video recording enabled: {hd_video_path}")
+
     # reset environment
     obs = env.get_observations()
     timestep = 0
     # simulate environment
-    while simulation_app.is_running():
-        start_time = time.time()
-        # run everything in inference mode
-        with torch.inference_mode():
-            # agent stepping
-            actions = policy(obs)
-            # env stepping
-            obs, _, dones, _ = env.step(actions)
-            # reset recurrent states for episodes that have terminated
-            policy_nn.reset(dones)
-        if args_cli.video:
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+    try:
+        while simulation_app.is_running():
+            start_time = time.time()
+            # run everything in inference mode
+            with torch.inference_mode():
+                # agent stepping
+                actions = policy(obs)
+                # env stepping
+                obs, _, dones, _ = env.step(actions)
+                # reset recurrent states for episodes that have terminated
+                policy_nn.reset(dones)
 
-        # time delay for real-time evaluation
-        sleep_time = dt - (time.time() - start_time)
-        if args_cli.real_time and sleep_time > 0:
-            time.sleep(sleep_time)
+            # capture HD camera frame
+            if hd_video_writer is not None:
+                physics_step_count += env_cfg.decimation
+                if physics_step_count % capture_interval == 0:
+                    frame = hd_camera.data.output["rgb"][0].cpu().numpy()
+                    if frame.shape[-1] == 4:
+                        frame = frame[..., :3]
+                    hd_video_writer.append_data(frame)
+
+            if args_cli.video:
+                timestep += 1
+                # Exit the play loop after recording one video
+                if timestep == args_cli.video_length:
+                    break
+
+            # time delay for real-time evaluation
+            sleep_time = dt - (time.time() - start_time)
+            if args_cli.real_time and sleep_time > 0:
+                time.sleep(sleep_time)
+    finally:
+        if hd_video_writer is not None:
+            hd_video_writer.close()
+            print(f"[INFO] HD video saved to: {hd_video_path}")
 
     # close the simulator
     env.close()
