@@ -10,7 +10,7 @@ import torch
 
 import isaacsim.core.utils.bounds as bounds_utils
 from isaaclab.assets import Articulation, RigidObject, RigidObjectCollection
-from isaaclab.envs import ManagerBasedEnv
+from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg, TerminationTermCfg
 from isaaclab.utils import math as math_utils
 
@@ -673,3 +673,9 @@ class check_obb_no_overlap_termination(ManagerTermBase):
             self._visualize_bounding_boxes(env)
 
         return ~obb_overlap
+
+def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes: int = 10):
+    # Get the progress context to access assets and offsets
+    context_term = env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
+    continuous_success_counter = getattr(context_term, "continuous_success_counter")
+    return continuous_success_counter >= num_consecutive_successes
