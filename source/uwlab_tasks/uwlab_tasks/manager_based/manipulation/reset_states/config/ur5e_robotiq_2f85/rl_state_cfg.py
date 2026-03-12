@@ -508,6 +508,7 @@ class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+    success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 5})
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
