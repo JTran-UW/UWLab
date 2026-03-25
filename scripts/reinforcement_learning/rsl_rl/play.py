@@ -179,12 +179,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     obs = env.get_observations()
     timestep = 0
     # simulate environment
-    import csv
-    file = open('joint_log.csv', 'w', newline='')
-    writer = csv.writer(file)
-    writer.writerow(["shoulder","upper_arm","forearm","wrist_1","wrist_2","wrist_3","robotiq_gripper","g1","g2","g3","g4","g5","g6","g7","ins_x","ins_y","ins_z","ins_xr","ins_yr","ins_zr","rec_x","rec_y","rec_z","rec_xr","rec_yr","rec_zr"])
-    from isaaclab.utils.math import euler_xyz_from_quat
-
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
@@ -213,9 +207,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 break
 
         # time delay for real-time evaluation
-        sleep_time = dt - (time.time() - start_time)
-        if args_cli.real_time and sleep_time > 0:
-            time.sleep(sleep_time)
+        # sleep_time = dt - (time.time() - start_time)
+        # if args_cli.real_time and sleep_time > 0:
+        #     time.sleep(sleep_time)
 
     # close the simulator
     file.close()
