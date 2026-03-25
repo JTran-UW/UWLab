@@ -273,7 +273,7 @@ class EvalEventCfg(BaseEventCfg):
         mode="reset",
         params={
             "base_paths": [
-                f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/Resets/ObjectPairs/ObjectAnywhereEEAnywhere",
+                f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/Resets/ObjectPairs/ObjectAnywhereEEAnywhereDemo",
             ],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
