@@ -32,6 +32,13 @@ parser.add_argument(
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
+    "--run_id",
+    type=str,
+    default=None,
+    help="Unique run identifier (e.g., SLURM_JOB_ID). If provided, uses this as the directory name "
+    "instead of a timestamp, enabling automatic resumption when a job is requeued.",
+)
+parser.add_argument(
     "--resume_path", type=str, default=None,
     help="Direct path to a checkpoint file to resume from (bypasses log directory search).",
 )
@@ -154,13 +161,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
-    # specify directory for logging runs: {time-stamp}_{run_name}
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    is_main_process = not args_cli.distributed or app_launcher.global_rank == 0
+
+    if args_cli.run_id:
+        # deterministic directory for cluster jobs — enables auto-resume on requeue
+        log_dir = args_cli.run_id
+        if agent_cfg.run_name:
+            log_dir += f"_{agent_cfg.run_name}"
+        log_dir = os.path.join(log_root_path, log_dir)
+
+        if os.path.exists(log_dir):
+            checkpoint_files = [f for f in os.listdir(log_dir) if f.endswith(".pt")]
+            if checkpoint_files:
+                if is_main_process:
+                    print(f"[INFO] Found existing run with {len(checkpoint_files)} checkpoints. Auto-resuming...")
+                agent_cfg.resume = True
+                agent_cfg.load_run = os.path.basename(log_dir)
+    else:
+        log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if agent_cfg.run_name:
+            log_dir += f"_{agent_cfg.run_name}"
+        log_dir = os.path.join(log_root_path, log_dir)
+
     # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not change it (see PR #2346, comment-2819298849)
-    print(f"Exact experiment name requested from command line: {log_dir}")
-    if agent_cfg.run_name:
-        log_dir += f"_{agent_cfg.run_name}"
-    log_dir = os.path.join(log_root_path, log_dir)
+    if is_main_process:
+        print(f"Exact experiment name requested from command line: {os.path.basename(log_dir)}")
 
     # set the IO descriptors export flag if requested
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):
@@ -217,12 +243,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # load previously trained model
         runner.load(resume_path)
 
-    # dump the configuration into log-directory
-    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    # dump the configuration into log-directory (only on main process to avoid duplicates)
+    if is_main_process:
+        dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+        dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+
+    # calculate remaining iterations (handles auto-resume from requeue)
+    iterations_to_run = agent_cfg.max_iterations
+    if agent_cfg.resume and hasattr(runner, "current_learning_iteration"):
+        iterations_to_run = agent_cfg.max_iterations - runner.current_learning_iteration
+        print(f"[INFO] Resuming from iteration {runner.current_learning_iteration}. Remaining iterations: {iterations_to_run}")
+        if iterations_to_run <= 0:
+            print(
+                f"[INFO] Training already completed (Current: {runner.current_learning_iteration} >="
+                f" Max: {agent_cfg.max_iterations}). Exiting."
+            )
+            env.close()
+            return
 
     # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    runner.learn(num_learning_iterations=iterations_to_run, init_at_random_ep_len=True)
 
     # close the simulator
     env.close()
