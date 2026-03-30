@@ -39,6 +39,7 @@ cat <<'EOFSCRIPT' > job.sh
 #SBATCH --qos=QOS_PLACEHOLDER
 #SBATCH --time=TIME_PLACEHOLDER
 #SBATCH --requeue
+#SBATCH --exclude=g022
 
 # Signal handler: send USR1 120 seconds before time limit to trigger requeue
 #SBATCH --signal=B:USR1@120

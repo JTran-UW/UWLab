@@ -31,3 +31,6 @@ _isaac_sim?
 docker/.uw-lab-docker-history
 # datasets
 /datasets/
+# large local artifacts
+/exported/
+/checkpoints/
