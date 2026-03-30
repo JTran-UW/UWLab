@@ -738,6 +738,16 @@ class check_obb_no_overlap_termination(ManagerTermBase):
         return ~obb_overlap
 
 
+def object_off_table(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("insertive_object"),
+    min_height: float = -0.05,
+) -> torch.Tensor:
+    """Terminate if the object falls below a height threshold (off the table)."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return asset.data.root_pos_w[:, 2] < min_height
+
+
 def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes: int = 10):
     # Get the progress context to access assets and offsets
     context_term = env.reward_manager.get_term_cfg("progress_context").func  # type: ignore

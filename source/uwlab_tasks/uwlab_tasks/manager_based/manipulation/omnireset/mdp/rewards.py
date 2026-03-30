@@ -89,16 +89,37 @@ class ProgressContext(ManagerTermBase):
         self.insertive_asset: Articulation | RigidObject = env.scene[cfg.params.get("insertive_asset_cfg").name]  # type: ignore
         self.receptive_asset: Articulation | RigidObject = env.scene[cfg.params.get("receptive_asset_cfg").name]  # type: ignore
 
-        insertive_meta = utils.read_metadata_from_usd_directory(self.insertive_asset.cfg.spawn.usd_path)
-        receptive_meta = utils.read_metadata_from_usd_directory(self.receptive_asset.cfg.spawn.usd_path)
-        self.insertive_asset_offset = Offset(
-            pos=tuple(insertive_meta.get("assembled_offset").get("pos")),
-            quat=tuple(insertive_meta.get("assembled_offset").get("quat")),
-        )
-        self.receptive_asset_offset = Offset(
-            pos=tuple(receptive_meta.get("assembled_offset").get("pos")),
-            quat=tuple(receptive_meta.get("assembled_offset").get("quat")),
-        )
+        insertive_usd_paths = utils.get_usd_paths_from_spawn_cfg(self.insertive_asset.cfg.spawn)
+        receptive_usd_paths = utils.get_usd_paths_from_spawn_cfg(self.receptive_asset.cfg.spawn)
+        self.num_task_types = len(insertive_usd_paths)
+        self.is_multitask = self.num_task_types > 1
+
+        if self.is_multitask:
+            self.task_type_ids = torch.arange(env.num_envs, device=env.device) % self.num_task_types
+            ins_offset_pos, ins_offset_quat = [], []
+            rec_offset_pos, rec_offset_quat = [], []
+            for ins_path, rec_path in zip(insertive_usd_paths, receptive_usd_paths):
+                im = utils.read_metadata_from_usd_directory(ins_path)
+                rm = utils.read_metadata_from_usd_directory(rec_path)
+                ins_offset_pos.append(im["assembled_offset"]["pos"])
+                ins_offset_quat.append(im["assembled_offset"]["quat"])
+                rec_offset_pos.append(rm["assembled_offset"]["pos"])
+                rec_offset_quat.append(rm["assembled_offset"]["quat"])
+            self.ins_offset_pos = torch.tensor(ins_offset_pos, device=env.device, dtype=torch.float32)
+            self.ins_offset_quat = torch.tensor(ins_offset_quat, device=env.device, dtype=torch.float32)
+            self.rec_offset_pos = torch.tensor(rec_offset_pos, device=env.device, dtype=torch.float32)
+            self.rec_offset_quat = torch.tensor(rec_offset_quat, device=env.device, dtype=torch.float32)
+        else:
+            insertive_meta = utils.read_metadata_from_usd_directory(insertive_usd_paths[0])
+            receptive_meta = utils.read_metadata_from_usd_directory(receptive_usd_paths[0])
+            self.insertive_asset_offset = Offset(
+                pos=tuple(insertive_meta["assembled_offset"]["pos"]),
+                quat=tuple(insertive_meta["assembled_offset"]["quat"]),
+            )
+            self.receptive_asset_offset = Offset(
+                pos=tuple(receptive_meta["assembled_offset"]["pos"]),
+                quat=tuple(receptive_meta["assembled_offset"]["quat"]),
+            )
 
         self.orientation_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
         self.position_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
@@ -109,6 +130,14 @@ class ProgressContext(ManagerTermBase):
 
         success_monitor_cfg = SuccessMonitorCfg(monitored_history_len=100, num_monitored_data=1, device=env.device)
         self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
+
+    def _apply_offset_multitask(self, asset, offset_pos_all, offset_quat_all):
+        """Apply per-env offsets for multi-task mode."""
+        env_offset_pos = offset_pos_all[self.task_type_ids]
+        env_offset_quat = offset_quat_all[self.task_type_ids]
+        return math_utils.combine_frame_transforms(
+            asset.data.root_pos_w, asset.data.root_quat_w, env_offset_pos, env_offset_quat,
+        )
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         super().reset(env_ids)
@@ -124,12 +153,22 @@ class ProgressContext(ManagerTermBase):
         task_command: TaskCommand = env.command_manager.get_term(command_context)
         success_position_threshold = task_command.success_position_threshold
         success_orientation_threshold = task_command.success_orientation_threshold
-        insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w = self.insertive_asset_offset.apply(
-            self.insertive_asset
-        )
-        receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self.receptive_asset_offset.apply(
-            self.receptive_asset
-        )
+
+        if self.is_multitask:
+            insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w = self._apply_offset_multitask(
+                self.insertive_asset, self.ins_offset_pos, self.ins_offset_quat,
+            )
+            receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self._apply_offset_multitask(
+                self.receptive_asset, self.rec_offset_pos, self.rec_offset_quat,
+            )
+        else:
+            insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w = self.insertive_asset_offset.apply(
+                self.insertive_asset
+            )
+            receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self.receptive_asset_offset.apply(
+                self.receptive_asset
+            )
+
         insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat = (
             math_utils.subtract_frame_transforms(
                 receptive_asset_alignment_pos_w,
@@ -138,7 +177,6 @@ class ProgressContext(ManagerTermBase):
                 insertive_asset_alignment_quat_w,
             )
         )
-        # yaw could be different
         e_x, e_y, _ = math_utils.euler_xyz_from_quat(insertive_asset_in_receptive_asset_frame_quat)
         self.euler_xy_distance[:] = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
         self.xyz_distance[:] = torch.norm(insertive_asset_in_receptive_asset_frame_pos, dim=1)
@@ -146,12 +184,10 @@ class ProgressContext(ManagerTermBase):
         self.orientation_aligned[:] = self.euler_xy_distance < success_orientation_threshold
         self.success[:] = self.orientation_aligned & self.position_aligned
 
-        # Update continuous success counter
         self.continuous_success_counter[:] = torch.where(
             self.success, self.continuous_success_counter + 1, torch.zeros_like(self.continuous_success_counter)
         )
 
-        # Update success monitor
         self.success_monitor.success_update(
             torch.zeros(env.num_envs, dtype=torch.int32, device=env.device), self.success
         )

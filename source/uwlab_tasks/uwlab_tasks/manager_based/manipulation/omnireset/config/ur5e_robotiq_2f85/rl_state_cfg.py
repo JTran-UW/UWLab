@@ -268,6 +268,8 @@ class TrainEvalEventCfg(BaseEventCfg):
     )
 
 
+
+
 @configclass
 class FinetuneEvalEventCfg(BaseEventCfg):
     """Eval after Stage 2: fixed sysid + OSC gains (scale_progress=1) + 1-path resets."""
@@ -613,7 +615,7 @@ class NoCurriculumsCfg:
     pass
 
 
-def make_insertive_object(usd_path: str):
+def make_insertive_object(usd_path: str, collision_enabled: bool = True):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
         spawn=sim_utils.UsdFileCfg(
@@ -626,6 +628,7 @@ def make_insertive_object(usd_path: str):
                 kinematic_enabled=False,
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.001),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=collision_enabled),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
     )
@@ -652,10 +655,13 @@ def make_receptive_object(usd_path: str):
 variants = {
     "scene.insertive_object": {
         "fbleg": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
+        "fbleg_nocol": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd", collision_enabled=False),
+        "fbleg_sdf64": make_insertive_object("/home/patrickhaoy/Downloads/SquareLeg/square_leg.usd"),
         "fbdrawerbottom": make_insertive_object(
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd"
         ),
         "peg": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"),
+        "peg_convex": make_insertive_object("/home/patrickhaoy/Downloads/Peg/peg.usd"),
         "cupcake": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/CupCake/cupcake.usd"),
         "cube": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/InsertiveCube/insertive_cube.usd"),
         "rectangle": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Rectangle/rectangle.usd"),
@@ -664,10 +670,14 @@ variants = {
         "fbtabletop": make_receptive_object(
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareTableTop/square_table_top.usd"
         ),
+        "fbtabletop_sdf64": make_receptive_object(
+            "/home/patrickhaoy/Downloads/SquareTableTop/square_table_top.usd"
+        ),
         "fbdrawerbox": make_receptive_object(
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd"
         ),
         "peghole": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"),
+        "peghole_convex": make_receptive_object("/home/patrickhaoy/Downloads/PegHole/peg_hole.usd"),
         "plate": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Plate/plate.usd"),
         "cube": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/ReceptiveCube/receptive_cube.usd"),
         "wall": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Wall/wall.usd"),

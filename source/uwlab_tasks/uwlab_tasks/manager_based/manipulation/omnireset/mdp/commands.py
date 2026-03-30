@@ -81,24 +81,50 @@ class TaskCommand(TaskDependentCommand):
     """Configuration for the command generator."""
 
     def __init__(self, cfg: TaskCommandCfg, env: ManagerBasedEnv):
-        # initialize the base class
         super().__init__(cfg, env)
 
-        # obtain the terrain asset
         self.insertive_asset: Articulation | RigidObject = env.scene[cfg.insertive_asset_cfg.name]
         self.receptive_asset: Articulation | RigidObject = env.scene[cfg.receptive_asset_cfg.name]
-        insertive_meta = utils.read_metadata_from_usd_directory(self.insertive_asset.cfg.spawn.usd_path)
-        receptive_meta = utils.read_metadata_from_usd_directory(self.receptive_asset.cfg.spawn.usd_path)
-        self.insertive_asset_offset = Offset(
-            pos=tuple(insertive_meta.get("assembled_offset").get("pos")),
-            quat=tuple(insertive_meta.get("assembled_offset").get("quat")),
-        )
-        self.receptive_asset_offset = Offset(
-            pos=tuple(receptive_meta.get("assembled_offset").get("pos")),
-            quat=tuple(receptive_meta.get("assembled_offset").get("quat")),
-        )
-        self.success_position_threshold: float = receptive_meta.get("success_thresholds").get("position")
-        self.success_orientation_threshold: float = receptive_meta.get("success_thresholds").get("orientation")
+
+        insertive_usd_paths = utils.get_usd_paths_from_spawn_cfg(self.insertive_asset.cfg.spawn)
+        receptive_usd_paths = utils.get_usd_paths_from_spawn_cfg(self.receptive_asset.cfg.spawn)
+        self.num_task_types = len(insertive_usd_paths)
+        self.is_multitask = self.num_task_types > 1
+
+        if self.is_multitask:
+            self.task_type_ids = torch.arange(env.num_envs, device=self.device) % self.num_task_types
+            ins_offset_pos, ins_offset_quat = [], []
+            rec_offset_pos, rec_offset_quat = [], []
+            pos_thresholds, ori_thresholds = [], []
+            for ins_path, rec_path in zip(insertive_usd_paths, receptive_usd_paths):
+                im = utils.read_metadata_from_usd_directory(ins_path)
+                rm = utils.read_metadata_from_usd_directory(rec_path)
+                ins_offset_pos.append(im["assembled_offset"]["pos"])
+                ins_offset_quat.append(im["assembled_offset"]["quat"])
+                rec_offset_pos.append(rm["assembled_offset"]["pos"])
+                rec_offset_quat.append(rm["assembled_offset"]["quat"])
+                pos_thresholds.append(rm["success_thresholds"]["position"])
+                ori_thresholds.append(rm["success_thresholds"]["orientation"])
+            self.ins_offset_pos = torch.tensor(ins_offset_pos, device=self.device, dtype=torch.float32)
+            self.ins_offset_quat = torch.tensor(ins_offset_quat, device=self.device, dtype=torch.float32)
+            self.rec_offset_pos = torch.tensor(rec_offset_pos, device=self.device, dtype=torch.float32)
+            self.rec_offset_quat = torch.tensor(rec_offset_quat, device=self.device, dtype=torch.float32)
+            self._pos_thresholds = torch.tensor(pos_thresholds, device=self.device, dtype=torch.float32)
+            self._ori_thresholds = torch.tensor(ori_thresholds, device=self.device, dtype=torch.float32)
+            self.task_names = [utils.object_name_from_usd(p) for p in insertive_usd_paths]
+        else:
+            insertive_meta = utils.read_metadata_from_usd_directory(insertive_usd_paths[0])
+            receptive_meta = utils.read_metadata_from_usd_directory(receptive_usd_paths[0])
+            self.insertive_asset_offset = Offset(
+                pos=tuple(insertive_meta["assembled_offset"]["pos"]),
+                quat=tuple(insertive_meta["assembled_offset"]["quat"]),
+            )
+            self.receptive_asset_offset = Offset(
+                pos=tuple(receptive_meta["assembled_offset"]["pos"]),
+                quat=tuple(receptive_meta["assembled_offset"]["quat"]),
+            )
+            self._success_position_threshold: float = receptive_meta["success_thresholds"]["position"]
+            self._success_orientation_threshold: float = receptive_meta["success_thresholds"]["orientation"]
 
         self.metrics["average_rot_align_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["average_pos_align_error"] = torch.zeros(self.num_envs, device=self.device)
@@ -111,33 +137,51 @@ class TaskCommand(TaskDependentCommand):
         self.euler_xy_distance = torch.zeros((self._env.num_envs), device=self._env.device)
         self.xyz_distance = torch.zeros((self._env.num_envs), device=self._env.device)
 
-    """
-    Properties
-    """
+    @property
+    def success_position_threshold(self):
+        if self.is_multitask:
+            return self._pos_thresholds[self.task_type_ids]
+        return self._success_position_threshold
+
+    @property
+    def success_orientation_threshold(self):
+        if self.is_multitask:
+            return self._ori_thresholds[self.task_type_ids]
+        return self._success_orientation_threshold
 
     @property
     def command(self) -> torch.Tensor:
         return torch.zeros(self.num_envs, 3, device=self.device)
 
-    """
-    Implementation specific functions.
-    """
+    def _apply_offset_multitask(self, asset, offset_pos_all, offset_quat_all):
+        env_offset_pos = offset_pos_all[self.task_type_ids]
+        env_offset_quat = offset_quat_all[self.task_type_ids]
+        return math_utils.combine_frame_transforms(
+            asset.data.root_pos_w, asset.data.root_quat_w, env_offset_pos, env_offset_quat,
+        )
 
     def _update_metrics(self):
-        # logs end of episode data
         reset_env = self._env.episode_length_buf == 0
         self.metrics["end_of_episode_rot_align_error"][reset_env] = self.euler_xy_distance[reset_env]
         self.metrics["end_of_episode_pos_align_error"][reset_env] = self.xyz_distance[reset_env]
         last_episode_success = (self.orientation_aligned & self.position_aligned)[reset_env]
         self.metrics["end_of_episode_success_rate"][reset_env] = last_episode_success.float()
 
-        # logs current data
-        insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w = self.insertive_asset_offset.apply(
-            self.insertive_asset
-        )
-        receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self.receptive_asset_offset.apply(
-            self.receptive_asset
-        )
+        if self.is_multitask:
+            insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w = self._apply_offset_multitask(
+                self.insertive_asset, self.ins_offset_pos, self.ins_offset_quat,
+            )
+            receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self._apply_offset_multitask(
+                self.receptive_asset, self.rec_offset_pos, self.rec_offset_quat,
+            )
+        else:
+            insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w = self.insertive_asset_offset.apply(
+                self.insertive_asset
+            )
+            receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self.receptive_asset_offset.apply(
+                self.receptive_asset
+            )
+
         insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat = (
             math_utils.subtract_frame_transforms(
                 receptive_asset_alignment_pos_w,

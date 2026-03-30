@@ -32,11 +32,20 @@ from pytorch3d.structures import Meshes
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 
+from isaaclab.sim.spawners.wrappers.wrappers_cfg import MultiAssetSpawnerCfg
+
 from .rigid_object_hasher import RigidObjectHasher
 
 # ---- module-scope caches ----
 _PRIM_SAMPLE_CACHE: dict[tuple[str, int], np.ndarray] = {}  # (prim_hash, num_points) -> (N,3) in root frame
 _FINAL_SAMPLE_CACHE: dict[str, np.ndarray] = {}  # env_hash -> (num_points,3) in root frame
+
+
+def get_usd_paths_from_spawn_cfg(spawn_cfg) -> list[str]:
+    """Extract USD paths from a single UsdFileCfg or a MultiAssetSpawnerCfg."""
+    if isinstance(spawn_cfg, MultiAssetSpawnerCfg):
+        return [asset_cfg.usd_path for asset_cfg in spawn_cfg.assets_cfg]
+    return [spawn_cfg.usd_path]
 
 
 def clear_pointcloud_caches():

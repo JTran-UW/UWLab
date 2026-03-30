@@ -33,6 +33,7 @@ from uwlab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActi
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
 
 from ..assembly_keypoints import Offset
+from .success_monitor import SuccessMonitor
 from .success_monitor_cfg import SuccessMonitorCfg
 
 
@@ -1005,44 +1006,57 @@ class MultiResetManager(ManagerTermBase):
         if len(reset_types) != len(probabilities):
             raise ValueError("Number of reset_types must match number of probabilities")
 
-        # Derive pair directory from scene objects
-        insertive_usd_path = env.scene["insertive_object"].cfg.spawn.usd_path
-        receptive_usd_path = env.scene["receptive_object"].cfg.spawn.usd_path
-        pair = utils.compute_pair_dir(insertive_usd_path, receptive_usd_path)
+        insertive_usd_paths = utils.get_usd_paths_from_spawn_cfg(env.scene["insertive_object"].cfg.spawn)
+        receptive_usd_paths = utils.get_usd_paths_from_spawn_cfg(env.scene["receptive_object"].cfg.spawn)
+        self.num_task_types = len(insertive_usd_paths)
+        self.is_multitask = self.num_task_types > 1
+        self.num_reset_types = len(reset_types)
 
-        # Generate dataset paths from pair directory and reset types
-        dataset_files = []
-        for rt in reset_types:
-            dataset_files.append(f"{dataset_dir}/Resets/{pair}/resets_{rt}.pt")
+        if self.is_multitask:
+            self.task_type_ids = torch.arange(env.num_envs, device=env.device) % self.num_task_types
+            self.task_names = [utils.object_name_from_usd(p) for p in insertive_usd_paths]
 
-        # Load all datasets
-        self.datasets = []
-        num_states = []
-        for dataset_file in dataset_files:
-            local_file_path = utils.safe_retrieve_file_path(dataset_file)
+        self.pair_datasets: list[list] = []
+        self.pair_num_states: list[list[int]] = []
 
-            # Check if local file exists (after potential download)
-            if not os.path.exists(local_file_path):
-                raise FileNotFoundError(f"Dataset file {dataset_file} could not be accessed or downloaded.")
+        for ins_path, rec_path in zip(insertive_usd_paths, receptive_usd_paths):
+            pair = utils.compute_pair_dir(ins_path, rec_path)
+            task_datasets = []
+            task_num_states = []
+            for rt in reset_types:
+                dataset_file = f"{dataset_dir}/Resets/{pair}/resets_{rt}.pt"
+                local_file_path = utils.safe_retrieve_file_path(dataset_file)
+                if not os.path.exists(local_file_path):
+                    raise FileNotFoundError(f"Dataset file {dataset_file} could not be accessed or downloaded.")
+                dataset = torch.load(local_file_path)
+                n = len(dataset["initial_state"]["articulation"]["robot"]["joint_position"])
+                task_num_states.append(n)
+                init_indices = torch.arange(n, device=env.device)
+                task_datasets.append(sample_state_data_set(dataset, init_indices, env.device))
+            self.pair_datasets.append(task_datasets)
+            self.pair_num_states.append(task_num_states)
 
-            dataset = torch.load(local_file_path)
-            num_states.append(len(dataset["initial_state"]["articulation"]["robot"]["joint_position"]))
-            init_indices = torch.arange(num_states[-1], device=env.device)
-            self.datasets.append(sample_state_data_set(dataset, init_indices, env.device))
-
-        # Normalize probabilities and store dataset lengths
         self.probs = torch.tensor(probabilities, device=env.device) / sum(probabilities)
-        self.num_states = torch.tensor(num_states, device=env.device)
-        self.num_tasks = len(self.datasets)
+        self.num_tasks = self.num_reset_types
+        num_monitored = self.num_task_types * self.num_reset_types if self.is_multitask else self.num_reset_types
 
-        # Initialize success monitor
         if cfg.params.get("success") is not None:
             success_monitor_cfg = SuccessMonitorCfg(
-                monitored_history_len=100, num_monitored_data=self.num_tasks, device=env.device
+                monitored_history_len=100, num_monitored_data=num_monitored, device=env.device
             )
             self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
 
+        self.curriculum_target: float | None = cfg.params.get("curriculum_target", None)
+        self.curriculum_kappa: float = cfg.params.get("curriculum_kappa", 2.0)
+        self.curriculum_temperature: float = cfg.params.get("curriculum_temperature", 2.0)
+
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
+
+    def _get_monitor_id(self, task_type_idx: int, reset_type_idx: torch.Tensor) -> torch.Tensor:
+        """Composite index for the success monitor: task_type * num_reset_types + reset_type."""
+        if self.is_multitask:
+            return task_type_idx * self.num_reset_types + reset_type_idx
+        return reset_type_idx
 
     def __call__(
         self,
@@ -1052,48 +1066,104 @@ class MultiResetManager(ManagerTermBase):
         reset_types: list[str],
         probs: list[float],
         success: str | None = None,
+        curriculum_target: float | None = None,
+        curriculum_kappa: float = 2.0,
+        curriculum_temperature: float = 2.0,
     ) -> None:
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self._env.device)
 
-        # Log current data
         if success is not None:
             success_mask = torch.where(eval(success)[env_ids], 1.0, 0.0)
-            self.success_monitor.success_update(self.task_id[env_ids], success_mask)
+            if self.is_multitask:
+                monitor_ids = self._get_monitor_id(self.task_type_ids[env_ids], self.task_id[env_ids])
+            else:
+                monitor_ids = self.task_id[env_ids]
+            self.success_monitor.success_update(monitor_ids, success_mask)
 
-            # Log metrics for each task
             success_rates = self.success_monitor.get_success_rate()
             if "log" not in self._env.extras:
                 self._env.extras["log"] = {}
-            for task_idx in range(self.num_tasks):
-                self._env.extras["log"].update({
-                    f"Metrics/task_{task_idx}_success_rate": success_rates[task_idx].item(),
-                    f"Metrics/task_{task_idx}_prob": self.probs[task_idx].item(),
-                    f"Metrics/task_{task_idx}_normalized_prob": self.probs[task_idx].item(),
-                })
 
-            # Log episode length at reset
+            if self.is_multitask:
+                for tt_idx in range(self.num_task_types):
+                    task_name = self.task_names[tt_idx]
+                    tt_mask = self.task_type_ids[env_ids] == tt_idx
+                    if tt_mask.any():
+                        tt_success = success_mask[tt_mask]
+                        self._env.extras["log"][f"Metrics/{task_name}_success_rate"] = tt_success.mean().item()
+                    for rt_idx in range(self.num_reset_types):
+                        mid = tt_idx * self.num_reset_types + rt_idx
+                        self._env.extras["log"][f"Metrics/{task_name}_rt{rt_idx}_success_rate"] = (
+                            success_rates[mid].item()
+                        )
+            else:
+                for task_idx in range(self.num_tasks):
+                    self._env.extras["log"].update({
+                        f"Metrics/task_{task_idx}_success_rate": success_rates[task_idx].item(),
+                        f"Metrics/task_{task_idx}_prob": self.probs[task_idx].item(),
+                        f"Metrics/task_{task_idx}_normalized_prob": self.probs[task_idx].item(),
+                    })
+
             ep_lengths = self._env.episode_length_buf[env_ids].float()
             self._env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
 
-        # Sample which dataset to use for each environment
-        dataset_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
-        self.task_id[env_ids] = dataset_indices
+        if self.curriculum_target is not None and hasattr(self, "success_monitor") and self.is_multitask:
+            success_rates = self.success_monitor.get_success_rate()
+            reset_type_indices = torch.empty(len(env_ids), dtype=torch.int64, device=self.device)
+            env_task_types = self.task_type_ids[env_ids]
 
-        # Process each dataset's environments
-        for dataset_idx in range(self.num_tasks):
-            mask = dataset_indices == dataset_idx
-            if not mask.any():
-                continue
+            if "log" not in self._env.extras:
+                self._env.extras["log"] = {}
 
-            current_env_ids = env_ids[mask]
-            state_indices = torch.randint(
-                0, self.num_states[dataset_idx], (len(current_env_ids),), device=self._env.device
-            )
-            states_to_reset_from = sample_from_nested_dict(self.datasets[dataset_idx], state_indices)
-            self._reset_to(states_to_reset_from["initial_state"], env_ids=current_env_ids, is_relative=True)
+            for tt_idx in range(self.num_task_types):
+                tt_mask = env_task_types == tt_idx
+                if not tt_mask.any():
+                    continue
+                start = tt_idx * self.num_reset_types
+                tt_rates = success_rates[start : start + self.num_reset_types]
+                choices, sampling_probs = SuccessMonitor.sample_by_target_rate_from_rates(
+                    tt_rates, int(tt_mask.sum()),
+                    self.curriculum_target, self.curriculum_kappa, self.curriculum_temperature,
+                )
+                reset_type_indices[tt_mask] = choices
 
-        # Reset velocities
+                task_name = self.task_names[tt_idx]
+                for rt_idx in range(self.num_reset_types):
+                    self._env.extras["log"][f"Curriculum/{task_name}_rt{rt_idx}_prob"] = (
+                        sampling_probs[rt_idx].item()
+                    )
+        else:
+            reset_type_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+
+        self.task_id[env_ids] = reset_type_indices
+
+        if self.is_multitask:
+            env_task_types = self.task_type_ids[env_ids]
+            for tt_idx in range(self.num_task_types):
+                tt_mask = env_task_types == tt_idx
+                if not tt_mask.any():
+                    continue
+                for rt_idx in range(self.num_reset_types):
+                    combined_mask = tt_mask & (reset_type_indices == rt_idx)
+                    if not combined_mask.any():
+                        continue
+                    current_env_ids = env_ids[combined_mask]
+                    n_states = self.pair_num_states[tt_idx][rt_idx]
+                    state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
+                    states = sample_from_nested_dict(self.pair_datasets[tt_idx][rt_idx], state_indices)
+                    self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
+        else:
+            for dataset_idx in range(self.num_tasks):
+                mask = reset_type_indices == dataset_idx
+                if not mask.any():
+                    continue
+                current_env_ids = env_ids[mask]
+                n_states = self.pair_num_states[0][dataset_idx]
+                state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
+                states = sample_from_nested_dict(self.pair_datasets[0][dataset_idx], state_indices)
+                self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
+
         robot: Articulation = self._env.scene["robot"]
         robot.set_joint_velocity_target(torch.zeros_like(robot.data.joint_vel[env_ids]), env_ids=env_ids)
 

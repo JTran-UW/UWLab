@@ -299,3 +299,90 @@ def binary_force_contact(
     force_norm = torch.norm(wrench_b[:, :3], dim=-1)  # (N,)
     contact = (force_norm > force_threshold).float()
     return contact.unsqueeze(-1)  # (N, 1)
+
+
+class MeshPointCloud(ManagerTermBase):
+    """Mesh-sampled pointcloud observation for implicit task conditioning.
+
+    At init: samples canonical points from the object's USD mesh (handles
+    multi-asset via RigidObjectHasher). At runtime: transforms canonical
+    points by current object pose, then into robot base frame. Returns
+    flattened [num_envs, num_points * 3].
+
+    Set ``visualize=True`` and ``visualize_env_ids=[0,1]`` to render
+    sphere markers in the viewport (non-headless only).
+    """
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        object_cfg: SceneEntityCfg = cfg.params["object_cfg"]
+        self.robot_cfg: SceneEntityCfg = cfg.params["robot_cfg"]
+        self.num_points: int = cfg.params.get("num_points", 128)
+
+        self.object_asset: RigidObject = env.scene[object_cfg.name]
+        self.robot_asset: Articulation = env.scene[self.robot_cfg.name]
+
+        prim_path_pattern = self.object_asset.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        self.canonical_points = utils.sample_object_point_cloud(
+            num_envs=env.num_envs,
+            num_points=self.num_points,
+            prim_path_pattern=prim_path_pattern,
+            device=str(env.device),
+        )  # [num_envs, num_points, 3] in object local frame
+
+        self._setup_visualization(cfg, env, object_cfg)
+
+    def _setup_visualization(self, cfg: ObservationTermCfg, env: ManagerBasedEnv, object_cfg: SceneEntityCfg):
+        self.visualize_enabled = cfg.params.get("visualize", False)
+        if not self.visualize_enabled:
+            return
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        self.visualize_env_ids = cfg.params.get("visualize_env_ids", [0])
+        obj_name = object_cfg.name
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path=f"/Visuals/pointcloud_{obj_name}",
+            markers={
+                "pt": sim_utils.SphereCfg(
+                    radius=0.003,
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=(1.0, 0.0, 0.0) if "insertive" in obj_name else (0.0, 0.0, 1.0),
+                    ),
+                ),
+            },
+        )
+        self._pc_markers = VisualizationMarkers(marker_cfg)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        object_cfg: SceneEntityCfg,
+        robot_cfg: SceneEntityCfg,
+        num_points: int = 128,
+        visualize: bool = False,
+        visualize_env_ids: list[int] | None = None,
+    ) -> torch.Tensor:
+        obj_pos_w = self.object_asset.data.root_pos_w  # [N, 3]
+        obj_quat_w = self.object_asset.data.root_quat_w  # [N, 4]
+
+        points_w = math_utils.quat_apply(
+            obj_quat_w.unsqueeze(1).expand(-1, self.num_points, -1),
+            self.canonical_points,
+        ) + obj_pos_w.unsqueeze(1)
+
+        if self.visualize_enabled:
+            vis_pts = points_w[self.visualize_env_ids].reshape(-1, 3)
+            self._pc_markers.visualize(translations=vis_pts)
+
+        robot_pos_w = self.robot_asset.data.root_pos_w  # [N, 3]
+        robot_quat_w = self.robot_asset.data.root_quat_w  # [N, 4]
+        robot_quat_w_inv = math_utils.quat_inv(robot_quat_w)
+
+        points_rel = points_w - robot_pos_w.unsqueeze(1)
+        points_b = math_utils.quat_apply(
+            robot_quat_w_inv.unsqueeze(1).expand(-1, self.num_points, -1),
+            points_rel,
+        )  # [N, num_points, 3]
+
+        return points_b.reshape(env.num_envs, -1)  # [N, num_points * 3]
