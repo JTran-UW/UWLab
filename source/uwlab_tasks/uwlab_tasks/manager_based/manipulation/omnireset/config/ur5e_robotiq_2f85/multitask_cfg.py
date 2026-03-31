@@ -456,6 +456,13 @@ class MultiTaskCurriculumEventCfg:
 
 
 @configclass
+class Ur5eRobotiq2f85RelCartesianOSCMultiTaskCurriculumTrainCfg(Ur5eRobotiq2f85RelCartesianOSCMultiTaskTrainCfg):
+    """Multi-task training with original rewards + GPS curriculum over reset types."""
+
+    events: MultiTaskCurriculumEventCfg = MultiTaskCurriculumEventCfg()
+
+
+@configclass
 class Ur5eRobotiq2f85RelCartesianOSCMultiTaskSimplifiedCurriculumTrainCfg(
     Ur5eRobotiq2f85RelCartesianOSCMultiTaskSimplifiedTrainCfg,
 ):
