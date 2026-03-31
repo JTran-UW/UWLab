@@ -302,25 +302,34 @@ def binary_force_contact(
 
 
 class MeshPointCloud(ManagerTermBase):
-    """Mesh-sampled pointcloud observation for implicit task conditioning.
+    """Mesh-sampled pointcloud in an arbitrary reference frame.
 
-    At init: samples canonical points from the object's USD mesh (handles
-    multi-asset via RigidObjectHasher). At runtime: transforms canonical
-    points by current object pose, then into robot base frame. Returns
-    flattened [num_envs, num_points * 3].
+    Samples canonical points from the object's USD mesh at init, then at
+    runtime transforms them into the reference frame specified by ``ref_cfg``.
 
-    Set ``visualize=True`` and ``visualize_env_ids=[0,1]`` to render
-    sphere markers in the viewport (non-headless only).
+    ``ref_cfg`` can be:
+      - An Articulation with ``body_names`` (e.g. wrist link)
+      - An Articulation without ``body_names`` (robot root frame)
+      - A RigidObject (e.g. receptive_object)
+
+    Falls back to legacy ``robot_cfg`` param if ``ref_cfg`` is not provided.
+
+    Returns flattened ``[num_envs, num_points * 3]``.
     """
 
     def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         object_cfg: SceneEntityCfg = cfg.params["object_cfg"]
-        self.robot_cfg: SceneEntityCfg = cfg.params["robot_cfg"]
+        ref_cfg: SceneEntityCfg = cfg.params.get("ref_cfg", cfg.params.get("robot_cfg"))
         self.num_points: int = cfg.params.get("num_points", 128)
 
         self.object_asset: RigidObject = env.scene[object_cfg.name]
-        self.robot_asset: Articulation = env.scene[self.robot_cfg.name]
+        self.ref_asset = env.scene[ref_cfg.name]
+
+        self.ref_body_idx: int | None = None
+        if ref_cfg.body_names and isinstance(self.ref_asset, Articulation):
+            ref_cfg.resolve(env.scene)
+            self.ref_body_idx = ref_cfg.body_ids[0]  # type: ignore
 
         prim_path_pattern = self.object_asset.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
         self.canonical_points = utils.sample_object_point_cloud(
@@ -332,6 +341,15 @@ class MeshPointCloud(ManagerTermBase):
 
         self._setup_visualization(cfg, env, object_cfg)
 
+    def _get_ref_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (pos_w, quat_w) of the reference frame, shape [N, 3] and [N, 4]."""
+        if self.ref_body_idx is not None:
+            return (
+                self.ref_asset.data.body_pos_w[:, self.ref_body_idx],
+                self.ref_asset.data.body_quat_w[:, self.ref_body_idx],
+            )
+        return self.ref_asset.data.root_pos_w, self.ref_asset.data.root_quat_w
+
     def _setup_visualization(self, cfg: ObservationTermCfg, env: ManagerBasedEnv, object_cfg: SceneEntityCfg):
         self.visualize_enabled = cfg.params.get("visualize", False)
         if not self.visualize_enabled:
@@ -340,14 +358,18 @@ class MeshPointCloud(ManagerTermBase):
         from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
         self.visualize_env_ids = cfg.params.get("visualize_env_ids", [0])
+        ref_cfg: SceneEntityCfg = cfg.params.get("ref_cfg", cfg.params.get("robot_cfg"))
         obj_name = object_cfg.name
+        body_suffix = "_" + "_".join(ref_cfg.body_names) if ref_cfg.body_names else ""
+        ref_name = ref_cfg.name + body_suffix
+        self._debug_label = f"{obj_name}_in_{ref_name}"
         marker_cfg = VisualizationMarkersCfg(
-            prim_path=f"/Visuals/pointcloud_{obj_name}",
+            prim_path=f"/Visuals/pointcloud_{self._debug_label}",
             markers={
                 "pt": sim_utils.SphereCfg(
                     radius=0.003,
                     visual_material=sim_utils.PreviewSurfaceCfg(
-                        diffuse_color=(1.0, 0.0, 0.0) if "insertive" in obj_name else (0.0, 0.0, 1.0),
+                        diffuse_color=cfg.params.get("marker_color", (1.0, 0.0, 0.0)),
                     ),
                 ),
             },
@@ -358,13 +380,15 @@ class MeshPointCloud(ManagerTermBase):
         self,
         env: ManagerBasedEnv,
         object_cfg: SceneEntityCfg,
-        robot_cfg: SceneEntityCfg,
+        ref_cfg: SceneEntityCfg | None = None,
+        robot_cfg: SceneEntityCfg | None = None,
         num_points: int = 128,
         visualize: bool = False,
         visualize_env_ids: list[int] | None = None,
+        marker_color: tuple[float, float, float] = (1.0, 0.0, 0.0),
     ) -> torch.Tensor:
-        obj_pos_w = self.object_asset.data.root_pos_w  # [N, 3]
-        obj_quat_w = self.object_asset.data.root_quat_w  # [N, 4]
+        obj_pos_w = self.object_asset.data.root_pos_w
+        obj_quat_w = self.object_asset.data.root_quat_w
 
         points_w = math_utils.quat_apply(
             obj_quat_w.unsqueeze(1).expand(-1, self.num_points, -1),
@@ -375,14 +399,12 @@ class MeshPointCloud(ManagerTermBase):
             vis_pts = points_w[self.visualize_env_ids].reshape(-1, 3)
             self._pc_markers.visualize(translations=vis_pts)
 
-        robot_pos_w = self.robot_asset.data.root_pos_w  # [N, 3]
-        robot_quat_w = self.robot_asset.data.root_quat_w  # [N, 4]
-        robot_quat_w_inv = math_utils.quat_inv(robot_quat_w)
+        ref_pos_w, ref_quat_w = self._get_ref_pose_w()
+        ref_quat_w_inv = math_utils.quat_inv(ref_quat_w)
 
-        points_rel = points_w - robot_pos_w.unsqueeze(1)
-        points_b = math_utils.quat_apply(
-            robot_quat_w_inv.unsqueeze(1).expand(-1, self.num_points, -1),
-            points_rel,
-        )  # [N, num_points, 3]
+        points_ref = math_utils.quat_apply(
+            ref_quat_w_inv.unsqueeze(1).expand(-1, self.num_points, -1),
+            points_w - ref_pos_w.unsqueeze(1),
+        )
 
-        return points_b.reshape(env.num_envs, -1)  # [N, num_points * 3]
+        return points_ref.reshape(env.num_envs, -1)

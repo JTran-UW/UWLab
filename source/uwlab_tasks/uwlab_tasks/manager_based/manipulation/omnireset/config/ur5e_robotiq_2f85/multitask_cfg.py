@@ -342,7 +342,6 @@ class MultiTaskSimplifiedRewardsCfg:
     )
 
 
-
 # ---------------------------------------------------------------------------
 # Terminations (task-agnostic)
 # ---------------------------------------------------------------------------
@@ -469,3 +468,50 @@ class Ur5eRobotiq2f85RelCartesianOSCMultiTaskSimplifiedCurriculumTrainCfg(
     """Multi-task training with simplified rewards + GPS curriculum over reset types."""
 
     events: MultiTaskCurriculumEventCfg = MultiTaskCurriculumEventCfg()
+
+
+# ---------------------------------------------------------------------------
+# Events with per-state GPS curriculum (fine-grained per-reset-state sampling)
+# ---------------------------------------------------------------------------
+@configclass
+class MultiTaskPerStateCurriculumEventCfg:
+    """Reset events with per-state GPS curriculum: tracks success per individual reset state (~80K partitions)."""
+
+    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "curriculum_target": 0.33,
+            "curriculum_kappa": 2.0,
+            "curriculum_temperature": 2.0,
+        },
+    )
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCMultiTaskPerStateCurriculumTrainCfg(
+    Ur5eRobotiq2f85RelCartesianOSCMultiTaskTrainCfg,
+):
+    """Multi-task training with original rewards + per-state GPS curriculum."""
+
+    events: MultiTaskPerStateCurriculumEventCfg = MultiTaskPerStateCurriculumEventCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCMultiTaskSimplifiedPerStateCurriculumTrainCfg(
+    Ur5eRobotiq2f85RelCartesianOSCMultiTaskSimplifiedTrainCfg,
+):
+    """Multi-task training with simplified rewards + per-state GPS curriculum."""
+
+    events: MultiTaskPerStateCurriculumEventCfg = MultiTaskPerStateCurriculumEventCfg()

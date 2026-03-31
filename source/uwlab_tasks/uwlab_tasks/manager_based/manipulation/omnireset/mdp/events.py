@@ -1050,7 +1050,35 @@ class MultiResetManager(ManagerTermBase):
         self.curriculum_kappa: float = cfg.params.get("curriculum_kappa", 2.0)
         self.curriculum_temperature: float = cfg.params.get("curriculum_temperature", 2.0)
 
+        self.flat_datasets: list[dict] = []
+        self.flat_num_states: list[int] = []
+        self.flat_rt_labels: list[torch.Tensor] = []
+        for tt_idx in range(self.num_task_types):
+            all_states = []
+            all_rt_labels = []
+            offset = 0
+            for rt_idx in range(self.num_reset_types):
+                n = self.pair_num_states[tt_idx][rt_idx]
+                all_states.append(self.pair_datasets[tt_idx][rt_idx])
+                all_rt_labels.append(torch.full((n,), rt_idx, dtype=torch.long, device=env.device))
+                offset += n
+            self.flat_datasets.append(concat_nested_dicts(all_states))
+            self.flat_num_states.append(offset)
+            self.flat_rt_labels.append(torch.cat(all_rt_labels))
+
+        if self.curriculum_target is not None:
+            total_states = sum(self.flat_num_states)
+            curriculum_monitor_cfg = SuccessMonitorCfg(
+                monitored_history_len=100, num_monitored_data=total_states, device=env.device
+            )
+            self.curriculum_monitor = curriculum_monitor_cfg.class_type(curriculum_monitor_cfg)
+            self.flat_offsets = torch.tensor(
+                [sum(self.flat_num_states[:i]) for i in range(self.num_task_types)],
+                dtype=torch.long, device=env.device,
+            )
+
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
+        self.state_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
     def _get_monitor_id(self, task_type_idx: int, reset_type_idx: torch.Tensor) -> torch.Tensor:
         """Composite index for the success monitor: task_type * num_reset_types + reset_type."""
@@ -1081,6 +1109,10 @@ class MultiResetManager(ManagerTermBase):
                 monitor_ids = self.task_id[env_ids]
             self.success_monitor.success_update(monitor_ids, success_mask)
 
+            if hasattr(self, "curriculum_monitor") and self.is_multitask:
+                cur_monitor_ids = self.flat_offsets[self.task_type_ids[env_ids]] + self.state_id[env_ids]
+                self.curriculum_monitor.success_update(cur_monitor_ids, success_mask)
+
             success_rates = self.success_monitor.get_success_rate()
             if "log" not in self._env.extras:
                 self._env.extras["log"] = {}
@@ -1108,9 +1140,8 @@ class MultiResetManager(ManagerTermBase):
             ep_lengths = self._env.episode_length_buf[env_ids].float()
             self._env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
 
-        if self.curriculum_target is not None and hasattr(self, "success_monitor") and self.is_multitask:
-            success_rates = self.success_monitor.get_success_rate()
-            reset_type_indices = torch.empty(len(env_ids), dtype=torch.int64, device=self.device)
+        if self.curriculum_target is not None and hasattr(self, "curriculum_monitor") and self.is_multitask:
+            state_indices = torch.empty(len(env_ids), dtype=torch.int64, device=self.device)
             env_task_types = self.task_type_ids[env_ids]
 
             if "log" not in self._env.extras:
@@ -1120,49 +1151,73 @@ class MultiResetManager(ManagerTermBase):
                 tt_mask = env_task_types == tt_idx
                 if not tt_mask.any():
                     continue
-                start = tt_idx * self.num_reset_types
-                tt_rates = success_rates[start : start + self.num_reset_types]
+                offset = self.flat_offsets[tt_idx].item()
+                n = self.flat_num_states[tt_idx]
+                tt_rates = self.curriculum_monitor.success_rate[offset : offset + n]
                 choices, sampling_probs = SuccessMonitor.sample_by_target_rate_from_rates(
                     tt_rates, int(tt_mask.sum()),
                     self.curriculum_target, self.curriculum_kappa, self.curriculum_temperature,
                 )
-                reset_type_indices[tt_mask] = choices
+                state_indices[tt_mask] = choices
 
                 task_name = self.task_names[tt_idx]
+                rt_labels = self.flat_rt_labels[tt_idx]
+                chosen_rt = rt_labels[choices]
                 for rt_idx in range(self.num_reset_types):
-                    self._env.extras["log"][f"Curriculum/{task_name}_rt{rt_idx}_prob"] = (
-                        sampling_probs[rt_idx].item()
+                    rt_mask = rt_labels == rt_idx
+                    rt_rates = tt_rates[rt_mask]
+                    self._env.extras["log"][f"Curriculum/{task_name}_rt{rt_idx}_mean_rate"] = (
+                        rt_rates.mean().item() if rt_mask.any() else 0.0
                     )
-        else:
-            reset_type_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+                    self._env.extras["log"][f"Curriculum/{task_name}_rt{rt_idx}_sampled_frac"] = (
+                        (chosen_rt == rt_idx).float().mean().item()
+                    )
+                    rt_probs = sampling_probs[rt_mask]
+                    self._env.extras["log"][f"Curriculum/{task_name}_rt{rt_idx}_prob_mass"] = (
+                        rt_probs.sum().item() if rt_mask.any() else 0.0
+                    )
 
-        self.task_id[env_ids] = reset_type_indices
-
-        if self.is_multitask:
-            env_task_types = self.task_type_ids[env_ids]
             for tt_idx in range(self.num_task_types):
                 tt_mask = env_task_types == tt_idx
                 if not tt_mask.any():
                     continue
-                for rt_idx in range(self.num_reset_types):
-                    combined_mask = tt_mask & (reset_type_indices == rt_idx)
-                    if not combined_mask.any():
-                        continue
-                    current_env_ids = env_ids[combined_mask]
-                    n_states = self.pair_num_states[tt_idx][rt_idx]
-                    state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
-                    states = sample_from_nested_dict(self.pair_datasets[tt_idx][rt_idx], state_indices)
-                    self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
-        else:
-            for dataset_idx in range(self.num_tasks):
-                mask = reset_type_indices == dataset_idx
-                if not mask.any():
-                    continue
-                current_env_ids = env_ids[mask]
-                n_states = self.pair_num_states[0][dataset_idx]
-                state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
-                states = sample_from_nested_dict(self.pair_datasets[0][dataset_idx], state_indices)
+                current_env_ids = env_ids[tt_mask]
+                current_state_indices = state_indices[tt_mask]
+                states = sample_from_nested_dict(self.flat_datasets[tt_idx], current_state_indices)
                 self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
+                self.task_id[current_env_ids] = self.flat_rt_labels[tt_idx][current_state_indices]
+
+            self.state_id[env_ids] = state_indices
+
+        else:
+            reset_type_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+            self.task_id[env_ids] = reset_type_indices
+
+            if self.is_multitask:
+                env_task_types = self.task_type_ids[env_ids]
+                for tt_idx in range(self.num_task_types):
+                    tt_mask = env_task_types == tt_idx
+                    if not tt_mask.any():
+                        continue
+                    for rt_idx in range(self.num_reset_types):
+                        combined_mask = tt_mask & (reset_type_indices == rt_idx)
+                        if not combined_mask.any():
+                            continue
+                        current_env_ids = env_ids[combined_mask]
+                        n_states = self.pair_num_states[tt_idx][rt_idx]
+                        rand_state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
+                        states = sample_from_nested_dict(self.pair_datasets[tt_idx][rt_idx], rand_state_indices)
+                        self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
+            else:
+                for dataset_idx in range(self.num_tasks):
+                    mask = reset_type_indices == dataset_idx
+                    if not mask.any():
+                        continue
+                    current_env_ids = env_ids[mask]
+                    n_states = self.pair_num_states[0][dataset_idx]
+                    rand_state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
+                    states = sample_from_nested_dict(self.pair_datasets[0][dataset_idx], rand_state_indices)
+                    self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
 
         robot: Articulation = self._env.scene["robot"]
         robot.set_joint_velocity_target(torch.zeros_like(robot.data.joint_vel[env_ids]), env_ids=env_ids)
@@ -1261,6 +1316,20 @@ def sample_from_nested_dict(nested_dict: dict, idx) -> dict:
         else:
             raise TypeError(f"Unsupported type in nested dictionary: {type(value)}")
     return sampled_dict
+
+
+def concat_nested_dicts(list_of_dicts: list[dict]) -> dict:
+    """Concatenate tensors at matching keys across a list of nested dicts (dim=0)."""
+    result = {}
+    for key in list_of_dicts[0]:
+        values = [d[key] for d in list_of_dicts]
+        if isinstance(values[0], dict):
+            result[key] = concat_nested_dicts(values)
+        elif isinstance(values[0], torch.Tensor):
+            result[key] = torch.cat(values, dim=0)
+        else:
+            raise TypeError(f"Unsupported type in nested dictionary: {type(values[0])}")
+    return result
 
 
 class reset_root_states_uniform(ManagerTermBase):

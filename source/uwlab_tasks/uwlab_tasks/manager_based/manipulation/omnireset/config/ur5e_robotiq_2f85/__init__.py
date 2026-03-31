@@ -119,6 +119,39 @@ gym.register(
 )
 
 
+# Single-task state baseline ablation (no DR, no history, symmetric obs)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Baseline-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCStateBaselineTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# Single-task pointcloud ablation — wrist frame
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-PointCloud-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPointCloudTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# Single-task pointcloud ablation — robot base frame
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-PointCloud-BaseFrame-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPointCloudBaseFrameTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
 # Multi-task RL state environments
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-v0",
@@ -159,6 +192,31 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": (
             f"{__name__}.multitask_cfg:Ur5eRobotiq2f85RelCartesianOSCMultiTaskSimplifiedCurriculumTrainCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-PerStateCurriculum-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.multitask_cfg:Ur5eRobotiq2f85RelCartesianOSCMultiTaskPerStateCurriculumTrainCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-Simplified-PerStateCurriculum-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.multitask_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCMultiTaskSimplifiedPerStateCurriculumTrainCfg"
         ),
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },

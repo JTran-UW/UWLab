@@ -522,6 +522,117 @@ class ObservationsCfg:
 
 
 @configclass
+class StateBaselineObservationsCfg:
+    """Original state obs, no history, symmetric (policy == critic).
+
+    Same obs terms as ObservationsCfg.PolicyCfg but without history stacking.
+    Critic sees the same obs as policy (no privileged info).
+    """
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        insertive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        receptive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("receptive_object"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: PolicyCfg = PolicyCfg()
+
+
+@configclass
+class PointCloudObservationsCfg:
+    """State + pointcloud obs, no history, symmetric (policy == critic).
+
+    Two 64-pt pointclouds in wrist frame:
+      - insertive object (grasped object geometry)
+      - receptive object (target geometry)
+    No history stacking. No privileged critic.
+    """
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        insertive_pc_in_wrist = ObsTerm(
+            func=task_mdp.MeshPointCloud,
+            params={
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "object_cfg": SceneEntityCfg("insertive_object"),
+                "num_points": 64,
+            },
+        )
+
+        receptive_pc_in_wrist = ObsTerm(
+            func=task_mdp.MeshPointCloud,
+            params={
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "object_cfg": SceneEntityCfg("receptive_object"),
+                "num_points": 64,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: PolicyCfg = PolicyCfg()
+
+
+@configclass
 class RewardsCfg:
 
     # safety rewards
@@ -767,3 +878,96 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+@configclass
+class PointCloudTrainEventCfg:
+    """No dynamics randomization -- only scene reset + 4-path reset states."""
+
+    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+        },
+    )
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCStateBaselineTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    """State baseline ablation: no DR, no history, symmetric obs (policy == critic)."""
+
+    observations: StateBaselineObservationsCfg = StateBaselineObservationsCfg()
+    events: PointCloudTrainEventCfg = PointCloudTrainEventCfg()
+
+
+@configclass
+class PointCloudBaseFrameObservationsCfg:
+    """Same as PointCloudObservationsCfg but pointclouds in robot base frame."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        insertive_pc_in_base = ObsTerm(
+            func=task_mdp.MeshPointCloud,
+            params={
+                "ref_cfg": SceneEntityCfg("robot"),
+                "object_cfg": SceneEntityCfg("insertive_object"),
+                "num_points": 64,
+            },
+        )
+
+        receptive_pc_in_base = ObsTerm(
+            func=task_mdp.MeshPointCloud,
+            params={
+                "ref_cfg": SceneEntityCfg("robot"),
+                "object_cfg": SceneEntityCfg("receptive_object"),
+                "num_points": 64,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: PolicyCfg = PolicyCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPointCloudTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    """Pointcloud ablation (wrist frame): no DR, no history, symmetric obs."""
+
+    observations: PointCloudObservationsCfg = PointCloudObservationsCfg()
+    events: PointCloudTrainEventCfg = PointCloudTrainEventCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPointCloudBaseFrameTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    """Pointcloud ablation (robot base frame): no DR, no history, symmetric obs."""
+
+    observations: PointCloudBaseFrameObservationsCfg = PointCloudBaseFrameObservationsCfg()
+    events: PointCloudTrainEventCfg = PointCloudTrainEventCfg()
