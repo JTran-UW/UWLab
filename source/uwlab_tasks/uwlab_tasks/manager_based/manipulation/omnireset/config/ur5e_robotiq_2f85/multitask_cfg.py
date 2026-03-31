@@ -200,52 +200,21 @@ class MultiTaskObservationsCfg:
             },
         )
 
-        insertive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("insertive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        receptive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("receptive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        insertive_asset_in_receptive_asset_frame = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("insertive_object"),
-                "root_asset_cfg": SceneEntityCfg("receptive_object"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        insertive_point_cloud = ObsTerm(
+        insertive_pc_in_base = ObsTerm(
             func=task_mdp.MeshPointCloud,
             params={
-                "robot_cfg": SceneEntityCfg("robot"),
+                "ref_cfg": SceneEntityCfg("robot"),
                 "object_cfg": SceneEntityCfg("insertive_object"),
-                "num_points": 128,
-                # "visualize": True,
-                # "visualize_env_ids": [0, 1],
+                "num_points": 64,
             },
         )
 
-        receptive_point_cloud = ObsTerm(
+        receptive_pc_in_base = ObsTerm(
             func=task_mdp.MeshPointCloud,
             params={
-                "robot_cfg": SceneEntityCfg("robot"),
+                "ref_cfg": SceneEntityCfg("robot"),
                 "object_cfg": SceneEntityCfg("receptive_object"),
-                "num_points": 128,
-                # "visualize": True,
-                # "visualize_env_ids": [0, 1],
+                "num_points": 64,
             },
         )
 
