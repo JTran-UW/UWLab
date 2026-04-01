@@ -14,6 +14,12 @@ from uwlab_rl.rsl_rl.rl_cfg import (
 )
 
 
+@configclass
+class RslRlActorCriticWithEncoderCfg(RslRlFancyActorCriticCfg):
+    class_name: str = "ActorCriticWithEncoder"
+    encoder_groups: dict = dict()
+
+
 def my_experts_observation_func(env):
     obs = env.unwrapped.obs_buf["expert_obs"]
     return obs
@@ -80,4 +86,27 @@ class Base_DAggerRunnerCfg(Base_PPORunnerCfg):
                 loss_decay=1.0,
             )
         ),
+    )
+
+
+@configclass
+class SharedEncoder128PPORunnerCfg(Base_PPORunnerCfg):
+    """128-pt PC with shared MLP encoder (both objects concatenated)."""
+
+    obs_groups = {
+        "policy": ["proprio", "pointcloud"],
+        "critic": ["proprio", "pointcloud"],
+    }
+    policy = RslRlActorCriticWithEncoderCfg(
+        init_noise_std=1.0,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[512, 256, 128, 64],
+        critic_hidden_dims=[512, 256, 128, 64],
+        activation="elu",
+        noise_std_type="gsde",
+        state_dependent_std=False,
+        encoder_groups={
+            "pointcloud": {"hidden_dims": [256, 128], "output_dim": 32},
+        },
     )

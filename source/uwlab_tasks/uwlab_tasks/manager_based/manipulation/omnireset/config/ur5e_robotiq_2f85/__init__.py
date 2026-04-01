@@ -222,6 +222,30 @@ gym.register(
     },
 )
 
+# Multi-task pointcloud — 128pt wrist frame + shared MLP encoder
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-PointCloud-128-SharedEncoder-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.multitask_cfg:Ur5eRobotiq2f85RelCartesianOSCMultiTaskPC128SharedEncTrainCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
+    },
+)
+
+# Single-task pointcloud ablation — 128pt wrist frame + shared MLP encoder
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-PointCloud-128-SharedEncoder-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPC128SharedEncTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
+    },
+)
+
 # RGB environments for data collection and evaluation
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DataCollection-v0",

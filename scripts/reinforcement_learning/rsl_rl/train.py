@@ -108,6 +108,10 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
+
+import rsl_rl.runners.on_policy_runner as _runner_module
+from uwlab_rl.rsl_rl.actor_critic_encoder import ActorCriticWithEncoder
+_runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config

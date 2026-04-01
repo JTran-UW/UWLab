@@ -484,3 +484,67 @@ class Ur5eRobotiq2f85RelCartesianOSCMultiTaskSimplifiedPerStateCurriculumTrainCf
     """Multi-task training with simplified rewards + per-state GPS curriculum."""
 
     events: MultiTaskPerStateCurriculumEventCfg = MultiTaskPerStateCurriculumEventCfg()
+
+
+# ---------------------------------------------------------------------------
+# 128-pt wrist-frame PCs with shared MLP encoder (same as single-task ablation)
+# ---------------------------------------------------------------------------
+@configclass
+class MultiTaskSharedEncoder128PCObservationsCfg:
+    """128-pt wrist-frame PCs with 2 obs groups: proprio (pass-through) + pointcloud (shared encoder).
+
+    Groups: proprio (~21d), pointcloud (768d = 128×3×2 objects).
+    Shared encoder compresses concatenated PCs to 32d; main MLP sees 21+32=53d.
+    """
+
+    @configclass
+    class ProprioCfg(ObsGroup):
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class PointcloudCfg(ObsGroup):
+        insertive_pc_in_wrist = ObsTerm(
+            func=task_mdp.MeshPointCloud,
+            params={
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "object_cfg": SceneEntityCfg("insertive_object"),
+                "num_points": 128,
+            },
+        )
+        receptive_pc_in_wrist = ObsTerm(
+            func=task_mdp.MeshPointCloud,
+            params={
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "object_cfg": SceneEntityCfg("receptive_object"),
+                "num_points": 128,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    proprio: ProprioCfg = ProprioCfg()
+    pointcloud: PointcloudCfg = PointcloudCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCMultiTaskPC128SharedEncTrainCfg(
+    Ur5eRobotiq2f85RelCartesianOSCMultiTaskTrainCfg,
+):
+    """Multi-task training with 128-pt wrist-frame PCs + shared MLP encoder."""
+
+    observations: MultiTaskSharedEncoder128PCObservationsCfg = MultiTaskSharedEncoder128PCObservationsCfg()

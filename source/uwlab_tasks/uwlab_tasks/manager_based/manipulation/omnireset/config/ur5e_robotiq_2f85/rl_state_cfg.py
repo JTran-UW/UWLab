@@ -268,8 +268,6 @@ class TrainEvalEventCfg(BaseEventCfg):
     )
 
 
-
-
 @configclass
 class FinetuneEvalEventCfg(BaseEventCfg):
     """Eval after Stage 2: fixed sysid + OSC gains (scale_progress=1) + 1-path resets."""
@@ -522,117 +520,6 @@ class ObservationsCfg:
 
 
 @configclass
-class StateBaselineObservationsCfg:
-    """Original state obs, no history, symmetric (policy == critic).
-
-    Same obs terms as ObservationsCfg.PolicyCfg but without history stacking.
-    Critic sees the same obs as policy (no privileged info).
-    """
-
-    @configclass
-    class PolicyCfg(ObsGroup):
-
-        prev_actions = ObsTerm(func=task_mdp.last_action)
-
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
-
-        end_effector_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        insertive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("insertive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        receptive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("receptive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("insertive_object"),
-                "root_asset_cfg": SceneEntityCfg("receptive_object"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    policy: PolicyCfg = PolicyCfg()
-    critic: PolicyCfg = PolicyCfg()
-
-
-@configclass
-class PointCloudObservationsCfg:
-    """State + pointcloud obs, no history, symmetric (policy == critic).
-
-    Two 64-pt pointclouds in wrist frame:
-      - insertive object (grasped object geometry)
-      - receptive object (target geometry)
-    No history stacking. No privileged critic.
-    """
-
-    @configclass
-    class PolicyCfg(ObsGroup):
-
-        prev_actions = ObsTerm(func=task_mdp.last_action)
-
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
-
-        end_effector_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        insertive_pc_in_wrist = ObsTerm(
-            func=task_mdp.MeshPointCloud,
-            params={
-                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "object_cfg": SceneEntityCfg("insertive_object"),
-                "num_points": 64,
-            },
-        )
-
-        receptive_pc_in_wrist = ObsTerm(
-            func=task_mdp.MeshPointCloud,
-            params={
-                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "object_cfg": SceneEntityCfg("receptive_object"),
-                "num_points": 64,
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    policy: PolicyCfg = PolicyCfg()
-    critic: PolicyCfg = PolicyCfg()
-
-
-@configclass
 class RewardsCfg:
 
     # safety rewards
@@ -726,7 +613,7 @@ class NoCurriculumsCfg:
     pass
 
 
-def make_insertive_object(usd_path: str, collision_enabled: bool = True):
+def make_insertive_object(usd_path: str):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
         spawn=sim_utils.UsdFileCfg(
@@ -739,7 +626,6 @@ def make_insertive_object(usd_path: str, collision_enabled: bool = True):
                 kinematic_enabled=False,
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.001),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=collision_enabled),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
     )
@@ -766,13 +652,10 @@ def make_receptive_object(usd_path: str):
 variants = {
     "scene.insertive_object": {
         "fbleg": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
-        "fbleg_nocol": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd", collision_enabled=False),
-        "fbleg_sdf64": make_insertive_object("/home/patrickhaoy/Downloads/SquareLeg/square_leg.usd"),
         "fbdrawerbottom": make_insertive_object(
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd"
         ),
         "peg": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"),
-        "peg_convex": make_insertive_object("/home/patrickhaoy/Downloads/Peg/peg.usd"),
         "cupcake": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/CupCake/cupcake.usd"),
         "cube": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/InsertiveCube/insertive_cube.usd"),
         "rectangle": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Rectangle/rectangle.usd"),
@@ -781,14 +664,11 @@ variants = {
         "fbtabletop": make_receptive_object(
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareTableTop/square_table_top.usd"
         ),
-        "fbtabletop_sdf64": make_receptive_object(
-            "/home/patrickhaoy/Downloads/SquareTableTop/square_table_top.usd"
-        ),
         "fbdrawerbox": make_receptive_object(
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd"
         ),
         "peghole": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"),
-        "peghole_convex": make_receptive_object("/home/patrickhaoy/Downloads/PegHole/peg_hole.usd"),
+        "peghole_fast": make_receptive_object("/home/patrickhaoy/Downloads/PegHole/peg_hole_simplified.usd"),
         "plate": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Plate/plate.usd"),
         "cube": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/ReceptiveCube/receptive_cube.usd"),
         "wall": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Wall/wall.usd"),
@@ -904,24 +784,17 @@ class PointCloudTrainEventCfg:
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCStateBaselineTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
-    """State baseline ablation: no DR, no history, symmetric obs (policy == critic)."""
+class SharedEncoder128PCObservationsCfg:
+    """128-pt wrist-frame PCs with 2 obs groups: proprio (pass-through) + pointcloud (shared encoder).
 
-    observations: StateBaselineObservationsCfg = StateBaselineObservationsCfg()
-    events: PointCloudTrainEventCfg = PointCloudTrainEventCfg()
-
-
-@configclass
-class PointCloudBaseFrameObservationsCfg:
-    """Same as PointCloudObservationsCfg but pointclouds in robot base frame."""
+    Groups: proprio (~21d), pointcloud (768d = 128×3×2 objects).
+    Shared encoder compresses concatenated PCs to 32d; main MLP sees 21+32=53d.
+    """
 
     @configclass
-    class PolicyCfg(ObsGroup):
-
+    class ProprioCfg(ObsGroup):
         prev_actions = ObsTerm(func=task_mdp.last_action)
-
         joint_pos = ObsTerm(func=task_mdp.joint_pos)
-
         end_effector_pose = ObsTerm(
             func=task_mdp.target_asset_pose_in_root_asset_frame,
             params={
@@ -931,21 +804,26 @@ class PointCloudBaseFrameObservationsCfg:
             },
         )
 
-        insertive_pc_in_base = ObsTerm(
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class PointcloudCfg(ObsGroup):
+        insertive_pc_in_wrist = ObsTerm(
             func=task_mdp.MeshPointCloud,
             params={
-                "ref_cfg": SceneEntityCfg("robot"),
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "object_cfg": SceneEntityCfg("insertive_object"),
-                "num_points": 64,
+                "num_points": 128,
             },
         )
-
-        receptive_pc_in_base = ObsTerm(
+        receptive_pc_in_wrist = ObsTerm(
             func=task_mdp.MeshPointCloud,
             params={
-                "ref_cfg": SceneEntityCfg("robot"),
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "object_cfg": SceneEntityCfg("receptive_object"),
-                "num_points": 64,
+                "num_points": 128,
             },
         )
 
@@ -953,21 +831,13 @@ class PointCloudBaseFrameObservationsCfg:
             self.enable_corruption = True
             self.concatenate_terms = True
 
-    policy: PolicyCfg = PolicyCfg()
-    critic: PolicyCfg = PolicyCfg()
+    proprio: ProprioCfg = ProprioCfg()
+    pointcloud: PointcloudCfg = PointcloudCfg()
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCPointCloudTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
-    """Pointcloud ablation (wrist frame): no DR, no history, symmetric obs."""
+class Ur5eRobotiq2f85RelCartesianOSCPC128SharedEncTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    """128-pt wrist-frame PCs with shared MLP encoder. No DR, no history, symmetric obs."""
 
-    observations: PointCloudObservationsCfg = PointCloudObservationsCfg()
-    events: PointCloudTrainEventCfg = PointCloudTrainEventCfg()
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCPointCloudBaseFrameTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
-    """Pointcloud ablation (robot base frame): no DR, no history, symmetric obs."""
-
-    observations: PointCloudBaseFrameObservationsCfg = PointCloudBaseFrameObservationsCfg()
+    observations: SharedEncoder128PCObservationsCfg = SharedEncoder128PCObservationsCfg()
     events: PointCloudTrainEventCfg = PointCloudTrainEventCfg()

@@ -76,6 +76,11 @@ from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
+
+import rsl_rl.runners.on_policy_runner as _runner_module
+from uwlab_rl.rsl_rl.actor_critic_encoder import ActorCriticWithEncoder
+_runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
+
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config
 
@@ -193,11 +198,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
-        if args_cli.video:
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+
+        timestep += 1
+        if args_cli.video and timestep >= args_cli.video_length:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
