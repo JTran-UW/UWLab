@@ -548,3 +548,12 @@ class Ur5eRobotiq2f85RelCartesianOSCMultiTaskPC128SharedEncTrainCfg(
     """Multi-task training with 128-pt wrist-frame PCs + shared MLP encoder."""
 
     observations: MultiTaskSharedEncoder128PCObservationsCfg = MultiTaskSharedEncoder128PCObservationsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCMultiTaskPC128SharedEncPerStateCurriculumTrainCfg(
+    Ur5eRobotiq2f85RelCartesianOSCMultiTaskPC128SharedEncTrainCfg,
+):
+    """Multi-task 128-pt wrist-frame PC + shared encoder + per-state GPS curriculum."""
+
+    events: MultiTaskPerStateCurriculumEventCfg = MultiTaskPerStateCurriculumEventCfg()
