@@ -886,6 +886,244 @@ class reset_insertive_object_from_partial_assembly_dataset(ManagerTermBase):
         )
 
 
+class GravityTrickResetManager(ManagerTermBase):
+    """Procedural 50-50 reset: ObjectAnywhereEEAnywhere + ObjectPartiallyAssembledEENear.
+
+    Group A (50%): Object random position/orientation + EE random IK pose (fully procedural).
+    Group B (50%): Object from partial assembly dataset (relative to receptive) + EE near object via IK.
+
+    No grasp dataset needed — avoids collision issues from pre-computed grasps.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        dataset_dir: str = cfg.params.get("dataset_dir", "")
+        robot_ik_cfg: SceneEntityCfg = cfg.params.get(
+            "robot_ik_cfg", SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link")
+        )
+
+        self.robot: Articulation = env.scene[robot_ik_cfg.name]
+        self.insertive_object: RigidObject = env.scene["insertive_object"]
+        self.receptive_object: RigidObject = env.scene["receptive_object"]
+        self.joint_ids: list[int] | slice = robot_ik_cfg.joint_ids
+        self.n_joints: int = self.robot.num_joints if isinstance(self.joint_ids, slice) else len(self.joint_ids)
+
+        # -- Object anywhere ranges (position relative to env origin, random orientation) --
+        obj_anywhere_range: dict = cfg.params.get("obj_anywhere_range", {
+            "x": (0.3, 0.55), "y": (-0.1, 0.5), "z": (0.0, 0.3),
+            "roll": (-np.pi, np.pi), "pitch": (-np.pi, np.pi), "yaw": (-np.pi, np.pi),
+        })
+        self.obj_anywhere_range = torch.tensor(
+            [obj_anywhere_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # -- EE anywhere ranges (absolute position in robot base frame) --
+        ee_anywhere_range: dict = cfg.params.get("ee_anywhere_range", {
+            "x": (0.3, 0.7), "y": (-0.4, 0.4), "z": (0.0, 0.5),
+            "roll": (0.0, 0.0), "pitch": (np.pi / 4, 3 * np.pi / 4), "yaw": (np.pi / 2, 3 * np.pi / 2),
+        })
+        self.ee_anywhere_range = torch.tensor(
+            [ee_anywhere_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # -- EE near object ranges (offset relative to insertive object) --
+        ee_near_range: dict = cfg.params.get("ee_near_range", {
+            "x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.02, 0.05),
+            "roll": (0.0, 0.0), "pitch": (np.pi / 4, 3 * np.pi / 4), "yaw": (np.pi / 2, 3 * np.pi / 2),
+        })
+        self.ee_near_range = torch.tensor(
+            [ee_near_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # -- Load partial assembly dataset --
+        insertive_usd_path = self.insertive_object.cfg.spawn.usd_path
+        receptive_usd_path = self.receptive_object.cfg.spawn.usd_path
+        pair = utils.compute_pair_dir(insertive_usd_path, receptive_usd_path)
+        pa_path = f"{dataset_dir}/Resets/{pair}/partial_assemblies.pt"
+        local_path = utils.safe_retrieve_file_path(pa_path)
+        data = torch.load(local_path, map_location="cpu")
+
+        rel_pos = data.get("relative_position")
+        rel_quat = data.get("relative_orientation")
+        if rel_pos is None or rel_quat is None or len(rel_pos) == 0:
+            raise ValueError(f"No partial assembly data found in {pa_path}")
+        if not isinstance(rel_pos, torch.Tensor):
+            rel_pos = torch.as_tensor(rel_pos, dtype=torch.float32)
+        if not isinstance(rel_quat, torch.Tensor):
+            rel_quat = torch.as_tensor(rel_quat, dtype=torch.float32)
+        self.pa_rel_positions = rel_pos.to(env.device, dtype=torch.float32)
+        self.pa_rel_quaternions = rel_quat.to(env.device, dtype=torch.float32)
+        print(f"[GravityTrickResetManager] Loaded {len(self.pa_rel_positions)} partial assembly states from {pa_path}")
+
+        # -- Bottom offset for insertive object (so it sits on surfaces correctly) --
+        metadata = utils.read_metadata_from_usd_directory(insertive_usd_path)
+        bottom_offset = metadata.get("bottom_offset")
+        if bottom_offset is not None:
+            self.obj_bottom_offset = torch.tensor(bottom_offset.get("pos"), device=env.device).unsqueeze(0)
+        else:
+            self.obj_bottom_offset = torch.zeros(1, 3, device=env.device)
+
+        # -- IK solver --
+        robot_ik_solver_cfg = DifferentialInverseKinematicsActionCfg(
+            asset_name=robot_ik_cfg.name,
+            joint_names=robot_ik_cfg.joint_names,
+            body_name=robot_ik_cfg.body_names,
+            controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+            scale=1.0,
+        )
+        self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)
+
+        # -- Probabilities --
+        probs = cfg.params.get("probs", [0.5, 0.5])
+        self.probs = torch.tensor(probs, device=env.device) / sum(probs)
+
+        # -- Success monitoring --
+        self.task_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        if cfg.params.get("success") is not None:
+            success_monitor_cfg = SuccessMonitorCfg(
+                monitored_history_len=100, num_monitored_data=2, device=env.device
+            )
+            self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        dataset_dir: str,
+        probs: list[float] | None = None,
+        robot_ik_cfg: SceneEntityCfg | None = None,
+        obj_anywhere_range: dict | None = None,
+        ee_anywhere_range: dict | None = None,
+        ee_near_range: dict | None = None,
+        success: str | None = None,
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+        env_ids = env_ids.long()
+        if env_ids.numel() == 0:
+            return
+
+        # -- Success monitoring --
+        if success is not None:
+            success_mask = torch.where(eval(success)[env_ids], 1.0, 0.0)
+            self.success_monitor.success_update(self.task_id[env_ids], success_mask)
+            success_rates = self.success_monitor.get_success_rate()
+            if "log" not in env.extras:
+                env.extras["log"] = {}
+            env.extras["log"]["Metrics/anywhere_success_rate"] = success_rates[0].item()
+            env.extras["log"]["Metrics/partial_assembly_success_rate"] = success_rates[1].item()
+            ep_lengths = env.episode_length_buf[env_ids].float()
+            env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
+
+        # -- Split env_ids 50-50 --
+        reset_type_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+        self.task_id[env_ids] = reset_type_indices
+
+        mask_anywhere = reset_type_indices == 0
+        mask_partial = reset_type_indices == 1
+        ids_anywhere = env_ids[mask_anywhere]
+        ids_partial = env_ids[mask_partial]
+
+        # ============================================================
+        # Group A: ObjectAnywhereEEAnywhere (fully procedural)
+        # ============================================================
+        if ids_anywhere.numel() > 0:
+            n_a = ids_anywhere.numel()
+
+            # Random insertive object position (offset from env origin)
+            obj_samples = math_utils.sample_uniform(
+                self.obj_anywhere_range[:, 0], self.obj_anywhere_range[:, 1], (n_a, 6), device=env.device
+            )
+            obj_pos = env.scene.env_origins[ids_anywhere] + obj_samples[:, :3]
+            # Apply bottom offset so object sits on surface
+            obj_pos -= self.obj_bottom_offset.expand(n_a, -1)
+            obj_quat = math_utils.quat_from_euler_xyz(obj_samples[:, 3], obj_samples[:, 4], obj_samples[:, 5])
+
+            self.insertive_object.write_root_pose_to_sim(
+                torch.cat([obj_pos, obj_quat], dim=-1), env_ids=ids_anywhere
+            )
+            self.insertive_object.write_root_velocity_to_sim(
+                torch.zeros(n_a, 6, device=env.device), env_ids=ids_anywhere
+            )
+
+            # Random EE via IK (position relative to robot base)
+            ee_samples = math_utils.sample_uniform(
+                self.ee_anywhere_range[:, 0], self.ee_anywhere_range[:, 1], (n_a, 6), device=env.device
+            )
+            ee_pos_w = self.robot.data.root_link_pos_w[ids_anywhere] + ee_samples[:, :3]
+            ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
+
+            self._solve_ik(env, ids_anywhere, ee_pos_w, ee_quat_w)
+
+        # ============================================================
+        # Group B: ObjectPartiallyAssembledEENear (dataset + procedural EE)
+        # ============================================================
+        if ids_partial.numel() > 0:
+            n_b = ids_partial.numel()
+
+            # Object from partial assembly dataset (relative to receptive object)
+            receptive_pos_w = self.receptive_object.data.root_pos_w[ids_partial]
+            receptive_quat_w = self.receptive_object.data.root_quat_w[ids_partial]
+
+            assembly_indices = torch.randint(0, len(self.pa_rel_positions), (n_b,), device=env.device)
+            sampled_rel_pos = self.pa_rel_positions[assembly_indices]
+            sampled_rel_quat = self.pa_rel_quaternions[assembly_indices]
+
+            ins_pos_w, ins_quat_w = math_utils.combine_frame_transforms(
+                receptive_pos_w, receptive_quat_w, sampled_rel_pos, sampled_rel_quat
+            )
+
+            self.insertive_object.write_root_pose_to_sim(
+                torch.cat([ins_pos_w, ins_quat_w], dim=-1), env_ids=ids_partial
+            )
+            self.insertive_object.write_root_velocity_to_sim(
+                torch.zeros(n_b, 6, device=env.device), env_ids=ids_partial
+            )
+
+            # EE near insertive object via IK
+            ee_samples = math_utils.sample_uniform(
+                self.ee_near_range[:, 0], self.ee_near_range[:, 1], (n_b, 6), device=env.device
+            )
+            ee_pos_w = ins_pos_w + ee_samples[:, :3]
+            ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
+
+            self._solve_ik(env, ids_partial, ee_pos_w, ee_quat_w)
+
+        # Zero joint velocities for all reset envs
+        self.robot.set_joint_velocity_target(torch.zeros_like(self.robot.data.joint_vel[env_ids]), env_ids=env_ids)
+
+    def _solve_ik(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        target_pos_w: torch.Tensor,
+        target_quat_w: torch.Tensor,
+    ) -> None:
+        """Solve IK for the given target pose and write joint states."""
+        pos_b, quat_b = self.solver._compute_frame_pose()
+        pos_b[env_ids], quat_b[env_ids] = math_utils.subtract_frame_transforms(
+            self.robot.data.root_link_pos_w[env_ids],
+            self.robot.data.root_link_quat_w[env_ids],
+            target_pos_w,
+            target_quat_w,
+        )
+        self.solver.process_actions(torch.cat([pos_b, quat_b], dim=1))
+
+        for _ in range(10):
+            self.solver.apply_actions()
+            delta_joint_pos = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            self.robot.write_joint_state_to_sim(
+                position=(delta_joint_pos + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
+                joint_ids=self.joint_ids,
+                env_ids=env_ids,
+            )
+
+
 class pose_logging_event(ManagerTermBase):
     """EventTerm class for logging pose data from all environments."""
 

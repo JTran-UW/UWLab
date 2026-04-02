@@ -2,11 +2,15 @@
 # All Rights Reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Simplified OmniReset config with gravity trick: 2 reset distributions + gravity curriculum.
+"""OmniReset config with gravity trick: procedural resets + gravity curriculum.
 
-Inspired by Octi's approach: ObjectAnywhereEEAnywhere + ObjectPartiallyAssembledEEGrasped,
-with gravity ramping from 0 to -9.81 via ADR. No grasp sampling datasets needed for
-ObjectAnywhereEEAnywhere.
+50-50 procedural reset distribution:
+  - ObjectAnywhereEEAnywhere: object + gripper randomly spawned (fully procedural)
+  - ObjectPartiallyAssembledEENear: object from partial assembly dataset, gripper
+    spawned near object via IK (no grasp dataset — avoids collision issues)
+
+Gravity ramps from 0 to -9.81 via ADR. In zero-g, the floating object lets the robot
+learn to approach and grasp without the object falling.
 """
 
 from __future__ import annotations
@@ -32,29 +36,73 @@ from .rl_state_cfg import (
 
 
 # ---------------------------------------------------------------------------
-# Events: 2-reset + gravity curriculum
+# Events: procedural anywhere + partial assembly near + gravity curriculum
 # ---------------------------------------------------------------------------
 @configclass
 class GravityTrickEventCfg(BaseEventCfg):
-    """2 reset distributions + variable gravity.
+    """Procedural 50-50 resets + gravity trick.
 
-    Resets:
-      - ObjectAnywhereEEAnywhere (50%): object spawned randomly on table, EE random IK pose
-      - ObjectPartiallyAssembledEEGrasped (50%): near-goal, ensures non-zero success rate
+    50% ObjectAnywhereEEAnywhere: object random position/orientation, EE random IK pose.
+        In zero-g objects float — robot learns approach and manipulation freely.
+    50% ObjectPartiallyAssembledEENear: object from partial assembly dataset (near goal),
+        EE spawned near object via IK (NOT from grasp dataset — avoids collision issues).
+        Near-goal states ensure non-zero success rate (Octi's condition #1).
 
-    Gravity starts at 0 and ramps to -9.81 via GravityScheduler ADR.
+    Gravity ramps 0 → -9.81 via GravityScheduler ADR.
     """
 
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
+    reset_receptive_object_pose = EventTerm(
+        func=task_mdp.reset_root_states_uniform,
+        mode="reset",
+        params={
+            "pose_range": {
+                "x": (0.3, 0.55),
+                "y": (-0.1, 0.3),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (-np.pi / 12, np.pi / 12),
+            },
+            "velocity_range": {},
+            "asset_cfgs": {"receptive_object": SceneEntityCfg("receptive_object")},
+            "offset_asset_cfg": SceneEntityCfg("ur5_metal_support"),
+            "use_bottom_offset": True,
+        },
+    )
+
+    reset_procedural = EventTerm(
+        func=task_mdp.GravityTrickResetManager,
         mode="reset",
         params={
             "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectAnywhereEEAnywhere",
-                "ObjectPartiallyAssembledEEGrasped",
-            ],
             "probs": [0.5, 0.5],
+            "robot_ik_cfg": SceneEntityCfg(
+                "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
+            ),
+            "obj_anywhere_range": {
+                "x": (0.3, 0.55),
+                "y": (-0.1, 0.5),
+                "z": (0.0, 0.3),
+                "roll": (-np.pi, np.pi),
+                "pitch": (-np.pi, np.pi),
+                "yaw": (-np.pi, np.pi),
+            },
+            "ee_anywhere_range": {
+                "x": (0.3, 0.7),
+                "y": (-0.4, 0.4),
+                "z": (0.0, 0.5),
+                "roll": (0.0, 0.0),
+                "pitch": (np.pi / 4, 3 * np.pi / 4),
+                "yaw": (np.pi / 2, 3 * np.pi / 2),
+            },
+            "ee_near_range": {
+                "x": (-0.05, 0.05),
+                "y": (-0.05, 0.05),
+                "z": (-0.02, 0.05),
+                "roll": (0.0, 0.0),
+                "pitch": (np.pi / 4, 3 * np.pi / 4),
+                "yaw": (np.pi / 2, 3 * np.pi / 2),
+            },
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
         },
     )
@@ -120,7 +168,7 @@ class GravityTrickCurriculumsCfg:
 # ---------------------------------------------------------------------------
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
-    """Gravity trick training: 2 resets + gravity curriculum. Single-task peg by default."""
+    """Gravity trick training: procedural 50-50 resets + gravity curriculum. Single-task peg by default."""
 
     events: GravityTrickEventCfg = GravityTrickEventCfg()
     terminations: GravityTrickTerminationsCfg = GravityTrickTerminationsCfg()
