@@ -88,6 +88,17 @@ gym.register(
     },
 )
 
+# Gravity trick: 2 resets (ObjectAnywhereEEAnywhere + PartiallyAssembledEEGrasped) + gravity curriculum
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
