@@ -737,6 +737,20 @@ class check_obb_no_overlap_termination(ManagerTermBase):
 
         return ~obb_overlap
 
+
+def object_root_w_z_below_threshold(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg,
+    min_world_z: float = -0.02,
+) -> torch.Tensor:
+    """True when the object's world-frame root z is below ``min_world_z`` (Z up).
+
+    Conservative failure signal; tune ``min_world_z`` for your scene (e.g. -0.02).
+    """
+    object_asset = env.scene[object_cfg.name]
+    return object_asset.data.root_pos_w[:, 2] < min_world_z
+
+
 def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes: int = 10):
     # Get the progress context to access assets and offsets
     context_term = env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
