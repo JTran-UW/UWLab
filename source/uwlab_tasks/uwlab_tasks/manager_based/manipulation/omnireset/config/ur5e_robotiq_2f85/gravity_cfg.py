@@ -28,7 +28,6 @@ from isaaclab.utils import configclass
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 
 from ... import mdp as task_mdp
-from ...mdp.gravity_curriculum import GravityScheduler, gravity_interpolate_fn
 
 from .rl_state_cfg import (
     BaseEventCfg,
@@ -211,12 +210,12 @@ class GravityTrickEventCfg(BaseEventCfg):
         },
     )
 
-    # Gravity trick: start at zero-g, ramp to full gravity via curriculum
+    # Uniform gravity randomization: sample z-gravity from [0, -9.81] each reset
     variable_gravity = EventTerm(
         func=task_mdp.randomize_physics_scene_gravity,
         mode="reset",
         params={
-            "gravity_distribution_params": ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+            "gravity_distribution_params": ([0.0, 0.0, -9.81], [0.0, 0.0, 0.0]),
             "operation": "abs",
         },
     )
@@ -243,28 +242,9 @@ class GravityTrickTerminationsCfg(TerminationsCfg):
 # ---------------------------------------------------------------------------
 @configclass
 class GravityTrickCurriculumsCfg:
-    """Gravity curriculum: ramps from 0 to -9.81 based on success rate."""
+    """No curriculum — gravity is uniformly randomized each reset."""
 
-    gravity_scheduler = CurrTerm(
-        func=GravityScheduler,
-        params={
-            "success_str": "env.reward_manager.get_term_cfg('progress_context').func.success",
-            "max_difficulty": 10,
-        },
-    )
-
-    gravity_ramp = CurrTerm(
-        func=task_mdp.modify_term_cfg,
-        params={
-            "address": "events.variable_gravity.params.gravity_distribution_params",
-            "modify_fn": gravity_interpolate_fn,
-            "modify_params": {
-                "initial_gravity": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
-                "final_gravity": ((0.0, 0.0, -9.81), (0.0, 0.0, -9.81)),
-                "scheduler_term_str": "gravity_scheduler",
-            },
-        },
-    )
+    pass
 
 
 # ---------------------------------------------------------------------------
