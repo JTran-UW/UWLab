@@ -748,6 +748,21 @@ def object_off_table(
     return asset.data.root_pos_w[:, 2] < min_height
 
 
+def object_out_of_bound(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("insertive_object"),
+    in_bound_range: dict[str, tuple[float, float]] | None = None,
+) -> torch.Tensor:
+    """Terminate when the object leaves a bounding box (relative to env origin)."""
+    if in_bound_range is None:
+        in_bound_range = {}
+    obj: RigidObject = env.scene[asset_cfg.name]
+    range_list = [in_bound_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
+    ranges = torch.tensor(range_list, device=env.device)
+    pos_local = obj.data.root_pos_w - env.scene.env_origins
+    return ((pos_local < ranges[:, 0]) | (pos_local > ranges[:, 1])).any(dim=1)
+
+
 def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes: int = 10):
     # Get the progress context to access assets and offsets
     context_term = env.reward_manager.get_term_cfg("progress_context").func  # type: ignore

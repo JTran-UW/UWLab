@@ -26,6 +26,8 @@ from isaaclab.envs.mdp.actions.task_space_actions import DifferentialInverseKine
 from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import FRAME_MARKER_CFG
+
+from .collision_analyzer_cfg import CollisionAnalyzerCfg
 from pxr import Gf, UsdGeom, UsdLux
 
 from uwlab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
@@ -929,13 +931,13 @@ class GravityTrickResetManager(ManagerTermBase):
             device=env.device,
         )
 
-        # -- EE near object ranges (offset relative to insertive object) --
-        ee_near_range: dict = cfg.params.get("ee_near_range", {
-            "x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.02, 0.05),
-            "roll": (0.0, 0.0), "pitch": (np.pi / 4, 3 * np.pi / 4), "yaw": (np.pi / 2, 3 * np.pi / 2),
+        # -- EE above object ranges (offset relative to insertive object, 10-20cm above) --
+        ee_above_range: dict = cfg.params.get("ee_above_range", {
+            "x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (0.10, 0.20),
+            "roll": (0.0, 0.0), "pitch": (np.pi / 2 - np.pi / 12, np.pi / 2 + np.pi / 12), "yaw": (-np.pi, np.pi),
         })
-        self.ee_near_range = torch.tensor(
-            [ee_near_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+        self.ee_above_range = torch.tensor(
+            [ee_above_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
             device=env.device,
         )
 
@@ -955,9 +957,56 @@ class GravityTrickResetManager(ManagerTermBase):
             rel_pos = torch.as_tensor(rel_pos, dtype=torch.float32)
         if not isinstance(rel_quat, torch.Tensor):
             rel_quat = torch.as_tensor(rel_quat, dtype=torch.float32)
-        self.pa_rel_positions = rel_pos.to(env.device, dtype=torch.float32)
-        self.pa_rel_quaternions = rel_quat.to(env.device, dtype=torch.float32)
-        print(f"[GravityTrickResetManager] Loaded {len(self.pa_rel_positions)} partial assembly states from {pa_path}")
+        rel_pos = rel_pos.to(env.device, dtype=torch.float32)
+        rel_quat = rel_quat.to(env.device, dtype=torch.float32)
+
+        # Split partial assembly dataset into near-success and far based on distance
+        # Use assembled_offset to compute true distance to goal
+        insertive_meta = utils.read_metadata_from_usd_directory(insertive_usd_path)
+        receptive_meta = utils.read_metadata_from_usd_directory(receptive_usd_path)
+        ins_assembled_pos = torch.tensor(insertive_meta["assembled_offset"]["pos"], device=env.device)
+        ins_assembled_quat = torch.tensor(insertive_meta["assembled_offset"]["quat"], device=env.device)
+        rec_assembled_pos = torch.tensor(receptive_meta["assembled_offset"]["pos"], device=env.device)
+        rec_assembled_quat = torch.tensor(receptive_meta["assembled_offset"]["quat"], device=env.device)
+
+        # For each partial assembly state, compute distance to assembled state
+        # The assembled state in receptive frame: subtract_frame_transforms(rec_offset, ins_offset(rel_pos))
+        # Simplified: compute the position error between dataset state and the assembled relative position
+        # At assembly: insertive_alignment == receptive_alignment, so the relative pose of alignment frames is identity
+        # Dataset stores raw relative pose of insertive w.r.t. receptive root
+        # We need: distance of (ins_offset applied to dataset_rel) from (rec_offset) in receptive frame
+        n_states = len(rel_pos)
+        ins_align_pos, ins_align_quat = math_utils.combine_frame_transforms(
+            rel_pos, rel_quat,
+            ins_assembled_pos.unsqueeze(0).expand(n_states, -1),
+            ins_assembled_quat.unsqueeze(0).expand(n_states, -1),
+        )
+        # Distance of insertive alignment from receptive alignment (at assembly this is ~0)
+        error_pos, _ = math_utils.compute_pose_error(
+            rec_assembled_pos.unsqueeze(0).expand(n_states, -1),
+            rec_assembled_quat.unsqueeze(0).expand(n_states, -1),
+            ins_align_pos, ins_align_quat,
+        )
+        distances = torch.norm(error_pos, dim=1)
+
+        # Split by median distance
+        near_success_threshold = cfg.params.get("near_success_threshold", None)
+        if near_success_threshold is None:
+            near_success_threshold = distances.median().item()
+
+        near_mask = distances <= near_success_threshold
+        far_mask = ~near_mask
+
+        self.pa_near_positions = rel_pos[near_mask]
+        self.pa_near_quaternions = rel_quat[near_mask]
+        self.pa_far_positions = rel_pos[far_mask]
+        self.pa_far_quaternions = rel_quat[far_mask]
+
+        print(
+            f"[GravityTrickResetManager] Loaded {n_states} partial assembly states from {pa_path}"
+            f" — {near_mask.sum().item()} near-success (d<={near_success_threshold:.4f}),"
+            f" {far_mask.sum().item()} far (d>{near_success_threshold:.4f})"
+        )
 
         # -- Bottom offset for insertive object (so it sits on surfaces correctly) --
         metadata = utils.read_metadata_from_usd_directory(insertive_usd_path)
@@ -981,6 +1030,17 @@ class GravityTrickResetManager(ManagerTermBase):
         probs = cfg.params.get("probs", [0.5, 0.5])
         self.probs = torch.tensor(probs, device=env.device) / sum(probs)
 
+        # -- Collision analyzer (optional, for rejecting object-in-arm spawns) --
+        collision_analyzer_cfg: CollisionAnalyzerCfg | None = cfg.params.get("collision_analyzer_cfg", None)
+        if collision_analyzer_cfg is not None:
+            self.collision_analyzer = collision_analyzer_cfg.class_type(collision_analyzer_cfg, env)
+            self.max_resample_attempts = cfg.params.get("max_resample_attempts", 10)
+        else:
+            self.collision_analyzer = None
+
+        # -- Partial assembly success fraction (None = sample as-is, 0.5 = 50% near-success) --
+        self.pa_success_fraction: float | None = cfg.params.get("partial_assembly_success_fraction", None)
+
         # -- Success monitoring --
         self.task_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         if cfg.params.get("success") is not None:
@@ -998,7 +1058,11 @@ class GravityTrickResetManager(ManagerTermBase):
         robot_ik_cfg: SceneEntityCfg | None = None,
         obj_anywhere_range: dict | None = None,
         ee_anywhere_range: dict | None = None,
-        ee_near_range: dict | None = None,
+        ee_above_range: dict | None = None,
+        collision_analyzer_cfg: CollisionAnalyzerCfg | None = None,
+        max_resample_attempts: int = 10,
+        near_success_threshold: float | None = None,
+        partial_assembly_success_fraction: float | None = None,
         success: str | None = None,
     ) -> None:
         if env_ids is None:
@@ -1032,35 +1096,45 @@ class GravityTrickResetManager(ManagerTermBase):
         # Group A: ObjectAnywhereEEAnywhere (fully procedural)
         # ============================================================
         if ids_anywhere.numel() > 0:
+            # First solve EE IK so robot is in its final pose for collision checking
             n_a = ids_anywhere.numel()
-
-            # Random insertive object position (offset from env origin)
-            obj_samples = math_utils.sample_uniform(
-                self.obj_anywhere_range[:, 0], self.obj_anywhere_range[:, 1], (n_a, 6), device=env.device
-            )
-            obj_pos = env.scene.env_origins[ids_anywhere] + obj_samples[:, :3]
-            # Apply bottom offset so object sits on surface
-            obj_pos -= self.obj_bottom_offset.expand(n_a, -1)
-            obj_quat = math_utils.quat_from_euler_xyz(obj_samples[:, 3], obj_samples[:, 4], obj_samples[:, 5])
-
-            self.insertive_object.write_root_pose_to_sim(
-                torch.cat([obj_pos, obj_quat], dim=-1), env_ids=ids_anywhere
-            )
-            self.insertive_object.write_root_velocity_to_sim(
-                torch.zeros(n_a, 6, device=env.device), env_ids=ids_anywhere
-            )
-
-            # Random EE via IK (position relative to robot base)
             ee_samples = math_utils.sample_uniform(
                 self.ee_anywhere_range[:, 0], self.ee_anywhere_range[:, 1], (n_a, 6), device=env.device
             )
             ee_pos_w = self.robot.data.root_link_pos_w[ids_anywhere] + ee_samples[:, :3]
             ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
-
             self._solve_ik(env, ids_anywhere, ee_pos_w, ee_quat_w)
 
+            # Sample object pose with collision rejection
+            remaining_ids = ids_anywhere.clone()
+            for attempt in range(self.max_resample_attempts if self.collision_analyzer else 1):
+                if remaining_ids.numel() == 0:
+                    break
+                n_r = remaining_ids.numel()
+
+                obj_samples = math_utils.sample_uniform(
+                    self.obj_anywhere_range[:, 0], self.obj_anywhere_range[:, 1], (n_r, 6), device=env.device
+                )
+                obj_pos = env.scene.env_origins[remaining_ids] + obj_samples[:, :3]
+                obj_pos -= self.obj_bottom_offset.expand(n_r, -1)
+                obj_quat = math_utils.quat_from_euler_xyz(obj_samples[:, 3], obj_samples[:, 4], obj_samples[:, 5])
+
+                self.insertive_object.write_root_pose_to_sim(
+                    torch.cat([obj_pos, obj_quat], dim=-1), env_ids=remaining_ids
+                )
+                self.insertive_object.write_root_velocity_to_sim(
+                    torch.zeros(n_r, 6, device=env.device), env_ids=remaining_ids
+                )
+
+                if self.collision_analyzer is not None:
+                    collision_free = self.collision_analyzer(env, remaining_ids)
+                    remaining_ids = remaining_ids[~collision_free]
+                else:
+                    remaining_ids = remaining_ids[:0]  # empty
+
         # ============================================================
-        # Group B: ObjectPartiallyAssembledEENear (dataset + procedural EE)
+        # Group B: ObjectPartiallyAssembled + EE above (dataset + procedural EE)
+        #   50-50 split: near-success states vs far states
         # ============================================================
         if ids_partial.numel() > 0:
             n_b = ids_partial.numel()
@@ -1069,9 +1143,24 @@ class GravityTrickResetManager(ManagerTermBase):
             receptive_pos_w = self.receptive_object.data.root_pos_w[ids_partial]
             receptive_quat_w = self.receptive_object.data.root_quat_w[ids_partial]
 
-            assembly_indices = torch.randint(0, len(self.pa_rel_positions), (n_b,), device=env.device)
-            sampled_rel_pos = self.pa_rel_positions[assembly_indices]
-            sampled_rel_quat = self.pa_rel_quaternions[assembly_indices]
+            if self.pa_success_fraction is not None:
+                # Split: pa_success_fraction near-success, rest far
+                use_near = torch.rand(n_b, device=env.device) < self.pa_success_fraction
+                near_indices = torch.randint(0, len(self.pa_near_positions), (n_b,), device=env.device)
+                far_indices = torch.randint(0, len(self.pa_far_positions), (n_b,), device=env.device)
+                sampled_rel_pos = torch.where(
+                    use_near.unsqueeze(-1), self.pa_near_positions[near_indices], self.pa_far_positions[far_indices]
+                )
+                sampled_rel_quat = torch.where(
+                    use_near.unsqueeze(-1), self.pa_near_quaternions[near_indices], self.pa_far_quaternions[far_indices]
+                )
+            else:
+                # Sample uniformly from the full dataset
+                all_positions = torch.cat([self.pa_near_positions, self.pa_far_positions], dim=0)
+                all_quaternions = torch.cat([self.pa_near_quaternions, self.pa_far_quaternions], dim=0)
+                indices = torch.randint(0, len(all_positions), (n_b,), device=env.device)
+                sampled_rel_pos = all_positions[indices]
+                sampled_rel_quat = all_quaternions[indices]
 
             ins_pos_w, ins_quat_w = math_utils.combine_frame_transforms(
                 receptive_pos_w, receptive_quat_w, sampled_rel_pos, sampled_rel_quat
@@ -1084,9 +1173,9 @@ class GravityTrickResetManager(ManagerTermBase):
                 torch.zeros(n_b, 6, device=env.device), env_ids=ids_partial
             )
 
-            # EE near insertive object via IK
+            # EE above object via IK (10-20cm above, pointing down — avoids collision)
             ee_samples = math_utils.sample_uniform(
-                self.ee_near_range[:, 0], self.ee_near_range[:, 1], (n_b, 6), device=env.device
+                self.ee_above_range[:, 0], self.ee_above_range[:, 1], (n_b, 6), device=env.device
             )
             ee_pos_w = ins_pos_w + ee_samples[:, :3]
             ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
+from isaaclab.sensors import ContactSensor
 
 from ..assembly_keypoints import Offset
 from . import utils
@@ -213,6 +214,43 @@ def success_reward(env: ManagerBasedRLEnv, context: str = "progress_context") ->
     orientation_aligned: torch.Tensor = getattr(context_term, "orientation_aligned")
     position_aligned: torch.Tensor = getattr(context_term, "position_aligned")
     return torch.where(orientation_aligned & position_aligned, 1.0, 0.0)
+
+
+def gripper_contact(
+    env: ManagerBasedRLEnv,
+    threshold: float,
+    left_sensor_cfg: SceneEntityCfg = SceneEntityCfg("left_inner_finger_contact_sensor"),
+    right_sensor_cfg: SceneEntityCfg = SceneEntityCfg("right_inner_finger_contact_sensor"),
+) -> torch.Tensor:
+    """Binary reward: both gripper fingers in contact with object above threshold."""
+    left_sensor: ContactSensor = env.scene.sensors[left_sensor_cfg.name]
+    right_sensor: ContactSensor = env.scene.sensors[right_sensor_cfg.name]
+    left_force = torch.norm(left_sensor.data.force_matrix_w.view(env.num_envs, -1, 3)[:, 0, :], dim=-1)
+    right_force = torch.norm(right_sensor.data.force_matrix_w.view(env.num_envs, -1, 3)[:, 0, :], dim=-1)
+    return ((left_force > threshold) & (right_force > threshold)).float()
+
+
+def contact_gated_dense_success(
+    env: ManagerBasedRLEnv,
+    std: float,
+    threshold: float = 1.0,
+    context: str = "progress_context",
+    left_sensor_cfg: SceneEntityCfg = SceneEntityCfg("left_inner_finger_contact_sensor"),
+    right_sensor_cfg: SceneEntityCfg = SceneEntityCfg("right_inner_finger_contact_sensor"),
+) -> torch.Tensor:
+    """Dense success reward gated by gripper contact (like pat/hand's position_command_error_tanh)."""
+    context_term: ManagerTermBase = env.reward_manager.get_term_cfg(context).func  # type: ignore
+    xyz_distance: torch.Tensor = getattr(context_term, "xyz_distance")
+    in_contact = gripper_contact(env, threshold, left_sensor_cfg, right_sensor_cfg)
+    return (1 - torch.tanh(xyz_distance / std)) * in_contact
+
+
+def is_terminated_term(env: ManagerBasedRLEnv, term_keys: list[str]) -> torch.Tensor:
+    """Returns 1.0 for envs where any of the named termination terms fired this step."""
+    result = torch.zeros(env.num_envs, device=env.device)
+    for key in term_keys:
+        result = torch.max(result, env.termination_manager.get_term(key).float())
+    return result
 
 
 def action_l2_clamped(env: ManagerBasedRLEnv) -> torch.Tensor:
