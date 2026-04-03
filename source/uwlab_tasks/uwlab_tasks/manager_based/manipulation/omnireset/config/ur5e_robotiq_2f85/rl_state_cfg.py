@@ -20,7 +20,7 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-
+ 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85, IMPLICIT_UR5E_ROBOTIQ_2F85
 
@@ -568,9 +568,19 @@ class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
-    success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 5})
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
+
+    # Conservative failure: world Z only (cf. grasp_sampling check_grasp_success pos_above_ground on root_pos_w[:, 2])
+    insertive_fell_too_low = DoneTerm(
+        func=task_mdp.object_root_w_z_below_threshold,
+        params={
+            "object_cfg": SceneEntityCfg("insertive_object"),
+            "min_world_z": -0.2,
+        },
+    )
+
+    success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 10})
 
 
 @configclass
