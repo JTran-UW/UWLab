@@ -989,10 +989,11 @@ class GravityTrickResetManager(ManagerTermBase):
         )
         distances = torch.norm(error_pos, dim=1)
 
-        # Split by median distance
+        # Split by 2x the actual success threshold so "near" states can realistically reach success
         near_success_threshold = cfg.params.get("near_success_threshold", None)
         if near_success_threshold is None:
-            near_success_threshold = distances.median().item()
+            success_pos_thresh = receptive_meta["success_thresholds"]["position"]
+            near_success_threshold = success_pos_thresh * 2
 
         near_mask = distances <= near_success_threshold
         far_mask = ~near_mask
@@ -1001,6 +1002,12 @@ class GravityTrickResetManager(ManagerTermBase):
         self.pa_near_quaternions = rel_quat[near_mask]
         self.pa_far_positions = rel_pos[far_mask]
         self.pa_far_quaternions = rel_quat[far_mask]
+
+        if near_mask.sum() == 0:
+            raise ValueError(
+                f"No partial assembly states within near_success_threshold={near_success_threshold:.4f}. "
+                f"Min distance: {distances.min().item():.4f}. Dataset may not contain near-goal states."
+            )
 
         print(
             f"[GravityTrickResetManager] Loaded {n_states} partial assembly states from {pa_path}"
