@@ -9,46 +9,64 @@ from __future__ import annotations
 
 import argparse
 import math
-import time
+import os
 import torch
 from typing import cast
 
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
-parser = argparse.ArgumentParser(description="Visualize saved reset states from a dataset directory.")
+parser = argparse.ArgumentParser(
+    description="Visualize saved reset states from a dataset directory. Use --headless (app launcher group) to run without a display."
+)
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
     "--dataset_dir",
     type=str,
     default="./reset_state_datasets",
-    help="Directory containing reset-state datasets saved as <hash>.pt",
+    help="Directory containing reset-state datasets saved as <hash>.pt (ignored if --combine_four_resets).",
 )
-parser.add_argument("--reset_interval", type=float, default=0.1, help="Time interval between resets in seconds.")
+parser.add_argument(
+    "--combine_four_resets",
+    action="store_true",
+    help="Load from four dataset folders (25%% each): ObjectAnywhereEEAnywhere, ObjectRestingEEGrasped, ObjectAnywhereEEGrasped, ObjectPartiallyAssembledEEGrasped under --dataset_parent.",
+)
+parser.add_argument(
+    "--dataset_parent",
+    type=str,
+    default="./reset_state_datasets",
+    help="Parent directory for --combine_four_resets subfolders.",
+)
 parser.add_argument("--debug_clone_pose", action="store_true", help="Print captured vs clone gripper pose to debug offset.")
 parser.add_argument("--record", type=str, default=None, help="Output path for video (e.g. resets.mp4). If set, records the viewer after each reset.")
 parser.add_argument("--video_fps", type=int, default=30, help="Frames per second for the recorded video.")
-parser.add_argument("--record_hold_seconds", type=float, default=0.1, help="Seconds of video to record per reset (viewer hold time per state).")
+parser.add_argument("--record_hold_seconds_start", type=float, default=0.1, help="Seconds of video to record per reset at the start (viewer hold time); linearly interpolated to record_hold_seconds_end.")
+parser.add_argument("--record_hold_seconds_end", type=float, default=0.05, help="Seconds of video to record per reset at the end (linear interpolate from start).")
 parser.add_argument(
     "--camera_pos",
     type=str,
     default="ObjectAnywhereEEAnywhere",
     choices=["ObjectAnywhereEEAnywhere", "ObjectRestingEEGrasped", "ObjectAnywhereEEGrasped", "ObjectPartiallyAssembledEEGrasped"],
-    help="Reset-state type: selects which CAMERA_ORBIT_PRESETS entry (axis, speed, radius, height, target_z) to use for the orbit camera."
+    help="Orbit camera preset. With --combine_four_resets, orbit always uses ObjectAnywhereEEAnywhere (wider); this flag only affects single-dataset runs.",
 )
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, remaining_args = parser.parse_known_args()
 
-# launch omniverse app
-app_launcher = AppLauncher(headless=args_cli.headless)
+# When recording, cameras are required for env.render(); enable so headless + --record works
+if args_cli.record:
+    args_cli.enable_cameras = True
+
+# launch omniverse app (use --headless to run without a display)
+app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 """Rest everything else."""
 
 import contextlib
 import gymnasium as gym
+from tqdm import tqdm
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -75,9 +93,17 @@ LIGHT_TYPES = {
 CAMERA_ORBIT_PRESETS: dict[str, tuple[float, float, float, float, float, float]] = {
     "ObjectAnywhereEEAnywhere": (0.4, 0.0, 0.05, 1.6, 0.6, 0.1),
     "ObjectRestingEEGrasped": (0.6, 0.0, 0.05, 0.6, 0.3, 0.05), # (0.6, 0.0, 0.05, 0.6, 0.3, 0.1),
-    "ObjectAnywhereEEGrasped": (0.5, 0.0, 0.05, 0.6, 0.6, 0.3), # (0.6, 0.0, 0.05, 0.6, 0.4, 0.2),
-    "ObjectPartiallyAssembledEEGrasped": (0.4, 0.0, 0.05, 0.6, 0.25, 0.05),
+    "ObjectAnywhereEEGrasped": (0.5, 0.0, 0.05, 0.8, 0.6, 0.3), # (0.6, 0.0, 0.05, 0.6, 0.4, 0.2),
+    "ObjectPartiallyAssembledEEGrasped": (0.46, 0.06, 0.05, 0.8, 0.25, 0.05),
 }
+
+# Subfolder names under --dataset_parent for --combine_four_resets (must match MultiResetManager .pt layout per assembly hash).
+FOUR_RESET_DATASET_SUBDIRS: tuple[str, ...] = (
+    "ObjectAnywhereEEAnywhere",
+    "ObjectRestingEEGrasped",
+    "ObjectAnywhereEEGrasped",
+    "ObjectPartiallyAssembledEEGrasped",
+)
 
 
 def update_orbit_camera(
@@ -226,18 +252,30 @@ def main(env_cfg, agent_cfg) -> None:
     # make sure environment is non-deterministic for diverse pose discovery
     env_cfg.seed = None
 
-    # Set up the MultiResetManager to load states from the computed dataset
+    if args_cli.combine_four_resets:
+        base_paths = [os.path.join(args_cli.dataset_parent, name) for name in FOUR_RESET_DATASET_SUBDIRS]
+        reset_probs = [1.0, 1.0, 1.0, 1.0]
+        # Receptive / insertive poses change across reset families; refresh clones every reset (not single frozen receptive clone).
+        fix_objects = False
+    else:
+        base_paths = [args_cli.dataset_dir]
+        reset_probs = [1.0]
+        fix_objects = args_cli.camera_pos in [
+            "ObjectRestingEEGrasped",
+            "ObjectAnywhereEEGrasped",
+            "ObjectPartiallyAssembledEEGrasped",
+        ]
+
+    # Set up the MultiResetManager to load states from the computed dataset(s)
     reset_from_reset_states = EventTerm(
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "base_paths": [args_cli.dataset_dir],
-            "probs": [1.0],
+            "base_paths": base_paths,
+            "probs": reset_probs,
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
         },
     )
-
-    fix_objects = args_cli.camera_pos in ["ObjectRestingEEGrasped", "ObjectAnywhereEEGrasped", "ObjectPartiallyAssembledEEGrasped"]
 
     if fix_objects:
         print("Fixing objects")
@@ -262,11 +300,14 @@ def main(env_cfg, agent_cfg) -> None:
     except Exception:
         pass
 
-    orbit_params = CAMERA_ORBIT_PRESETS[args_cli.camera_pos]
+    orbit_camera_key = (
+        "ObjectAnywhereEEAnywhere" if args_cli.combine_four_resets else args_cli.camera_pos
+    )
+    orbit_params = CAMERA_ORBIT_PRESETS[orbit_camera_key]
     current_orbit_angle: list[float] = [0.0]
 
     # Initialize variables
-    print(f"Starting visualization of saved states from {args_cli.dataset_dir}")
+    print(f"Starting visualization of saved states from: {base_paths}")
     print("Press Ctrl+C to stop")
 
     # import pdb; pdb.set_trace()
@@ -303,18 +344,18 @@ def main(env_cfg, agent_cfg) -> None:
         UsdGeom.Xform.Define(stage, clones_path)
 
     # Turn off skylight
-    skylight_path = "/World/skyLight"
-    stage.GetPrimAtPath(skylight_path).SetActive(False)
+    # skylight_path = "/World/skyLight"
+    # stage.GetPrimAtPath(skylight_path).SetActive(False)
 
     # Pose marker for cloned EE poses (replaces visible robotiq_base_link per clone)
     robot = env.unwrapped.scene["robot"]
     ee_body_name = "robotiq_base_link"
     ee_body_idx = next(i for i, n in enumerate(robot.body_names) if n == ee_body_name)
-    frame_marker_cfg = FRAME_MARKER_CFG.copy()  # type: ignore
-    frame_marker_cfg.markers["frame"].scale = (0.03, 0.03, 0.03)
-    pose_marker = VisualizationMarkers(
-        frame_marker_cfg.replace(prim_path=clones_path + "/EEPoseMarkers")
-    )
+    # frame_marker_cfg = FRAME_MARKER_CFG.copy()  # type: ignore
+    # frame_marker_cfg.markers["frame"].scale = (0.03, 0.03, 0.03)
+    # pose_marker = VisualizationMarkers(
+    #     frame_marker_cfg.replace(prim_path=clones_path + "/EEPoseMarkers")
+    # )
     all_ee_pos = []
     all_ee_quat = []
 
@@ -322,9 +363,9 @@ def main(env_cfg, agent_cfg) -> None:
     if args_cli.record:
         print(
             f"Recording video to {args_cli.record} at {args_cli.video_fps} fps, "
-            f"{args_cli.record_hold_seconds}s per reset"
+            f"hold seconds: linear {args_cli.record_hold_seconds_start}s -> {args_cli.record_hold_seconds_end}s per reset"
         )
-        frames_to_record = max(1, int(args_cli.record_hold_seconds * args_cli.video_fps))
+        frames_to_record = max(1, int(args_cli.record_hold_seconds_start * args_cli.video_fps))
         for _ in range(frames_to_record):
             update_orbit_camera(env, current_orbit_angle, args_cli.video_fps, orbit_params)
             img = env.render()
@@ -337,8 +378,9 @@ def main(env_cfg, agent_cfg) -> None:
                 )
             video_writer.write(img)
 
+    num_resets = 1000
     with contextlib.suppress(KeyboardInterrupt):
-        for i in range(1000):
+        for i in tqdm(range(num_resets), desc="Resets", unit="reset"):
             asset = env.unwrapped.scene["robot"]
             # specific for robotiq
             gripper_joint_positions = asset.data.joint_pos[:, asset.find_joints(["right_inner_finger_joint"])[0][0]]
@@ -355,7 +397,6 @@ def main(env_cfg, agent_cfg) -> None:
             for _ in range(3):
                 env.unwrapped.sim.step()
             success = env.unwrapped.reward_manager.get_term_cfg("progress_context").func.success
-            print("Success: ", success)
 
             # Read original poses and full link state before we reset
             insertive = env.unwrapped.scene["insertive_object"]
@@ -378,7 +419,7 @@ def main(env_cfg, agent_cfg) -> None:
                 clone_prim.SetInstanceable(False)
             disable_collisions_under_prim(clone_path)
             # disable_lights(clone_path, stage=stage)
-            set_clone_material_translucent(clone_path, ["visuals/drawer_bottom"], stage=stage)
+            set_clone_material_translucent(clone_path, ["visuals/bolt", "visuals/leg"], stage=stage)
 
             if not fix_objects or (fix_objects and i == 0):
                 # Receptive object clone
@@ -389,8 +430,21 @@ def main(env_cfg, agent_cfg) -> None:
                     receptive_clone_prim.SetInstanceable(False)
                 disable_collisions_under_prim(receptive_clone_path)
                 # disable_lights(receptive_clone_path, stage=stage)
-                # if not fix_objects or args_cli.camera_pos in ["ObjectRestingEEGrasped", "ObjectAnywhereEEGrasped"]:
-                # set_clone_material_translucent(receptive_clone_path, ["visuals/drawer_box_bottom", "visuals/drawer_box_top"], stage=stage)
+                set_clone_material_translucent(
+                    receptive_clone_path,
+                    [
+                        "visuals/table_top",
+                        "visuals/wall",
+                        "visuals/wall1",
+                        "visuals/wall2",
+                        "visuals/wall3",
+                        "visuals/hole",
+                        "visuals/hole1",
+                        "visuals/hole2",
+                        "visuals/hole3",
+                    ],
+                    stage=stage,
+                )
 
             # Robot clone (same pattern: clone -> reset -> set pose -> disable collisions)
             robot_clone_path = "/World/envs/env_0/Clones/RobotClone_" + str(i)
@@ -440,14 +494,17 @@ def main(env_cfg, agent_cfg) -> None:
             all_ee_quat.append(quat_ee)
             poses_pos = torch.stack(all_ee_pos, dim=0).to(device=env.device)
             poses_quat = torch.stack(all_ee_quat, dim=0).to(device=env.device)
-            pose_marker.visualize(poses_pos, poses_quat)
+            # pose_marker.visualize(poses_pos, poses_quat)
 
             # Delete the robot clone entirely now that the pose marker replaces it
             stage.RemovePrim(robot_clone_path)
 
             # Record current view before we capture/reset (so video shows this state, then the reset)
             if args_cli.record:
-                frames_to_record = max(1, int(args_cli.record_hold_seconds * args_cli.video_fps))
+                # Linear interpolate hold time from start to end over the run (gradual speedup)
+                t = i / max(1, num_resets - 1)
+                hold_seconds = (1.0 - t) * args_cli.record_hold_seconds_start + t * args_cli.record_hold_seconds_end
+                frames_to_record = max(1, int(hold_seconds * args_cli.video_fps))
                 for _ in range(frames_to_record):
                     update_orbit_camera(env, current_orbit_angle, args_cli.video_fps, orbit_params)
                     img = env.render()

@@ -94,168 +94,180 @@ class RlStateSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    ground = AssetBaseCfg(
-        prim_path="/World/GroundPlane",
-        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.868)),
-        spawn=sim_utils.GroundPlaneCfg(),
-    )
+    # ground = AssetBaseCfg(
+    #     prim_path="/World/GroundPlane",
+    #     init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.868)),
+    #     spawn=sim_utils.GroundPlaneCfg(),
+    # )
 
-    sky_light = AssetBaseCfg(
-        prim_path="/World/skyLight",
-        spawn=sim_utils.DomeLightCfg(
-            intensity=10000.0,
-            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
-        ),
-    )
-
-    # hd_camera: TiledCameraCfg = TiledCameraCfg(
-    #     prim_path="{ENV_REGEX_NS}/hd_camera",
-    #     update_period=0,
-    #     height=1080,
-    #     width=1920,
-    #     data_types=["rgb"],
-    #     spawn=sim_utils.PinholeCameraCfg(
-    #         focal_length=13.5,
-    #     ),
-    #     offset=TiledCameraCfg.OffsetCfg(
-    #         pos=(0.9, 0.6, 0.2),
-    #         rot=(0.38671, 0.29673, 0.53155, 0.69272),
-    #         convention="opengl",
+    # sky_light = AssetBaseCfg(
+    #     prim_path="/World/skyLight",
+    #     spawn=sim_utils.DomeLightCfg(
+    #         intensity=10000.0,
+    #         texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
     #     ),
     # )
+
+    warehouse = AssetBaseCfg(
+        prim_path="/World/warehouse",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/warehouse.usd",
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, -0.87), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+    hd_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/hd_camera",
+        update_period=0,
+        height=1080,
+        width=1920,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=13.5,
+        ),
+        offset=TiledCameraCfg.OffsetCfg(
+            # other settings
+            # pos=(1.0, 0.6, 0.2),
+            # rot=(0.37629, 0.28981, 0.53663, 0.69746),
+            # rectangle
+            pos=(1.05, -0.35, 0.2),
+            rot=(0.6849, 0.52721, 0.30661, 0.39869),
+            convention="opengl",
+        ),
+    )
 
 
 @configclass
 class BaseEventCfg:
     """Configuration for events."""
 
-    # # mode: startup (randomize dynamics)
-    # robot_material = EventTerm(
-    #     func=task_mdp.randomize_rigid_body_material,  # type: ignore
-    #     mode="startup",
-    #     params={
-    #         "static_friction_range": (0.3, 1.2),
-    #         "dynamic_friction_range": (0.2, 1.0),
-    #         "restitution_range": (0.0, 0.0),
-    #         "num_buckets": 256,
-    #         "asset_cfg": SceneEntityCfg("robot"),
-    #         "make_consistent": True,
-    #     },
-    # )
+    # mode: startup (randomize dynamics)
+    robot_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.3, 1.2),
+            "dynamic_friction_range": (0.2, 1.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("robot"),
+            "make_consistent": True,
+        },
+    )
 
-    # # use large friction to avoid slipping
-    # insertive_object_material = EventTerm(
-    #     func=task_mdp.randomize_rigid_body_material,  # type: ignore
-    #     mode="startup",
-    #     params={
-    #         "static_friction_range": (1.0, 2.0),
-    #         "dynamic_friction_range": (0.9, 1.9),
-    #         "restitution_range": (0.0, 0.0),
-    #         "num_buckets": 256,
-    #         "asset_cfg": SceneEntityCfg("insertive_object"),
-    #         "make_consistent": True,
-    #     },
-    # )
+    # use large friction to avoid slipping
+    insertive_object_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (1.0, 2.0),
+            "dynamic_friction_range": (0.9, 1.9),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            "make_consistent": True,
+        },
+    )
 
-    # # use large friction to avoid slipping
-    # receptive_object_material = EventTerm(
-    #     func=task_mdp.randomize_rigid_body_material,  # type: ignore
-    #     mode="startup",
-    #     params={
-    #         "static_friction_range": (1.0, 2.0),
-    #         "dynamic_friction_range": (0.9, 1.9),
-    #         "restitution_range": (0.0, 0.0),
-    #         "num_buckets": 256,
-    #         "asset_cfg": SceneEntityCfg("receptive_object"),
-    #         "make_consistent": True,
-    #     },
-    # )
+    # use large friction to avoid slipping
+    receptive_object_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (1.0, 2.0),
+            "dynamic_friction_range": (0.9, 1.9),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("receptive_object"),
+            "make_consistent": True,
+        },
+    )
 
-    # table_material = EventTerm(
-    #     func=task_mdp.randomize_rigid_body_material,  # type: ignore
-    #     mode="startup",
-    #     params={
-    #         "static_friction_range": (0.3, 0.6),
-    #         "dynamic_friction_range": (0.2, 0.5),
-    #         "restitution_range": (0.0, 0.0),
-    #         "num_buckets": 256,
-    #         "asset_cfg": SceneEntityCfg("table"),
-    #         "make_consistent": True,
-    #     },
-    # )
+    table_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.3, 0.6),
+            "dynamic_friction_range": (0.2, 0.5),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("table"),
+            "make_consistent": True,
+        },
+    )
 
-    # randomize_robot_mass = EventTerm(
-    #     func=task_mdp.randomize_rigid_body_mass,
-    #     mode="startup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot"),
-    #         "mass_distribution_params": (0.7, 1.3),
-    #         "operation": "scale",
-    #         "distribution": "uniform",
-    #         "recompute_inertia": True,
-    #     },
-    # )
+    randomize_robot_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "mass_distribution_params": (0.7, 1.3),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
 
-    # randomize_insertive_object_mass = EventTerm(
-    #     func=task_mdp.randomize_rigid_body_mass,
-    #     mode="startup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("insertive_object"),
-    #         # we assume insertive object is somewhere between 20g and 200g
-    #         "mass_distribution_params": (0.02, 0.2),
-    #         "operation": "abs",
-    #         "distribution": "uniform",
-    #         "recompute_inertia": True,
-    #     },
-    # )
+    randomize_insertive_object_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            # we assume insertive object is somewhere between 20g and 200g
+            "mass_distribution_params": (0.02, 0.2),
+            "operation": "abs",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
 
-    # randomize_receptive_object_mass = EventTerm(
-    #     func=task_mdp.randomize_rigid_body_mass,
-    #     mode="startup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("receptive_object"),
-    #         "mass_distribution_params": (0.5, 1.5),
-    #         "operation": "scale",
-    #         "distribution": "uniform",
-    #         "recompute_inertia": True,
-    #     },
-    # )
+    randomize_receptive_object_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("receptive_object"),
+            "mass_distribution_params": (0.5, 1.5),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
 
-    # randomize_table_mass = EventTerm(
-    #     func=task_mdp.randomize_rigid_body_mass,
-    #     mode="startup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("table"),
-    #         "mass_distribution_params": (0.5, 1.5),
-    #         "operation": "scale",
-    #         "distribution": "uniform",
-    #         "recompute_inertia": True,
-    #     },
-    # )
+    randomize_table_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("table"),
+            "mass_distribution_params": (0.5, 1.5),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
 
-    # randomize_robot_joint_parameters = EventTerm(
-    #     func=task_mdp.randomize_joint_parameters,
-    #     mode="reset",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*", "finger_joint"]),
-    #         "friction_distribution_params": (0.25, 4.0),
-    #         "armature_distribution_params": (0.25, 4.0),
-    #         "operation": "scale",
-    #         "distribution": "log_uniform",
-    #     },
-    # )
+    randomize_robot_joint_parameters = EventTerm(
+        func=task_mdp.randomize_joint_parameters,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*", "finger_joint"]),
+            "friction_distribution_params": (0.25, 4.0),
+            "armature_distribution_params": (0.25, 4.0),
+            "operation": "scale",
+            "distribution": "log_uniform",
+        },
+    )
 
-    # randomize_gripper_actuator_parameters = EventTerm(
-    #     func=task_mdp.randomize_actuator_gains,
-    #     mode="reset",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_joint"]),
-    #         "stiffness_distribution_params": (0.5, 2.0),
-    #         "damping_distribution_params": (0.5, 2.0),
-    #         "operation": "scale",
-    #         "distribution": "log_uniform",
-    #     },
-    # )
+    randomize_gripper_actuator_parameters = EventTerm(
+        func=task_mdp.randomize_actuator_gains,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_joint"]),
+            "stiffness_distribution_params": (0.5, 2.0),
+            "damping_distribution_params": (0.5, 2.0),
+            "operation": "scale",
+            "distribution": "log_uniform",
+        },
+    )
 
     # mode: reset
     reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})

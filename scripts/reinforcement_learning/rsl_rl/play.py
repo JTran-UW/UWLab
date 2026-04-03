@@ -81,6 +81,14 @@ from uwlab_tasks.utils.hydra import hydra_task_config
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
+def _capture_hd_frame(hd_camera, writer):
+    """Grab one frame from hd_camera and append to the video writer."""
+    frame = hd_camera.data.output["rgb"][0].cpu().numpy()
+    if frame.shape[-1] == 4:
+        frame = frame[..., :3]
+    writer.append_data(frame)
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -175,7 +183,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
-    # HD video recording setup
+    # HD video recording at 30 Hz (render/save 3 frames per policy step when policy is 10 Hz)
+    video_fps = 30
     hd_camera = env.unwrapped.scene.sensors.get("hd_camera", None)
     hd_video_writer = None
     if hd_camera is not None:
@@ -183,11 +192,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         os.makedirs(video_dir, exist_ok=True)
         hd_video_path = os.path.join(video_dir, "hd_video.mp4")
         hd_video_writer = imageio.get_writer(
-            hd_video_path, fps=30, codec="libx264", quality=10, pixelformat="yuv420p", macro_block_size=1
+            hd_video_path, fps=video_fps, codec="libx264", quality=10, pixelformat="yuv420p", macro_block_size=1
         )
-        capture_interval = max(1, int(round(1.0 / (30.0 * env.unwrapped.physics_dt))))
-        physics_step_count = 0
-        print(f"[INFO] HD video recording enabled: {hd_video_path}")
+        decimation = env_cfg.decimation
+        n_frames_per_step = max(1, int(round(video_fps * dt)))  # e.g. 3 for 30 Hz and dt=0.1
+        interval_physics_steps = max(1, decimation // n_frames_per_step)
+        env.unwrapped.set_video_frame_callback(
+            lambda: _capture_hd_frame(hd_camera, hd_video_writer),
+            interval_physics_steps=interval_physics_steps,
+        )
+        print(f"[INFO] HD video recording at {video_fps} Hz: {hd_video_path}")
 
     # reset environment
     obs = env.get_observations()
@@ -205,15 +219,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # reset recurrent states for episodes that have terminated
                 policy_nn.reset(dones)
 
-            # capture HD camera frame
-            if hd_video_writer is not None:
-                physics_step_count += env_cfg.decimation
-                if physics_step_count % capture_interval == 0:
-                    frame = hd_camera.data.output["rgb"][0].cpu().numpy()
-                    if frame.shape[-1] == 4:
-                        frame = frame[..., :3]
-                    hd_video_writer.append_data(frame)
-
             if args_cli.video:
                 timestep += 1
                 # Exit the play loop after recording one video
@@ -226,6 +231,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 time.sleep(sleep_time)
     finally:
         if hd_video_writer is not None:
+            env.unwrapped.set_video_frame_callback(None)
             hd_video_writer.close()
             print(f"[INFO] HD video saved to: {hd_video_path}")
 
