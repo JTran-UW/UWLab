@@ -265,10 +265,15 @@ def action_rate_l2_clamped(env: ManagerBasedRLEnv) -> torch.Tensor:
     )
 
 
-def mechanical_work(env: ManagerBasedRLEnv, robot_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Mechanical work: sum of abs(torque * joint_vel) * dt across all joints."""
-    robot: Articulation = env.scene[robot_cfg.name]
-    return torch.sum((robot.data.applied_torque * robot.data.joint_vel).abs(), dim=1) * env.step_dt
+def mechanical_work(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"]),
+) -> torch.Tensor:
+    """Mechanical work: mean of abs(torque * joint_vel) * dt across arm joints only."""
+    robot: Articulation = env.scene[asset_cfg.name]
+    joint_ids = asset_cfg.joint_ids
+    work = (robot.data.applied_torque[:, joint_ids] * robot.data.joint_vel[:, joint_ids]).abs()
+    return work.mean(dim=1) * env.step_dt
 
 
 def joint_vel_l2_clamped(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:

@@ -68,7 +68,7 @@ class GravityTrickRewardsCfg(RewardsCfg):
     success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
 
     # Mechanical work penalty: sum(abs(torque * joint_vel)) * dt
-    mech_work = RewTerm(func=task_mdp.mechanical_work, weight=-1e-9)
+    mech_work = RewTerm(func=task_mdp.mechanical_work, weight=-1e-5)
 
     # Fail penalty: fires on abnormal_robot or object_out_of_bound
     fail = RewTerm(
@@ -261,7 +261,7 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickHighWorkTrainCfg(Ur5eRobotiq2f85
 
     def __post_init__(self):
         super().__post_init__()
-        self.rewards.mech_work.weight = -1e-10
+        self.rewards.mech_work.weight = -1e-4
 
 
 @configclass
