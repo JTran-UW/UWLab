@@ -1221,22 +1221,20 @@ class GravityTrickResetManager(ManagerTermBase):
 
 
 class IKCurriculumResetManager(ManagerTermBase):
-    """Procedural reset with randomized IK iterations toward the object.
+    """Procedural 50-50 reset: ObjectAnywhere + ObjectPartiallyAssembled.
 
-    For each env on reset:
-      1. Sample random object pose (position + orientation)
-      2. Sample random EE pose (fully random in workspace)
-      3. Solve IK toward that random EE pose (always, to get a valid joint config)
-      4. Sample random number of IK iterations k ~ Uniform(0, max_ik_iters)
-      5. Run k additional IK iterations toward the object position (with offset above)
-      6. Collision check between gripper and object; resample object if colliding
+    Group A (50%): Object random position/orientation, EE random IK pose, lerp EE toward object.
+    Group B (50%): Object from partial assembly dataset (relative to receptive), EE random IK pose,
+                   lerp EE toward object.
 
-    k=0 → EE stays random (exploration). k=max → EE precisely near object (near-goal).
+    Both groups use the same EE strategy: random EE → IK solve → lerp toward object.
+    On collision resample, envs stay in their assigned group.
     """
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
 
+        dataset_dir: str = cfg.params.get("dataset_dir", "")
         robot_ik_cfg: SceneEntityCfg = cfg.params.get(
             "robot_ik_cfg",
             SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"),
@@ -1277,6 +1275,28 @@ class IKCurriculumResetManager(ManagerTermBase):
         else:
             self.obj_bottom_offset = torch.zeros(1, 3, device=env.device)
 
+        # -- Load partial assembly dataset --
+        receptive_usd_path = self.receptive_object.cfg.spawn.usd_path
+        pair = utils.compute_pair_dir(insertive_usd_path, receptive_usd_path)
+        pa_path = f"{dataset_dir}/Resets/{pair}/partial_assemblies.pt"
+        local_path = utils.safe_retrieve_file_path(pa_path)
+        data = torch.load(local_path, map_location="cpu")
+
+        rel_pos = data.get("relative_position")
+        rel_quat = data.get("relative_orientation")
+        if rel_pos is None or rel_quat is None or len(rel_pos) == 0:
+            raise ValueError(f"No partial assembly data found in {pa_path}")
+        if not isinstance(rel_pos, torch.Tensor):
+            rel_pos = torch.as_tensor(rel_pos, dtype=torch.float32)
+        if not isinstance(rel_quat, torch.Tensor):
+            rel_quat = torch.as_tensor(rel_quat, dtype=torch.float32)
+        self.pa_positions = rel_pos.to(env.device, dtype=torch.float32)
+        self.pa_quaternions = rel_quat.to(env.device, dtype=torch.float32)
+
+        print(
+            f"[IKCurriculumResetManager] Loaded {len(self.pa_positions)} partial assembly states from {pa_path}"
+        )
+
         # IK solver
         robot_ik_solver_cfg = DifferentialInverseKinematicsActionCfg(
             asset_name=robot_ik_cfg.name,
@@ -1291,10 +1311,20 @@ class IKCurriculumResetManager(ManagerTermBase):
         self.collision_min_dist: float = cfg.params.get("collision_min_dist", 0.01)
         self.max_resample_attempts: int = cfg.params.get("max_resample_attempts", 10)
 
+        # Group assignment: 0 = anywhere, 1 = partial assembly
+        self.group_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+        # Success monitoring
+        success_monitor_cfg = SuccessMonitorCfg(
+            monitored_history_len=100, num_monitored_data=2, device=env.device
+        )
+        self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
+
     def __call__(
         self,
         env: ManagerBasedEnv,
         env_ids: torch.Tensor,
+        dataset_dir: str = "",
         robot_ik_cfg: SceneEntityCfg | None = None,
         obj_anywhere_range: dict | None = None,
         ee_anywhere_range: dict | None = None,
@@ -1307,21 +1337,51 @@ class IKCurriculumResetManager(ManagerTermBase):
         if env_ids.numel() == 0:
             return
 
+        # -- Success monitoring --
+        success_mask = env.termination_manager.get_term("success")[env_ids].float()
+        self.success_monitor.success_update(self.group_id[env_ids], success_mask)
+        success_rates = self.success_monitor.get_success_rate()
+        if "log" not in env.extras:
+            env.extras["log"] = {}
+        env.extras["log"]["Metrics/anywhere_success_rate"] = success_rates[0].item()
+        env.extras["log"]["Metrics/partial_assembly_success_rate"] = success_rates[1].item()
+
+        # -- 50-50 group assignment --
         n = env_ids.numel()
-        device = env.device
+        group = torch.randint(0, 2, (n,), device=env.device)
+        self.group_id[env_ids] = group
 
-        self._reset_envs(env, env_ids, n, device)
+        ids_anywhere = env_ids[group == 0]
+        ids_partial = env_ids[group == 1]
 
-        # Per-body collision check — resample everything if object too close to any robot body
+        # -- Group A: ObjectAnywhere --
+        if ids_anywhere.numel() > 0:
+            self._reset_anywhere(env, ids_anywhere)
+
+        # -- Group B: ObjectPartiallyAssembled --
+        if ids_partial.numel() > 0:
+            self._reset_partial_assembly(env, ids_partial)
+
+        # -- EE reset for all envs: random EE → IK solve → lerp toward object --
+        self._reset_ee(env, env_ids)
+
+        # -- Collision check with group-preserving resample --
         remaining_ids = env_ids.clone()
-        for attempt in range(self.max_resample_attempts):
+        for _ in range(self.max_resample_attempts):
             if remaining_ids.numel() == 0:
                 break
             collision_free = self._check_per_body_collision(env, remaining_ids)
             colliding = remaining_ids[~collision_free]
             if colliding.numel() == 0:
                 break
-            self._reset_envs(env, colliding, colliding.numel(), device)
+            # Resample within the same group
+            col_anywhere = colliding[self.group_id[colliding] == 0]
+            col_partial = colliding[self.group_id[colliding] == 1]
+            if col_anywhere.numel() > 0:
+                self._reset_anywhere(env, col_anywhere)
+            if col_partial.numel() > 0:
+                self._reset_partial_assembly(env, col_partial)
+            self._reset_ee(env, colliding)
             remaining_ids = colliding
 
         # Zero joint velocities
@@ -1329,13 +1389,11 @@ class IKCurriculumResetManager(ManagerTermBase):
             torch.zeros_like(self.robot.data.joint_vel[env_ids]), env_ids=env_ids
         )
 
-    def _reset_envs(
-        self, env: ManagerBasedEnv, env_ids: torch.Tensor, n: int, device,
-    ) -> None:
-        """Sample object, EE, interpolate EE toward object, solve IK."""
-        # 1. Sample random object pose
+    def _reset_anywhere(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
+        """Sample random object pose in workspace."""
+        n = env_ids.numel()
         obj_samples = math_utils.sample_uniform(
-            self.obj_range[:, 0], self.obj_range[:, 1], (n, 6), device=device
+            self.obj_range[:, 0], self.obj_range[:, 1], (n, 6), device=env.device
         )
         obj_pos = env.scene.env_origins[env_ids] + obj_samples[:, :3]
         obj_pos -= self.obj_bottom_offset.expand(n, -1)
@@ -1345,10 +1403,36 @@ class IKCurriculumResetManager(ManagerTermBase):
             torch.cat([obj_pos, obj_quat], dim=-1), env_ids=env_ids
         )
         self.insertive_object.write_root_velocity_to_sim(
-            torch.zeros(n, 6, device=device), env_ids=env_ids
+            torch.zeros(n, 6, device=env.device), env_ids=env_ids
         )
 
-        # 2. Sample random EE pose and solve IK
+    def _reset_partial_assembly(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
+        """Sample object from partial assembly dataset relative to receptive object."""
+        n = env_ids.numel()
+        receptive_pos_w = self.receptive_object.data.root_pos_w[env_ids]
+        receptive_quat_w = self.receptive_object.data.root_quat_w[env_ids]
+
+        indices = torch.randint(0, len(self.pa_positions), (n,), device=env.device)
+        sampled_rel_pos = self.pa_positions[indices]
+        sampled_rel_quat = self.pa_quaternions[indices]
+
+        ins_pos_w, ins_quat_w = math_utils.combine_frame_transforms(
+            receptive_pos_w, receptive_quat_w, sampled_rel_pos, sampled_rel_quat
+        )
+
+        self.insertive_object.write_root_pose_to_sim(
+            torch.cat([ins_pos_w, ins_quat_w], dim=-1), env_ids=env_ids
+        )
+        self.insertive_object.write_root_velocity_to_sim(
+            torch.zeros(n, 6, device=env.device), env_ids=env_ids
+        )
+
+    def _reset_ee(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
+        """Random EE pose → IK solve → lerp toward object."""
+        n = env_ids.numel()
+        device = env.device
+
+        # 1. Sample random EE pose and solve IK
         ee_samples = math_utils.sample_uniform(
             self.ee_range[:, 0], self.ee_range[:, 1], (n, 6), device=device
         )
@@ -1356,18 +1440,17 @@ class IKCurriculumResetManager(ManagerTermBase):
         ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
         self._solve_ik(env, env_ids, ee_pos_w, ee_quat_w, num_iters=10)
 
-        # 3. Interpolate EE toward object: t ~ Uniform(0, 1)
-        t = torch.rand(n, 1, device=device)  # Uniform(0, 1)
+        # 2. Interpolate EE toward object: t ~ Uniform(0, 1)
+        t = torch.rand(n, 1, device=device)
         robot_ik_body_idx = self.solver._body_idx
-        current_ee_pos = self.robot.data.body_pos_w[env_ids, robot_ik_body_idx]  # (n, 3)
-        current_ee_quat = self.robot.data.body_quat_w[env_ids, robot_ik_body_idx]  # (n, 4)
+        current_ee_pos = self.robot.data.body_pos_w[env_ids, robot_ik_body_idx]
+        current_ee_quat = self.robot.data.body_quat_w[env_ids, robot_ik_body_idx]
 
-        # Lerp position: (1-t)*ee_pos + t*obj_pos
+        obj_pos = self.insertive_object.data.root_pos_w[env_ids]
         target_pos_w = (1 - t) * current_ee_pos + t * obj_pos
-        # Keep current EE orientation
         target_quat_w = current_ee_quat
 
-        # 4. Solve IK to interpolated target
+        # 3. Solve IK to interpolated target
         self._solve_ik(env, env_ids, target_pos_w, target_quat_w, num_iters=10)
 
         # Update data buffers so collision checker sees current positions
@@ -1397,24 +1480,11 @@ class IKCurriculumResetManager(ManagerTermBase):
             )
 
     def _check_per_body_collision(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> torch.Tensor:
-        """Check if the insertive object is too close to any robot body.
-
-        For each robot body, computes distance between body center and object center.
-        Returns collision-free mask (True = no collision).
-        """
-        n = env_ids.numel()
-        obj_pos = self.insertive_object.data.root_pos_w[env_ids]  # (n, 3)
-
-        # Get all robot body positions: (n, num_bodies, 3)
-        body_pos = self.robot.data.body_pos_w[env_ids]  # (n, num_bodies, 3)
-
-        # Distance from object to each body center
-        dists = torch.norm(body_pos - obj_pos.unsqueeze(1), dim=-1)  # (n, num_bodies)
-
-        # Min distance across all bodies
-        min_dist_vals, min_dist_body = dists.min(dim=1)
-
-        body_names = self.robot.body_names
+        """Check if the insertive object is too close to any robot body."""
+        obj_pos = self.insertive_object.data.root_pos_w[env_ids]
+        body_pos = self.robot.data.body_pos_w[env_ids]
+        dists = torch.norm(body_pos - obj_pos.unsqueeze(1), dim=-1)
+        min_dist_vals, _ = dists.min(dim=1)
         return min_dist_vals >= self.collision_min_dist
 
 

@@ -27,6 +27,8 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
 
+from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+
 from ... import mdp as task_mdp
 
 from .rl_state_cfg import (
@@ -117,6 +119,7 @@ class GravityTrickEventCfg(BaseEventCfg):
         func=task_mdp.IKCurriculumResetManager,
         mode="reset",
         params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
             "robot_ik_cfg": SceneEntityCfg(
                 "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
             ),
@@ -136,7 +139,7 @@ class GravityTrickEventCfg(BaseEventCfg):
                 "pitch": (np.pi / 4, 3 * np.pi / 4),
                 "yaw": (np.pi / 2, 3 * np.pi / 2),
             },
-            "collision_min_dist": 0.02,  # 2cm center-to-center clearance from any robot body
+            "collision_min_dist": 0.02,
             "max_resample_attempts": 10,
         },
     )
