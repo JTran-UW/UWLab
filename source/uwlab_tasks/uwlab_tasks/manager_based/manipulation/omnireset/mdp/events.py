@@ -1338,7 +1338,11 @@ class IKCurriculumResetManager(ManagerTermBase):
             return
 
         # -- Success monitoring --
-        success_mask = env.termination_manager.get_term("success")[env_ids].float()
+        # NOTE: termination_manager.compute() runs BEFORE reward_manager.compute() in IsaacLab,
+        # so get_term("success") returns the PREVIOUS step's ProgressContext.success.
+        # Read ProgressContext.success directly — it's updated in the current step's reward computation.
+        context_term = env.reward_manager.get_term_cfg("progress_context").func
+        success_mask = getattr(context_term, "success")[env_ids].float()
         self.success_monitor.success_update(self.group_id[env_ids], success_mask)
         success_rates = self.success_monitor.get_success_rate()
         if "log" not in env.extras:
