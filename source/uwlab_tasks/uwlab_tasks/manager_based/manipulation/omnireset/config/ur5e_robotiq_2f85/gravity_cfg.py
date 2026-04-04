@@ -67,7 +67,7 @@ class GravityTrickRewardsCfg(RewardsCfg):
     )
 
     # Sparse success
-    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=10.0)
 
     # Mechanical work penalty: sum(abs(torque * joint_vel)) * dt
     mech_work = RewTerm(func=task_mdp.mechanical_work, weight=-1e-9)
