@@ -1330,6 +1330,9 @@ class IKCurriculumResetManager(ManagerTermBase):
         ee_anywhere_range: dict | None = None,
         collision_min_dist: float = 0.01,
         max_resample_attempts: int = 10,
+        curriculum_target: float | None = None,
+        curriculum_kappa: float = 2.0,
+        curriculum_temperature: float = 2.0,
     ) -> None:
         if env_ids is None:
             env_ids = torch.arange(env.num_envs, device=env.device)
@@ -1350,9 +1353,16 @@ class IKCurriculumResetManager(ManagerTermBase):
         env.extras["log"]["Metrics/anywhere_success_rate"] = success_rates[0].item()
         env.extras["log"]["Metrics/partial_assembly_success_rate"] = success_rates[1].item()
 
-        # -- 50-50 group assignment --
+        # -- Group assignment: GPS or 50-50 --
         n = env_ids.numel()
-        group = torch.randint(0, 2, (n,), device=env.device)
+        if curriculum_target is not None:
+            group, probs = SuccessMonitor.sample_by_target_rate_from_rates(
+                success_rates, n, target=curriculum_target, kappa=curriculum_kappa, temperature=curriculum_temperature
+            )
+            env.extras["log"]["Metrics/group_anywhere_prob"] = probs[0].item()
+            env.extras["log"]["Metrics/group_partial_assembly_prob"] = probs[1].item()
+        else:
+            group = torch.randint(0, 2, (n,), device=env.device)
         self.group_id[env_ids] = group
 
         ids_anywhere = env_ids[group == 0]

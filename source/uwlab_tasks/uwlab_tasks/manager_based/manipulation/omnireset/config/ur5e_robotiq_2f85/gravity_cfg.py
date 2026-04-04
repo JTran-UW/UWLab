@@ -296,3 +296,16 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC100to1TrainCfg(
     def __post_init__(self):
         super().__post_init__()
         self.rewards.fail.weight = -0.1
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCGPSTrainCfg(
+    Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg
+):
+    """Gravity trick + scene pointcloud + GPS curriculum (10:1 reward ratio)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_procedural.params["curriculum_target"] = 0.33
+        self.events.reset_procedural.params["curriculum_kappa"] = 2.0
+        self.events.reset_procedural.params["curriculum_temperature"] = 2.0
