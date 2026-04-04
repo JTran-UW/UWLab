@@ -1220,6 +1220,204 @@ class GravityTrickResetManager(ManagerTermBase):
             )
 
 
+class IKCurriculumResetManager(ManagerTermBase):
+    """Procedural reset with randomized IK iterations toward the object.
+
+    For each env on reset:
+      1. Sample random object pose (position + orientation)
+      2. Sample random EE pose (fully random in workspace)
+      3. Solve IK toward that random EE pose (always, to get a valid joint config)
+      4. Sample random number of IK iterations k ~ Uniform(0, max_ik_iters)
+      5. Run k additional IK iterations toward the object position (with offset above)
+      6. Collision check between gripper and object; resample object if colliding
+
+    k=0 → EE stays random (exploration). k=max → EE precisely near object (near-goal).
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        robot_ik_cfg: SceneEntityCfg = cfg.params.get(
+            "robot_ik_cfg",
+            SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"),
+        )
+
+        self.robot: Articulation = env.scene[robot_ik_cfg.name]
+        self.insertive_object: RigidObject = env.scene["insertive_object"]
+        self.receptive_object: RigidObject = env.scene["receptive_object"]
+        self.joint_ids: list[int] | slice = robot_ik_cfg.joint_ids
+        self.n_joints: int = self.robot.num_joints if isinstance(self.joint_ids, slice) else len(self.joint_ids)
+
+        # Object anywhere ranges
+        obj_range: dict = cfg.params.get("obj_anywhere_range", {
+            "x": (0.3, 0.55), "y": (-0.1, 0.5), "z": (0.0, 0.3),
+            "roll": (-np.pi, np.pi), "pitch": (-np.pi, np.pi), "yaw": (-np.pi, np.pi),
+        })
+        self.obj_range = torch.tensor(
+            [obj_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # EE anywhere ranges (for initial random pose)
+        ee_range: dict = cfg.params.get("ee_anywhere_range", {
+            "x": (0.3, 0.7), "y": (-0.4, 0.4), "z": (0.0, 0.5),
+            "roll": (0.0, 0.0), "pitch": (np.pi / 4, 3 * np.pi / 4), "yaw": (np.pi / 2, 3 * np.pi / 2),
+        })
+        self.ee_range = torch.tensor(
+            [ee_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # Bottom offset for insertive object
+        insertive_usd_path = self.insertive_object.cfg.spawn.usd_path
+        metadata = utils.read_metadata_from_usd_directory(insertive_usd_path)
+        bottom_offset = metadata.get("bottom_offset")
+        if bottom_offset is not None:
+            self.obj_bottom_offset = torch.tensor(bottom_offset.get("pos"), device=env.device).unsqueeze(0)
+        else:
+            self.obj_bottom_offset = torch.zeros(1, 3, device=env.device)
+
+        # IK solver
+        robot_ik_solver_cfg = DifferentialInverseKinematicsActionCfg(
+            asset_name=robot_ik_cfg.name,
+            joint_names=robot_ik_cfg.joint_names,
+            body_name=robot_ik_cfg.body_names,
+            controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+            scale=1.0,
+        )
+        self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)
+
+        # Per-body collision checking params
+        self.collision_min_dist: float = cfg.params.get("collision_min_dist", 0.01)
+        self.max_resample_attempts: int = cfg.params.get("max_resample_attempts", 10)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        robot_ik_cfg: SceneEntityCfg | None = None,
+        obj_anywhere_range: dict | None = None,
+        ee_anywhere_range: dict | None = None,
+        collision_min_dist: float = 0.01,
+        max_resample_attempts: int = 10,
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+        env_ids = env_ids.long()
+        if env_ids.numel() == 0:
+            return
+
+        n = env_ids.numel()
+        device = env.device
+
+        self._reset_envs(env, env_ids, n, device)
+
+        # Per-body collision check — resample everything if object too close to any robot body
+        remaining_ids = env_ids.clone()
+        for attempt in range(self.max_resample_attempts):
+            if remaining_ids.numel() == 0:
+                break
+            collision_free = self._check_per_body_collision(env, remaining_ids)
+            colliding = remaining_ids[~collision_free]
+            if colliding.numel() == 0:
+                break
+            self._reset_envs(env, colliding, colliding.numel(), device)
+            remaining_ids = colliding
+
+        # Zero joint velocities
+        self.robot.set_joint_velocity_target(
+            torch.zeros_like(self.robot.data.joint_vel[env_ids]), env_ids=env_ids
+        )
+
+    def _reset_envs(
+        self, env: ManagerBasedEnv, env_ids: torch.Tensor, n: int, device,
+    ) -> None:
+        """Sample object, EE, interpolate EE toward object, solve IK."""
+        # 1. Sample random object pose
+        obj_samples = math_utils.sample_uniform(
+            self.obj_range[:, 0], self.obj_range[:, 1], (n, 6), device=device
+        )
+        obj_pos = env.scene.env_origins[env_ids] + obj_samples[:, :3]
+        obj_pos -= self.obj_bottom_offset.expand(n, -1)
+        obj_quat = math_utils.quat_from_euler_xyz(obj_samples[:, 3], obj_samples[:, 4], obj_samples[:, 5])
+
+        self.insertive_object.write_root_pose_to_sim(
+            torch.cat([obj_pos, obj_quat], dim=-1), env_ids=env_ids
+        )
+        self.insertive_object.write_root_velocity_to_sim(
+            torch.zeros(n, 6, device=device), env_ids=env_ids
+        )
+
+        # 2. Sample random EE pose and solve IK
+        ee_samples = math_utils.sample_uniform(
+            self.ee_range[:, 0], self.ee_range[:, 1], (n, 6), device=device
+        )
+        ee_pos_w = self.robot.data.root_link_pos_w[env_ids] + ee_samples[:, :3]
+        ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
+        self._solve_ik(env, env_ids, ee_pos_w, ee_quat_w, num_iters=10)
+
+        # 3. Interpolate EE toward object: t ~ Uniform(0, 1)
+        t = torch.rand(n, 1, device=device)  # Uniform(0, 1)
+        robot_ik_body_idx = self.solver._body_idx
+        current_ee_pos = self.robot.data.body_pos_w[env_ids, robot_ik_body_idx]  # (n, 3)
+        current_ee_quat = self.robot.data.body_quat_w[env_ids, robot_ik_body_idx]  # (n, 4)
+
+        # Lerp position: (1-t)*ee_pos + t*obj_pos
+        target_pos_w = (1 - t) * current_ee_pos + t * obj_pos
+        # Keep current EE orientation
+        target_quat_w = current_ee_quat
+
+        # 4. Solve IK to interpolated target
+        self._solve_ik(env, env_ids, target_pos_w, target_quat_w, num_iters=10)
+
+        # Update data buffers so collision checker sees current positions
+        self.robot.update(env.sim.get_physics_dt())
+        self.insertive_object.update(env.sim.get_physics_dt())
+
+    def _solve_ik(
+        self, env: ManagerBasedEnv, env_ids: torch.Tensor,
+        target_pos_w: torch.Tensor, target_quat_w: torch.Tensor,
+        num_iters: int = 10,
+    ) -> None:
+        """Solve IK with fixed number of iterations."""
+        pos_b, quat_b = self.solver._compute_frame_pose()
+        pos_b[env_ids], quat_b[env_ids] = math_utils.subtract_frame_transforms(
+            self.robot.data.root_link_pos_w[env_ids],
+            self.robot.data.root_link_quat_w[env_ids],
+            target_pos_w, target_quat_w,
+        )
+        self.solver.process_actions(torch.cat([pos_b, quat_b], dim=1))
+        for _ in range(num_iters):
+            self.solver.apply_actions()
+            delta = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            self.robot.write_joint_state_to_sim(
+                position=(delta + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
+                joint_ids=self.joint_ids, env_ids=env_ids,
+            )
+
+    def _check_per_body_collision(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> torch.Tensor:
+        """Check if the insertive object is too close to any robot body.
+
+        For each robot body, computes distance between body center and object center.
+        Returns collision-free mask (True = no collision).
+        """
+        n = env_ids.numel()
+        obj_pos = self.insertive_object.data.root_pos_w[env_ids]  # (n, 3)
+
+        # Get all robot body positions: (n, num_bodies, 3)
+        body_pos = self.robot.data.body_pos_w[env_ids]  # (n, num_bodies, 3)
+
+        # Distance from object to each body center
+        dists = torch.norm(body_pos - obj_pos.unsqueeze(1), dim=-1)  # (n, num_bodies)
+
+        # Min distance across all bodies
+        min_dist_vals, min_dist_body = dists.min(dim=1)
+
+        body_names = self.robot.body_names
+        return min_dist_vals >= self.collision_min_dist
+
+
 class pose_logging_event(ManagerTermBase):
     """EventTerm class for logging pose data from all environments."""
 

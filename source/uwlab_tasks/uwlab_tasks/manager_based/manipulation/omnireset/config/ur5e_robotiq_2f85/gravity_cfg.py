@@ -19,13 +19,13 @@ import numpy as np
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
 
-from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 
 from ... import mdp as task_mdp
 
@@ -39,79 +39,20 @@ from .rl_state_cfg import (
 
 
 # ---------------------------------------------------------------------------
-# Scene: add gripper contact sensors
-# ---------------------------------------------------------------------------
-@configclass
-class GravityTrickSceneCfg(RlStateSceneCfg):
-    """Scene with contact sensors on gripper fingers for contact-gated rewards."""
-
-    right_inner_finger_contact_sensor = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/right_inner_finger",
-        update_period=0.0,
-        history_length=6,
-        debug_vis=False,
-        track_friction_forces=True,
-        max_contact_data_count_per_prim=16,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/InsertiveObject"],
-    )
-
-    left_inner_finger_contact_sensor = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/left_inner_finger",
-        update_period=0.0,
-        history_length=6,
-        debug_vis=False,
-        track_friction_forces=True,
-        max_contact_data_count_per_prim=16,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/InsertiveObject"],
-    )
-
-
-# ---------------------------------------------------------------------------
-# Rewards: pat/hand-style weights with contact-gated rewards
+# Rewards: sparse success + mechanical work + fail penalty
 # ---------------------------------------------------------------------------
 @configclass
 class GravityTrickRewardsCfg(RewardsCfg):
-    """Rewards mirroring pat/hand structure: reach → contact → contact-gated progress → success."""
+    """Sparse reward: success +1, fail -1, mechanical work penalty."""
 
-    # -- Override weights to match pat/hand --
-    action_magnitude = RewTerm(func=task_mdp.action_l2_clamped, weight=-0.005)
-    action_rate = RewTerm(func=task_mdp.action_rate_l2_clamped, weight=-0.005)
+    # -- Disable inherited dense rewards --
     joint_vel = None
-
-    # Reaching: 1.0
-    ee_asset_distance = RewTerm(
-        func=task_mdp.ee_asset_distance_tanh,
-        weight=1.0,
-        params={
-            "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
-            "target_asset_cfg": SceneEntityCfg("insertive_object"),
-            "root_asset_offset_metadata_key": "gripper_offset",
-            "std": 1.0,
-        },
-    )
-
-    # Gripper contact: 0.5 (analogous to good_finger_contact)
-    gripper_contact = RewTerm(
-        func=task_mdp.gripper_contact,
-        weight=0.5,
-        params={"threshold": 1.0},
-    )
-
-    # Contact-gated dense success: 2.0 (analogous to position_command_error_tanh)
-    contact_gated_dense_success = RewTerm(
-        func=task_mdp.contact_gated_dense_success,
-        weight=2.0,
-        params={"std": 0.2, "threshold": 1.0},
-    )
-
-    # Termination penalty: -1.0 (replaces abnormal_robot -100)
     abnormal_robot = None
+    dense_success_reward = None
+    ee_asset_distance = None
 
-    early_termination = RewTerm(
-        func=task_mdp.is_terminated_term,
-        weight=-1.0,
-        params={"term_keys": ["abnormal_robot", "object_out_of_bound"]},
-    )
+    action_magnitude = None
+    action_rate = None
 
     # Must be non-zero or IsaacLab skips calling it entirely
     progress_context = RewTerm(
@@ -123,11 +64,18 @@ class GravityTrickRewardsCfg(RewardsCfg):
         },
     )
 
-    # Dense success: drop (replaced by contact_gated_dense_success)
-    dense_success_reward = None
+    # Sparse success
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
 
-    # Success: 10.0 (was 1.0)
-    success_reward = RewTerm(func=task_mdp.success_reward, weight=10.0)
+    # Mechanical work penalty: sum(abs(torque * joint_vel)) * dt
+    mech_work = RewTerm(func=task_mdp.mechanical_work, weight=-1e-5)
+
+    # Fail penalty: fires on abnormal_robot or object_out_of_bound
+    fail = RewTerm(
+        func=task_mdp.is_terminated_term,
+        weight=-1.0,
+        params={"term_keys": ["abnormal_robot", "object_out_of_bound"]},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +114,9 @@ class GravityTrickEventCfg(BaseEventCfg):
     )
 
     reset_procedural = EventTerm(
-        func=task_mdp.GravityTrickResetManager,
+        func=task_mdp.IKCurriculumResetManager,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "probs": [0.5, 0.5],
             "robot_ik_cfg": SceneEntityCfg(
                 "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
             ),
@@ -190,23 +136,8 @@ class GravityTrickEventCfg(BaseEventCfg):
                 "pitch": (np.pi / 4, 3 * np.pi / 4),
                 "yaw": (np.pi / 2, 3 * np.pi / 2),
             },
-            "ee_above_range": {
-                "x": (-0.05, 0.05),
-                "y": (-0.05, 0.05),
-                "z": (0.10, 0.20),
-                "roll": (0.0, 0.0),
-                "pitch": (np.pi / 2 - np.pi / 12, np.pi / 2 + np.pi / 12),
-                "yaw": (-np.pi, np.pi),
-            },
-            "collision_analyzer_cfg": task_mdp.CollisionAnalyzerCfg(
-                num_points=512,
-                max_dist=0.5,
-                min_dist=0.005,
-                asset_cfg=SceneEntityCfg("insertive_object"),
-                obstacle_cfgs=[SceneEntityCfg("robot")],
-            ),
+            "collision_min_dist": 0.02,  # 2cm center-to-center clearance from any robot body
             "max_resample_attempts": 10,
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
         },
     )
 
@@ -236,6 +167,8 @@ class GravityTrickTerminationsCfg(TerminationsCfg):
         },
     )
 
+    success = DoneTerm(func=task_mdp.success_termination)
+
 
 # ---------------------------------------------------------------------------
 # Curriculum: gravity ramp via GravityScheduler
@@ -254,7 +187,7 @@ class GravityTrickCurriculumsCfg:
 class Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
     """Gravity trick training: procedural 50-50 resets + gravity curriculum. Single-task peg by default."""
 
-    scene: GravityTrickSceneCfg = GravityTrickSceneCfg(num_envs=32, env_spacing=1.5)
+    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
     rewards: GravityTrickRewardsCfg = GravityTrickRewardsCfg()
     events: GravityTrickEventCfg = GravityTrickEventCfg()
     terminations: GravityTrickTerminationsCfg = GravityTrickTerminationsCfg()
@@ -262,8 +195,6 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg(Ur5eRobotiq2f85RelCarte
 
     def __post_init__(self):
         super().__post_init__()
-        self.scene.robot.spawn.activate_contact_sensors = True
-        self.scene.insertive_object.spawn.activate_contact_sensors = True
 
 
 @configclass
@@ -273,3 +204,62 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickSuccessTrainCfg(Ur5eRobotiq2f85R
     def __post_init__(self):
         super().__post_init__()
         self.events.reset_procedural.params["partial_assembly_success_fraction"] = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Scene pointcloud observations: single combined PC from robot+insertive+receptive
+# ---------------------------------------------------------------------------
+@configclass
+class ScenePCObservationsCfg:
+    """512-pt scene pointcloud (robot+insertive+receptive) in robot base frame.
+
+    Groups: proprio (~21d), pointcloud (1536d = 512×3).
+    Shared encoder compresses PC to 32d; main MLP sees 21+32=53d.
+    """
+
+    @configclass
+    class ProprioCfg(ObsGroup):
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class PointcloudCfg(ObsGroup):
+        scene_pc = ObsTerm(
+            func=task_mdp.ScenePointCloud,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "insertive_cfg": SceneEntityCfg("insertive_object"),
+                "receptive_cfg": SceneEntityCfg("receptive_object"),
+                "visualize": False,
+                "num_points": 512,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    proprio: ProprioCfg = ProprioCfg()
+    pointcloud: PointcloudCfg = PointcloudCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """Gravity trick + scene pointcloud (robot+insertive+receptive, 512pts, base frame)."""
+
+    observations: ScenePCObservationsCfg = ScenePCObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()

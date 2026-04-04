@@ -763,6 +763,12 @@ def object_out_of_bound(
     return ((pos_local < ranges[:, 0]) | (pos_local > ranges[:, 1])).any(dim=1)
 
 
+def success_termination(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Terminate on first frame of success (position + orientation aligned)."""
+    context_term = env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
+    return getattr(context_term, "success")
+
+
 def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes: int = 10):
     # Get the progress context to access assets and offsets
     context_term = env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
