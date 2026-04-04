@@ -99,6 +99,17 @@ gym.register(
     },
 )
 
+# Gravity trick + higher mech_work penalty (-1e-4)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-HighWork-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickHighWorkTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
 # Gravity trick + scene pointcloud (robot+insertive+receptive, 512pts)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-v0",

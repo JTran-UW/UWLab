@@ -256,6 +256,15 @@ class ScenePCObservationsCfg:
 
 
 @configclass
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickHighWorkTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """Gravity trick with higher mech_work penalty (-1e-4 instead of -1e-5)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.mech_work.weight = -1e-4
+
+
+@configclass
 class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
     """Gravity trick + scene pointcloud (robot+insertive+receptive, 512pts, base frame)."""
 
