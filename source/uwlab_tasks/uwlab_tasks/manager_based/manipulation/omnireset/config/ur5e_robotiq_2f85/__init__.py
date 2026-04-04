@@ -121,6 +121,28 @@ gym.register(
     },
 )
 
+# Gravity trick + scene pointcloud, success=1.0, fail=-1.0 (1:1)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-1to1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC1to1TrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
+    },
+)
+
+# Gravity trick + scene pointcloud, success=10.0, fail=-0.1 (100:1)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-100to1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC100to1TrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
+    },
+)
+
 # Gravity trick + 50% of partial assemblies near-success
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-Success-v0",

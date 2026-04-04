@@ -268,9 +268,31 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickHighWorkTrainCfg(Ur5eRobotiq2f85
 
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick + scene pointcloud (robot+insertive+receptive, 512pts, base frame)."""
+    """Gravity trick + scene pointcloud. Inherits success=10.0, fail=-1.0 (10:1)."""
 
     observations: ScenePCObservationsCfg = ScenePCObservationsCfg()
 
     def __post_init__(self):
         super().__post_init__()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC1to1TrainCfg(
+    Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg
+):
+    """Gravity trick + scene pointcloud, success=1.0, fail=-1.0 (1:1)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.success_reward.weight = 1.0
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC100to1TrainCfg(
+    Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg
+):
+    """Gravity trick + scene pointcloud, success=10.0, fail=-0.1 (100:1)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.fail.weight = -0.1
