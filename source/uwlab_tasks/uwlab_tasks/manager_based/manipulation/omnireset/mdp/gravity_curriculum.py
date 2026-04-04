@@ -16,12 +16,14 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-class GravityScheduler(ManagerTermBase):
-    """Adaptive gravity scheduler based on task success rate.
+class GravityCurriculum(ManagerTermBase):
+    """Curriculum that ramps gravity from zero-g to full gravity based on success rate.
 
-    Tracks per-environment difficulty. Promotes on success, demotes on failure.
-    Exposes `difficulty_frac` (0→1) used by `gravity_interpolate_fn` to ramp gravity.
-    Uses the success signal from ProgressContext (via string eval).
+    Tracks a global difficulty fraction (0→1). On each reset batch, increments
+    difficulty for successful envs and decrements for failed ones. Sets the physics
+    scene gravity to ``(0, 0, -9.81 * difficulty_frac)`` each time it's called.
+
+    Returns the current difficulty fraction for wandb logging.
     """
 
     def __init__(self, cfg, env):
@@ -35,42 +37,26 @@ class GravityScheduler(ManagerTermBase):
         env_ids,
         success_str: str = "env.reward_manager.get_term_cfg('progress_context').func.success",
         max_difficulty: int = 10,
-    ):
-        if env_ids is None or len(env_ids) == 0:
-            return self.difficulty_frac
+        full_gravity: float = -9.81,
+    ) -> dict[str, float]:
+        if env_ids is not None and len(env_ids) > 0:
+            success = eval(success_str)  # (num_envs,) bool tensor
+            success_mask = success[env_ids]
 
-        success = eval(success_str)  # (num_envs,) bool tensor
-        success_mask = success[env_ids]
+            self.current_difficulties[env_ids] = torch.where(
+                success_mask,
+                self.current_difficulties[env_ids] + 1,
+                self.current_difficulties[env_ids] - 1,
+            ).clamp(min=0, max=max_difficulty)
 
-        self.current_difficulties[env_ids] = torch.where(
-            success_mask,
-            self.current_difficulties[env_ids] + 1,
-            self.current_difficulties[env_ids] - 1,
-        ).clamp(min=0, max=max_difficulty)
+            self.difficulty_frac = self.current_difficulties.mean().item() / max(max_difficulty, 1)
 
-        self.difficulty_frac = self.current_difficulties.mean().item() / max(max_difficulty, 1)
-        return self.difficulty_frac
+        # Set gravity based on current difficulty
+        import carb
+        from isaaclab.sim import SimulationContext
 
+        gravity = carb.Float3(0.0, 0.0, full_gravity * self.difficulty_frac)
+        physics_sim_view = SimulationContext.instance().physics_sim_view
+        physics_sim_view.set_gravity(gravity)
 
-def gravity_interpolate_fn(env, env_id, data, initial_gravity, final_gravity, scheduler_term_str):
-    """Interpolate gravity based on GravityScheduler difficulty fraction.
-
-    Args:
-        initial_gravity: tuple of (mean, std) for zero-g, e.g. ((0,0,0), (0,0,0))
-        final_gravity: tuple of (mean, std) for full gravity, e.g. ((0,0,-9.81), (0,0,-9.81))
-        scheduler_term_str: name of the GravityScheduler curriculum term
-    """
-    from isaaclab.envs.mdp import modify_term_cfg
-
-    scheduler: GravityScheduler = getattr(env.curriculum_manager.cfg, scheduler_term_str).func
-    frac = scheduler.difficulty_frac
-
-    if frac < 0.05:
-        return modify_term_cfg.NO_CHANGE
-
-    # Linear interpolation between initial and final gravity
-    result = []
-    for ig, fg in zip(initial_gravity, final_gravity):
-        interpolated = tuple(ig_i + frac * (fg_i - ig_i) for ig_i, fg_i in zip(ig, fg))
-        result.append(interpolated)
-    return tuple(result)
+        return {"gravity_frac": self.difficulty_frac}

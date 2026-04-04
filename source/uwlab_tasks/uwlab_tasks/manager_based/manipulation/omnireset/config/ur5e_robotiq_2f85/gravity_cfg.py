@@ -144,15 +144,7 @@ class GravityTrickEventCfg(BaseEventCfg):
         },
     )
 
-    # Uniform gravity randomization: sample z-gravity from [0, -9.81] each reset
-    variable_gravity = EventTerm(
-        func=task_mdp.randomize_physics_scene_gravity,
-        mode="reset",
-        params={
-            "gravity_distribution_params": ([0.0, 0.0, -9.81], [0.0, 0.0, 0.0]),
-            "operation": "abs",
-        },
-    )
+    # Gravity is now controlled by GravityCurriculum (see GravityTrickCurriculumsCfg)
 
 
 # ---------------------------------------------------------------------------
@@ -178,9 +170,16 @@ class GravityTrickTerminationsCfg(TerminationsCfg):
 # ---------------------------------------------------------------------------
 @configclass
 class GravityTrickCurriculumsCfg:
-    """No curriculum — gravity is uniformly randomized each reset."""
+    """Gravity curriculum: ramps from zero-g to full gravity based on success rate."""
 
-    pass
+    gravity_curriculum = CurrTerm(
+        func=task_mdp.GravityCurriculum,
+        params={
+            "success_str": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "max_difficulty": 10,
+            "full_gravity": -9.81,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
