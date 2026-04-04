@@ -259,11 +259,11 @@ class ScenePCObservationsCfg:
 
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCGravityTrickHighWorkTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick with higher mech_work penalty (-1e-10 instead of -1e-9)."""
+    """Gravity trick with success=10.0, fail=-0.1 (100:1 ratio)."""
 
     def __post_init__(self):
         super().__post_init__()
-        self.rewards.mech_work.weight = -1e-10
+        self.rewards.fail.weight = -0.1
 
 
 @configclass
