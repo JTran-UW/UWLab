@@ -1312,6 +1312,9 @@ class IKCurriculumResetManager(ManagerTermBase):
         self.max_resample_attempts: int = cfg.params.get("max_resample_attempts", 10)
         self.ee_lerp_range: tuple[float, float] = tuple(cfg.params.get("ee_lerp_range", (0.0, 1.0)))
         # Mesh-based collision check (lazy-init on first call to avoid USD race in distributed)
+        self.collision_num_points: int = cfg.params.get("collision_num_points", 128)
+        self.collision_max_dist: float = cfg.params.get("collision_max_dist", 0.3)
+        self.collision_min_dist: float = cfg.params.get("collision_min_dist", 0.005)
         self.grasp_collision_analyzer = None
 
         # Gripper offset: IK body (robotiq_base_link) → fingertip grasp point
@@ -1356,6 +1359,9 @@ class IKCurriculumResetManager(ManagerTermBase):
         ee_anywhere_range: dict | None = None,
         max_resample_attempts: int = 10,
         ee_lerp_range: tuple[float, float] = (0.0, 1.0),
+        collision_num_points: int = 128,
+        collision_max_dist: float = 0.3,
+        collision_min_dist: float = 0.005,
         curriculum_target: float | None = None,
         curriculum_kappa: float = 2.0,
         curriculum_temperature: float = 2.0,
@@ -1564,9 +1570,9 @@ class IKCurriculumResetManager(ManagerTermBase):
         """Check robot-object mesh collision (0.5mm clearance). Lazy-inits CollisionAnalyzer on first call."""
         if self.grasp_collision_analyzer is None:
             grasp_collision_cfg = CollisionAnalyzerCfg(
-                num_points=64,
-                max_dist=0.3,
-                min_dist=0.0005,
+                num_points=self.collision_num_points,
+                max_dist=self.collision_max_dist,
+                min_dist=self.collision_min_dist,
                 asset_cfg=SceneEntityCfg("robot"),
                 obstacle_cfgs=[SceneEntityCfg("insertive_object")],
             )
