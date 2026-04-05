@@ -139,7 +139,6 @@ class GravityTrickEventCfg(BaseEventCfg):
                 "pitch": (np.pi / 4, 3 * np.pi / 4),
                 "yaw": (np.pi / 2, 3 * np.pi / 2),
             },
-            "collision_min_dist": 0.02,
             "max_resample_attempts": 10,
         },
     )

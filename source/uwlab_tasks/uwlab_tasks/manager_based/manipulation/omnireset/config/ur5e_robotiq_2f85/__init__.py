@@ -25,6 +25,13 @@ gym.register(
     disable_env_checker=True,
 )
 
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-GripperClose-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": f"{__name__}.gripper_close_cfg:Ur5eRobotiq2f85GripperCloseCfg"},
+    disable_env_checker=True,
+)
+
 # Register reset states environments
 gym.register(
     id="OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEAnywhere-v0",

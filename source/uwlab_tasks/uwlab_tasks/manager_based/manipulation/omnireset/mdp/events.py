@@ -1235,6 +1235,7 @@ class IKCurriculumResetManager(ManagerTermBase):
         super().__init__(cfg, env)
 
         dataset_dir: str = cfg.params.get("dataset_dir", "")
+        self._dataset_dir = dataset_dir
         robot_ik_cfg: SceneEntityCfg = cfg.params.get(
             "robot_ik_cfg",
             SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"),
@@ -1307,9 +1308,41 @@ class IKCurriculumResetManager(ManagerTermBase):
         )
         self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)
 
-        # Per-body collision checking params
-        self.collision_min_dist: float = cfg.params.get("collision_min_dist", 0.01)
+        # Collision checking and resample params
         self.max_resample_attempts: int = cfg.params.get("max_resample_attempts", 10)
+        self.ee_lerp_range: tuple[float, float] = tuple(cfg.params.get("ee_lerp_range", (0.0, 1.0)))
+        # Mesh-based collision check (0.5mm clearance to reject penetrating states)
+        grasp_collision_cfg = CollisionAnalyzerCfg(
+            num_points=64,
+            max_dist=0.3,
+            min_dist=0.0005,
+            asset_cfg=SceneEntityCfg("robot"),
+            obstacle_cfgs=[SceneEntityCfg("insertive_object")],
+        )
+        self.grasp_collision_analyzer = grasp_collision_cfg.class_type(grasp_collision_cfg, env)
+
+        # Gripper offset: IK body (robotiq_base_link) → fingertip grasp point
+        robot_usd_path = self.robot.cfg.spawn.usd_path
+        robot_metadata = utils.read_metadata_from_usd_directory(robot_usd_path)
+        gripper_offset = robot_metadata.get("gripper_offset", {})
+        self.gripper_offset_pos = torch.tensor(
+            gripper_offset.get("pos", [0.0, 0.0, 0.0]), device=env.device, dtype=torch.float32
+        )
+        self.gripper_offset_quat = torch.tensor(
+            gripper_offset.get("quat", [1.0, 0.0, 0.0, 0.0]), device=env.device, dtype=torch.float32
+        )
+
+        # Gripper close: load pre-recorded trajectory of joint positions from open to closed
+        gripper_joint_names = [
+            "finger_joint", "right_outer_knuckle_joint",
+            "left_inner_knuckle_joint", "right_inner_knuckle_joint",
+            "left_inner_finger_knuckle_joint", "right_inner_finger_knuckle_joint",
+        ]
+        self.gripper_joint_ids: list[int] = [
+            list(self.robot.joint_names).index(n) for n in gripper_joint_names if n in self.robot.joint_names
+        ]
+        # Load gripper close trajectory from pre-recorded file (next to robot USD)
+        self.gripper_close_states = self._load_gripper_close_states(env)
 
         # Group assignment: 0 = anywhere, 1 = partial assembly
         self.group_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
@@ -1328,11 +1361,12 @@ class IKCurriculumResetManager(ManagerTermBase):
         robot_ik_cfg: SceneEntityCfg | None = None,
         obj_anywhere_range: dict | None = None,
         ee_anywhere_range: dict | None = None,
-        collision_min_dist: float = 0.01,
         max_resample_attempts: int = 10,
+        ee_lerp_range: tuple[float, float] = (0.0, 1.0),
         curriculum_target: float | None = None,
         curriculum_kappa: float = 2.0,
         curriculum_temperature: float = 2.0,
+        partial_assembly_fraction: float = 0.5,
     ) -> None:
         if env_ids is None:
             env_ids = torch.arange(env.num_envs, device=env.device)
@@ -1353,7 +1387,7 @@ class IKCurriculumResetManager(ManagerTermBase):
         env.extras["log"]["Metrics/anywhere_success_rate"] = success_rates[0].item()
         env.extras["log"]["Metrics/partial_assembly_success_rate"] = success_rates[1].item()
 
-        # -- Group assignment: GPS or 50-50 --
+        # -- Group assignment: GPS or fraction-based --
         n = env_ids.numel()
         if curriculum_target is not None:
             group, probs = SuccessMonitor.sample_by_target_rate_from_rates(
@@ -1362,7 +1396,8 @@ class IKCurriculumResetManager(ManagerTermBase):
             env.extras["log"]["Metrics/group_anywhere_prob"] = probs[0].item()
             env.extras["log"]["Metrics/group_partial_assembly_prob"] = probs[1].item()
         else:
-            group = torch.randint(0, 2, (n,), device=env.device)
+            # group 0 = anywhere, group 1 = partial assembly
+            group = (torch.rand(n, device=env.device) < partial_assembly_fraction).long()
         self.group_id[env_ids] = group
 
         ids_anywhere = env_ids[group == 0]
@@ -1379,16 +1414,20 @@ class IKCurriculumResetManager(ManagerTermBase):
         # -- EE reset for all envs: random EE → IK solve → lerp toward object --
         self._reset_ee(env, env_ids)
 
-        # -- Collision check with group-preserving resample --
+        # -- Close gripper to random state from trajectory (open to fully closed) --
+        self._close_gripper(env, env_ids)
+
+        # -- Collision check + resample loop --
         remaining_ids = env_ids.clone()
         for _ in range(self.max_resample_attempts):
             if remaining_ids.numel() == 0:
                 break
-            collision_free = self._check_per_body_collision(env, remaining_ids)
+            self.robot.update(env.sim.get_physics_dt())
+            collision_free = self._check_collision(env, remaining_ids)
             colliding = remaining_ids[~collision_free]
             if colliding.numel() == 0:
                 break
-            # Resample within the same group
+            # Resample full pose + re-close gripper
             col_anywhere = colliding[self.group_id[colliding] == 0]
             col_partial = colliding[self.group_id[colliding] == 1]
             if col_anywhere.numel() > 0:
@@ -1396,6 +1435,7 @@ class IKCurriculumResetManager(ManagerTermBase):
             if col_partial.numel() > 0:
                 self._reset_partial_assembly(env, col_partial)
             self._reset_ee(env, colliding)
+            self._close_gripper(env, colliding)
             remaining_ids = colliding
 
         # Zero joint velocities
@@ -1454,14 +1494,18 @@ class IKCurriculumResetManager(ManagerTermBase):
         ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
         self._solve_ik(env, env_ids, ee_pos_w, ee_quat_w, num_iters=10)
 
-        # 2. Interpolate EE toward object: t ~ Uniform(0, 1)
-        t = torch.rand(n, 1, device=device)
+        # 2. Interpolate EE toward object: t ~ Uniform(t_min, t_max)
+        t = self.ee_lerp_range[0] + (self.ee_lerp_range[1] - self.ee_lerp_range[0]) * torch.rand(n, 1, device=device)
         robot_ik_body_idx = self.solver._body_idx
         current_ee_pos = self.robot.data.body_pos_w[env_ids, robot_ik_body_idx]
         current_ee_quat = self.robot.data.body_quat_w[env_ids, robot_ik_body_idx]
 
+        # Compute IK target so fingertips (not robotiq_base_link) land on the object.
+        # ik_target = obj_pos - R_ee * gripper_offset_local
         obj_pos = self.insertive_object.data.root_pos_w[env_ids]
-        target_pos_w = (1 - t) * current_ee_pos + t * obj_pos
+        offset_world = math_utils.quat_apply(current_ee_quat, self.gripper_offset_pos.expand(n, -1))
+        grasp_ik_target = obj_pos - offset_world
+        target_pos_w = (1 - t) * current_ee_pos + t * grasp_ik_target
         target_quat_w = current_ee_quat
 
         # 3. Solve IK to interpolated target
@@ -1493,13 +1537,53 @@ class IKCurriculumResetManager(ManagerTermBase):
                 joint_ids=self.joint_ids, env_ids=env_ids,
             )
 
-    def _check_per_body_collision(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> torch.Tensor:
-        """Check if the insertive object is too close to any robot body."""
-        obj_pos = self.insertive_object.data.root_pos_w[env_ids]
-        body_pos = self.robot.data.body_pos_w[env_ids]
-        dists = torch.norm(body_pos - obj_pos.unsqueeze(1), dim=-1)
-        min_dist_vals, _ = dists.min(dim=1)
-        return min_dist_vals >= self.collision_min_dist
+    def _load_gripper_close_states(self, env: ManagerBasedEnv) -> torch.Tensor:
+        """Load pre-recorded gripper close trajectory from dataset directory.
+
+        Expected file: {dataset_dir}/GripperClose/{robot_name}/gripper_close_trajectory.pt
+        Contains dict with 'joint_names' (list[str]) and 'joint_positions' (Tensor of shape (N, J)).
+        We reorder columns to match self.gripper_joint_ids ordering.
+        """
+        robot_usd_path = self.robot.cfg.spawn.usd_path
+        traj_path = os.path.dirname(robot_usd_path) + "/gripper_close_trajectory.pt"
+        local_path = utils.safe_retrieve_file_path(traj_path)
+        data = torch.load(local_path, map_location="cpu")
+
+        saved_names = data["joint_names"]
+        saved_positions = data["joint_positions"]  # (N, J)
+
+        # Reorder to match self.gripper_joint_ids
+        result = torch.zeros(saved_positions.shape[0], len(self.gripper_joint_ids), dtype=torch.float32)
+        for i, joint_idx in enumerate(self.gripper_joint_ids):
+            joint_name = self.robot.joint_names[joint_idx]
+            if joint_name in saved_names:
+                src_col = saved_names.index(joint_name)
+                result[:, i] = saved_positions[:, src_col]
+
+        result = result.to(env.device)
+        print(
+            f"[IKCurriculumResetManager] Loaded {result.shape[0]} gripper close states from {traj_path}. "
+            f"finger_joint range: [{result[:, 0].min():.4f}, {result[:, 0].max():.4f}]"
+        )
+        return result
+
+    def _check_collision(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> torch.Tensor:
+        """Check robot-object mesh collision (0.5mm clearance)."""
+        return self.grasp_collision_analyzer(env, env_ids)
+
+    def _close_gripper(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
+        """Teleport gripper joints to a random state from the pre-recorded close trajectory."""
+        traj_len = self.gripper_close_states.shape[0]
+        indices = torch.randint(0, traj_len, (env_ids.numel(),), device=env.device)
+        sampled_pos = self.gripper_close_states[indices]
+        self.robot.write_joint_state_to_sim(
+            sampled_pos, torch.zeros_like(sampled_pos),
+            joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+        self.robot.set_joint_position_target(
+            sampled_pos, joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+
 
 
 class pose_logging_event(ManagerTermBase):
