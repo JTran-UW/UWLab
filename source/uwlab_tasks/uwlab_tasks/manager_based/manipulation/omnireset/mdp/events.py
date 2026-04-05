@@ -1311,15 +1311,8 @@ class IKCurriculumResetManager(ManagerTermBase):
         # Collision checking and resample params
         self.max_resample_attempts: int = cfg.params.get("max_resample_attempts", 10)
         self.ee_lerp_range: tuple[float, float] = tuple(cfg.params.get("ee_lerp_range", (0.0, 1.0)))
-        # Mesh-based collision check (0.5mm clearance to reject penetrating states)
-        grasp_collision_cfg = CollisionAnalyzerCfg(
-            num_points=64,
-            max_dist=0.3,
-            min_dist=0.0005,
-            asset_cfg=SceneEntityCfg("robot"),
-            obstacle_cfgs=[SceneEntityCfg("insertive_object")],
-        )
-        self.grasp_collision_analyzer = grasp_collision_cfg.class_type(grasp_collision_cfg, env)
+        # Mesh-based collision check (lazy-init on first call to avoid USD race in distributed)
+        self.grasp_collision_analyzer = None
 
         # Gripper offset: IK body (robotiq_base_link) → fingertip grasp point
         robot_usd_path = self.robot.cfg.spawn.usd_path
@@ -1568,7 +1561,16 @@ class IKCurriculumResetManager(ManagerTermBase):
         return result
 
     def _check_collision(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> torch.Tensor:
-        """Check robot-object mesh collision (0.5mm clearance)."""
+        """Check robot-object mesh collision (0.5mm clearance). Lazy-inits CollisionAnalyzer on first call."""
+        if self.grasp_collision_analyzer is None:
+            grasp_collision_cfg = CollisionAnalyzerCfg(
+                num_points=64,
+                max_dist=0.3,
+                min_dist=0.0005,
+                asset_cfg=SceneEntityCfg("robot"),
+                obstacle_cfgs=[SceneEntityCfg("insertive_object")],
+            )
+            self.grasp_collision_analyzer = grasp_collision_cfg.class_type(grasp_collision_cfg, env)
         return self.grasp_collision_analyzer(env, env_ids)
 
     def _close_gripper(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
