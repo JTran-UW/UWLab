@@ -324,9 +324,9 @@ def get_temp_dir(rank: int | None = None) -> str:
         rank = int(os.getenv("RANK", "0"))
 
     uid = os.getuid()
-    job_id = os.getenv("SLURM_JOB_ID") or os.getenv("PBS_JOBID") or "local"
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
 
-    download_dir = os.path.join("/tmp", "uwlab", str(uid), str(job_id), f"rank_{rank}")
+    download_dir = os.path.join("/tmp", "uwlab", str(uid), f"gpu_{local_rank}")
     os.makedirs(download_dir, mode=0o700, exist_ok=True)
 
     return download_dir
