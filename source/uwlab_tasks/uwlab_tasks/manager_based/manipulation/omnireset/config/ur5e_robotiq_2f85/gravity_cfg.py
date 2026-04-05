@@ -298,6 +298,18 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC100to1TrainCfg(
 
 
 @configclass
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCLowMagTrainCfg(
+    Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg
+):
+    """Gravity trick + scene pointcloud, success=1.0, fail=-0.1 (10:1 low magnitude)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.success_reward.weight = 1.0
+        self.rewards.fail.weight = -0.1
+
+
+@configclass
 class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCGPSTrainCfg(
     Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg
 ):

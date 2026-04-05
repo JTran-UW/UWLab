@@ -150,6 +150,17 @@ gym.register(
     },
 )
 
+# Gravity trick + scene pointcloud, success=1.0, fail=-0.1 (10:1 low magnitude)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-LowMag-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCLowMagTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
+    },
+)
+
 # Gravity trick + scene pointcloud + GPS curriculum (10:1 reward ratio)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-GPS-v0",
