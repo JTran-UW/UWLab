@@ -273,7 +273,7 @@ def mechanical_work(
     robot: Articulation = env.scene[asset_cfg.name]
     joint_ids = asset_cfg.joint_ids
     work = (robot.data.applied_torque[:, joint_ids] * robot.data.joint_vel[:, joint_ids]).abs()
-    return work.mean(dim=1) * env.step_dt
+    return torch.clamp(work.mean(dim=1) * env.step_dt, max=1.0)
 
 
 def joint_vel_l2_clamped(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:

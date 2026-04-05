@@ -95,7 +95,7 @@ gym.register(
     },
 )
 
-# Gravity trick: 2 resets (ObjectAnywhereEEAnywhere + PartiallyAssembledEEGrasped) + gravity curriculum
+# Gravity trick: procedural resets + gravity curriculum (success=1.0, fail=-1.0)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -106,79 +106,24 @@ gym.register(
     },
 )
 
-# Gravity trick + higher mech_work penalty (-1e-4)
+# Gravity trick: success=10.0, fail=-1.0 (10:1)
 gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-HighWork-v0",
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-10to1-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickHighWorkTrainCfg",
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrick10to1TrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )
 
-# Gravity trick + scene pointcloud (robot+insertive+receptive, 512pts)
+# Gravity trick: success=1.0, fail=-1.0 + GPS curriculum
 gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-v0",
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-GPS-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# Gravity trick + scene pointcloud, success=1.0, fail=-1.0 (1:1)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-1to1-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC1to1TrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# Gravity trick + scene pointcloud, success=10.0, fail=-0.1 (100:1)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-100to1-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC100to1TrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# Gravity trick + scene pointcloud, success=1.0, fail=-0.1 (10:1 low magnitude)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-LowMag-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCLowMagTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# Gravity trick + scene pointcloud + GPS curriculum (10:1 reward ratio)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-ScenePC-GPS-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCGPSTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# Gravity trick + 50% of partial assemblies near-success
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-Success-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickSuccessTrainCfg",
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickGPSTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )

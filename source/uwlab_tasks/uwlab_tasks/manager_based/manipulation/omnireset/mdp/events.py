@@ -1276,6 +1276,15 @@ class IKCurriculumResetManager(ManagerTermBase):
         else:
             self.obj_bottom_offset = torch.zeros(1, 3, device=env.device)
 
+        # Canonical mesh surface points for insertive object (used as EE targets)
+        ins_prim_path = self.insertive_object.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        self.ins_canonical_points = utils.sample_object_point_cloud(
+            num_envs=env.num_envs,
+            num_points=64,
+            prim_path_pattern=ins_prim_path,
+            device=str(env.device),
+        )  # [num_envs, 64, 3] in object local frame
+
         # -- Load partial assembly dataset --
         receptive_usd_path = self.receptive_object.cfg.spawn.usd_path
         pair = utils.compute_pair_dir(insertive_usd_path, receptive_usd_path)
@@ -1499,11 +1508,15 @@ class IKCurriculumResetManager(ManagerTermBase):
         current_ee_pos = self.robot.data.body_pos_w[env_ids, robot_ik_body_idx]
         current_ee_quat = self.robot.data.body_quat_w[env_ids, robot_ik_body_idx]
 
-        # Compute IK target so fingertips (not robotiq_base_link) land on the object.
-        # ik_target = obj_pos - R_ee * gripper_offset_local
-        obj_pos = self.insertive_object.data.root_pos_w[env_ids]
+        # Compute IK target so fingertips (not robotiq_base_link) land on a random mesh surface point.
+        # Sample a random point on the insertive object's mesh, transform to world frame.
+        obj_pos_w = self.insertive_object.data.root_pos_w[env_ids]
+        obj_quat_w = self.insertive_object.data.root_quat_w[env_ids]
+        rand_idx = torch.randint(0, self.ins_canonical_points.shape[1], (n,), device=device)
+        mesh_pts_local = self.ins_canonical_points[env_ids, rand_idx]  # [n, 3]
+        mesh_pts_w = math_utils.quat_apply(obj_quat_w, mesh_pts_local) + obj_pos_w  # [n, 3]
         offset_world = math_utils.quat_apply(current_ee_quat, self.gripper_offset_pos.expand(n, -1))
-        grasp_ik_target = obj_pos - offset_world
+        grasp_ik_target = mesh_pts_w - offset_world
         target_pos_w = (1 - t) * current_ee_pos + t * grasp_ik_target
         target_quat_w = current_ee_quat
 

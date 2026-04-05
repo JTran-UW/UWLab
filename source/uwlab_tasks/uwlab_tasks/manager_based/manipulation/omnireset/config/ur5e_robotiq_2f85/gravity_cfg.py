@@ -48,13 +48,17 @@ class GravityTrickRewardsCfg(RewardsCfg):
     """Sparse reward: success +1, fail -1, mechanical work penalty."""
 
     # -- Disable inherited dense rewards --
-    joint_vel = None
+    joint_vel = RewTerm(
+        func=task_mdp.joint_vel_l2_clamped,
+        weight=-1e-3,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
+    )
     abnormal_robot = None
     dense_success_reward = None
     ee_asset_distance = None
 
-    action_magnitude = None
-    action_rate = None
+    action_magnitude = RewTerm(func=task_mdp.action_l2_clamped, weight=-1e-5)
+    action_rate = RewTerm(func=task_mdp.action_rate_l2_clamped, weight=-1e-4)
 
     # Must be non-zero or IsaacLab skips calling it entirely
     progress_context = RewTerm(
@@ -67,10 +71,7 @@ class GravityTrickRewardsCfg(RewardsCfg):
     )
 
     # Sparse success
-    success_reward = RewTerm(func=task_mdp.success_reward, weight=10.0)
-
-    # Mechanical work penalty: sum(abs(torque * joint_vel)) * dt
-    mech_work = RewTerm(func=task_mdp.mechanical_work, weight=-1e-9)
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
 
     # Fail penalty: fires on abnormal_robot or object_out_of_bound
     fail = RewTerm(
@@ -199,121 +200,17 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg(Ur5eRobotiq2f85RelCarte
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickSuccessTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick with 50% of partial assemblies sampled near-success."""
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrick10to1TrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """Gravity trick with success=10.0, fail=-1.0 (10:1 ratio)."""
 
     def __post_init__(self):
         super().__post_init__()
-        self.events.reset_procedural.params["partial_assembly_success_fraction"] = 0.5
-
-
-# ---------------------------------------------------------------------------
-# Scene pointcloud observations: single combined PC from robot+insertive+receptive
-# ---------------------------------------------------------------------------
-@configclass
-class ScenePCObservationsCfg:
-    """512-pt scene pointcloud (robot+insertive+receptive) in robot base frame.
-
-    Groups: proprio (~21d), pointcloud (1536d = 512×3).
-    Shared encoder compresses PC to 32d; main MLP sees 21+32=53d.
-    """
-
-    @configclass
-    class ProprioCfg(ObsGroup):
-        prev_actions = ObsTerm(func=task_mdp.last_action)
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
-        end_effector_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    @configclass
-    class PointcloudCfg(ObsGroup):
-        scene_pc = ObsTerm(
-            func=task_mdp.ScenePointCloud,
-            params={
-                "robot_cfg": SceneEntityCfg("robot"),
-                "insertive_cfg": SceneEntityCfg("insertive_object"),
-                "receptive_cfg": SceneEntityCfg("receptive_object"),
-                "visualize": False,
-                "num_points": 512,
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    proprio: ProprioCfg = ProprioCfg()
-    pointcloud: PointcloudCfg = PointcloudCfg()
+        self.rewards.success_reward.weight = 10.0
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickHighWorkTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick with success=10.0, fail=-0.1 (100:1 ratio)."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.rewards.fail.weight = -0.1
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick + scene pointcloud. Inherits success=10.0, fail=-1.0 (10:1)."""
-
-    observations: ScenePCObservationsCfg = ScenePCObservationsCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC1to1TrainCfg(
-    Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg
-):
-    """Gravity trick + scene pointcloud, success=1.0, fail=-1.0 (1:1)."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.rewards.success_reward.weight = 1.0
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePC100to1TrainCfg(
-    Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg
-):
-    """Gravity trick + scene pointcloud, success=10.0, fail=-0.1 (100:1)."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.rewards.fail.weight = -0.1
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCLowMagTrainCfg(
-    Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg
-):
-    """Gravity trick + scene pointcloud, success=1.0, fail=-0.1 (10:1 low magnitude)."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.rewards.success_reward.weight = 1.0
-        self.rewards.fail.weight = -0.1
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCGPSTrainCfg(
-    Ur5eRobotiq2f85RelCartesianOSCGravityTrickScenePCTrainCfg
-):
-    """Gravity trick + scene pointcloud + GPS curriculum (10:1 reward ratio)."""
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickGPSTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """Gravity trick with success=1.0, fail=-1.0 + GPS curriculum."""
 
     def __post_init__(self):
         super().__post_init__()
