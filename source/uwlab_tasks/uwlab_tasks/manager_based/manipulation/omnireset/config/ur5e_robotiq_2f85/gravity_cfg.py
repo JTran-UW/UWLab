@@ -19,10 +19,12 @@ import numpy as np
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.sensors import ContactSensorCfg
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
 
 
@@ -172,13 +174,59 @@ class GravityTrickCurriculumsCfg:
 
 
 # ---------------------------------------------------------------------------
+# Scene pointcloud observations: single combined PC from robot+insertive+receptive
+# ---------------------------------------------------------------------------
+@configclass
+class ScenePCObservationsCfg:
+    """512-pt scene pointcloud (robot+insertive+receptive) in robot base frame."""
+
+    @configclass
+    class ProprioCfg(ObsGroup):
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class PointcloudCfg(ObsGroup):
+        scene_pc = ObsTerm(
+            func=task_mdp.ScenePointCloud,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "insertive_cfg": SceneEntityCfg("insertive_object"),
+                "receptive_cfg": SceneEntityCfg("receptive_object"),
+                "visualize": False,
+                "num_points": 512,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    proprio: ProprioCfg = ProprioCfg()
+    pointcloud: PointcloudCfg = PointcloudCfg()
+
+
+# ---------------------------------------------------------------------------
 # Base env config
 # ---------------------------------------------------------------------------
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
-    """Gravity trick baseline: sparse reward + gravity curriculum. Single-task peg by default."""
+    """Gravity trick baseline: sparse reward + gravity curriculum + ScenePC."""
 
     scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: ScenePCObservationsCfg = ScenePCObservationsCfg()
     rewards: GravityTrickRewardsCfg = GravityTrickRewardsCfg()
     events: GravityTrickEventCfg = GravityTrickEventCfg()
     terminations: GravityTrickTerminationsCfg = GravityTrickTerminationsCfg()
