@@ -19,6 +19,7 @@ import numpy as np
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
@@ -209,3 +210,95 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickSuccess50TrainCfg(Ur5eRobotiq2f8
     def __post_init__(self):
         super().__post_init__()
         self.rewards.success_reward.weight = 50.0
+
+
+# ---------------------------------------------------------------------------
+# Ablation: uniform random gravity (no curriculum)
+# ---------------------------------------------------------------------------
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickRandomGravTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """Gravity trick + uniform random gravity [0, -9.81] each reset (no curriculum)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Disable gravity curriculum
+        self.curriculum = None
+        # Randomize gravity every 16s (interval mode = global, not per-env)
+        self.events.variable_gravity = EventTerm(
+            func=task_mdp.randomize_physics_scene_gravity,
+            mode="interval",
+            interval_range_s=(16.0, 16.0),
+            params={
+                "gravity_distribution_params": ([0.0, 0.0, -9.81], [0.0, 0.0, 0.0]),
+                "operation": "abs",
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Ablation: contact rewards (sanity check — reach + contact + contact-gated dense success)
+# ---------------------------------------------------------------------------
+@configclass
+class GravityTrickContactSceneCfg(RlStateSceneCfg):
+    """Scene with contact sensors on gripper fingers."""
+
+    right_inner_finger_contact_sensor = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/right_inner_finger",
+        update_period=0.0,
+        history_length=6,
+        debug_vis=False,
+        track_friction_forces=True,
+        max_contact_data_count_per_prim=16,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/InsertiveObject"],
+    )
+
+    left_inner_finger_contact_sensor = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/left_inner_finger",
+        update_period=0.0,
+        history_length=6,
+        debug_vis=False,
+        track_friction_forces=True,
+        max_contact_data_count_per_prim=16,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/InsertiveObject"],
+    )
+
+
+@configclass
+class GravityTrickContactRewardsCfg(GravityTrickRewardsCfg):
+    """Sparse rewards + reach + contact + contact-gated dense success."""
+
+    ee_asset_distance = RewTerm(
+        func=task_mdp.ee_asset_distance_tanh,
+        weight=1.0,
+        params={
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_offset_metadata_key": "gripper_offset",
+            "std": 1.0,
+        },
+    )
+
+    gripper_contact = RewTerm(
+        func=task_mdp.gripper_contact,
+        weight=0.5,
+        params={"threshold": 1.0},
+    )
+
+    contact_gated_dense_success = RewTerm(
+        func=task_mdp.contact_gated_dense_success,
+        weight=2.0,
+        params={"std": 0.2, "threshold": 1.0},
+    )
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickContactTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """Gravity trick + contact rewards (sanity check that env works)."""
+
+    scene: GravityTrickContactSceneCfg = GravityTrickContactSceneCfg(num_envs=32, env_spacing=1.5)
+    rewards: GravityTrickContactRewardsCfg = GravityTrickContactRewardsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.terminations.success = None
+        self.scene.robot.spawn.activate_contact_sensors = True

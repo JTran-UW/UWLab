@@ -128,6 +128,28 @@ gym.register(
     },
 )
 
+# Gravity trick: uniform random gravity (no curriculum)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-RandomGrav-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickRandomGravTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# Gravity trick: contact rewards (sanity check — reach + contact + contact-gated dense)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-Contact-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickContactTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
