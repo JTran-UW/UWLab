@@ -19,8 +19,6 @@ import numpy as np
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
@@ -41,24 +39,25 @@ from .rl_state_cfg import (
 
 
 # ---------------------------------------------------------------------------
-# Rewards: sparse success + mechanical work + fail penalty
+# Rewards: sparse success + regularizers + fail penalty
 # ---------------------------------------------------------------------------
 @configclass
 class GravityTrickRewardsCfg(RewardsCfg):
-    """Sparse reward: success +1, fail -1, mechanical work penalty."""
+    """Sparse reward with regularizers. Inherits from RewardsCfg, disables dense rewards."""
 
     # -- Disable inherited dense rewards --
-    joint_vel = RewTerm(
-        func=task_mdp.joint_vel_l2_clamped,
-        weight=-1e-3,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
-    )
     abnormal_robot = None
     dense_success_reward = None
     ee_asset_distance = None
 
+    # Regularizers (10x smaller than baseline)
     action_magnitude = RewTerm(func=task_mdp.action_l2_clamped, weight=-1e-5)
     action_rate = RewTerm(func=task_mdp.action_rate_l2_clamped, weight=-1e-4)
+    joint_vel = RewTerm(
+        func=task_mdp.joint_vel_l2_clamped,
+        weight=-1e-4,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
+    )
 
     # Must be non-zero or IsaacLab skips calling it entirely
     progress_context = RewTerm(
@@ -71,7 +70,7 @@ class GravityTrickRewardsCfg(RewardsCfg):
     )
 
     # Sparse success
-    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=10.0)
 
     # Fail penalty: fires on abnormal_robot or object_out_of_bound
     fail = RewTerm(
@@ -86,16 +85,7 @@ class GravityTrickRewardsCfg(RewardsCfg):
 # ---------------------------------------------------------------------------
 @configclass
 class GravityTrickEventCfg(BaseEventCfg):
-    """Procedural 50-50 resets + gravity trick.
-
-    50% ObjectAnywhereEEAnywhere: object random position/orientation, EE random IK pose.
-        In zero-g objects float — robot learns approach and manipulation freely.
-    50% ObjectPartiallyAssembledEENear: object from partial assembly dataset (near goal),
-        EE spawned near object via IK (NOT from grasp dataset — avoids collision issues).
-        Near-goal states ensure non-zero success rate (Octi's condition #1).
-
-    Gravity ramps 0 → -9.81 via GravityScheduler ADR.
-    """
+    """Procedural 50-50 resets + gravity trick."""
 
     reset_receptive_object_pose = EventTerm(
         func=task_mdp.reset_root_states_uniform,
@@ -144,8 +134,6 @@ class GravityTrickEventCfg(BaseEventCfg):
         },
     )
 
-    # Gravity is now controlled by GravityCurriculum (see GravityTrickCurriculumsCfg)
-
 
 # ---------------------------------------------------------------------------
 # Terminations: add out-of-bounds for zero-g object drift
@@ -183,11 +171,11 @@ class GravityTrickCurriculumsCfg:
 
 
 # ---------------------------------------------------------------------------
-# Full env config
+# Base env config
 # ---------------------------------------------------------------------------
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
-    """Gravity trick training: procedural 50-50 resets + gravity curriculum. Single-task peg by default."""
+    """Gravity trick baseline: sparse reward + gravity curriculum. Single-task peg by default."""
 
     scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
     rewards: GravityTrickRewardsCfg = GravityTrickRewardsCfg()
@@ -199,21 +187,25 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg(Ur5eRobotiq2f85RelCarte
         super().__post_init__()
 
 
+# ---------------------------------------------------------------------------
+# Ablation: PA EE lerp range (0.9, 1.0) — EE spawns very close to object for partial assemblies
+# ---------------------------------------------------------------------------
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrick10to1TrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick with success=10.0, fail=-1.0 (10:1 ratio)."""
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickPALerpTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """Gravity trick + partial assembly EE lerp (0.9, 1.0)."""
 
     def __post_init__(self):
         super().__post_init__()
-        self.rewards.success_reward.weight = 10.0
+        self.events.reset_procedural.params["pa_ee_lerp_range"] = (0.9, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Ablation: success_reward weight = 50
+# ---------------------------------------------------------------------------
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickGPSTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick with success=1.0, fail=-1.0 + GPS curriculum."""
+class Ur5eRobotiq2f85RelCartesianOSCGravityTrickSuccess50TrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """Gravity trick + success_reward weight = 50."""
 
     def __post_init__(self):
         super().__post_init__()
-        self.events.reset_procedural.params["curriculum_target"] = 0.33
-        self.events.reset_procedural.params["curriculum_kappa"] = 2.0
-        self.events.reset_procedural.params["curriculum_temperature"] = 2.0
+        self.rewards.success_reward.weight = 50.0

@@ -95,7 +95,7 @@ gym.register(
     },
 )
 
-# Gravity trick: procedural resets + gravity curriculum (success=1.0, fail=-1.0)
+# Gravity trick: baseline (success=10.0, fail=-1.0)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -106,24 +106,24 @@ gym.register(
     },
 )
 
-# Gravity trick: success=10.0, fail=-1.0 (10:1)
+# Gravity trick: PA EE lerp (0.9, 1.0)
 gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-10to1-v0",
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-PALerp-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrick10to1TrainCfg",
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickPALerpTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )
 
-# Gravity trick: success=1.0, fail=-1.0 + GPS curriculum
+# Gravity trick: success_reward weight = 50
 gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-GPS-v0",
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-Success50-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickGPSTrainCfg",
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickSuccess50TrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )

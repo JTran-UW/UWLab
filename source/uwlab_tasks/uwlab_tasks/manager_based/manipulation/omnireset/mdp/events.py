@@ -1320,10 +1320,11 @@ class IKCurriculumResetManager(ManagerTermBase):
         # Collision checking and resample params
         self.max_resample_attempts: int = cfg.params.get("max_resample_attempts", 10)
         self.ee_lerp_range: tuple[float, float] = tuple(cfg.params.get("ee_lerp_range", (0.0, 1.0)))
+        self.pa_ee_lerp_range: tuple[float, float] = tuple(cfg.params.get("pa_ee_lerp_range", (0.0, 1.0)))
         # Mesh-based collision check (lazy-init on first call to avoid USD race in distributed)
         self.collision_num_points: int = cfg.params.get("collision_num_points", 128)
         self.collision_max_dist: float = cfg.params.get("collision_max_dist", 0.3)
-        self.collision_min_dist: float = cfg.params.get("collision_min_dist", 0.005)
+        self.collision_min_dist: float = cfg.params.get("collision_min_dist", 0.0)
         self.grasp_collision_analyzer = None
 
         # Gripper offset: IK body (robotiq_base_link) → fingertip grasp point
@@ -1368,9 +1369,10 @@ class IKCurriculumResetManager(ManagerTermBase):
         ee_anywhere_range: dict | None = None,
         max_resample_attempts: int = 10,
         ee_lerp_range: tuple[float, float] = (0.0, 1.0),
+        pa_ee_lerp_range: tuple[float, float] = (0.0, 1.0),
         collision_num_points: int = 128,
         collision_max_dist: float = 0.3,
-        collision_min_dist: float = 0.005,
+        collision_min_dist: float = 0.0,
         curriculum_target: float | None = None,
         curriculum_kappa: float = 2.0,
         curriculum_temperature: float = 2.0,
@@ -1502,21 +1504,30 @@ class IKCurriculumResetManager(ManagerTermBase):
         ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
         self._solve_ik(env, env_ids, ee_pos_w, ee_quat_w, num_iters=10)
 
-        # 2. Interpolate EE toward object: t ~ Uniform(t_min, t_max)
-        t = self.ee_lerp_range[0] + (self.ee_lerp_range[1] - self.ee_lerp_range[0]) * torch.rand(n, 1, device=device)
+        # 2. Interpolate EE toward object: t ~ Uniform(t_min, t_max), per-group ranges
+        t_min = torch.full((n, 1), self.ee_lerp_range[0], device=device)
+        t_max = torch.full((n, 1), self.ee_lerp_range[1], device=device)
+        pa_mask = self.group_id[env_ids] == 1
+        t_min[pa_mask] = self.pa_ee_lerp_range[0]
+        t_max[pa_mask] = self.pa_ee_lerp_range[1]
+        t = t_min + (t_max - t_min) * torch.rand(n, 1, device=device)
         robot_ik_body_idx = self.solver._body_idx
         current_ee_pos = self.robot.data.body_pos_w[env_ids, robot_ik_body_idx]
         current_ee_quat = self.robot.data.body_quat_w[env_ids, robot_ik_body_idx]
 
-        # Compute IK target so fingertips (not robotiq_base_link) land on a random mesh surface point.
-        # Sample a random point on the insertive object's mesh, transform to world frame.
+        # Compute IK target: sample 2 random mesh surface points, target their midpoint.
+        # Approximates antipodal grasping — works for rods, spheres, arbitrary geometry.
         obj_pos_w = self.insertive_object.data.root_pos_w[env_ids]
         obj_quat_w = self.insertive_object.data.root_quat_w[env_ids]
-        rand_idx = torch.randint(0, self.ins_canonical_points.shape[1], (n,), device=device)
-        mesh_pts_local = self.ins_canonical_points[env_ids, rand_idx]  # [n, 3]
-        mesh_pts_w = math_utils.quat_apply(obj_quat_w, mesh_pts_local) + obj_pos_w  # [n, 3]
+        num_pts = self.ins_canonical_points.shape[1]
+        idx1 = torch.randint(0, num_pts, (n,), device=device)
+        idx2 = torch.randint(0, num_pts, (n,), device=device)
+        pt1_local = self.ins_canonical_points[env_ids, idx1]  # [n, 3]
+        pt2_local = self.ins_canonical_points[env_ids, idx2]  # [n, 3]
+        midpoint_local = (pt1_local + pt2_local) * 0.5
+        midpoint_w = math_utils.quat_apply(obj_quat_w, midpoint_local) + obj_pos_w  # [n, 3]
         offset_world = math_utils.quat_apply(current_ee_quat, self.gripper_offset_pos.expand(n, -1))
-        grasp_ik_target = mesh_pts_w - offset_world
+        grasp_ik_target = midpoint_w - offset_world
         target_pos_w = (1 - t) * current_ee_pos + t * grasp_ik_target
         target_quat_w = current_ee_quat
 
