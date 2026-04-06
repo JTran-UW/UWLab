@@ -2,7 +2,7 @@
 # All Rights Reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Gravity curriculum for OmniReset: ramps gravity from 0 to full based on success rate."""
+"""Gravity + reward-weight curriculums for OmniReset."""
 
 from __future__ import annotations
 
@@ -60,3 +60,47 @@ class GravityCurriculum(ManagerTermBase):
         physics_sim_view.set_gravity(gravity)
 
         return {"gravity_frac": self.difficulty_frac}
+
+
+class RewardWeightCurriculum(ManagerTermBase):
+    """Curriculum that anneals reward term weights toward zero as gravity difficulty increases.
+
+    Tracks the gravity curriculum's difficulty fraction and linearly decays the
+    specified reward weights from their initial values to zero.
+    At difficulty_frac=0 (zero-g), weights are at full value.
+    At difficulty_frac=1 (full gravity), weights are zero.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._initial_weights: dict[str, float] = {}
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids,
+        reward_term_names: list[str] | None = None,
+        gravity_curriculum_name: str = "gravity_curriculum",
+    ) -> dict[str, float]:
+        if reward_term_names is None:
+            reward_term_names = []
+
+        # Capture initial weights on first call
+        if not self._initial_weights:
+            for name in reward_term_names:
+                self._initial_weights[name] = env.reward_manager.get_term_cfg(name).weight
+
+        # Get gravity difficulty fraction from gravity curriculum
+        gravity_term = env.curriculum_manager.get_term_cfg(gravity_curriculum_name).func
+        difficulty_frac = getattr(gravity_term, "difficulty_frac", 0.0)
+        decay = 1.0 - difficulty_frac
+
+        log = {}
+        for name in reward_term_names:
+            cfg = env.reward_manager.get_term_cfg(name)
+            cfg.weight = self._initial_weights[name] * decay
+            env.reward_manager.set_term_cfg(name, cfg)
+            log[f"dense_reward_decay/{name}_weight"] = cfg.weight
+
+        log["dense_reward_decay/decay_factor"] = decay
+        return log

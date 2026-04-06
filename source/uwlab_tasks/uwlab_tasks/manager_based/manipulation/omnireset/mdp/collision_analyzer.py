@@ -80,7 +80,6 @@ class CollisionAnalyzer:
         obstacle_relative_transforms = [[[] for _ in range(env.num_envs)] for _ in range(len(self.obstacles))]
 
         for i, obstacle in enumerate(self.obstacles):
-            # start = time.perf_counter()
             obs_h = RigidObjectHasher(env.num_envs, prim_path_pattern=obstacle.cfg.prim_path, device=env.device)
             for prim, p_hash, rel_tf, eid in zip(
                 obs_h.collider_prims,
@@ -88,7 +87,6 @@ class CollisionAnalyzer:
                 obs_h.collider_prim_relative_transforms,
                 obs_h.collider_prim_env_ids,
             ):
-                # convert each USD prim → Warp mesh...
                 obstacle_relative_transforms[i][eid].append(rel_tf)
                 if p_hash.item() in obs_h.get_warp_mesh_store():
                     env_handles[i][eid].append(obs_h.get_warp_mesh_store()[p_hash.item()].id)
@@ -97,16 +95,31 @@ class CollisionAnalyzer:
                     obs_h.get_warp_mesh_store()[p_hash.item()] = wp_mesh
                     env_handles[i][eid].append(wp_mesh.id)
 
-            self.num_coll_per_obstacle_per_env[i] = torch.bincount(obs_h.collider_prim_env_ids)
-            self.obstacle_root_scales[i] = obs_h.root_prim_scales
-            # pc_time = time.perf_counter() - start
-            # print(f"Sampled {len(obs_h.collider_prims)} wp meshes at '{obstacle.cfg.prim_path}' in {pc_time:.3f}s")
+            # For instanced envs, the hasher may only find collider prims for env 0.
+            # Replicate env 0's data to all other envs that have no collider prims.
+            if env_handles[i][0] and any(len(h) == 0 for h in env_handles[i][1:]):
+                for eid in range(1, env.num_envs):
+                    if len(env_handles[i][eid]) == 0:
+                        env_handles[i][eid] = list(env_handles[i][0])
+                        obstacle_relative_transforms[i][eid] = list(obstacle_relative_transforms[i][0])
+
+            counts = torch.bincount(obs_h.collider_prim_env_ids, minlength=env.num_envs)
+            if counts.shape[0] < env.num_envs:
+                counts = torch.cat([counts, counts[0:1].expand(env.num_envs - counts.shape[0])])
+            elif counts[1:].sum() == 0 and counts[0] > 0:
+                counts = counts[0:1].expand(env.num_envs).clone()
+            self.num_coll_per_obstacle_per_env[i] = counts
+            # root_prim_scales may be incomplete if hasher exited early for instanced envs
+            scales = obs_h.root_prim_scales
+            if scales.shape[0] < env.num_envs:
+                scales = scales[0:1].expand(env.num_envs, -1).clone()
+            self.obstacle_root_scales[i] = scales
         self.max_prims = torch.max(self.num_coll_per_obstacle_per_env).item()
         handle_list = []
         rel_transform = []
         for i in range(len(env_handles)):
             handle_list.extend([torch.tensor(lst, dtype=torch.int64, device=env.device) for lst in env_handles[i]])
-            rel_transform.extend([torch.cat((tf), dim=0) for tf in obstacle_relative_transforms[i]])
+            rel_transform.extend([torch.cat(tf, dim=0) for tf in obstacle_relative_transforms[i]])
         self.handles_tensor = pad_sequence(handle_list, batch_first=True, padding_value=0).view(
             len(self.obstacles), env.num_envs, -1
         )

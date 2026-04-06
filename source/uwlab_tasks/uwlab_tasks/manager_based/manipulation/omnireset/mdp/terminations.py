@@ -5,6 +5,7 @@
 
 """MDP functions for manipulation tasks."""
 
+import logging
 import numpy as np
 import torch
 
@@ -271,12 +272,13 @@ class check_reset_state_success(ManagerTermBase):
                 quat=tuple(receptive_meta.get("assembled_offset").get("quat")),
             )
             assembly_threshold_scale = cfg.params.get("assembly_threshold_scale", 1.0)
-            self.assembly_pos_threshold: float = (
-                receptive_meta.get("success_thresholds").get("position") * assembly_threshold_scale
-            )
-            self.assembly_ori_threshold: float = (
-                receptive_meta.get("success_thresholds").get("orientation") * assembly_threshold_scale
-            )
+            assembly_threshold_min_scale = cfg.params.get("assembly_threshold_min_scale", 0.0)
+            base_pos = receptive_meta.get("success_thresholds").get("position")
+            base_ori = receptive_meta.get("success_thresholds").get("orientation")
+            self.assembly_pos_threshold: float = base_pos * assembly_threshold_scale
+            self.assembly_ori_threshold: float = base_ori * assembly_threshold_scale
+            self.assembly_pos_min_threshold: float = base_pos * assembly_threshold_min_scale
+            self.assembly_ori_min_threshold: float = base_ori * assembly_threshold_min_scale
             self.require_assembly_success = torch.rand(env.num_envs, device=env.device) < self.assembly_success_prob
             self._pending_reflip = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
 
@@ -328,6 +330,8 @@ class check_reset_state_success(ManagerTermBase):
         receptive_asset_cfg: SceneEntityCfg | None = None,
         assembly_success_prob: float | None = None,
         assembly_threshold_scale: float = 1.0,
+        assembly_threshold_min_scale: float = 0.0,
+        check_gripper_orientation: bool = True,
     ) -> torch.Tensor:
 
         # Check time out
@@ -339,14 +343,17 @@ class check_reset_state_success(ManagerTermBase):
         ).any(dim=1)
 
         # Check if gripper orientation is pointing downward within 60 degrees of vertical
-        ee_quat = self.robot_asset.data.body_link_quat_w[:, self.ee_body_idx]
-        gripper_approach_local = torch.tensor(
-            self.gripper_approach_direction, device=env.device, dtype=torch.float32
-        ).expand(env.num_envs, -1)
-        gripper_approach_world = math_utils.quat_apply(ee_quat, gripper_approach_local)
-        gripper_orientation_within_range = (
-            gripper_approach_world[:, 2] < -0.5
-        )  # cos(60°) = 0.5, so z < -0.5 for 60° cone
+        if check_gripper_orientation:
+            ee_quat = self.robot_asset.data.body_link_quat_w[:, self.ee_body_idx]
+            gripper_approach_local = torch.tensor(
+                self.gripper_approach_direction, device=env.device, dtype=torch.float32
+            ).expand(env.num_envs, -1)
+            gripper_approach_world = math_utils.quat_apply(ee_quat, gripper_approach_local)
+            gripper_orientation_within_range = (
+                gripper_approach_world[:, 2] < -0.5
+            )  # cos(60°) = 0.5, so z < -0.5 for 60° cone
+        else:
+            gripper_orientation_within_range = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
 
         # Check if asset velocities are small
         current_step_stable = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
@@ -410,6 +417,30 @@ class check_reset_state_success(ManagerTermBase):
             & time_out
         )
 
+        # Log rejection reasons at timeout
+        if time_out.any():
+            n_timeout = time_out.sum().item()
+            reasons = []
+            if abnormal_gripper_state[time_out].any():
+                reasons.append(f"abnormal_gripper={abnormal_gripper_state[time_out].sum().item()}")
+            if (~gripper_orientation_within_range[time_out]).any():
+                reasons.append(f"bad_orientation={(~gripper_orientation_within_range[time_out]).sum().item()}")
+            if (~stability_reached[time_out]).any():
+                reasons.append(f"unstable={(~stability_reached[time_out]).sum().item()}")
+            if excessive_pose_deviation[time_out].any():
+                reasons.append(f"pose_deviation={excessive_pose_deviation[time_out].sum().item()}")
+            if pos_below_threshold[time_out].any():
+                reasons.append(f"below_ground={pos_below_threshold[time_out].sum().item()}")
+            if (~collision_free[time_out]).any():
+                reasons.append(f"collision={(~collision_free[time_out]).sum().item()}")
+            n_success = reset_success[time_out].sum().item()
+            msg = f"[reset_state_check] timeout={n_timeout} success={n_success}"
+            if reasons:
+                msg += " | " + " | ".join(reasons)
+            else:
+                msg += " | all checks passed"
+            logging.info(msg)
+
         if self.assembly_success_prob is not None:
             ins_pos_w, ins_quat_w = self.insertive_asset_offset.apply(self.insertive_asset)
             rec_pos_w, rec_quat_w = self.receptive_asset_offset.apply(self.receptive_asset)
@@ -417,7 +448,9 @@ class check_reset_state_success(ManagerTermBase):
             e_x, e_y, _ = math_utils.euler_xyz_from_quat(rel_quat)
             euler_xy_dist = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
             xyz_dist = torch.norm(rel_pos, dim=1)
-            assembly_success = (xyz_dist < self.assembly_pos_threshold) & (euler_xy_dist < self.assembly_ori_threshold)
+            within_max = (xyz_dist < self.assembly_pos_threshold) & (euler_xy_dist < self.assembly_ori_threshold)
+            beyond_min = (xyz_dist > self.assembly_pos_min_threshold) | (euler_xy_dist > self.assembly_ori_min_threshold)
+            assembly_success = within_max & beyond_min
             assembly_match = torch.where(self.require_assembly_success, assembly_success, ~assembly_success)
             reset_success = reset_success & assembly_match
             self._pending_reflip |= reset_success

@@ -350,3 +350,171 @@ class Ur5eRobotiq2f85RelCartesianOSCGravityTrickContactTrainCfg(Ur5eRobotiq2f85R
         super().__post_init__()
         self.terminations.success = None
         self.scene.robot.spawn.activate_contact_sensors = True
+
+
+# ===========================================================================
+# Zero-G State-Based Ablations
+# ===========================================================================
+# All three load pre-recorded ZeroG states via MultiResetManager + gravity curriculum.
+
+
+# ---------------------------------------------------------------------------
+# Events: load ZeroG states 50-50 (no GPS)
+# ---------------------------------------------------------------------------
+@configclass
+class ZeroGStatesEventCfg(BaseEventCfg):
+    """Load pre-recorded ZeroG states with 50-50 anywhere/partial-assembly mix."""
+
+    reset_receptive_object_pose = EventTerm(
+        func=task_mdp.reset_root_states_uniform,
+        mode="reset",
+        params={
+            "pose_range": {
+                "x": (0.3, 0.55),
+                "y": (-0.1, 0.3),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (-np.pi / 12, np.pi / 12),
+            },
+            "velocity_range": {},
+            "asset_cfgs": {"receptive_object": SceneEntityCfg("receptive_object")},
+            "offset_asset_cfg": SceneEntityCfg("ur5_metal_support"),
+            "use_bottom_offset": True,
+        },
+    )
+
+    reset_from_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
+            "probs": [0.5, 0.5],
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Events: load ZeroG states with GPS curriculum over all 20K states
+# ---------------------------------------------------------------------------
+@configclass
+class ZeroGStatesGPSEventCfg(BaseEventCfg):
+    """Load pre-recorded ZeroG states with GPS curriculum."""
+
+    reset_receptive_object_pose = EventTerm(
+        func=task_mdp.reset_root_states_uniform,
+        mode="reset",
+        params={
+            "pose_range": {
+                "x": (0.3, 0.55),
+                "y": (-0.1, 0.3),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (-np.pi / 12, np.pi / 12),
+            },
+            "velocity_range": {},
+            "asset_cfgs": {"receptive_object": SceneEntityCfg("receptive_object")},
+            "offset_asset_cfg": SceneEntityCfg("ur5_metal_support"),
+            "use_bottom_offset": True,
+        },
+    )
+
+    reset_from_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
+            "probs": [0.5, 0.5],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "curriculum_target": 0.33,
+            "curriculum_kappa": 2.0,
+            "curriculum_temperature": 2.0,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ablation A: ZeroG states baseline (50-50 sampling, sparse rewards)
+# ---------------------------------------------------------------------------
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCZeroGBaselineTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """ZeroG states + 50-50 sampling + sparse rewards + gravity curriculum."""
+
+    events: ZeroGStatesEventCfg = ZeroGStatesEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+
+
+# ---------------------------------------------------------------------------
+# Ablation B: ZeroG states + GPS over all 20K states
+# ---------------------------------------------------------------------------
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCZeroGGPSTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """ZeroG states + GPS curriculum over all states + sparse rewards + gravity curriculum."""
+
+    events: ZeroGStatesGPSEventCfg = ZeroGStatesGPSEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+
+
+# ---------------------------------------------------------------------------
+# Ablation C: ZeroG states + 50-50 + dense rewards (curricuumed out)
+# ---------------------------------------------------------------------------
+@configclass
+class ZeroGDenseRewardsCfg(GravityTrickRewardsCfg):
+    """Sparse + dense rewards (contact + dense success) that get curricuumed out."""
+
+    ee_asset_distance = RewTerm(
+        func=task_mdp.ee_asset_distance_tanh,
+        weight=1.0,
+        params={
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_offset_metadata_key": "gripper_offset",
+            "std": 1.0,
+        },
+    )
+
+    gripper_contact = RewTerm(
+        func=task_mdp.gripper_contact,
+        weight=0.5,
+        params={"threshold": 1.0},
+    )
+
+    contact_gated_dense_success = RewTerm(
+        func=task_mdp.contact_gated_dense_success,
+        weight=2.0,
+        params={"std": 0.2, "threshold": 1.0},
+    )
+
+
+@configclass
+class ZeroGDenseCurriculumsCfg(GravityTrickCurriculumsCfg):
+    """Gravity curriculum + reward weight decay for dense rewards."""
+
+    reward_weight_decay = CurrTerm(
+        func=task_mdp.RewardWeightCurriculum,
+        params={
+            "reward_term_names": ["ee_asset_distance", "gripper_contact", "contact_gated_dense_success"],
+            "gravity_curriculum_name": "gravity_curriculum",
+        },
+    )
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCZeroGDenseTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
+    """ZeroG states + 50-50 + dense rewards curricuumed out as gravity increases."""
+
+    scene: GravityTrickContactSceneCfg = GravityTrickContactSceneCfg(num_envs=32, env_spacing=1.5)
+    events: ZeroGStatesEventCfg = ZeroGStatesEventCfg()
+    rewards: ZeroGDenseRewardsCfg = ZeroGDenseRewardsCfg()
+    curriculum: ZeroGDenseCurriculumsCfg = ZeroGDenseCurriculumsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot.spawn.activate_contact_sensors = True

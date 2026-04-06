@@ -87,6 +87,10 @@ def main(env_cfg, agent_cfg) -> None:
     reset_type = args_cli.reset_type
     if reset_type is None:
         for candidate in [
+            "ZeroGPartialAssembly",
+            "ZeroGAnywhere",
+            "GravityTrickAnywhere",
+            "GravityTrickPartialAssembly",
             "ObjectAnywhereEEAnywhere",
             "ObjectRestingEEGrasped",
             "ObjectAnywhereEEGrasped",
@@ -122,7 +126,7 @@ def main(env_cfg, agent_cfg) -> None:
     current_successful_reset_conditions = 0
     actions = torch.zeros(env.action_space.shape, device=env.device, dtype=torch.float32)
     if "ObjectAnywhereEEGrasped" in args_cli.task or "ObjectRestingEEGrasped" in args_cli.task:
-        actions[:, -1] = -1.0
+        actions[:, -1] = -1.0  # Always close gripper
     else:
         actions[:, -1] = (
             torch.randint(0, 2, (env.num_envs,), device=env.device, dtype=torch.float32) * 2 - 1

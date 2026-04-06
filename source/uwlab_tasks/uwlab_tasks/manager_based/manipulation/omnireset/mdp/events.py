@@ -542,6 +542,510 @@ class global_physics_control_event(ManagerTermBase):
                 )
 
 
+class reset_ee_toward_object(ManagerTermBase):
+    """Reset end-effector with approach orientation toward a random mesh surface point.
+
+    1. Sample random EE position in workspace
+    2. Sample random surface point on the target object mesh
+    3. Orient gripper approach axis toward the surface point
+    4. Lerp EE position: ee_final = (1-t)*ee_random + t*(surface_point - gripper_offset), t ~ U(0,1)
+    5. IK solve to (ee_final, approach_quat)
+
+    The gripper always "looks at" the object surface, regardless of where it spawns.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        robot_ik_cfg: SceneEntityCfg = cfg.params.get(
+            "robot_ik_cfg",
+            SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"),
+        )
+        self.robot: Articulation = env.scene[robot_ik_cfg.name]
+        self.target_object: RigidObject = env.scene[cfg.params.get("target_object_cfg", SceneEntityCfg("insertive_object")).name]
+        self.joint_ids: list[int] | slice = robot_ik_cfg.joint_ids
+        self.n_joints: int = self.robot.num_joints if isinstance(self.joint_ids, slice) else len(self.joint_ids)
+
+        # EE workspace range
+        ee_range: dict = cfg.params.get("ee_pose_range", {
+            "x": (0.3, 0.7), "y": (-0.4, 0.4), "z": (0.0, 0.5),
+        })
+        self.ee_range = torch.tensor(
+            [ee_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z"]],
+            device=env.device,
+        )
+
+        # Gripper approach direction from robot metadata (e.g., [0, 0, -1] for Robotiq)
+        robot_metadata = utils.read_metadata_from_usd_directory(self.robot.cfg.spawn.usd_path)
+        self.gripper_approach_dir = torch.tensor(
+            robot_metadata.get("gripper_approach_direction", [0.0, 0.0, -1.0]),
+            device=env.device, dtype=torch.float32,
+        )
+
+        # Gripper offset: IK body (robotiq_base_link) -> fingertip grasp point
+        gripper_offset = robot_metadata.get("gripper_offset", {})
+        self.gripper_offset_pos = torch.tensor(
+            gripper_offset.get("pos", [0.0, 0.0, 0.0]), device=env.device, dtype=torch.float32
+        )
+
+        # Canonical mesh surface points for the target object
+        target_prim_path = self.target_object.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        self.canonical_points = utils.sample_object_point_cloud(
+            num_envs=env.num_envs, num_points=64, prim_path_pattern=target_prim_path, device=str(env.device),
+        )  # [num_envs, 64, 3] in object local frame
+
+        # Gripper joint IDs and pre-recorded close trajectory
+        gripper_joint_names = [
+            "finger_joint", "right_outer_knuckle_joint",
+            "left_inner_knuckle_joint", "right_inner_knuckle_joint",
+            "left_inner_finger_knuckle_joint", "right_inner_finger_knuckle_joint",
+        ]
+        self.gripper_joint_ids: list[int] = [
+            list(self.robot.joint_names).index(n) for n in gripper_joint_names if n in self.robot.joint_names
+        ]
+        # Load gripper close trajectory from file next to robot USD
+        robot_usd_path = self.robot.cfg.spawn.usd_path
+        traj_path = os.path.dirname(robot_usd_path) + "/gripper_close_trajectory.pt"
+        local_path = utils.safe_retrieve_file_path(traj_path)
+        data = torch.load(local_path, map_location="cpu")
+        saved_names = data["joint_names"]
+        saved_positions = data["joint_positions"]
+        result = torch.zeros(saved_positions.shape[0], len(self.gripper_joint_ids), dtype=torch.float32)
+        for i, joint_idx in enumerate(self.gripper_joint_ids):
+            joint_name = self.robot.joint_names[joint_idx]
+            if joint_name in saved_names:
+                result[:, i] = saved_positions[:, saved_names.index(joint_name)]
+        self.gripper_close_states = result.to(env.device)
+
+        # IK solver
+        robot_ik_solver_cfg = DifferentialInverseKinematicsActionCfg(
+            asset_name=robot_ik_cfg.name,
+            joint_names=robot_ik_cfg.joint_names,
+            body_name=robot_ik_cfg.body_names,
+            controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+            scale=1.0,
+        )
+        self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        robot_ik_cfg: SceneEntityCfg | None = None,
+        target_object_cfg: SceneEntityCfg | None = None,
+        ee_pose_range: dict | None = None,
+        ee_roll_range: tuple[float, float] = (0.0, 6.283185),
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+        n = env_ids.numel()
+        device = env.device
+
+        # 1. Get object state and transform all canonical points to world frame
+        obj_pos_w = self.target_object.data.root_pos_w[env_ids]
+        obj_quat_w = self.target_object.data.root_quat_w[env_ids]
+        robot_root_pos = self.robot.data.root_link_pos_w[env_ids]
+        all_pts_world = math_utils.quat_apply(
+            obj_quat_w.unsqueeze(1).expand(-1, self.canonical_points.shape[1], -1),
+            self.canonical_points[env_ids],
+        ) + obj_pos_w.unsqueeze(1)  # [n, 64, 3]
+
+        # 2-3: Sample EE position + entry surface point + approach direction
+        # Resample envs where approach direction isn't within 60° of downward
+        ee_pos_w = torch.zeros(n, 3, device=device)
+        entry_point = torch.zeros(n, 3, device=device)
+        approach_dir = torch.zeros(n, 3, device=device)
+        remaining = torch.ones(n, dtype=torch.bool, device=device)
+
+        for _ in range(20):  # max resample attempts
+            if not remaining.any():
+                break
+            m = remaining.sum()
+
+            # Sample random EE position in workspace
+            ee_samples = math_utils.sample_uniform(
+                self.ee_range[:, 0], self.ee_range[:, 1], (m, 3), device=device
+            )
+            ee_pos_w[remaining] = robot_root_pos[remaining] + ee_samples
+
+            # Sample random surface point as entry
+            pt_idx = torch.randint(0, self.canonical_points.shape[1], (m,), device=device)
+            entry_point[remaining] = all_pts_world[remaining][:, :, :].gather(
+                1, pt_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, 3)
+            ).squeeze(1)
+
+            # Compute approach direction: EE -> entry point
+            d = entry_point[remaining] - ee_pos_w[remaining]
+            d = d / (d.norm(dim=-1, keepdim=True) + 1e-8)
+            approach_dir[remaining] = d
+
+            # Check: approach direction within 60° of downward (z < -0.5)
+            bad = d[:, 2] > -0.5
+            remaining[remaining.clone()] = bad
+
+        # 4. Compute exit depth: project all canonical points onto approach dir
+        #    relative to entry point, find max depth along approach direction
+        offsets = all_pts_world - entry_point.unsqueeze(1)  # [n, 64, 3]
+        projections = (offsets * approach_dir.unsqueeze(1)).sum(dim=-1)  # [n, 64]
+        max_depth = projections.max(dim=1).values.clamp(min=0.001)  # [n]
+
+        # 5. Sample random depth along ray inside object
+        depth = torch.rand(n, device=device) * max_depth  # [n]
+
+        # 6. Compute EE target: entry point + depth along approach - gripper offset
+        ee_quat_w = self._quat_from_approach(approach_dir, device, ee_roll_range)
+        target_pos = entry_point + approach_dir * depth.unsqueeze(-1)  # [n, 3]
+        offset_world = math_utils.quat_apply(ee_quat_w, self.gripper_offset_pos.expand(n, -1))
+        ee_target = target_pos - offset_world
+
+        # 7. IK solve
+        self._solve_ik(env, env_ids, ee_target, ee_quat_w, num_iters=10)
+
+        # 8. Randomize gripper from pre-recorded close trajectory
+        traj_len = self.gripper_close_states.shape[0]
+        indices = torch.randint(0, traj_len, (n,), device=device)
+        sampled_pos = self.gripper_close_states[indices]
+        self.robot.write_joint_state_to_sim(
+            sampled_pos, torch.zeros_like(sampled_pos),
+            joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+        self.robot.set_joint_position_target(
+            sampled_pos, joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+
+        # Update buffers
+        self.robot.update(env.sim.get_physics_dt())
+
+    def _quat_from_approach(
+        self, approach_dir: torch.Tensor, device: torch.device,
+        roll_range: tuple[float, float] = (0.0, 6.283185),
+    ) -> torch.Tensor:
+        """Compute quaternion that aligns the gripper approach axis with the given direction.
+
+        Uses the rotation that maps gripper_approach_dir -> approach_dir, then applies
+        random roll around the approach axis within roll_range.
+        """
+        n = approach_dir.shape[0]
+        src = self.gripper_approach_dir.expand(n, -1)  # [n, 3]
+        dst = approach_dir  # [n, 3]
+
+        # Rotation axis = cross(src, dst), angle = acos(dot(src, dst))
+        cross = torch.cross(src, dst, dim=-1)
+        dot = (src * dst).sum(dim=-1, keepdim=True)  # [n, 1]
+        cross_norm = cross.norm(dim=-1, keepdim=True)  # [n, 1]
+
+        # Handle parallel/anti-parallel cases
+        # For nearly parallel vectors, return identity
+        # For anti-parallel, pick an arbitrary perpendicular axis
+        axis = cross / (cross_norm + 1e-8)
+        angle = torch.atan2(cross_norm, dot)  # [n, 1]
+
+        # Axis-angle to quaternion: q = [cos(a/2), sin(a/2) * axis]
+        half_angle = angle * 0.5
+        quat = torch.cat([
+            torch.cos(half_angle),  # w
+            torch.sin(half_angle) * axis,  # x, y, z
+        ], dim=-1)  # [n, 4]
+
+        # Normalize
+        quat = quat / (quat.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Random roll around approach axis
+        roll_angle = roll_range[0] + (roll_range[1] - roll_range[0]) * torch.rand(n, 1, device=device)
+        roll_half = roll_angle * 0.5
+        roll_quat = torch.cat([
+            torch.cos(roll_half),
+            torch.sin(roll_half) * dst,  # rotate around approach direction
+        ], dim=-1)
+        roll_quat = roll_quat / (roll_quat.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Compose: first align approach, then roll
+        quat = math_utils.quat_mul(roll_quat, quat)
+        return quat
+
+    def _solve_ik(
+        self, env: ManagerBasedEnv, env_ids: torch.Tensor,
+        target_pos_w: torch.Tensor, target_quat_w: torch.Tensor,
+        num_iters: int = 10,
+    ) -> None:
+        """Solve IK with fixed number of iterations."""
+        pos_b, quat_b = self.solver._compute_frame_pose()
+        pos_b[env_ids], quat_b[env_ids] = math_utils.subtract_frame_transforms(
+            self.robot.data.root_link_pos_w[env_ids],
+            self.robot.data.root_link_quat_w[env_ids],
+            target_pos_w, target_quat_w,
+        )
+        self.solver.process_actions(torch.cat([pos_b, quat_b], dim=1))
+        for _ in range(num_iters):
+            self.solver.apply_actions()
+            delta = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            self.robot.write_joint_state_to_sim(
+                position=(delta + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
+                joint_ids=self.joint_ids, env_ids=env_ids,
+            )
+
+
+class reset_ee_convex_hull_approach(ManagerTermBase):
+    """Reset EE by approaching the target object along convex hull surface normals.
+
+    1. Compute convex hull of target object mesh (once, at init)
+    2. Sample random point on convex hull + get outward normal
+    3. Place fingertip at surface_point + normal * d, where d ~ U(-d_range, d_range)
+    4. EE target = fingertip + normal * gripper_offset (back along normal)
+    5. Orient EE approach axis = -normal (pointing inward toward object)
+    6. IK solve
+    7. Randomize gripper open/close from pre-recorded trajectory
+
+    This is geometry-agnostic: the convex hull handles any object shape (rods, bowls, cubes).
+    The gripper_offset and d_range are EE-specific but constant across objects.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        robot_ik_cfg: SceneEntityCfg = cfg.params.get(
+            "robot_ik_cfg",
+            SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"),
+        )
+        self.robot: Articulation = env.scene[robot_ik_cfg.name]
+        self.target_object: RigidObject = env.scene[cfg.params.get("target_object_cfg", SceneEntityCfg("insertive_object")).name]
+        self.joint_ids: list[int] | slice = robot_ik_cfg.joint_ids
+        self.n_joints: int = self.robot.num_joints if isinstance(self.joint_ids, slice) else len(self.joint_ids)
+
+        # Gripper approach direction from robot metadata
+        robot_metadata = utils.read_metadata_from_usd_directory(self.robot.cfg.spawn.usd_path)
+        self.gripper_approach_dir = torch.tensor(
+            robot_metadata.get("gripper_approach_direction", [0.0, 0.0, -1.0]),
+            device=env.device, dtype=torch.float32,
+        )
+
+        # Gripper offset and d_range from params (EE-specific constants)
+        self.gripper_offset = cfg.params.get("gripper_offset", 0.115)
+        self.d_range = cfg.params.get("d_range", 0.025)
+
+        # Optional: receptive object for occlusion filtering at runtime
+        receptive_cfg = cfg.params.get("receptive_object_cfg", None)
+        if receptive_cfg is not None:
+            self.receptive_object: RigidObject | None = env.scene[receptive_cfg.name]
+            # Load receptive mesh for point-in-mesh checks (trimesh)
+            rec_pts = utils.sample_object_point_cloud(
+                num_envs=1, num_points=2048,
+                prim_path_pattern=self.receptive_object.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*"),
+                device="cpu",
+            )[0].numpy()
+            self.receptive_trimesh = trimesh.Trimesh(vertices=rec_pts).convex_hull
+            logging.info(
+                f"[reset_ee_convex_hull_approach] Receptive convex hull: {len(self.receptive_trimesh.vertices)} verts"
+            )
+        else:
+            self.receptive_object = None
+            self.receptive_trimesh = None
+
+        # Build convex hull from target object mesh
+        target_prim_path = self.target_object.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        canonical_pts = utils.sample_object_point_cloud(
+            num_envs=1, num_points=1024, prim_path_pattern=target_prim_path, device="cpu",
+        )  # [1, 1024, 3]
+        pts_np = canonical_pts[0].numpy()
+        mesh = trimesh.Trimesh(vertices=pts_np)
+        hull = mesh.convex_hull
+        self.hull_vertices = torch.tensor(hull.vertices, device=env.device, dtype=torch.float32)  # [V, 3]
+        self.hull_faces = torch.tensor(hull.faces, device=env.device, dtype=torch.long)  # [F, 3]
+        self.hull_face_normals = torch.tensor(hull.face_normals, device=env.device, dtype=torch.float32)  # [F, 3]
+        hull_face_areas = torch.tensor(hull.area_faces, device=env.device, dtype=torch.float32)  # [F]
+        self.hull_face_probs = hull_face_areas / hull_face_areas.sum()
+        logging.info(
+            f"[reset_ee_convex_hull_approach] Convex hull: {len(hull.vertices)} verts, {len(hull.faces)} faces"
+        )
+
+        # Gripper joint IDs and pre-recorded close trajectory
+        gripper_joint_names = [
+            "finger_joint", "right_outer_knuckle_joint",
+            "left_inner_knuckle_joint", "right_inner_knuckle_joint",
+            "left_inner_finger_knuckle_joint", "right_inner_finger_knuckle_joint",
+        ]
+        self.gripper_joint_ids: list[int] = [
+            list(self.robot.joint_names).index(n) for n in gripper_joint_names if n in self.robot.joint_names
+        ]
+        robot_usd_path = self.robot.cfg.spawn.usd_path
+        traj_path = os.path.dirname(robot_usd_path) + "/gripper_close_trajectory.pt"
+        local_path = utils.safe_retrieve_file_path(traj_path)
+        data = torch.load(local_path, map_location="cpu")
+        saved_names = data["joint_names"]
+        saved_positions = data["joint_positions"]
+        result = torch.zeros(saved_positions.shape[0], len(self.gripper_joint_ids), dtype=torch.float32)
+        for i, joint_idx in enumerate(self.gripper_joint_ids):
+            joint_name = self.robot.joint_names[joint_idx]
+            if joint_name in saved_names:
+                result[:, i] = saved_positions[:, saved_names.index(joint_name)]
+        self.gripper_close_states = result.to(env.device)
+
+        # IK solver
+        robot_ik_solver_cfg = DifferentialInverseKinematicsActionCfg(
+            asset_name=robot_ik_cfg.name,
+            joint_names=robot_ik_cfg.joint_names,
+            body_name=robot_ik_cfg.body_names,
+            controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+            scale=1.0,
+        )
+        self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        robot_ik_cfg: SceneEntityCfg | None = None,
+        target_object_cfg: SceneEntityCfg | None = None,
+        receptive_object_cfg: SceneEntityCfg | None = None,
+        gripper_offset: float = 0.115,
+        d_range: float = 0.025,
+        ee_roll_range: tuple[float, float] = (0.0, 6.283185),
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+        n = env_ids.numel()
+        device = env.device
+
+        # 1. Get object state
+        obj_pos_w = self.target_object.data.root_pos_w[env_ids]  # [n, 3]
+        obj_quat_w = self.target_object.data.root_quat_w[env_ids]  # [n, 4]
+
+        # 2. Sample random point on convex hull, reject points inside receptive object
+        surface_pt_w = torch.zeros(n, 3, device=device)
+        assigned = torch.zeros(n, dtype=torch.bool, device=device)
+
+        for _ in range(20):
+            if assigned.all():
+                break
+            m = (~assigned).sum()
+
+            face_indices = torch.multinomial(self.hull_face_probs, m, replacement=True)
+            r1 = torch.rand(m, device=device)
+            r2 = torch.rand(m, device=device)
+            over = r1 + r2 > 1
+            r1[over] = 1 - r1[over]
+            r2[over] = 1 - r2[over]
+
+            faces = self.hull_faces[face_indices]
+            v0 = self.hull_vertices[faces[:, 0]]
+            v1 = self.hull_vertices[faces[:, 1]]
+            v2 = self.hull_vertices[faces[:, 2]]
+
+            sp_local = v0 + r1.unsqueeze(-1) * (v1 - v0) + r2.unsqueeze(-1) * (v2 - v0)
+            sp_w = math_utils.quat_apply(obj_quat_w[~assigned], sp_local) + obj_pos_w[~assigned]
+
+            # Occlusion filter: reject points inside the receptive object
+            if self.receptive_object is not None:
+                rec_pos = self.receptive_object.data.root_pos_w[env_ids[~assigned]]
+                rec_quat = self.receptive_object.data.root_quat_w[env_ids[~assigned]]
+                # Transform surface points to receptive object local frame
+                sp_in_rec = math_utils.quat_apply(
+                    math_utils.quat_conjugate(rec_quat), sp_w - rec_pos
+                )
+                # Check if points are inside the receptive convex hull
+                inside = self.receptive_trimesh.contains(sp_in_rec.detach().cpu().numpy())
+                good = ~torch.tensor(inside, device=device)
+            else:
+                good = torch.ones(m, dtype=torch.bool, device=device)
+
+            unassigned_idx = (~assigned).nonzero(as_tuple=False).squeeze(-1)
+            good_idx = unassigned_idx[good]
+            surface_pt_w[good_idx] = sp_w[good]
+            assigned[good_idx] = True
+
+        # 4. Sample random approach direction within 60° cone of downward (independent of surface normal)
+        approach_dir = torch.zeros(n, 3, device=device)
+        for _ in range(20):
+            remaining = (approach_dir.norm(dim=-1) < 0.5)  # not yet assigned
+            if not remaining.any():
+                break
+            m = remaining.sum()
+            # Random direction on unit sphere
+            dirs = torch.randn(m, 3, device=device)
+            dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-8)
+            # Keep only those within 60° cone of downward (z < -cos(60°) = -0.5)
+            good = dirs[:, 2] < -0.5
+            remaining_idx = remaining.nonzero(as_tuple=False).squeeze(-1)
+            good_idx = remaining_idx[good]
+            approach_dir[good_idx] = dirs[good]
+
+        approach_dir = approach_dir / (approach_dir.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # 5. Sample d ~ U(-d_range, d_range) and compute EE target
+        # EE is placed along the approach direction (not the surface normal)
+        # fingertip at surface_point, offset by d along approach direction
+        d = (2 * torch.rand(n, device=device) - 1) * self.d_range  # [n]
+        fingertip_pos = surface_pt_w - approach_dir * d.unsqueeze(-1)  # [n, 3] (negative because approach points inward)
+        ee_target_pos = fingertip_pos - approach_dir * self.gripper_offset  # [n, 3] (back along approach)
+
+        # 6. Compute EE orientation from approach direction
+        ee_quat_w = self._quat_from_approach(approach_dir, device, ee_roll_range)
+
+        # 7. IK solve
+        self._solve_ik(env, env_ids, ee_target_pos, ee_quat_w, num_iters=10)
+
+        # 8. Gripper starts open — actions during collection will randomize open/close
+        open_pos = torch.zeros(n, len(self.gripper_joint_ids), device=device)
+        self.robot.write_joint_state_to_sim(
+            open_pos, torch.zeros_like(open_pos),
+            joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+        self.robot.set_joint_position_target(
+            open_pos, joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+
+        self.robot.update(env.sim.get_physics_dt())
+
+    def _quat_from_approach(
+        self, approach_dir: torch.Tensor, device: torch.device,
+        roll_range: tuple[float, float] = (0.0, 6.283185),
+    ) -> torch.Tensor:
+        """Compute quaternion that aligns the gripper approach axis with the given direction."""
+        n = approach_dir.shape[0]
+        src = self.gripper_approach_dir.expand(n, -1)
+        dst = approach_dir
+
+        cross = torch.cross(src, dst, dim=-1)
+        dot = (src * dst).sum(dim=-1, keepdim=True)
+        cross_norm = cross.norm(dim=-1, keepdim=True)
+
+        axis = cross / (cross_norm + 1e-8)
+        angle = torch.atan2(cross_norm, dot)
+
+        half_angle = angle * 0.5
+        quat = torch.cat([torch.cos(half_angle), torch.sin(half_angle) * axis], dim=-1)
+        quat = quat / (quat.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Random roll around approach axis
+        roll_angle = roll_range[0] + (roll_range[1] - roll_range[0]) * torch.rand(n, 1, device=device)
+        roll_half = roll_angle * 0.5
+        roll_quat = torch.cat([torch.cos(roll_half), torch.sin(roll_half) * dst], dim=-1)
+        roll_quat = roll_quat / (roll_quat.norm(dim=-1, keepdim=True) + 1e-8)
+
+        return math_utils.quat_mul(roll_quat, quat)
+
+    def _solve_ik(
+        self, env: ManagerBasedEnv, env_ids: torch.Tensor,
+        target_pos_w: torch.Tensor, target_quat_w: torch.Tensor,
+        num_iters: int = 10,
+    ) -> None:
+        """Solve IK with fixed number of iterations."""
+        pos_b, quat_b = self.solver._compute_frame_pose()
+        pos_b[env_ids], quat_b[env_ids] = math_utils.subtract_frame_transforms(
+            self.robot.data.root_link_pos_w[env_ids],
+            self.robot.data.root_link_quat_w[env_ids],
+            target_pos_w, target_quat_w,
+        )
+        self.solver.process_actions(torch.cat([pos_b, quat_b], dim=1))
+        for _ in range(num_iters):
+            self.solver.apply_actions()
+            delta = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            self.robot.write_joint_state_to_sim(
+                position=(delta + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
+                joint_ids=self.joint_ids, env_ids=env_ids,
+            )
+
+
 class reset_end_effector_round_fixed_asset(ManagerTermBase):
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         fixed_asset_cfg: SceneEntityCfg = cfg.params.get("fixed_asset_cfg")  # type: ignore
@@ -1726,9 +2230,22 @@ class assembly_sampling_event(ManagerTermBase):
 
 
 class MultiResetManager(ManagerTermBase):
+    _lazy_initialized: bool = False
+
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
+        self._lazy_initialized = False
 
+    def _lazy_init(self):
+        """Deferred init — called on first __call__ since IsaacLab's EventManager
+        does not instantiate ManagerTermBase class terms for 'reset' mode before
+        the simulation starts."""
+        if self._lazy_initialized:
+            return
+        self._lazy_initialized = True
+
+        cfg = self.cfg
+        env = self._env
         dataset_dir: str = cfg.params.get("dataset_dir", "")
         reset_types: list[str] = cfg.params.get("reset_types", [])
         probabilities: list[float] = cfg.params.get("probs", [])
@@ -1822,14 +2339,16 @@ class MultiResetManager(ManagerTermBase):
         self,
         env: ManagerBasedEnv,
         env_ids: torch.Tensor,
-        dataset_dir: str,
-        reset_types: list[str],
-        probs: list[float],
+        dataset_dir: str = "",
+        reset_types: list[str] | None = None,
+        probs: list[float] | None = None,
         success: str | None = None,
         curriculum_target: float | None = None,
         curriculum_kappa: float = 2.0,
         curriculum_temperature: float = 2.0,
     ) -> None:
+        self._lazy_init()
+
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self._env.device)
 

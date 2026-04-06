@@ -99,7 +99,7 @@ def sample_object_point_cloud(
         else RigidObjectHasher(num_envs, prim_path_pattern, device=device)
     )
 
-    if hasher.num_root == 0:
+    if hasher.num_root == 0 or len(hasher.collider_prims) == 0:
         return None
 
     replicated_env = torch.all(hasher.root_prim_hashes == hasher.root_prim_hashes[0])

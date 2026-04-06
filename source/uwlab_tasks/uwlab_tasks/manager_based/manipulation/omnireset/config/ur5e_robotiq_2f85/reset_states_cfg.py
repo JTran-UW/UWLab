@@ -603,3 +603,165 @@ class ObjectPartiallyAssembledEEGraspedResetStatesCfg(UR5eRobotiq2f85ResetStates
         self.terminations.success.params["receptive_asset_cfg"] = SceneEntityCfg("receptive_object")
         self.terminations.success.params["assembly_success_prob"] = 0.5
         self.terminations.success.params["assembly_threshold_scale"] = 1.5
+
+
+# ---------------------------------------------------------------------------
+# Zero-G reset states termination: collision-free, no stability check
+# ---------------------------------------------------------------------------
+@configclass
+class ZeroGResetStatesTerminationCfg:
+    """Termination for zero-G reset state recording.
+
+    Checks: robot-insertive + robot-receptive collision free, displacement < 10cm.
+    No stability check, no gripper orientation check.
+    """
+
+    time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+
+    abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
+
+    success = DoneTerm(
+        func=task_mdp.check_reset_state_success,
+        params={
+            "object_cfgs": [SceneEntityCfg("insertive_object"), SceneEntityCfg("receptive_object")],
+            "robot_cfg": SceneEntityCfg("robot"),
+            "ee_body_name": "robotiq_base_link",
+            "collision_analyzer_cfgs": [
+                task_mdp.CollisionAnalyzerCfg(
+                    num_points=1024,
+                    max_dist=0.5,
+                    min_dist=-0.0005,
+                    asset_cfg=SceneEntityCfg("robot"),
+                    obstacle_cfgs=[SceneEntityCfg("insertive_object")],
+                ),
+                task_mdp.CollisionAnalyzerCfg(
+                    num_points=1024,
+                    max_dist=0.5,
+                    min_dist=-0.0005,
+                    asset_cfg=SceneEntityCfg("robot"),
+                    obstacle_cfgs=[SceneEntityCfg("receptive_object")],
+                ),
+            ],
+            "max_robot_pos_deviation": 0.1,
+            "max_object_pos_deviation": 0.1,
+            "pos_z_threshold": -10.0,
+            "consecutive_stability_steps": 0,
+            "check_gripper_orientation": False,
+        },
+        time_out=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Zero-G event configs for reset state recording
+# ---------------------------------------------------------------------------
+@configclass
+class ZeroGPartialAssemblyEventCfg(ResetStatesBaseEventCfg):
+    """Zero-G approach: object from PA dataset + EE placed along convex hull surface normals."""
+
+    reset_insertive_object_pose_from_partial_assembly_dataset = EventTerm(
+        func=task_mdp.reset_insertive_object_from_partial_assembly_dataset,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "insertive_object_cfg": SceneEntityCfg("insertive_object"),
+            "receptive_object_cfg": SceneEntityCfg("receptive_object"),
+            "pose_range_b": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+        },
+    )
+
+    reset_end_effector_convex_hull = EventTerm(
+        func=task_mdp.reset_ee_convex_hull_approach,
+        mode="reset",
+        params={
+            "robot_ik_cfg": SceneEntityCfg(
+                "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
+            ),
+            "target_object_cfg": SceneEntityCfg("insertive_object"),
+            "receptive_object_cfg": SceneEntityCfg("receptive_object"),
+            "gripper_offset": 0.115,
+            "d_range": 0.025,
+        },
+    )
+
+
+@configclass
+class ZeroGAnywhereEventCfg(ResetStatesBaseEventCfg):
+    """Zero-G: Object anywhere + EE anywhere (random position around robot)."""
+
+    reset_insertive_object_pose = EventTerm(
+        func=task_mdp.reset_root_states_uniform,
+        mode="reset",
+        params={
+            "pose_range": {
+                "x": (0.3, 0.55),
+                "y": (-0.1, 0.5),
+                "z": (0.0, 0.3),
+                "roll": (-np.pi, np.pi),
+                "pitch": (-np.pi, np.pi),
+                "yaw": (-np.pi, np.pi),
+            },
+            "velocity_range": {},
+            "asset_cfgs": {"insertive_object": SceneEntityCfg("insertive_object")},
+            "offset_asset_cfg": SceneEntityCfg("ur5_metal_support"),
+            "use_bottom_offset": True,
+        },
+    )
+
+    reset_end_effector_pose = EventTerm(
+        func=task_mdp.reset_end_effector_round_fixed_asset,
+        mode="reset",
+        params={
+            "fixed_asset_cfg": SceneEntityCfg("robot"),
+            "fixed_asset_offset": None,
+            "pose_range_b": {
+                "x": (0.3, 0.7),
+                "y": (-0.4, 0.4),
+                "z": (0.0, 0.5),
+                "roll": (0.0, 0.0),
+                "pitch": (np.pi / 4, 3 * np.pi / 4),
+                "yaw": (np.pi / 2, 3 * np.pi / 2),
+            },
+            "robot_ik_cfg": SceneEntityCfg(
+                "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
+            ),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Zero-G approach reset states (top-level env configs)
+# ---------------------------------------------------------------------------
+@configclass
+class ZeroGPartialAssemblyResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
+    """Reset states: object from PA dataset + EE via convex hull approach. Zero gravity."""
+
+    events: ZeroGPartialAssemblyEventCfg = ZeroGPartialAssemblyEventCfg()
+    terminations: ZeroGResetStatesTerminationCfg = ZeroGResetStatesTerminationCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.sim.gravity = (0.0, 0.0, 0.0)
+        self.terminations.success.params["insertive_asset_cfg"] = SceneEntityCfg("insertive_object")
+        self.terminations.success.params["receptive_asset_cfg"] = SceneEntityCfg("receptive_object")
+        self.terminations.success.params["assembly_success_prob"] = 0.5
+        self.terminations.success.params["assembly_threshold_scale"] = 4.0
+
+
+@configclass
+class ZeroGAnywhereResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
+    """Reset states: object anywhere + EE anywhere. Zero gravity."""
+
+    events: ZeroGAnywhereEventCfg = ZeroGAnywhereEventCfg()
+    terminations: ZeroGResetStatesTerminationCfg = ZeroGResetStatesTerminationCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.sim.gravity = (0.0, 0.0, 0.0)
