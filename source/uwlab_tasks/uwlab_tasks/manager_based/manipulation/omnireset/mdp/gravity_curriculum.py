@@ -91,7 +91,10 @@ class RewardWeightCurriculum(ManagerTermBase):
                 self._initial_weights[name] = env.reward_manager.get_term_cfg(name).weight
 
         # Get gravity difficulty fraction from gravity curriculum
-        gravity_term = env.curriculum_manager.get_term_cfg(gravity_curriculum_name).func
+        # CurriculumManager doesn't have get_term_cfg, so look up by name directly
+        cm = env.curriculum_manager
+        gravity_cfg = cm._term_cfgs[cm._term_names.index(gravity_curriculum_name)]
+        gravity_term = gravity_cfg.func
         difficulty_frac = getattr(gravity_term, "difficulty_frac", 0.0)
         decay = 1.0 - difficulty_frac
 
