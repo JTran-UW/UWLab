@@ -58,6 +58,7 @@ class ee_asset_distance_tanh(ManagerTermBase):
         root_asset_offset_metadata_key: str,
         target_asset_offset_metadata_key: str | None = None,
         std: float = 0.1,
+        penalize_distance: bool = False,
     ) -> torch.Tensor:
         root_asset_alignment_pos_w, root_asset_alignment_quat_w = self.root_asset_offset.combine(
             self.root_asset.data.body_link_pos_w[:, root_asset_cfg.body_ids].view(-1, 3),
@@ -81,6 +82,9 @@ class ee_asset_distance_tanh(ManagerTermBase):
 
         pos_distance = torch.norm(target_asset_in_root_asset_frame_pos, dim=1)
 
+        if penalize_distance:
+            # 0 when close, 1 when far — use with negative weight to penalize distance
+            return torch.tanh(pos_distance / std)
         return 1 - torch.tanh(pos_distance / std)
 
 
@@ -219,15 +223,22 @@ def success_reward(env: ManagerBasedRLEnv, context: str = "progress_context") ->
 def gripper_contact(
     env: ManagerBasedRLEnv,
     threshold: float,
+    penalize_no_contact: bool = False,
     left_sensor_cfg: SceneEntityCfg = SceneEntityCfg("left_inner_finger_contact_sensor"),
     right_sensor_cfg: SceneEntityCfg = SceneEntityCfg("right_inner_finger_contact_sensor"),
 ) -> torch.Tensor:
-    """Binary reward: both gripper fingers in contact with object above threshold."""
+    """Binary reward: both gripper fingers in contact with object above threshold.
+
+    If penalize_no_contact is True, returns 1 when NOT in contact (use with negative weight).
+    """
     left_sensor: ContactSensor = env.scene.sensors[left_sensor_cfg.name]
     right_sensor: ContactSensor = env.scene.sensors[right_sensor_cfg.name]
     left_force = torch.norm(left_sensor.data.force_matrix_w.view(env.num_envs, -1, 3)[:, 0, :], dim=-1)
     right_force = torch.norm(right_sensor.data.force_matrix_w.view(env.num_envs, -1, 3)[:, 0, :], dim=-1)
-    return ((left_force > threshold) & (right_force > threshold)).float()
+    in_contact = ((left_force > threshold) & (right_force > threshold)).float()
+    if penalize_no_contact:
+        return 1.0 - in_contact
+    return in_contact
 
 
 def contact_gated_dense_success(

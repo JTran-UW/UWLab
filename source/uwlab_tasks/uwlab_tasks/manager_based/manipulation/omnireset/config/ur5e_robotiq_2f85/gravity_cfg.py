@@ -464,44 +464,39 @@ class Ur5eRobotiq2f85RelCartesianOSCZeroGGPSTrainCfg(Ur5eRobotiq2f85RelCartesian
 
 
 # ---------------------------------------------------------------------------
-# Ablation C: ZeroG states + 50-50 + dense rewards (curricuumed out)
+# Ablation C: ZeroG states + 50-50 + negative distance penalty
 # ---------------------------------------------------------------------------
 @configclass
 class ZeroGDenseRewardsCfg(GravityTrickRewardsCfg):
-    """Sparse + dense rewards (contact + dense success) that get curricuumed out."""
+    """Sparse success + negative penalties for distance and no-contact (decayed with success)."""
 
     ee_asset_distance = RewTerm(
         func=task_mdp.ee_asset_distance_tanh,
-        weight=1.0,
+        weight=-0.1,
         params={
             "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
             "target_asset_cfg": SceneEntityCfg("insertive_object"),
             "root_asset_offset_metadata_key": "gripper_offset",
             "std": 1.0,
+            "penalize_distance": True,
         },
     )
 
     gripper_contact = RewTerm(
         func=task_mdp.gripper_contact,
-        weight=0.5,
-        params={"threshold": 1.0},
-    )
-
-    contact_gated_dense_success = RewTerm(
-        func=task_mdp.contact_gated_dense_success,
-        weight=2.0,
-        params={"std": 0.2, "threshold": 1.0},
+        weight=-0.1,
+        params={"threshold": 1.0, "penalize_no_contact": True},
     )
 
 
 @configclass
 class ZeroGDenseCurriculumsCfg(GravityTrickCurriculumsCfg):
-    """Gravity curriculum + reward weight decay for dense rewards."""
+    """Gravity curriculum + reward weight decay for dense penalties."""
 
     reward_weight_decay = CurrTerm(
         func=task_mdp.RewardWeightCurriculum,
         params={
-            "reward_term_names": ["ee_asset_distance", "gripper_contact", "contact_gated_dense_success"],
+            "reward_term_names": ["ee_asset_distance", "gripper_contact"],
             "gravity_curriculum_name": "gravity_curriculum",
         },
     )
@@ -509,7 +504,7 @@ class ZeroGDenseCurriculumsCfg(GravityTrickCurriculumsCfg):
 
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCZeroGDenseTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """ZeroG states + 50-50 + dense rewards curricuumed out as gravity increases."""
+    """ZeroG states + 50-50 + negative distance/contact penalties (decayed) + gravity curriculum."""
 
     scene: GravityTrickContactSceneCfg = GravityTrickContactSceneCfg(num_envs=32, env_spacing=1.5)
     events: ZeroGStatesEventCfg = ZeroGStatesEventCfg()
