@@ -71,7 +71,7 @@ from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
-from uwlab.envs import UWLabRslRlVecEnvWrapper as RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
 

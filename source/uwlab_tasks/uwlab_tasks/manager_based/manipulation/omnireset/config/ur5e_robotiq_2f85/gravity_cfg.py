@@ -2,21 +2,24 @@
 # All Rights Reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""OmniReset config with gravity trick: procedural resets + gravity curriculum.
+"""ZeroG gravity trick configs for OmniReset peg insertion.
 
-50-50 procedural reset distribution:
-  - ObjectAnywhereEEAnywhere: object + gripper randomly spawned (fully procedural)
-  - ObjectPartiallyAssembledEENear: object from partial assembly dataset, gripper
-    spawned near object via IK (no grasp dataset — avoids collision issues)
+Self-contained — no inheritance from rl_state_cfg. No dynamics randomization.
+Policy and critic share the same observations.
 
-Gravity ramps from 0 to -9.81 via ADR. In zero-g, the floating object lets the robot
-learn to approach and grasp without the object falling.
+Ablations:
+  A) baseline       — ScenePC obs, 50-50 reset sampling
+  B) baseline-state — state obs (pose, no history), 50-50 reset sampling
+  C) gps            — ScenePC obs, GPS curriculum
+  D) gps-state      — state obs, GPS curriculum
+  E) gps-state-nosuccessterm — state obs, GPS, no success termination
 """
 
 from __future__ import annotations
 
-import numpy as np
-
+import isaaclab.sim as sim_utils
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -24,164 +27,98 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.sensors import ContactSensorCfg
+from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
-
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+from uwlab_assets.robots.ur5e_robotiq_gripper import IMPLICIT_UR5E_ROBOTIQ_2F85
 
 from ... import mdp as task_mdp
 
-from .rl_state_cfg import (
-    BaseEventCfg,
-    RewardsCfg,
-    RlStateSceneCfg,
-    TerminationsCfg,
-    Ur5eRobotiq2f85RelCartesianOSCTrainCfg,
-)
 
-
-# ---------------------------------------------------------------------------
-# Rewards: sparse success + regularizers + fail penalty
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Scene
+# ===========================================================================
 @configclass
-class GravityTrickRewardsCfg(RewardsCfg):
-    """Sparse reward with regularizers. Inherits from RewardsCfg, disables dense rewards."""
+class ZeroGSceneCfg(InteractiveSceneCfg):
 
-    # -- Disable inherited dense rewards --
-    abnormal_robot = None
-    dense_success_reward = None
-    ee_asset_distance = None
+    robot = IMPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-    # Regularizers (10x smaller than baseline)
-    action_magnitude = RewTerm(func=task_mdp.action_l2_clamped, weight=-1e-5)
-    action_rate = RewTerm(func=task_mdp.action_rate_l2_clamped, weight=-1e-4)
-    joint_vel = RewTerm(
-        func=task_mdp.joint_vel_l2_clamped,
-        weight=-1e-4,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
-    )
-
-    # Must be non-zero or IsaacLab skips calling it entirely
-    progress_context = RewTerm(
-        func=task_mdp.ProgressContext,  # type: ignore
-        weight=0.1,
-        params={
-            "insertive_asset_cfg": SceneEntityCfg("insertive_object"),
-            "receptive_asset_cfg": SceneEntityCfg("receptive_object"),
-        },
-    )
-
-    # Sparse success
-    success_reward = RewTerm(func=task_mdp.success_reward, weight=10.0)
-
-    # Fail penalty: fires on abnormal_robot or object_out_of_bound
-    fail = RewTerm(
-        func=task_mdp.is_terminated_term,
-        weight=-1.0,
-        params={"term_keys": ["abnormal_robot", "object_out_of_bound"]},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Events: procedural anywhere + partial assembly near + gravity curriculum
-# ---------------------------------------------------------------------------
-@configclass
-class GravityTrickEventCfg(BaseEventCfg):
-    """Procedural 50-50 resets + gravity trick."""
-
-    reset_receptive_object_pose = EventTerm(
-        func=task_mdp.reset_root_states_uniform,
-        mode="reset",
-        params={
-            "pose_range": {
-                "x": (0.3, 0.55),
-                "y": (-0.1, 0.3),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (-np.pi / 12, np.pi / 12),
-            },
-            "velocity_range": {},
-            "asset_cfgs": {"receptive_object": SceneEntityCfg("receptive_object")},
-            "offset_asset_cfg": SceneEntityCfg("ur5_metal_support"),
-            "use_bottom_offset": True,
-        },
-    )
-
-    reset_procedural = EventTerm(
-        func=task_mdp.IKCurriculumResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "robot_ik_cfg": SceneEntityCfg(
-                "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
+    insertive_object: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/InsertiveObject",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
+            scale=(1, 1, 1),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+                disable_gravity=False,
+                kinematic_enabled=False,
             ),
-            "obj_anywhere_range": {
-                "x": (0.3, 0.55),
-                "y": (-0.1, 0.5),
-                "z": (0.0, 0.3),
-                "roll": (-np.pi, np.pi),
-                "pitch": (-np.pi, np.pi),
-                "yaw": (-np.pi, np.pi),
-            },
-            "ee_anywhere_range": {
-                "x": (0.3, 0.7),
-                "y": (-0.4, 0.4),
-                "z": (0.0, 0.5),
-                "roll": (0.0, 0.0),
-                "pitch": (np.pi / 4, 3 * np.pi / 4),
-                "yaw": (np.pi / 2, 3 * np.pi / 2),
-            },
-            "max_resample_attempts": 10,
-        },
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.02),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+    receptive_object: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/ReceptiveObject",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd",
+            scale=(1, 1, 1),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+                disable_gravity=False,
+                kinematic_enabled=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+    table = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Table",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, 0.0, -0.881), rot=(0.707, 0.0, 0.0, -0.707)),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Mounts/UWPatVention/pat_vention.usd",
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+        ),
+    )
+
+    ur5_metal_support = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/UR5MetalSupport",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0, -0.013), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Mounts/UWPatVention2/Ur5MetalSupport/ur5plate.usd",
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+        ),
+    )
+
+    ground = AssetBaseCfg(
+        prim_path="/World/GroundPlane",
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.868)),
+        spawn=sim_utils.GroundPlaneCfg(),
+    )
+
+    sky_light = AssetBaseCfg(
+        prim_path="/World/skyLight",
+        spawn=sim_utils.DomeLightCfg(
+            intensity=1000.0,
+            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+        ),
     )
 
 
-# ---------------------------------------------------------------------------
-# Terminations: add out-of-bounds for zero-g object drift
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Observations — two variants: ScenePC and State (pose)
+# ===========================================================================
 @configclass
-class GravityTrickTerminationsCfg(TerminationsCfg):
-    """Standard terminations + object out-of-bounds (for zero-g drift)."""
-
-    object_out_of_bound = DoneTerm(
-        func=task_mdp.object_out_of_bound,
-        params={
-            "asset_cfg": SceneEntityCfg("insertive_object"),
-            "in_bound_range": {"x": (-0.5, 1.0), "y": (-0.5, 1.0), "z": (-0.1, 1.0)},
-        },
-    )
-
-    success = DoneTerm(func=task_mdp.success_termination)
-
-
-# ---------------------------------------------------------------------------
-# Curriculum: gravity ramp via GravityScheduler
-# ---------------------------------------------------------------------------
-@configclass
-class GravityTrickCurriculumsCfg:
-    """Gravity curriculum: ramps from zero-g to full gravity based on success rate."""
-
-    gravity_curriculum = CurrTerm(
-        func=task_mdp.GravityCurriculum,
-        params={
-            "success_str": "env.reward_manager.get_term_cfg('progress_context').func.success",
-            "max_difficulty": 10,
-            "full_gravity": -9.81,
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
-# Scene pointcloud observations: single combined PC from robot+insertive+receptive
-# ---------------------------------------------------------------------------
-@configclass
-class ScenePCObservationsCfg:
-    """512-pt scene pointcloud (robot+insertive+receptive) in robot base frame."""
+class ScenePCObsCfg:
+    """512-pt scene PC (robot+insertive+receptive). Same obs for policy and critic."""
 
     @configclass
-    class ProprioCfg(ObsGroup):
+    class GroupCfg(ObsGroup):
         prev_actions = ObsTerm(func=task_mdp.last_action)
         joint_pos = ObsTerm(func=task_mdp.joint_pos)
         end_effector_pose = ObsTerm(
@@ -214,175 +151,155 @@ class ScenePCObservationsCfg:
             self.enable_corruption = True
             self.concatenate_terms = True
 
-    proprio: ProprioCfg = ProprioCfg()
+    proprio: GroupCfg = GroupCfg()
     pointcloud: PointcloudCfg = PointcloudCfg()
 
 
-# ---------------------------------------------------------------------------
-# Base env config
-# ---------------------------------------------------------------------------
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
-    """Gravity trick baseline: sparse reward + gravity curriculum + ScenePC."""
+class StateObsCfg:
+    """State obs (poses, no history). Same obs for policy and critic."""
 
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ScenePCObservationsCfg = ScenePCObservationsCfg()
-    rewards: GravityTrickRewardsCfg = GravityTrickRewardsCfg()
-    events: GravityTrickEventCfg = GravityTrickEventCfg()
-    terminations: GravityTrickTerminationsCfg = GravityTrickTerminationsCfg()
-    curriculum: GravityTrickCurriculumsCfg = GravityTrickCurriculumsCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-
-
-# ---------------------------------------------------------------------------
-# Ablation: PA EE lerp range (0.9, 1.0) — EE spawns very close to object for partial assemblies
-# ---------------------------------------------------------------------------
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickPALerpTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick + partial assembly EE lerp (0.9, 1.0)."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.events.reset_procedural.params["pa_ee_lerp_range"] = (0.9, 1.0)
-
-
-# ---------------------------------------------------------------------------
-# Ablation: success_reward weight = 50
-# ---------------------------------------------------------------------------
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickSuccess50TrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick + success_reward weight = 50."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.rewards.success_reward.weight = 50.0
-
-
-# ---------------------------------------------------------------------------
-# Ablation: uniform random gravity (no curriculum)
-# ---------------------------------------------------------------------------
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickRandomGravTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick + uniform random gravity [0, -9.81] each reset (no curriculum)."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        # Disable gravity curriculum
-        self.curriculum = None
-        # Randomize gravity every 16s (interval mode = global, not per-env)
-        self.events.variable_gravity = EventTerm(
-            func=task_mdp.randomize_physics_scene_gravity,
-            mode="interval",
-            interval_range_s=(16.0, 16.0),
+    @configclass
+    class GroupCfg(ObsGroup):
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
             params={
-                "gravity_distribution_params": ([0.0, 0.0, -9.81], [0.0, 0.0, 0.0]),
-                "operation": "abs",
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        insertive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        receptive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        insertive_in_receptive_frame = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("receptive_object"),
+                "rotation_repr": "axis_angle",
             },
         )
 
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
 
-# ---------------------------------------------------------------------------
-# Ablation: contact rewards (sanity check — reach + contact + contact-gated dense success)
-# ---------------------------------------------------------------------------
-@configclass
-class GravityTrickContactSceneCfg(RlStateSceneCfg):
-    """Scene with contact sensors on gripper fingers."""
-
-    right_inner_finger_contact_sensor = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/right_inner_finger",
-        update_period=0.0,
-        history_length=6,
-        debug_vis=False,
-        track_friction_forces=True,
-        max_contact_data_count_per_prim=16,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/InsertiveObject"],
-    )
-
-    left_inner_finger_contact_sensor = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/left_inner_finger",
-        update_period=0.0,
-        history_length=6,
-        debug_vis=False,
-        track_friction_forces=True,
-        max_contact_data_count_per_prim=16,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/InsertiveObject"],
-    )
-
-
-@configclass
-class GravityTrickContactRewardsCfg(GravityTrickRewardsCfg):
-    """Sparse rewards + reach + contact + contact-gated dense success."""
-
-    ee_asset_distance = RewTerm(
-        func=task_mdp.ee_asset_distance_tanh,
-        weight=1.0,
-        params={
-            "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
-            "target_asset_cfg": SceneEntityCfg("insertive_object"),
-            "root_asset_offset_metadata_key": "gripper_offset",
-            "std": 1.0,
-        },
-    )
-
-    gripper_contact = RewTerm(
-        func=task_mdp.gripper_contact,
-        weight=0.5,
-        params={"threshold": 1.0},
-    )
-
-    contact_gated_dense_success = RewTerm(
-        func=task_mdp.contact_gated_dense_success,
-        weight=2.0,
-        params={"std": 0.2, "threshold": 1.0},
-    )
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCGravityTrickContactTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """Gravity trick + contact rewards (sanity check that env works)."""
-
-    scene: GravityTrickContactSceneCfg = GravityTrickContactSceneCfg(num_envs=32, env_spacing=1.5)
-    rewards: GravityTrickContactRewardsCfg = GravityTrickContactRewardsCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.terminations.success = None
-        self.scene.robot.spawn.activate_contact_sensors = True
+    policy: GroupCfg = GroupCfg()
+    critic: GroupCfg = GroupCfg()
 
 
 # ===========================================================================
-# Zero-G State-Based Ablations
+# Actions
 # ===========================================================================
-# All three load pre-recorded ZeroG states via MultiResetManager + gravity curriculum.
+from .actions import Ur5eRobotiq2f85RelativeOSCAction  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Events: load ZeroG states 50-50 (no GPS)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Commands
+# ===========================================================================
 @configclass
-class ZeroGStatesEventCfg(BaseEventCfg):
-    """Load pre-recorded ZeroG states with 50-50 anywhere/partial-assembly mix."""
+class CommandsCfg:
+    task_command = task_mdp.TaskCommandCfg(
+        asset_cfg=SceneEntityCfg("robot", body_names="body"),
+        resampling_time_range=(1e6, 1e6),
+        insertive_asset_cfg=SceneEntityCfg("insertive_object"),
+        receptive_asset_cfg=SceneEntityCfg("receptive_object"),
+    )
 
-    reset_receptive_object_pose = EventTerm(
-        func=task_mdp.reset_root_states_uniform,
-        mode="reset",
+
+# ===========================================================================
+# Rewards — sparse success + regularizers
+# ===========================================================================
+@configclass
+class ZeroGRewardsCfg:
+    action_magnitude = RewTerm(func=task_mdp.action_l2_clamped, weight=-1e-5)
+    action_rate = RewTerm(func=task_mdp.action_rate_l2_clamped, weight=-1e-4)
+    joint_vel = RewTerm(
+        func=task_mdp.joint_vel_l2_clamped,
+        weight=-1e-4,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
+    )
+
+    # Must be non-zero or IsaacLab skips calling it entirely
+    progress_context = RewTerm(
+        func=task_mdp.ProgressContext,  # type: ignore
+        weight=0.1,
         params={
-            "pose_range": {
-                "x": (0.3, 0.55),
-                "y": (-0.1, 0.3),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (-np.pi / 12, np.pi / 12),
-            },
-            "velocity_range": {},
-            "asset_cfgs": {"receptive_object": SceneEntityCfg("receptive_object")},
-            "offset_asset_cfg": SceneEntityCfg("ur5_metal_support"),
-            "use_bottom_offset": True,
+            "insertive_asset_cfg": SceneEntityCfg("insertive_object"),
+            "receptive_asset_cfg": SceneEntityCfg("receptive_object"),
         },
     )
+
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
+
+    fail = RewTerm(
+        func=task_mdp.is_terminated_term,
+        weight=-1.0,
+        params={"term_keys": ["abnormal_robot", "object_out_of_bound"]},
+    )
+
+
+# ===========================================================================
+# Terminations
+# ===========================================================================
+@configclass
+class ZeroGTerminationsCfg:
+    time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+    abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
+    object_out_of_bound = DoneTerm(
+        func=task_mdp.object_out_of_bound,
+        params={
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            "in_bound_range": {"x": (-0.5, 1.0), "y": (-0.5, 1.0), "z": (-0.1, 1.0)},
+        },
+    )
+    success = DoneTerm(func=task_mdp.success_termination)
+
+
+@configclass
+class ZeroGNoSuccessTerminationsCfg(ZeroGTerminationsCfg):
+    success = None
+
+
+# ===========================================================================
+# Curriculum — gravity ramp
+# ===========================================================================
+@configclass
+class ZeroGCurriculumCfg:
+    gravity_curriculum = CurrTerm(
+        func=task_mdp.GravityCurriculum,
+        params={
+            "success_str": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "max_difficulty": 10,
+            "full_gravity": -9.81,
+        },
+    )
+
+
+# ===========================================================================
+# Events — two variants: 50-50 uniform and GPS
+# ===========================================================================
+@configclass
+class ZeroGUniformEventCfg:
+    """Reset from pre-recorded ZeroG states, 50-50 anywhere/partial-assembly."""
+
+    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
 
     reset_from_states = EventTerm(
         func=task_mdp.MultiResetManager,
@@ -396,31 +313,11 @@ class ZeroGStatesEventCfg(BaseEventCfg):
     )
 
 
-# ---------------------------------------------------------------------------
-# Events: load ZeroG states with GPS curriculum over all 20K states
-# ---------------------------------------------------------------------------
 @configclass
-class ZeroGStatesGPSEventCfg(BaseEventCfg):
-    """Load pre-recorded ZeroG states with GPS curriculum."""
+class ZeroGGPSEventCfg:
+    """Reset from pre-recorded ZeroG states with GPS curriculum."""
 
-    reset_receptive_object_pose = EventTerm(
-        func=task_mdp.reset_root_states_uniform,
-        mode="reset",
-        params={
-            "pose_range": {
-                "x": (0.3, 0.55),
-                "y": (-0.1, 0.3),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (-np.pi / 12, np.pi / 12),
-            },
-            "velocity_range": {},
-            "asset_cfgs": {"receptive_object": SceneEntityCfg("receptive_object")},
-            "offset_asset_cfg": SceneEntityCfg("ur5_metal_support"),
-            "use_bottom_offset": True,
-        },
-    )
+    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
 
     reset_from_states = EventTerm(
         func=task_mdp.MultiResetManager,
@@ -437,80 +334,125 @@ class ZeroGStatesGPSEventCfg(BaseEventCfg):
     )
 
 
-# ---------------------------------------------------------------------------
-# Ablation A: ZeroG states baseline (50-50 sampling, sparse rewards)
-# ---------------------------------------------------------------------------
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCZeroGBaselineTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """ZeroG states + 50-50 sampling + sparse rewards + gravity curriculum."""
-
-    events: ZeroGStatesEventCfg = ZeroGStatesEventCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-
-
-# ---------------------------------------------------------------------------
-# Ablation B: ZeroG states + GPS over all 20K states
-# ---------------------------------------------------------------------------
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCZeroGGPSTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """ZeroG states + GPS curriculum over all states + sparse rewards + gravity curriculum."""
-
-    events: ZeroGStatesGPSEventCfg = ZeroGStatesGPSEventCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-
-
-# ---------------------------------------------------------------------------
-# Ablation C: ZeroG states + 50-50 + negative distance penalty
-# ---------------------------------------------------------------------------
-@configclass
-class ZeroGDenseRewardsCfg(GravityTrickRewardsCfg):
-    """Sparse success + negative penalties for distance and no-contact (decayed with success)."""
-
-    ee_asset_distance = RewTerm(
-        func=task_mdp.ee_asset_distance_tanh,
-        weight=-0.1,
-        params={
-            "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
-            "target_asset_cfg": SceneEntityCfg("insertive_object"),
-            "root_asset_offset_metadata_key": "gripper_offset",
-            "std": 1.0,
-            "penalize_distance": True,
-        },
-    )
-
-    gripper_contact = RewTerm(
-        func=task_mdp.gripper_contact,
-        weight=-0.1,
-        params={"threshold": 1.0, "penalize_no_contact": True},
+# ===========================================================================
+# Hydra variants (single-task object swaps)
+# ===========================================================================
+def _make_rigid_obj(usd_path: str, kinematic: bool = False, mass: float = 0.02) -> RigidObjectCfg:
+    return RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/InsertiveObject" if not kinematic else "{ENV_REGEX_NS}/ReceptiveObject",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=usd_path,
+            scale=(1, 1, 1),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+                disable_gravity=False,
+                kinematic_enabled=kinematic,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=mass),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
     )
 
 
+variants = {
+    "scene.insertive_object": {
+        "peg": _make_rigid_obj(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"),
+        "fbleg": _make_rigid_obj(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
+        "fbdrawerbottom": _make_rigid_obj(
+            f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd"
+        ),
+    },
+    "scene.receptive_object": {
+        "peghole": _make_rigid_obj(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd", kinematic=True, mass=0.5),
+        "fbtabletop": _make_rigid_obj(
+            f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareTableTop/square_table_top.usd", kinematic=True, mass=0.5
+        ),
+        "fbdrawerbox": _make_rigid_obj(
+            f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd", kinematic=True, mass=0.5
+        ),
+    },
+}
+
+
+# ===========================================================================
+# Base env config
+# ===========================================================================
 @configclass
-class ZeroGDenseCurriculumsCfg(GravityTrickCurriculumsCfg):
-    """Gravity curriculum + reward weight decay for dense penalties."""
+class ZeroGBaseCfg(ManagerBasedRLEnvCfg):
+    """Base config for all ZeroG ablations. Subclasses set observations and events."""
 
-    reward_weight_decay = CurrTerm(
-        func=task_mdp.RewardWeightCurriculum,
-        params={
-            "reward_term_names": ["ee_asset_distance", "gripper_contact"],
-            "gravity_curriculum_name": "gravity_curriculum",
-        },
-    )
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCZeroGDenseTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg):
-    """ZeroG states + 50-50 + negative distance/contact penalties (decayed) + gravity curriculum."""
-
-    scene: GravityTrickContactSceneCfg = GravityTrickContactSceneCfg(num_envs=32, env_spacing=1.5)
-    events: ZeroGStatesEventCfg = ZeroGStatesEventCfg()
-    rewards: ZeroGDenseRewardsCfg = ZeroGDenseRewardsCfg()
-    curriculum: ZeroGDenseCurriculumsCfg = ZeroGDenseCurriculumsCfg()
+    scene: ZeroGSceneCfg = ZeroGSceneCfg(num_envs=32, env_spacing=1.5)
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    rewards: ZeroGRewardsCfg = ZeroGRewardsCfg()
+    terminations: ZeroGTerminationsCfg = ZeroGTerminationsCfg()
+    curriculum: ZeroGCurriculumCfg = ZeroGCurriculumCfg()
+    commands: CommandsCfg = CommandsCfg()
+    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
 
     def __post_init__(self):
-        super().__post_init__()
-        self.scene.robot.spawn.activate_contact_sensors = True
+        self.decimation = 12
+        self.episode_length_s = 16.0
+        self.sim.dt = 1 / 120.0
+        self.sim.physx.solver_type = 1
+        self.sim.physx.max_position_iteration_count = 192
+        self.sim.physx.max_velocity_iteration_count = 1
+        self.sim.physx.bounce_threshold_velocity = 0.02
+        self.sim.physx.friction_offset_threshold = 0.01
+        self.sim.physx.friction_correlation_distance = 0.0005
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
+        self.sim.physx.gpu_max_rigid_contact_count = 2**23
+        self.sim.physx.gpu_max_rigid_patch_count = 2**23
+        self.sim.physx.gpu_collision_stack_size = 2**31
+        self.sim.render.enable_dlssg = True
+        self.sim.render.enable_ambient_occlusion = True
+        self.sim.render.enable_reflections = True
+        self.sim.render.enable_dl_denoiser = True
+        self.variants = variants
+
+
+# ===========================================================================
+# Ablation A: baseline (ScenePC, 50-50)
+# ===========================================================================
+@configclass
+class ZeroGBaselineTrainCfg(ZeroGBaseCfg):
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+    events: ZeroGUniformEventCfg = ZeroGUniformEventCfg()
+
+
+# ===========================================================================
+# Ablation B: baseline-state (state obs, 50-50)
+# ===========================================================================
+@configclass
+class ZeroGBaselineStateTrainCfg(ZeroGBaseCfg):
+    observations: StateObsCfg = StateObsCfg()
+    events: ZeroGUniformEventCfg = ZeroGUniformEventCfg()
+
+
+# ===========================================================================
+# Ablation C: gps (ScenePC, GPS)
+# ===========================================================================
+@configclass
+class ZeroGGPSTrainCfg(ZeroGBaseCfg):
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
+
+
+# ===========================================================================
+# Ablation D: gps-state (state obs, GPS)
+# ===========================================================================
+@configclass
+class ZeroGGPSStateTrainCfg(ZeroGBaseCfg):
+    observations: StateObsCfg = StateObsCfg()
+    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
+
+
+# ===========================================================================
+# Ablation E: gps-state-nosuccessterm (state obs, GPS, no success termination)
+# ===========================================================================
+@configclass
+class ZeroGGPSStateNoTermTrainCfg(ZeroGBaseCfg):
+    observations: StateObsCfg = StateObsCfg()
+    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
+    terminations: ZeroGNoSuccessTerminationsCfg = ZeroGNoSuccessTerminationsCfg()

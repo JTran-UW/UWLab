@@ -12,7 +12,7 @@ from . import agents
 # Register the partial assemblies environment
 gym.register(
     id="OmniReset-PartialAssemblies-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={"env_cfg_entry_point": f"{__name__}.partial_assemblies_cfg:PartialAssembliesCfg"},
     disable_env_checker=True,
 )
@@ -20,14 +20,14 @@ gym.register(
 # Register the grasp sampling environment
 gym.register(
     id="OmniReset-Robotiq2f85-GraspSampling-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={"env_cfg_entry_point": f"{__name__}.grasp_sampling_cfg:Robotiq2f85GraspSamplingCfg"},
     disable_env_checker=True,
 )
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-GripperClose-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={"env_cfg_entry_point": f"{__name__}.gripper_close_cfg:Ur5eRobotiq2f85GripperCloseCfg"},
     disable_env_checker=True,
 )
@@ -35,35 +35,35 @@ gym.register(
 # Register reset states environments
 gym.register(
     id="OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEAnywhere-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ObjectAnywhereEEAnywhereResetStatesCfg"},
 )
 
 gym.register(
     id="OmniReset-UR5eRobotiq2f85-ObjectRestingEEGrasped-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ObjectRestingEEGraspedResetStatesCfg"},
 )
 
 gym.register(
     id="OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEGrasped-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ObjectAnywhereEEGraspedResetStatesCfg"},
 )
 
 gym.register(
     id="OmniReset-UR5eRobotiq2f85-ObjectPartiallyAssembledEEAnywhere-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ObjectPartiallyAssembledEEAnywhereResetStatesCfg"},
 )
 
 gym.register(
     id="OmniReset-UR5eRobotiq2f85-ObjectPartiallyAssembledEEGrasped-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ObjectPartiallyAssembledEEGraspedResetStatesCfg"},
 )
@@ -71,14 +71,14 @@ gym.register(
 # Zero-G approach reset state recording
 gym.register(
     id="OmniReset-UR5eRobotiq2f85-ZeroGPartialAssembly-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ZeroGPartialAssemblyResetStatesCfg"},
 )
 
 gym.register(
     id="OmniReset-UR5eRobotiq2f85-ZeroGAnywhere-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ZeroGAnywhereResetStatesCfg"},
 )
@@ -86,7 +86,7 @@ gym.register(
 # Register SysID env
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-Sysid-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.sysid_cfg:SysidEnvCfg"},
 )
@@ -94,7 +94,7 @@ gym.register(
 # Register Camera Alignment env
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-CameraAlign-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={"env_cfg_entry_point": f"{__name__}.camera_align_cfg:CameraAlignEnvCfg"},
 )
@@ -102,7 +102,7 @@ gym.register(
 # Register RL state environments
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCTrainCfg",
@@ -110,98 +110,68 @@ gym.register(
     },
 )
 
-# Gravity trick: baseline (success=10.0, fail=-1.0)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
+# ===========================================================================
+# ZeroG ablations (self-contained in gravity_cfg.py, no dynamics rand)
+# ===========================================================================
 
-# Gravity trick: PA EE lerp (0.9, 1.0)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-PALerp-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickPALerpTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# Gravity trick: success_reward weight = 50
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-Success50-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickSuccess50TrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# Gravity trick: uniform random gravity (no curriculum)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-RandomGrav-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickRandomGravTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# Gravity trick: contact rewards (sanity check — reach + contact + contact-gated dense)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-GravityTrick-Contact-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCGravityTrickContactTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# ZeroG state-based ablations (load pre-recorded ZeroG states + gravity curriculum)
-# A: baseline 50-50 sampling, sparse rewards
+# A: baseline (ScenePC, 50-50)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-Baseline-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCZeroGBaselineTrainCfg",
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGBaselineTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
     },
 )
 
-# B: GPS over all 20K states
+# B: baseline-state (state obs, 50-50)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-BaselineState-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGBaselineStateTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# C: gps (ScenePC, GPS)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCZeroGGPSTrainCfg",
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
     },
 )
 
-# C: 50-50 + dense rewards curricuumed out over time
+# D: gps-state (state obs, GPS)
 gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-Dense-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSState-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:Ur5eRobotiq2f85RelCartesianOSCZeroGDenseTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStateTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# E: gps-state-nosuccessterm (state obs, GPS, no success termination)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSState-NoTerm-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStateNoTermTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCFinetuneCfg",
@@ -211,7 +181,7 @@ gym.register(
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCEvalCfg",
@@ -221,7 +191,7 @@ gym.register(
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg",
@@ -233,7 +203,7 @@ gym.register(
 # Single-task state baseline ablation (no DR, no history, symmetric obs)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Baseline-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCStateBaselineTrainCfg",
@@ -244,7 +214,7 @@ gym.register(
 # Single-task pointcloud ablation — wrist frame
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-PointCloud-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPointCloudTrainCfg",
@@ -255,7 +225,7 @@ gym.register(
 # Single-task pointcloud ablation — robot base frame
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-PointCloud-BaseFrame-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPointCloudBaseFrameTrainCfg",
@@ -266,7 +236,7 @@ gym.register(
 # Multi-task RL state environments
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.multitask_cfg:Ur5eRobotiq2f85RelCartesianOSCMultiTaskTrainCfg",
@@ -276,7 +246,7 @@ gym.register(
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-Simplified-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.multitask_cfg:Ur5eRobotiq2f85RelCartesianOSCMultiTaskSimplifiedTrainCfg",
@@ -286,7 +256,7 @@ gym.register(
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-Curriculum-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": (
@@ -298,7 +268,7 @@ gym.register(
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-Simplified-Curriculum-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": (
@@ -310,7 +280,7 @@ gym.register(
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-PerStateCurriculum-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": (
@@ -322,7 +292,7 @@ gym.register(
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-Simplified-PerStateCurriculum-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": (
@@ -336,7 +306,7 @@ gym.register(
 # Multi-task pointcloud — 128pt wrist frame + shared MLP encoder
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-PointCloud-128-SharedEncoder-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": (
@@ -349,7 +319,7 @@ gym.register(
 # Multi-task pointcloud — 128pt wrist frame + shared MLP encoder + per-state GPS curriculum
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-MultiTask-PointCloud-128-SharedEncoder-PerStateCurriculum-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": (
@@ -363,7 +333,7 @@ gym.register(
 # Single-task pointcloud ablation — 128pt wrist frame + shared MLP encoder
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-PointCloud-128-SharedEncoder-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPC128SharedEncTrainCfg",
@@ -374,7 +344,7 @@ gym.register(
 # RGB environments for data collection and evaluation
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DataCollection-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.data_collection_rgb_cfg:Ur5eRobotiq2f85DataCollectionRGBRelCartesianOSCCfg",
@@ -384,7 +354,7 @@ gym.register(
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-Play-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.data_collection_rgb_cfg:Ur5eRobotiq2f85EvalRGBRelCartesianOSCCfg",
@@ -395,7 +365,7 @@ gym.register(
 # OOD (out-of-distribution) RGB environments
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-OOD-DataCollection-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": (
@@ -407,7 +377,7 @@ gym.register(
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-OOD-Play-v0",
-    entry_point="uwlab.envs:UWLabManagerBasedRLEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.data_collection_rgb_cfg:Ur5eRobotiq2f85EvalRGBRelCartesianOSCOODCfg",
