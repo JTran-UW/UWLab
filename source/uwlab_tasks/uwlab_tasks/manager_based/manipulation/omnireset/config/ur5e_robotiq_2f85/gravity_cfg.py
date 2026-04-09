@@ -16,6 +16,7 @@ Ablations:
   F) gps-state-consecutiveterm — state obs, GPS, consecutive success termination (T=10)
   G) gps-state-highreward — state obs, GPS, success termination + high success reward (10x)
   H) gps-state-truncatesuccess — state obs, GPS, success as truncation (bootstraps V)
+  B2) baseline-state-truncatesuccess — state obs, 50-50, success as truncation
 """
 
 from __future__ import annotations
@@ -465,6 +466,16 @@ class ZeroGBaselineTrainCfg(ZeroGBaseCfg):
 class ZeroGBaselineStateTrainCfg(ZeroGBaseCfg):
     observations: StateObsCfg = StateObsCfg()
     events: ZeroGUniformEventCfg = ZeroGUniformEventCfg()
+
+
+# ===========================================================================
+# Ablation B2: baseline-state-truncatesuccess (state obs, 50-50, success as truncation)
+# ===========================================================================
+@configclass
+class ZeroGBaselineStateTruncateSuccessTrainCfg(ZeroGBaseCfg):
+    observations: StateObsCfg = StateObsCfg()
+    events: ZeroGUniformEventCfg = ZeroGUniformEventCfg()
+    terminations: ZeroGTruncateSuccessTerminationsCfg = ZeroGTruncateSuccessTerminationsCfg()
 
 
 # ===========================================================================

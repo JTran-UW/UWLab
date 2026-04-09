@@ -136,6 +136,17 @@ gym.register(
     },
 )
 
+# B2: baseline-state-truncatesuccess (state obs, 50-50, success as truncation)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-BaselineState-TruncateSuccess-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGBaselineStateTruncateSuccessTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
 # C: gps (ScenePC, GPS)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-v0",
