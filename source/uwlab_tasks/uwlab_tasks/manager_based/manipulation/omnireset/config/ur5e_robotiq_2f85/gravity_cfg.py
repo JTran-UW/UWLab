@@ -13,6 +13,9 @@ Ablations:
   C) gps            — ScenePC obs, GPS curriculum
   D) gps-state      — state obs, GPS curriculum
   E) gps-state-nosuccessterm — state obs, GPS, no success termination
+  F) gps-state-consecutiveterm — state obs, GPS, consecutive success termination (T=10)
+  G) gps-state-highreward — state obs, GPS, success termination + high success reward (10x)
+  H) gps-state-truncatesuccess — state obs, GPS, success as truncation (bootstraps V)
 """
 
 from __future__ import annotations
@@ -255,6 +258,25 @@ class ZeroGRewardsCfg:
     )
 
 
+@configclass
+class ZeroGConsecutiveRewardsCfg(ZeroGRewardsCfg):
+    """Reward only on consecutive success (T=10). No per-frame success reward."""
+
+    success_reward = None
+    consecutive_success_reward = RewTerm(
+        func=task_mdp.consecutive_success_reward,
+        weight=1.0,
+        params={"num_consecutive": 10},
+    )
+
+
+@configclass
+class ZeroGHighRewardsCfg(ZeroGRewardsCfg):
+    """Same as base but success reward weight 50x higher."""
+
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=50.0)
+
+
 # ===========================================================================
 # Terminations
 # ===========================================================================
@@ -275,6 +297,21 @@ class ZeroGTerminationsCfg:
 @configclass
 class ZeroGNoSuccessTerminationsCfg(ZeroGTerminationsCfg):
     success = None
+
+
+@configclass
+class ZeroGTruncateSuccessTerminationsCfg(ZeroGTerminationsCfg):
+    """Success is a truncation (time_out=True) so rsl_rl bootstraps V(s) at success."""
+
+    success = DoneTerm(func=task_mdp.success_termination, time_out=True)
+
+
+@configclass
+class ZeroGConsecutiveSuccessTerminationsCfg(ZeroGTerminationsCfg):
+    success = DoneTerm(
+        func=task_mdp.consecutive_success_state,
+        params={"num_consecutive_successes": 10},
+    )
 
 
 # ===========================================================================
@@ -456,3 +493,34 @@ class ZeroGGPSStateNoTermTrainCfg(ZeroGBaseCfg):
     observations: StateObsCfg = StateObsCfg()
     events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
     terminations: ZeroGNoSuccessTerminationsCfg = ZeroGNoSuccessTerminationsCfg()
+
+
+# ===========================================================================
+# Ablation F: gps-state-consecutiveterm (state obs, GPS, consecutive success T=10)
+# ===========================================================================
+@configclass
+class ZeroGGPSStateConsecutiveTermTrainCfg(ZeroGBaseCfg):
+    observations: StateObsCfg = StateObsCfg()
+    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
+    rewards: ZeroGConsecutiveRewardsCfg = ZeroGConsecutiveRewardsCfg()
+    terminations: ZeroGConsecutiveSuccessTerminationsCfg = ZeroGConsecutiveSuccessTerminationsCfg()
+
+
+# ===========================================================================
+# Ablation G: gps-state-highreward (state obs, GPS, success term + 10x reward)
+# ===========================================================================
+@configclass
+class ZeroGGPSStateHighRewardTrainCfg(ZeroGBaseCfg):
+    observations: StateObsCfg = StateObsCfg()
+    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
+    rewards: ZeroGHighRewardsCfg = ZeroGHighRewardsCfg()
+
+
+# ===========================================================================
+# Ablation H: gps-state-truncatesuccess (state obs, GPS, success as truncation)
+# ===========================================================================
+@configclass
+class ZeroGGPSStateTruncateSuccessTrainCfg(ZeroGBaseCfg):
+    observations: StateObsCfg = StateObsCfg()
+    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
+    terminations: ZeroGTruncateSuccessTerminationsCfg = ZeroGTruncateSuccessTerminationsCfg()
