@@ -796,10 +796,42 @@ def object_out_of_bound(
     return ((pos_local < ranges[:, 0]) | (pos_local > ranges[:, 1])).any(dim=1)
 
 
-def success_termination(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Terminate on first frame of success (position + orientation aligned)."""
-    context_term = env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
-    return getattr(context_term, "success")
+class success_termination(ManagerTermBase):
+    """Terminate on first frame of success (position + orientation aligned).
+
+    Computes success directly from physics state rather than reading the cached
+    value from progress_context, which is stale because the termination manager
+    runs BEFORE the reward manager each step.
+    """
+
+    def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        from .commands import TaskCommand
+
+        self.task_command: TaskCommand = env.command_manager.get_term("task_command")
+
+    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+        tc = self.task_command
+        success_pos_thresh = tc.success_position_threshold
+        success_ori_thresh = tc.success_orientation_threshold
+
+        if tc.is_multitask:
+            ins_pos_w, ins_quat_w = tc._apply_offset_multitask(
+                tc.insertive_asset, tc.ins_offset_pos, tc.ins_offset_quat,
+            )
+            rec_pos_w, rec_quat_w = tc._apply_offset_multitask(
+                tc.receptive_asset, tc.rec_offset_pos, tc.rec_offset_quat,
+            )
+        else:
+            ins_pos_w, ins_quat_w = tc.insertive_asset_offset.apply(tc.insertive_asset)
+            rec_pos_w, rec_quat_w = tc.receptive_asset_offset.apply(tc.receptive_asset)
+
+        rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
+        e_x, e_y, _ = math_utils.euler_xyz_from_quat(rel_quat)
+        euler_xy_distance = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
+        xyz_distance = torch.norm(rel_pos, dim=1)
+
+        return (xyz_distance < success_pos_thresh) & (euler_xy_distance < success_ori_thresh)
 
 
 def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes: int = 10):
