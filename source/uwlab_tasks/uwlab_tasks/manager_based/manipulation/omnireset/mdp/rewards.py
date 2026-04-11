@@ -146,7 +146,10 @@ class ProgressContext(ManagerTermBase):
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         super().reset(env_ids)
-        self.continuous_success_counter[:] = 0
+        if env_ids is None:
+            self.continuous_success_counter[:] = 0
+        else:
+            self.continuous_success_counter[env_ids] = 0
 
     def __call__(
         self,
@@ -218,6 +221,15 @@ def success_reward(env: ManagerBasedRLEnv, context: str = "progress_context") ->
     orientation_aligned: torch.Tensor = getattr(context_term, "orientation_aligned")
     position_aligned: torch.Tensor = getattr(context_term, "position_aligned")
     return torch.where(orientation_aligned & position_aligned, 1.0, 0.0)
+
+
+def consecutive_success_reward(
+    env: ManagerBasedRLEnv, num_consecutive: int = 10, context: str = "progress_context"
+) -> torch.Tensor:
+    """Returns 1.0 only on the frame when continuous_success_counter reaches num_consecutive."""
+    context_term: ManagerTermBase = env.reward_manager.get_term_cfg(context).func  # type: ignore
+    counter: torch.Tensor = getattr(context_term, "continuous_success_counter")
+    return torch.where(counter == num_consecutive, 1.0, 0.0)
 
 
 def gripper_contact(
