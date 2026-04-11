@@ -111,98 +111,10 @@ gym.register(
 )
 
 # ===========================================================================
-# ZeroG ablations (self-contained in gravity_cfg.py, no dynamics rand)
+# ZeroG (self-contained in gravity_cfg.py, GPS + truncated success)
 # ===========================================================================
 
-# A: baseline (ScenePC, 50-50)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-Baseline-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGBaselineTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# B: baseline-state (state obs, 50-50)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-BaselineState-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGBaselineStateTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
-    },
-)
-
-# B2: baseline-state-truncatesuccess (state obs, 50-50, success as truncation)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-BaselineState-TruncateSuccess-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGBaselineStateTruncateSuccessTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
-    },
-)
-
-# C: gps (ScenePC, GPS)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# D: gps-state (state obs, GPS)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSState-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStateTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
-    },
-)
-
-# E: gps-state-nosuccessterm (state obs, GPS, no success termination)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSState-NoTerm-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStateNoTermTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
-    },
-)
-
-# F: gps-state-consecutiveterm (state obs, GPS, consecutive success T=10)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSState-ConsecTerm-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStateConsecutiveTermTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
-    },
-)
-
-# G: gps-state-highreward (state obs, GPS, success termination + 10x success reward)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSState-HighReward-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStateHighRewardTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
-    },
-)
-
-# H: gps-state-truncatesuccess (state obs, GPS, success as truncation — bootstraps V)
+# State obs + GPS + truncated success
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSState-TruncateSuccess-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -210,6 +122,17 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStateTruncateSuccessTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# ScenePC 512pt + GPS + truncated success
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-TruncateSuccess-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSScenePCTruncateSuccessTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
     },
 )
 

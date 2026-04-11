@@ -2,21 +2,17 @@
 # All Rights Reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""ZeroG gravity trick configs for OmniReset peg insertion.
+"""ZeroG gravity trick configs for OmniReset.
 
 Self-contained — no inheritance from rl_state_cfg. No dynamics randomization.
 Policy and critic share the same observations.
 
-Ablations:
-  A) baseline       — ScenePC obs, 50-50 reset sampling
-  B) baseline-state — state obs (pose, no history), 50-50 reset sampling
-  C) gps            — ScenePC obs, GPS curriculum
-  D) gps-state      — state obs, GPS curriculum
-  E) gps-state-nosuccessterm — state obs, GPS, no success termination
-  F) gps-state-consecutiveterm — state obs, GPS, consecutive success termination (T=10)
-  G) gps-state-highreward — state obs, GPS, success termination + high success reward (10x)
-  H) gps-state-truncatesuccess — state obs, GPS, success as truncation (bootstraps V)
-  B2) baseline-state-truncatesuccess — state obs, 50-50, success as truncation
+GPS resets + truncated success termination (bootstraps V at success).
+Hydra variants swap insertive/receptive objects for peg, leg, drawer.
+
+Configs:
+  ZeroGGPSStateTruncateSuccessTrainCfg      — state obs, GPS, truncated success
+  ZeroGGPSScenePCTruncateSuccessTrainCfg    — ScenePC 512pt obs, GPS, truncated success
 """
 
 from __future__ import annotations
@@ -115,11 +111,11 @@ class ZeroGSceneCfg(InteractiveSceneCfg):
 
 
 # ===========================================================================
-# Observations — two variants: ScenePC and State (pose)
+# Observations
 # ===========================================================================
 @configclass
 class ScenePCObsCfg:
-    """512-pt scene PC (robot+insertive+receptive). Same obs for policy and critic."""
+    """512-pt scene PC (robot+insertive+receptive) + proprio. Shared encoder compresses PC to 32d."""
 
     @configclass
     class GroupCfg(ObsGroup):
@@ -259,27 +255,8 @@ class ZeroGRewardsCfg:
     )
 
 
-@configclass
-class ZeroGConsecutiveRewardsCfg(ZeroGRewardsCfg):
-    """Reward only on consecutive success (T=10). No per-frame success reward."""
-
-    success_reward = None
-    consecutive_success_reward = RewTerm(
-        func=task_mdp.consecutive_success_reward,
-        weight=1.0,
-        params={"num_consecutive": 10},
-    )
-
-
-@configclass
-class ZeroGHighRewardsCfg(ZeroGRewardsCfg):
-    """Same as base but success reward weight 50x higher."""
-
-    success_reward = RewTerm(func=task_mdp.success_reward, weight=50.0)
-
-
 # ===========================================================================
-# Terminations
+# Terminations — truncated success (bootstraps V at success)
 # ===========================================================================
 @configclass
 class ZeroGTerminationsCfg:
@@ -292,27 +269,7 @@ class ZeroGTerminationsCfg:
             "in_bound_range": {"x": (-0.5, 1.0), "y": (-0.5, 1.0), "z": (-0.1, 1.0)},
         },
     )
-    success = DoneTerm(func=task_mdp.success_termination)
-
-
-@configclass
-class ZeroGNoSuccessTerminationsCfg(ZeroGTerminationsCfg):
-    success = None
-
-
-@configclass
-class ZeroGTruncateSuccessTerminationsCfg(ZeroGTerminationsCfg):
-    """Success is a truncation (time_out=True) so rsl_rl bootstraps V(s) at success."""
-
     success = DoneTerm(func=task_mdp.success_termination, time_out=True)
-
-
-@configclass
-class ZeroGConsecutiveSuccessTerminationsCfg(ZeroGTerminationsCfg):
-    success = DoneTerm(
-        func=task_mdp.consecutive_success_state,
-        params={"num_consecutive_successes": 10},
-    )
 
 
 # ===========================================================================
@@ -331,26 +288,8 @@ class ZeroGCurriculumCfg:
 
 
 # ===========================================================================
-# Events — two variants: 50-50 uniform and GPS
+# Events — GPS curriculum resets
 # ===========================================================================
-@configclass
-class ZeroGUniformEventCfg:
-    """Reset from pre-recorded ZeroG states, 50-50 anywhere/partial-assembly."""
-
-    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
-
-    reset_from_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
-            "probs": [0.5, 0.5],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-
 @configclass
 class ZeroGGPSEventCfg:
     """Reset from pre-recorded ZeroG states with GPS curriculum."""
@@ -418,13 +357,14 @@ variants = {
 # ===========================================================================
 @configclass
 class ZeroGBaseCfg(ManagerBasedRLEnvCfg):
-    """Base config for all ZeroG ablations. Subclasses set observations and events."""
+    """Base config — GPS resets, truncated success, gravity curriculum."""
 
     scene: ZeroGSceneCfg = ZeroGSceneCfg(num_envs=32, env_spacing=1.5)
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
     rewards: ZeroGRewardsCfg = ZeroGRewardsCfg()
     terminations: ZeroGTerminationsCfg = ZeroGTerminationsCfg()
     curriculum: ZeroGCurriculumCfg = ZeroGCurriculumCfg()
+    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
     commands: CommandsCfg = CommandsCfg()
     viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
 
@@ -451,87 +391,16 @@ class ZeroGBaseCfg(ManagerBasedRLEnvCfg):
 
 
 # ===========================================================================
-# Ablation A: baseline (ScenePC, 50-50)
-# ===========================================================================
-@configclass
-class ZeroGBaselineTrainCfg(ZeroGBaseCfg):
-    observations: ScenePCObsCfg = ScenePCObsCfg()
-    events: ZeroGUniformEventCfg = ZeroGUniformEventCfg()
-
-
-# ===========================================================================
-# Ablation B: baseline-state (state obs, 50-50)
-# ===========================================================================
-@configclass
-class ZeroGBaselineStateTrainCfg(ZeroGBaseCfg):
-    observations: StateObsCfg = StateObsCfg()
-    events: ZeroGUniformEventCfg = ZeroGUniformEventCfg()
-
-
-# ===========================================================================
-# Ablation B2: baseline-state-truncatesuccess (state obs, 50-50, success as truncation)
-# ===========================================================================
-@configclass
-class ZeroGBaselineStateTruncateSuccessTrainCfg(ZeroGBaseCfg):
-    observations: StateObsCfg = StateObsCfg()
-    events: ZeroGUniformEventCfg = ZeroGUniformEventCfg()
-    terminations: ZeroGTruncateSuccessTerminationsCfg = ZeroGTruncateSuccessTerminationsCfg()
-
-
-# ===========================================================================
-# Ablation C: gps (ScenePC, GPS)
-# ===========================================================================
-@configclass
-class ZeroGGPSTrainCfg(ZeroGBaseCfg):
-    observations: ScenePCObsCfg = ScenePCObsCfg()
-    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
-
-
-# ===========================================================================
-# Ablation D: gps-state (state obs, GPS)
-# ===========================================================================
-@configclass
-class ZeroGGPSStateTrainCfg(ZeroGBaseCfg):
-    observations: StateObsCfg = StateObsCfg()
-    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
-
-
-# ===========================================================================
-# Ablation E: gps-state-nosuccessterm (state obs, GPS, no success termination)
-# ===========================================================================
-@configclass
-class ZeroGGPSStateNoTermTrainCfg(ZeroGBaseCfg):
-    observations: StateObsCfg = StateObsCfg()
-    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
-    terminations: ZeroGNoSuccessTerminationsCfg = ZeroGNoSuccessTerminationsCfg()
-
-
-# ===========================================================================
-# Ablation F: gps-state-consecutiveterm (state obs, GPS, consecutive success T=10)
-# ===========================================================================
-@configclass
-class ZeroGGPSStateConsecutiveTermTrainCfg(ZeroGBaseCfg):
-    observations: StateObsCfg = StateObsCfg()
-    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
-    rewards: ZeroGConsecutiveRewardsCfg = ZeroGConsecutiveRewardsCfg()
-    terminations: ZeroGConsecutiveSuccessTerminationsCfg = ZeroGConsecutiveSuccessTerminationsCfg()
-
-
-# ===========================================================================
-# Ablation G: gps-state-highreward (state obs, GPS, success term + 10x reward)
-# ===========================================================================
-@configclass
-class ZeroGGPSStateHighRewardTrainCfg(ZeroGBaseCfg):
-    observations: StateObsCfg = StateObsCfg()
-    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
-    rewards: ZeroGHighRewardsCfg = ZeroGHighRewardsCfg()
-
-
-# ===========================================================================
-# Ablation H: gps-state-truncatesuccess (state obs, GPS, success as truncation)
+# State obs (pose) + GPS + truncated success
 # ===========================================================================
 @configclass
 class ZeroGGPSStateTruncateSuccessTrainCfg(ZeroGBaseCfg):
     observations: StateObsCfg = StateObsCfg()
-    events: ZeroGGPSEventCfg = ZeroGGPSEventCfg()
-    terminations: ZeroGTruncateSuccessTerminationsCfg = ZeroGTruncateSuccessTerminationsCfg()
+
+
+# ===========================================================================
+# ScenePC 512pt + GPS + truncated success
+# ===========================================================================
+@configclass
+class ZeroGGPSScenePCTruncateSuccessTrainCfg(ZeroGBaseCfg):
+    observations: ScenePCObsCfg = ScenePCObsCfg()
