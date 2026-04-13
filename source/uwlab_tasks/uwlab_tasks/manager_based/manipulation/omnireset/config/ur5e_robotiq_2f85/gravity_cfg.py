@@ -435,6 +435,17 @@ class ZeroGGPSScenePCTerminateSuccessHighSuccessTrainCfg(ZeroGBaseCfg):
 
 
 # ===========================================================================
+# ScenePC 512pt + GPS STRICT + TERMINATE success + success weight 100
+# ===========================================================================
+@configclass
+class ZeroGGPSStrictScenePCTerminateSuccessHighSuccessTrainCfg(ZeroGBaseCfg):
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+    rewards: ZeroGRewardsHighSuccessCfg = ZeroGRewardsHighSuccessCfg()
+    terminations: ZeroGTerminateSuccessCfg = ZeroGTerminateSuccessCfg()
+    events: ZeroGGPSStrictEventCfg = ZeroGGPSStrictEventCfg()
+
+
+# ===========================================================================
 # State obs + GPS (strict PA) + truncated success
 # ===========================================================================
 @configclass

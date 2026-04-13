@@ -154,6 +154,17 @@ gym.register(
     },
 )
 
+# ScenePC 512pt + GPS STRICT + TERMINATE success + success weight 100 (ablation)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSStrict-TerminateSuccess-HighSuccess-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStrictScenePCTerminateSuccessHighSuccessTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
+    },
+)
+
 # State obs + GPS (strict PA, scale=2.0) + truncated success
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSStrictState-TruncateSuccess-v0",
