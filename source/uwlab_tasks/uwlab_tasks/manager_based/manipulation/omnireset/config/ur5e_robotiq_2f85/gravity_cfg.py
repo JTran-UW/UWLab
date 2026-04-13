@@ -311,6 +311,14 @@ class ZeroGGPSEventCfg:
     )
 
 
+@configclass
+class ZeroGGPSStrictEventCfg(ZeroGGPSEventCfg):
+    """Same as ZeroGGPSEventCfg but uses tighter (scale=2.0) PA reset states."""
+
+    def __post_init__(self):
+        self.reset_from_states.params["reset_types"] = ["ZeroGAnywhere", "ZeroGPartialAssemblyStrict"]
+
+
 # ===========================================================================
 # Hydra variants (single-task object swaps)
 # ===========================================================================
@@ -404,3 +412,41 @@ class ZeroGGPSStateTruncateSuccessTrainCfg(ZeroGBaseCfg):
 @configclass
 class ZeroGGPSScenePCTruncateSuccessTrainCfg(ZeroGBaseCfg):
     observations: ScenePCObsCfg = ScenePCObsCfg()
+
+
+# ===========================================================================
+# ScenePC 512pt + GPS + TERMINATE success (not truncate) + success weight 100
+# ===========================================================================
+@configclass
+class ZeroGRewardsHighSuccessCfg(ZeroGRewardsCfg):
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=100.0)
+
+
+@configclass
+class ZeroGTerminateSuccessCfg(ZeroGTerminationsCfg):
+    success = DoneTerm(func=task_mdp.success_termination, time_out=False)
+
+
+@configclass
+class ZeroGGPSScenePCTerminateSuccessHighSuccessTrainCfg(ZeroGBaseCfg):
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+    rewards: ZeroGRewardsHighSuccessCfg = ZeroGRewardsHighSuccessCfg()
+    terminations: ZeroGTerminateSuccessCfg = ZeroGTerminateSuccessCfg()
+
+
+# ===========================================================================
+# State obs + GPS (strict PA) + truncated success
+# ===========================================================================
+@configclass
+class ZeroGGPSStrictStateTruncateSuccessTrainCfg(ZeroGBaseCfg):
+    observations: StateObsCfg = StateObsCfg()
+    events: ZeroGGPSStrictEventCfg = ZeroGGPSStrictEventCfg()
+
+
+# ===========================================================================
+# ScenePC 512pt + GPS (strict PA) + truncated success
+# ===========================================================================
+@configclass
+class ZeroGGPSStrictScenePCTruncateSuccessTrainCfg(ZeroGBaseCfg):
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+    events: ZeroGGPSStrictEventCfg = ZeroGGPSStrictEventCfg()
