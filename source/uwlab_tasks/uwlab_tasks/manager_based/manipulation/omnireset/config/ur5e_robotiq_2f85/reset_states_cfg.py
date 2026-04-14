@@ -756,6 +756,19 @@ class ZeroGPartialAssemblyResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
 
 
 @configclass
+class ZeroGPartialAssemblyStrictResetStatesCfg(ZeroGPartialAssemblyResetStatesCfg):
+    """Same as ZeroGPartialAssembly but with tighter assembly basin (scale=2.0 instead of 4.0).
+
+    Produces reset states where the object is deeper/closer to the fully assembled pose,
+    yielding a more concentrated distribution near success.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.terminations.success.params["assembly_threshold_scale"] = 2.0
+
+
+@configclass
 class ZeroGAnywhereResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
     """Reset states: object anywhere + EE anywhere. Zero gravity."""
 

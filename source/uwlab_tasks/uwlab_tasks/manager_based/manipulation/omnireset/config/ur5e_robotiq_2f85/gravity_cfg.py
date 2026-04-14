@@ -28,6 +28,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sim.spawners.wrappers.wrappers_cfg import MultiAssetSpawnerCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
@@ -460,4 +461,85 @@ class ZeroGGPSStrictStateTruncateSuccessTrainCfg(ZeroGBaseCfg):
 @configclass
 class ZeroGGPSStrictScenePCTruncateSuccessTrainCfg(ZeroGBaseCfg):
     observations: ScenePCObsCfg = ScenePCObsCfg()
+    events: ZeroGGPSStrictEventCfg = ZeroGGPSStrictEventCfg()
+
+
+# ===========================================================================
+# Multi-task ZeroG: peg + leg via MultiAssetSpawner
+# ===========================================================================
+@configclass
+class ZeroGMultiTaskSceneCfg(ZeroGSceneCfg):
+    """Peg + leg in one scene via MultiAssetSpawnerCfg. replicate_physics=False required."""
+
+    replicate_physics = False
+
+    insertive_object: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/InsertiveObject",
+        spawn=MultiAssetSpawnerCfg(
+            assets_cfg=[
+                sim_utils.UsdFileCfg(
+                    usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
+                    scale=(1, 1, 1),
+                ),
+                sim_utils.UsdFileCfg(
+                    usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd",
+                    scale=(1, 1, 1),
+                ),
+            ],
+            random_choice=False,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+                disable_gravity=False,
+                kinematic_enabled=False,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.02),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+    receptive_object: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/ReceptiveObject",
+        spawn=MultiAssetSpawnerCfg(
+            assets_cfg=[
+                sim_utils.UsdFileCfg(
+                    usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd",
+                    scale=(1, 1, 1),
+                ),
+                sim_utils.UsdFileCfg(
+                    usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareTableTop/square_table_top.usd",
+                    scale=(1, 1, 1),
+                ),
+            ],
+            random_choice=False,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+                disable_gravity=False,
+                kinematic_enabled=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+
+@configclass
+class ZeroGMultiTaskBaseCfg(ZeroGBaseCfg):
+    """Multi-task base: peg+leg scene, no Hydra object variants."""
+
+    scene: ZeroGMultiTaskSceneCfg = ZeroGMultiTaskSceneCfg(num_envs=32, env_spacing=1.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.variants = {}
+
+
+@configclass
+class ZeroGMultiTaskGPSStrictScenePCTerminateSuccessHighSuccessTrainCfg(ZeroGMultiTaskBaseCfg):
+    """Multi-task R13: peg+leg + ScenePC 512pt + GPSStrict + Terminate Success + success weight 100."""
+
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+    rewards: ZeroGRewardsHighSuccessCfg = ZeroGRewardsHighSuccessCfg()
+    terminations: ZeroGTerminateSuccessCfg = ZeroGTerminateSuccessCfg()
     events: ZeroGGPSStrictEventCfg = ZeroGGPSStrictEventCfg()

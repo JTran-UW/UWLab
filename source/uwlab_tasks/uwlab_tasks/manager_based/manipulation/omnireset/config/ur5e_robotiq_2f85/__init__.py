@@ -187,6 +187,19 @@ gym.register(
     },
 )
 
+# Multi-task ZeroG R13: peg + leg + ScenePC 512pt + GPSStrict + Terminate Success + weight 100
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-MultiTask-GPSStrict-TerminateSuccess-HighSuccess-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.gravity_cfg:ZeroGMultiTaskGPSStrictScenePCTerminateSuccessHighSuccessTrainCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
+    },
+)
+
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
