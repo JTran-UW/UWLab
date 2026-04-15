@@ -2254,6 +2254,7 @@ class MultiResetManager(ManagerTermBase):
             raise ValueError("No reset_types provided")
         if len(reset_types) != len(probabilities):
             raise ValueError("Number of reset_types must match number of probabilities")
+        self.reset_types: list[str] = list(reset_types)
 
         insertive_usd_paths = utils.get_usd_paths_from_spawn_cfg(env.scene["insertive_object"].cfg.spawn)
         receptive_usd_paths = utils.get_usd_paths_from_spawn_cfg(env.scene["receptive_object"].cfg.spawn)
@@ -2329,11 +2330,71 @@ class MultiResetManager(ManagerTermBase):
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
         self.state_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        # One-shot reset-write sanity check: after the first reset, compare the realized
+        # insertive/receptive poses against the dataset we sampled from. Catches silent
+        # failures in MultiAsset heterogeneous writes (e.g. peg states landing in leg envs).
+        self._reset_sanity_done = False
+
     def _get_monitor_id(self, task_type_idx: int, reset_type_idx: torch.Tensor) -> torch.Tensor:
         """Composite index for the success monitor: task_type * num_reset_types + reset_type."""
         if self.is_multitask:
             return task_type_idx * self.num_reset_types + reset_type_idx
         return reset_type_idx
+
+    def _log_reset_sanity(self, env_ids: torch.Tensor) -> None:
+        """One-shot sanity check: read back realized object poses after reset and verify that
+        each env lands near one of the states in its own task-type dataset. Logs per-task
+        mean position error to catch silent cross-asset mis-writes."""
+        if self._reset_sanity_done:
+            return
+        env = self._env
+        ins = env.scene["insertive_object"]
+        rec = env.scene["receptive_object"]
+        # Force a sim write so data buffers reflect the writes from _reset_to.
+        env.scene.write_data_to_sim()
+        ins_pos_local = ins.data.root_pos_w[env_ids] - env.scene.env_origins[env_ids]
+        rec_pos_local = rec.data.root_pos_w[env_ids] - env.scene.env_origins[env_ids]
+
+        print("[MultiResetManager] reset-write sanity check:")
+        for tt_idx in range(self.num_task_types):
+            if self.is_multitask:
+                tt_mask = self.task_type_ids[env_ids] == tt_idx
+            else:
+                tt_mask = torch.ones(env_ids.shape[0], dtype=torch.bool, device=env_ids.device)
+            if not tt_mask.any():
+                continue
+            tt_name = self.task_names[tt_idx] if self.is_multitask else "task_0"
+            ins_sample = ins_pos_local[tt_mask]
+            rec_sample = rec_pos_local[tt_mask]
+
+            # Compare to dataset distribution for this task: min distance from each realized
+            # pose to the closest dataset state for the matching reset type (use PA index 1).
+            rt_idx = min(1, self.num_reset_types - 1)
+            init = self.pair_datasets[tt_idx][rt_idx]["initial_state"]
+            dataset_ins = init["rigid_object"]["insertive_object"]["root_pose"][:, :3]
+            dataset_rec = init["rigid_object"]["receptive_object"]["root_pose"][:, :3]
+            n_sample = min(64, ins_sample.shape[0])
+            ins_sample_k = ins_sample[:n_sample]
+            # Nearest-neighbor distance for each realized env to the dataset.
+            d = torch.cdist(ins_sample_k, dataset_ins)
+            min_d, _ = d.min(dim=1)
+            print(
+                f"  [{tt_name}] n_envs={int(tt_mask.sum())} "
+                f"realized ins_pos mean={ins_sample.mean(dim=0).tolist()} "
+                f"rec_pos mean={rec_sample.mean(dim=0).tolist()}"
+            )
+            print(
+                f"  [{tt_name}] dataset({rt_idx}={self.reset_types[rt_idx]}) "
+                f"ins_pos mean={dataset_ins.mean(dim=0).tolist()} "
+                f"min-NN-dist over {n_sample} envs: mean={min_d.mean().item():.4f} "
+                f"max={min_d.max().item():.4f}"
+            )
+            if min_d.mean().item() > 0.2:
+                print(
+                    f"  [{tt_name}] WARNING: realized object positions are far from the sampled "
+                    f"dataset — reset write may not be landing on the right envs."
+                )
+        self._reset_sanity_done = True
 
     def __call__(
         self,
@@ -2472,6 +2533,9 @@ class MultiResetManager(ManagerTermBase):
 
         robot: Articulation = self._env.scene["robot"]
         robot.set_joint_velocity_target(torch.zeros_like(robot.data.joint_vel[env_ids]), env_ids=env_ids)
+
+        if not self._reset_sanity_done:
+            self._log_reset_sanity(env_ids)
 
     def _reset_to(
         self,

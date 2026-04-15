@@ -87,7 +87,6 @@ def main(env_cfg, agent_cfg) -> None:
     reset_type = args_cli.reset_type
     if reset_type is None:
         for candidate in [
-            "ZeroGPartialAssemblyStrict",
             "ZeroGPartialAssembly",
             "ZeroGAnywhere",
             "GravityTrickAnywhere",

@@ -741,7 +741,11 @@ class ZeroGAnywhereEventCfg(ResetStatesBaseEventCfg):
 # ---------------------------------------------------------------------------
 @configclass
 class ZeroGPartialAssemblyResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
-    """Reset states: object from PA dataset + EE via convex hull approach. Zero gravity."""
+    """Reset states: object from PA dataset + EE via convex hull approach. Zero gravity.
+
+    Uses ``assembly_threshold_scale=2.0`` so recorded states cluster tightly near the
+    assembled pose — the loose scale=4.0 variant was dropped after R14.
+    """
 
     events: ZeroGPartialAssemblyEventCfg = ZeroGPartialAssemblyEventCfg()
     terminations: ZeroGResetStatesTerminationCfg = ZeroGResetStatesTerminationCfg()
@@ -752,19 +756,6 @@ class ZeroGPartialAssemblyResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
         self.terminations.success.params["insertive_asset_cfg"] = SceneEntityCfg("insertive_object")
         self.terminations.success.params["receptive_asset_cfg"] = SceneEntityCfg("receptive_object")
         self.terminations.success.params["assembly_success_prob"] = 0.5
-        self.terminations.success.params["assembly_threshold_scale"] = 4.0
-
-
-@configclass
-class ZeroGPartialAssemblyStrictResetStatesCfg(ZeroGPartialAssemblyResetStatesCfg):
-    """Same as ZeroGPartialAssembly but with tighter assembly basin (scale=2.0 instead of 4.0).
-
-    Produces reset states where the object is deeper/closer to the fully assembled pose,
-    yielding a more concentrated distribution near success.
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
         self.terminations.success.params["assembly_threshold_scale"] = 2.0
 
 

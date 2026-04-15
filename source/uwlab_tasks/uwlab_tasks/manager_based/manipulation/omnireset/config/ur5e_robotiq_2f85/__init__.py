@@ -77,13 +77,6 @@ gym.register(
 )
 
 gym.register(
-    id="OmniReset-UR5eRobotiq2f85-ZeroGPartialAssemblyStrict-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ZeroGPartialAssemblyStrictResetStatesCfg"},
-)
-
-gym.register(
     id="OmniReset-UR5eRobotiq2f85-ZeroGAnywhere-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -121,81 +114,24 @@ gym.register(
 # ZeroG (self-contained in gravity_cfg.py, GPS + truncated success)
 # ===========================================================================
 
-# State obs + GPS + truncated success
+# ScenePC 512pt + GPS + terminate on success (single-task)
 gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSState-TruncateSuccess-v0",
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStateTruncateSuccessTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
-    },
-)
-
-# ScenePC 512pt + GPS + truncated success
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-TruncateSuccess-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSScenePCTruncateSuccessTrainCfg",
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSScenePCTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
     },
 )
 
-# ScenePC 512pt + GPS + TERMINATE success + success weight 100 (ablation)
+# Multi-task ZeroG: peg + leg + ScenePC 512pt + GPS + terminate on success
 gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-TerminateSuccess-HighSuccess-v0",
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-MultiTask-GPS-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSScenePCTerminateSuccessHighSuccessTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# ScenePC 512pt + GPS STRICT + TERMINATE success + success weight 100 (ablation)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSStrict-TerminateSuccess-HighSuccess-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStrictScenePCTerminateSuccessHighSuccessTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# State obs + GPS (strict PA, scale=2.0) + truncated success
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSStrictState-TruncateSuccess-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStrictStateTruncateSuccessTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
-    },
-)
-
-# ScenePC 512pt + GPS (strict PA, scale=2.0) + truncated success
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPSStrict-TruncateSuccess-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSStrictScenePCTruncateSuccessTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
-    },
-)
-
-# Multi-task ZeroG R13: peg + leg + ScenePC 512pt + GPSStrict + Terminate Success + weight 100
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-MultiTask-GPSStrict-TerminateSuccess-HighSuccess-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": (
-            f"{__name__}.gravity_cfg:ZeroGMultiTaskGPSStrictScenePCTerminateSuccessHighSuccessTrainCfg"
-        ),
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGMultiTaskGPSScenePCTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
     },
 )

@@ -5,14 +5,14 @@
 """ZeroG gravity trick configs for OmniReset.
 
 Self-contained — no inheritance from rl_state_cfg. No dynamics randomization.
-Policy and critic share the same observations.
+Policy and critic share the same observations. ScenePC 512pt obs only.
 
-GPS resets + truncated success termination (bootstraps V at success).
+GPS resets + terminate on success + gravity curriculum.
 Hydra variants swap insertive/receptive objects for peg, leg, drawer.
 
 Configs:
-  ZeroGGPSStateTruncateSuccessTrainCfg      — state obs, GPS, truncated success
-  ZeroGGPSScenePCTruncateSuccessTrainCfg    — ScenePC 512pt obs, GPS, truncated success
+  ZeroGGPSScenePCTrainCfg           — single-task ScenePC 512pt + GPS
+  ZeroGMultiTaskGPSScenePCTrainCfg  — multi-task peg+leg ScenePC 512pt + GPS
 """
 
 from __future__ import annotations
@@ -156,55 +156,6 @@ class ScenePCObsCfg:
     pointcloud: PointcloudCfg = PointcloudCfg()
 
 
-@configclass
-class StateObsCfg:
-    """State obs (poses, no history). Same obs for policy and critic."""
-
-    @configclass
-    class GroupCfg(ObsGroup):
-        prev_actions = ObsTerm(func=task_mdp.last_action)
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
-        end_effector_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-        insertive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("insertive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-        receptive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("receptive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-        insertive_in_receptive_frame = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("insertive_object"),
-                "root_asset_cfg": SceneEntityCfg("receptive_object"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    policy: GroupCfg = GroupCfg()
-    critic: GroupCfg = GroupCfg()
-
-
 # ===========================================================================
 # Actions
 # ===========================================================================
@@ -247,7 +198,7 @@ class ZeroGRewardsCfg:
         },
     )
 
-    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=100.0)
 
     fail = RewTerm(
         func=task_mdp.is_terminated_term,
@@ -257,7 +208,7 @@ class ZeroGRewardsCfg:
 
 
 # ===========================================================================
-# Terminations — truncated success (bootstraps V at success)
+# Terminations — terminate on success (success is a hard reset, not a truncation)
 # ===========================================================================
 @configclass
 class ZeroGTerminationsCfg:
@@ -270,7 +221,7 @@ class ZeroGTerminationsCfg:
             "in_bound_range": {"x": (-0.5, 1.0), "y": (-0.5, 1.0), "z": (-0.1, 1.0)},
         },
     )
-    success = DoneTerm(func=task_mdp.success_termination, time_out=True)
+    success = DoneTerm(func=task_mdp.success_termination, time_out=False)
 
 
 # ===========================================================================
@@ -310,14 +261,6 @@ class ZeroGGPSEventCfg:
             "curriculum_temperature": 2.0,
         },
     )
-
-
-@configclass
-class ZeroGGPSStrictEventCfg(ZeroGGPSEventCfg):
-    """Same as ZeroGGPSEventCfg but uses tighter (scale=2.0) PA reset states."""
-
-    def __post_init__(self):
-        self.reset_from_states.params["reset_types"] = ["ZeroGAnywhere", "ZeroGPartialAssemblyStrict"]
 
 
 # ===========================================================================
@@ -366,7 +309,7 @@ variants = {
 # ===========================================================================
 @configclass
 class ZeroGBaseCfg(ManagerBasedRLEnvCfg):
-    """Base config — GPS resets, truncated success, gravity curriculum."""
+    """Base config — GPS resets, terminate on success, gravity curriculum."""
 
     scene: ZeroGSceneCfg = ZeroGSceneCfg(num_envs=32, env_spacing=1.5)
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
@@ -400,68 +343,11 @@ class ZeroGBaseCfg(ManagerBasedRLEnvCfg):
 
 
 # ===========================================================================
-# State obs (pose) + GPS + truncated success
+# ScenePC 512pt + GPS + terminate on success (single-task)
 # ===========================================================================
 @configclass
-class ZeroGGPSStateTruncateSuccessTrainCfg(ZeroGBaseCfg):
-    observations: StateObsCfg = StateObsCfg()
-
-
-# ===========================================================================
-# ScenePC 512pt + GPS + truncated success
-# ===========================================================================
-@configclass
-class ZeroGGPSScenePCTruncateSuccessTrainCfg(ZeroGBaseCfg):
+class ZeroGGPSScenePCTrainCfg(ZeroGBaseCfg):
     observations: ScenePCObsCfg = ScenePCObsCfg()
-
-
-# ===========================================================================
-# ScenePC 512pt + GPS + TERMINATE success (not truncate) + success weight 100
-# ===========================================================================
-@configclass
-class ZeroGRewardsHighSuccessCfg(ZeroGRewardsCfg):
-    success_reward = RewTerm(func=task_mdp.success_reward, weight=100.0)
-
-
-@configclass
-class ZeroGTerminateSuccessCfg(ZeroGTerminationsCfg):
-    success = DoneTerm(func=task_mdp.success_termination, time_out=False)
-
-
-@configclass
-class ZeroGGPSScenePCTerminateSuccessHighSuccessTrainCfg(ZeroGBaseCfg):
-    observations: ScenePCObsCfg = ScenePCObsCfg()
-    rewards: ZeroGRewardsHighSuccessCfg = ZeroGRewardsHighSuccessCfg()
-    terminations: ZeroGTerminateSuccessCfg = ZeroGTerminateSuccessCfg()
-
-
-# ===========================================================================
-# ScenePC 512pt + GPS STRICT + TERMINATE success + success weight 100
-# ===========================================================================
-@configclass
-class ZeroGGPSStrictScenePCTerminateSuccessHighSuccessTrainCfg(ZeroGBaseCfg):
-    observations: ScenePCObsCfg = ScenePCObsCfg()
-    rewards: ZeroGRewardsHighSuccessCfg = ZeroGRewardsHighSuccessCfg()
-    terminations: ZeroGTerminateSuccessCfg = ZeroGTerminateSuccessCfg()
-    events: ZeroGGPSStrictEventCfg = ZeroGGPSStrictEventCfg()
-
-
-# ===========================================================================
-# State obs + GPS (strict PA) + truncated success
-# ===========================================================================
-@configclass
-class ZeroGGPSStrictStateTruncateSuccessTrainCfg(ZeroGBaseCfg):
-    observations: StateObsCfg = StateObsCfg()
-    events: ZeroGGPSStrictEventCfg = ZeroGGPSStrictEventCfg()
-
-
-# ===========================================================================
-# ScenePC 512pt + GPS (strict PA) + truncated success
-# ===========================================================================
-@configclass
-class ZeroGGPSStrictScenePCTruncateSuccessTrainCfg(ZeroGBaseCfg):
-    observations: ScenePCObsCfg = ScenePCObsCfg()
-    events: ZeroGGPSStrictEventCfg = ZeroGGPSStrictEventCfg()
 
 
 # ===========================================================================
@@ -536,10 +422,7 @@ class ZeroGMultiTaskBaseCfg(ZeroGBaseCfg):
 
 
 @configclass
-class ZeroGMultiTaskGPSStrictScenePCTerminateSuccessHighSuccessTrainCfg(ZeroGMultiTaskBaseCfg):
-    """Multi-task R13: peg+leg + ScenePC 512pt + GPSStrict + Terminate Success + success weight 100."""
+class ZeroGMultiTaskGPSScenePCTrainCfg(ZeroGMultiTaskBaseCfg):
+    """Multi-task: peg+leg + ScenePC 512pt + GPS + terminate on success."""
 
     observations: ScenePCObsCfg = ScenePCObsCfg()
-    rewards: ZeroGRewardsHighSuccessCfg = ZeroGRewardsHighSuccessCfg()
-    terminations: ZeroGTerminateSuccessCfg = ZeroGTerminateSuccessCfg()
-    events: ZeroGGPSStrictEventCfg = ZeroGGPSStrictEventCfg()
