@@ -39,7 +39,7 @@ class PatchGPSManager(IKCurriculumResetManager):
 
         # GPS parameters
         self.gps_num_patches: int = cfg.params.get("gps_num_patches", 10000)
-        self.gps_target: float = cfg.params.get("gps_target", 0.33)
+        self.gps_target: float = cfg.params.get("gps_target", 0.5)
         self.gps_kappa: float = cfg.params.get("gps_kappa", 2.0)
         self.gps_temperature: float = cfg.params.get("gps_temperature", 2.0)
         self.gps_anywhere_fraction: float = cfg.params.get("gps_anywhere_fraction", 0.5)
@@ -206,7 +206,7 @@ class PatchGPSManager(IKCurriculumResetManager):
         collision_min_dist: float = 0.0,
         # GPS params (used at init only)
         gps_num_patches: int = 10000,
-        gps_target: float = 0.33,
+        gps_target: float = 0.5,
         gps_kappa: float = 2.0,
         gps_temperature: float = 2.0,
         gps_anywhere_fraction: float = 0.5,

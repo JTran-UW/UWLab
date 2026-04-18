@@ -57,7 +57,7 @@ class SuccessMonitor:
     def sample_by_target_rate_from_rates(
         rates: torch.Tensor,
         num_samples: int,
-        target: float = 0.33,
+        target: float = 0.5,
         kappa: float = 2.0,
         temperature: float = 2.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:

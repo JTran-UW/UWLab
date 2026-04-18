@@ -256,7 +256,7 @@ class ZeroGGPSEventCfg:
             "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
             "probs": [0.5, 0.5],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-            "curriculum_target": 0.33,
+            "curriculum_target": 0.5,
             "curriculum_kappa": 2.0,
             "curriculum_temperature": 2.0,
             "use_classifier": True,
