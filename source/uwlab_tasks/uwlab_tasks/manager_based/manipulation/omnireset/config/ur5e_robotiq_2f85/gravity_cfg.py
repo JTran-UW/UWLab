@@ -152,8 +152,50 @@ class ScenePCObsCfg:
             self.enable_corruption = True
             self.concatenate_terms = True
 
+    @configclass
+    class TimeLeftCfg(ObsGroup):
+        time_left = ObsTerm(func=task_mdp.time_left)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class SuccessClassifierCfg(ObsGroup):
+        """Obs for the auxiliary V_success head: kinematic state + time_left.
+
+        ee_pose is intentionally omitted — no offline FK utility exists, and
+        joint_pos is a bijection to ee_pose, so V_success can learn it.
+        """
+
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        insertive_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "quat",
+            },
+        )
+        receptive_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "quat",
+            },
+        )
+        time_left = ObsTerm(func=task_mdp.time_left)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     proprio: GroupCfg = GroupCfg()
     pointcloud: PointcloudCfg = PointcloudCfg()
+    time_left: TimeLeftCfg = TimeLeftCfg()
+    success_classifier: SuccessClassifierCfg = SuccessClassifierCfg()
 
 
 # ===========================================================================
@@ -262,6 +304,7 @@ class ZeroGGPSEventCfg:
             "use_classifier": True,
             "classifier_hidden_dim": 64,
             "classifier_lr": 1e-3,
+            "use_success_critic": False,
         },
     )
 

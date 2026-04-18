@@ -5,4 +5,5 @@
 
 from .actor_critic_encoder import ActorCriticWithEncoder
 from .on_policy_runner_with_classifier import OnPolicyRunnerWithClassifier
-from .rl_cfg import BehaviorCloningCfg, OffPolicyAlgorithmCfg, RslRlFancyPpoAlgorithmCfg
+from .on_policy_runner_with_success_critic import OnPolicyRunnerWithSuccessCritic
+from .rl_cfg import BehaviorCloningCfg, OffPolicyAlgorithmCfg, RslRlFancyPpoAlgorithmCfg, SuccessCriticCfg

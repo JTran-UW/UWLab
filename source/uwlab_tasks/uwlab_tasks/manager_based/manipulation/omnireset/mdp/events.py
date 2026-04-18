@@ -2364,6 +2364,38 @@ class MultiResetManager(ManagerTermBase):
                 f"total flat states={sum(self.flat_num_states)}"
             )
 
+        # V_success auxiliary value head — injected by the runner.
+        # Candidate success_classifier_obs per reset state: matches live obs group
+        # `success_classifier` = [prev_actions=0, joint_pos, ins_pose_in_robot_frame,
+        #                         rec_pose_in_robot_frame, time_left=1.0].
+        self.use_success_critic: bool = cfg.params.get("use_success_critic", False)
+        if self.use_classifier and self.use_success_critic:
+            raise ValueError("use_classifier and use_success_critic are mutually exclusive")
+        if self.use_success_critic:
+            if self.curriculum_target is None:
+                raise ValueError("use_success_critic=True requires curriculum_target to be set")
+            num_actions = int(env.action_manager.total_action_dim)
+            # Robot base is assumed at world origin — standard for these OmniReset envs.
+            # The live obs uses target_asset_pose_in_root_asset_frame with rotation_repr="quaternion",
+            # which yields 7d (pos+quat). Stored root_pose is 7d in world frame ≈ robot frame when
+            # robot is at origin. Confirm via a log line below; a large residual should surface.
+            self.flat_sc_obs: list[torch.Tensor] = []
+            for tt_idx in range(self.num_task_types):
+                init = self.flat_datasets[tt_idx]["initial_state"]
+                joints = init["articulation"]["robot"]["joint_position"].to(env.device)
+                ins_pose = init["rigid_object"]["insertive_object"]["root_pose"].to(env.device)
+                rec_pose = init["rigid_object"]["receptive_object"]["root_pose"].to(env.device)
+                n = joints.shape[0]
+                prev_actions = torch.zeros(n, num_actions, device=env.device)
+                time_left = torch.ones(n, 1, device=env.device)
+                sc_obs = torch.cat([prev_actions, joints, ins_pose, rec_pose, time_left], dim=-1)
+                self.flat_sc_obs.append(sc_obs)
+            self.success_critic = None  # injected by runner via set_success_critic()
+            print(
+                f"[MultiResetManager] V_success GPS enabled. sc_obs_dim={self.flat_sc_obs[0].shape[-1]}, "
+                f"total flat states={sum(self.flat_num_states)}"
+            )
+
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
         self.state_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
@@ -2447,6 +2479,7 @@ class MultiResetManager(ManagerTermBase):
         use_classifier: bool = False,
         classifier_hidden_dim: int = 64,
         classifier_lr: float = 1e-3,
+        use_success_critic: bool = False,
     ) -> None:
         self._lazy_init()
 
@@ -2517,6 +2550,8 @@ class MultiResetManager(ManagerTermBase):
                 n = self.flat_num_states[tt_idx]
                 if self.use_classifier:
                     tt_rates = self.classifier.predict(self.flat_features[tt_idx])
+                elif self.use_success_critic:
+                    tt_rates = self.success_critic_predict(tt_idx)
                 else:
                     tt_rates = self.curriculum_monitor.success_rate[offset : offset + n]
                 choices, sampling_probs = SuccessMonitor.sample_by_target_rate_from_rates(
@@ -2643,6 +2678,21 @@ class MultiResetManager(ManagerTermBase):
                 )
 
         return metrics
+
+    def set_success_critic(self, critic) -> None:
+        """Runner-side injection: attach the trained V_success module for GPS scoring."""
+        self.success_critic = critic
+
+    @torch.no_grad()
+    def success_critic_predict(self, tt_idx: int) -> torch.Tensor:
+        """Score all candidate reset states of task-type ``tt_idx`` with V_success.
+
+        Returns per-state P(success) in [0, 1]. Before the runner has injected the
+        critic (first rollout), returns uniform 0.5 so the beta kernel is near-uniform.
+        """
+        if getattr(self, "success_critic", None) is None:
+            return torch.full((self.flat_num_states[tt_idx],), 0.5, device=self.device)
+        return self.success_critic.predict(self.flat_sc_obs[tt_idx])
 
     def _reset_to(
         self,

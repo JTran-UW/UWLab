@@ -77,3 +77,20 @@ class RslRlFancyPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
 
     offline_algorithm_cfg: OffPolicyAlgorithmCfg | None = None
     """The configuration for the offline algorithms."""
+
+
+@configclass
+class SuccessCriticCfg:
+    """Auxiliary V_success head trained from terminal-success reward with TD/GAE."""
+
+    hidden_dims: list[int] = [256, 128, 64]
+    activation: str = "elu"
+    obs_normalization: bool = True
+    lr: float = 3e-4
+    num_learning_epochs: int = 4
+    num_mini_batches: int = 4
+    gamma: float = 1.0
+    lam: float = 0.95
+    use_clipped_value_loss: bool = True
+    clip_param: float = 0.2
+    max_grad_norm: float = 1.0

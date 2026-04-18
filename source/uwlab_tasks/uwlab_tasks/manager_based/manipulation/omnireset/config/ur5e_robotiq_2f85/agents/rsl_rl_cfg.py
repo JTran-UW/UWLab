@@ -11,6 +11,7 @@ from uwlab_rl.rsl_rl.rl_cfg import (
     OffPolicyAlgorithmCfg,
     RslRlFancyActorCriticCfg,
     RslRlFancyPpoAlgorithmCfg,
+    SuccessCriticCfg,
 )
 
 
@@ -99,7 +100,8 @@ class SharedEncoder128PPORunnerCfg(Base_PPORunnerCfg):
 
     obs_groups = {
         "policy": ["proprio", "pointcloud"],
-        "critic": ["proprio", "pointcloud"],
+        "critic": ["proprio", "pointcloud", "time_left"],
+        "success_classifier": ["success_classifier"],
     }
     policy = RslRlActorCriticWithEncoderCfg(
         init_noise_std=1.0,
@@ -114,3 +116,4 @@ class SharedEncoder128PPORunnerCfg(Base_PPORunnerCfg):
             "pointcloud": {"hidden_dims": [256, 128], "output_dim": 32},
         },
     )
+    success_critic: SuccessCriticCfg = SuccessCriticCfg()
