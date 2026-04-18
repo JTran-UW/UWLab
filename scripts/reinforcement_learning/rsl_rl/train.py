@@ -111,10 +111,12 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 import rsl_rl.runners.distillation_runner as _distillation_runner_module
 
 from uwlab_rl.rsl_rl.distillation_dagger import DistillationDAgger
+from uwlab_rl.rsl_rl.distillation_runner_split import DistillationRunnerSplit
 from uwlab_rl.rsl_rl.student_teacher_vision import StudentTeacherVision
 
 _distillation_runner_module.StudentTeacherVision = StudentTeacherVision
 _distillation_runner_module.DistillationDAgger = DistillationDAgger
+_distillation_runner_module.DistillationRunnerSplit = DistillationRunnerSplit
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
@@ -243,6 +245,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name == "DistillationRunnerSplit":
+        runner = DistillationRunnerSplit(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs

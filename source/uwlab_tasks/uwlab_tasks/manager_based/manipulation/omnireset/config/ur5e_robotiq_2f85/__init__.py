@@ -130,6 +130,17 @@ gym.register(
     },
 )
 
+# Depth DAgger with fixed per-env student/teacher pool split
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Split-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerSplitRunnerCfg",
+    },
+)
+
 
 # RGB environments for data collection and evaluation
 gym.register(

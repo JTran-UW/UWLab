@@ -1058,7 +1058,8 @@ class MultiResetManager(ManagerTermBase):
 
         # Log current data
         if success is not None:
-            success_mask = torch.where(eval(success)[env_ids], 1.0, 0.0)
+            raw_success = eval(success)
+            success_mask = torch.where(raw_success[env_ids], 1.0, 0.0)
             self.success_monitor.success_update(self.task_id[env_ids], success_mask)
 
             # Log metrics for each task
@@ -1071,6 +1072,28 @@ class MultiResetManager(ManagerTermBase):
                     f"Metrics/task_{task_idx}_prob": self.probs[task_idx].item(),
                     f"Metrics/task_{task_idx}_normalized_prob": self.probs[task_idx].item(),
                 })
+
+            # Per-pool success logging for split student/teacher DAgger.
+            # Runner sets ``env.pool_mask`` (bool, True=student pool). Without it
+            # this block is a no-op.
+            pool_mask = getattr(self._env, "pool_mask", None)
+            if pool_mask is not None:
+                if not hasattr(self, "_student_success_buf"):
+                    self._student_success_buf = torch.zeros(0, device=self.device)
+                    self._teacher_success_buf = torch.zeros(0, device=self.device)
+                    self._pool_buf_len = 1024  # rolling window of most recent resets
+                is_student = pool_mask[env_ids]
+                succ = raw_success[env_ids].float()
+                student_succ = succ[is_student]
+                teacher_succ = succ[~is_student]
+                if student_succ.numel() > 0:
+                    self._student_success_buf = torch.cat([self._student_success_buf, student_succ])[-self._pool_buf_len:]
+                if teacher_succ.numel() > 0:
+                    self._teacher_success_buf = torch.cat([self._teacher_success_buf, teacher_succ])[-self._pool_buf_len:]
+                if self._student_success_buf.numel() > 0:
+                    self._env.extras["log"]["Metrics/success_student_only"] = self._student_success_buf.mean().item()
+                if self._teacher_success_buf.numel() > 0:
+                    self._env.extras["log"]["Metrics/success_teacher_only"] = self._teacher_success_buf.mean().item()
 
             # Log episode length at reset
             ep_lengths = self._env.episode_length_buf[env_ids].float()

@@ -108,6 +108,21 @@ class Depth_DAggerRunnerCfg(RslRlBaseRunnerCfg):
 
 
 @configclass
+class Depth_DAggerSplitRunnerCfg(Depth_DAggerRunnerCfg):
+    """Fixed-mask split variant: first ``student_fraction`` of envs are student-driven, rest teacher-driven.
+
+    Disables β annealing (mutually exclusive with the split mask) and emits
+    ``Metrics/success_student_only`` / ``Metrics/success_teacher_only`` from
+    the reset event for clean attribution.
+    """
+
+    class_name: str = "DistillationRunnerSplit"
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_split"
+    student_fraction: float = 0.5
+    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(beta_anneal_iters=0)
+
+
+@configclass
 class Base_DAggerRunnerCfg(Base_PPORunnerCfg):
     algorithm = RslRlFancyPpoAlgorithmCfg(
         value_loss_coef=1.0,
