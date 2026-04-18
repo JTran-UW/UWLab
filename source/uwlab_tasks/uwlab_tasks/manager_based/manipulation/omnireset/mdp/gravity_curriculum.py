@@ -19,17 +19,48 @@ if TYPE_CHECKING:
 class GravityCurriculum(ManagerTermBase):
     """Curriculum that ramps gravity from zero-g to full gravity based on success rate.
 
-    Tracks a global difficulty fraction (0→1). On each reset batch, increments
-    difficulty for successful envs and decrements for failed ones. Sets the physics
-    scene gravity to ``(0, 0, -9.81 * difficulty_frac)`` each time it's called.
+    Supports two reduction modes for turning per-reset outcomes into a single
+    ``difficulty_frac`` in ``[0, 1]``:
 
-    Returns the current difficulty fraction for wandb logging.
+    - ``mean`` (default, legacy): per-env integer counter in ``[0, max_difficulty]``,
+      ``+1`` on success-aligned-at-reset, ``-1`` otherwise. ``difficulty_frac`` is
+      the mean counter across envs divided by ``max_difficulty``.
+    - ``min_per_bucket``: one float counter per reset bucket (rt0, rt1, ...).
+      Each counter accumulates ``wins - losses`` within that bucket, normalized
+      by total ``num_envs`` per batch so the scale matches the legacy path.
+      ``difficulty_frac`` is the ``min`` of per-bucket counters divided by
+      ``max_difficulty`` — gravity ramps only when the slowest bucket is
+      accumulating net wins. Decouples gravity from reset-sampling distribution.
+
+    Sets the physics scene gravity to ``(0, 0, full_gravity * difficulty_frac)``
+    each call. Returns the current ``difficulty_frac`` for wandb logging.
     """
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
+        # Legacy per-env counter.
         self.current_difficulties = torch.zeros(env.num_envs, device=env.device)
+        # Per-bucket counters (lazy: shape set on first call in min_per_bucket mode).
+        self.bucket_difficulties: torch.Tensor | None = None
+        self._reset_manager = None
         self.difficulty_frac = 0.0
+
+    def _find_reset_manager(self, env):
+        """Walk ``env.event_manager`` to find the first ``MultiResetManager``.
+
+        Imports inside the function to avoid import-time cycles with uwlab_tasks.
+        """
+        event_mgr = getattr(env, "event_manager", None)
+        if event_mgr is None:
+            return None
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp.events import MultiResetManager
+
+        for mode_cfgs in event_mgr._mode_class_term_cfgs.values():
+            for term_cfg in mode_cfgs:
+                func = term_cfg.func
+                if isinstance(func, MultiResetManager):
+                    return func
+        return None
 
     def __call__(
         self,
@@ -38,18 +69,57 @@ class GravityCurriculum(ManagerTermBase):
         success_str: str = "env.reward_manager.get_term_cfg('progress_context').func.success",
         max_difficulty: int = 10,
         full_gravity: float = -9.81,
+        reduction: str = "mean",
     ) -> dict[str, float]:
+        if reduction not in ("mean", "min_per_bucket"):
+            raise ValueError(f"Unknown reduction '{reduction}', expected 'mean' or 'min_per_bucket'")
+
+        log: dict[str, float] = {}
+
         if env_ids is not None and len(env_ids) > 0:
             success = eval(success_str)  # (num_envs,) bool tensor
             success_mask = success[env_ids]
 
-            self.current_difficulties[env_ids] = torch.where(
-                success_mask,
-                self.current_difficulties[env_ids] + 1,
-                self.current_difficulties[env_ids] - 1,
-            ).clamp(min=0, max=max_difficulty)
+            if reduction == "mean":
+                self.current_difficulties[env_ids] = torch.where(
+                    success_mask,
+                    self.current_difficulties[env_ids] + 1,
+                    self.current_difficulties[env_ids] - 1,
+                ).clamp(min=0, max=max_difficulty)
+                self.difficulty_frac = self.current_difficulties.mean().item() / max(max_difficulty, 1)
 
-            self.difficulty_frac = self.current_difficulties.mean().item() / max(max_difficulty, 1)
+            else:  # min_per_bucket
+                if self._reset_manager is None:
+                    self._reset_manager = self._find_reset_manager(env)
+                if self._reset_manager is None or not hasattr(self._reset_manager, "task_id"):
+                    # Reset manager not ready yet (first-ever reset before MultiResetManager._lazy_init).
+                    # Fall back: no update this step. difficulty_frac stays at 0.
+                    pass
+                else:
+                    num_reset_types = self._reset_manager.num_reset_types
+                    if self.bucket_difficulties is None:
+                        self.bucket_difficulties = torch.zeros(
+                            num_reset_types, dtype=torch.float, device=env.device
+                        )
+                    task_ids = self._reset_manager.task_id[env_ids]
+                    per_env_step = 1.0 / env.num_envs
+                    for k in range(num_reset_types):
+                        mask = task_ids == k
+                        if not mask.any():
+                            continue
+                        wins = success_mask[mask].float().sum()
+                        losses = (~success_mask[mask]).float().sum()
+                        delta = (wins - losses) * per_env_step
+                        self.bucket_difficulties[k] = (
+                            self.bucket_difficulties[k] + delta
+                        ).clamp(min=0, max=max_difficulty)
+                    self.difficulty_frac = (
+                        self.bucket_difficulties.min().item() / max(max_difficulty, 1)
+                    )
+                    for k in range(num_reset_types):
+                        log[f"gravity_bucket_{k}_frac"] = (
+                            self.bucket_difficulties[k].item() / max(max_difficulty, 1)
+                        )
 
         # Set gravity based on current difficulty
         import carb
@@ -59,7 +129,8 @@ class GravityCurriculum(ManagerTermBase):
         physics_sim_view = SimulationContext.instance().physics_sim_view
         physics_sim_view.set_gravity(gravity)
 
-        return {"gravity_frac": self.difficulty_frac}
+        log["gravity_frac"] = self.difficulty_frac
+        return log
 
 
 class RewardWeightCurriculum(ManagerTermBase):

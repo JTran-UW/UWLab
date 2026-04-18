@@ -277,6 +277,7 @@ class ZeroGCurriculumCfg:
             "success_str": "env.reward_manager.get_term_cfg('progress_context').func.success",
             "max_difficulty": 10,
             "full_gravity": -9.81,
+            "reduction": "mean",  # "mean" (legacy, per-env counter) or "min_per_bucket" (decouples from GPS sampling)
         },
     )
 
