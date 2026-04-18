@@ -74,6 +74,16 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
 
+# Inject UWLab distillation classes into rsl_rl's distillation_runner module so
+# the runner's eval(class_name) lookup resolves them at checkpoint load time.
+import rsl_rl.runners.distillation_runner as _distillation_runner_module
+
+from uwlab_rl.rsl_rl.distillation_dagger import DistillationDAgger
+from uwlab_rl.rsl_rl.student_teacher_vision import StudentTeacherVision
+
+_distillation_runner_module.StudentTeacherVision = StudentTeacherVision
+_distillation_runner_module.DistillationDAgger = DistillationDAgger
+
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path

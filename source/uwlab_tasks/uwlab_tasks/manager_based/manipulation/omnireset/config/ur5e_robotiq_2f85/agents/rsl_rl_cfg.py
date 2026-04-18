@@ -3,8 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from dataclasses import MISSING
+
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
 from uwlab_rl.rsl_rl.rl_cfg import (
     BehaviorCloningCfg,
@@ -50,6 +52,58 @@ class Base_PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
+    )
+
+
+@configclass
+class DistillationDAggerAlgorithmCfg:
+    """Algorithm cfg for ``DistillationDAgger`` (β-annealed DAgger, MSE on mean)."""
+
+    class_name: str = "DistillationDAgger"
+    num_learning_epochs: int = 5
+    learning_rate: float = 1.0e-4
+    gradient_length: int = 15
+    max_grad_norm: float | None = 1.0
+    optimizer: str = "adam"
+    loss_type: str = "mse"
+    beta_anneal_iters: int = 0
+
+
+@configclass
+class StudentTeacherVisionPolicyCfg:
+    """Policy cfg for the depth CNN student + JIT teacher."""
+
+    class_name: str = "StudentTeacherVision"
+    # non-MISSING default so hydra CLI string overrides pass type-check
+    teacher_jit_path: str = ""
+    vision_groups: list[str] = MISSING
+    embed_dim: int = 128
+    student_hidden_dims: list[int] = MISSING
+    activation: str = "elu"
+    init_noise_std: float = 0.1
+    noise_std_type: str = "scalar"
+    student_obs_normalization: bool = True
+
+
+@configclass
+class Depth_DAggerRunnerCfg(RslRlBaseRunnerCfg):
+    """DAgger with depth student + JIT state teacher via rsl_rl ``DistillationRunner``."""
+
+    class_name: str = "DistillationRunner"
+    num_steps_per_env: int = 8
+    max_iterations: int = 30000
+    save_interval: int = 100
+    # Leave empirical_normalization as MISSING so IsaacLab's deprecated-cfg shim
+    # skips the auto-migration (it assumes actor/critic-style policies).
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger"
+    obs_groups: dict = {
+        "policy": ["proprio"],
+        "teacher": ["teacher"],
+    }
+    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(beta_anneal_iters=2000)
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth"],
+        student_hidden_dims=[512, 256],
     )
 
 

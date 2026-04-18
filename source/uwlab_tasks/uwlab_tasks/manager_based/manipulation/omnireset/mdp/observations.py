@@ -209,6 +209,7 @@ def process_image(
     data_type: str = "rgb",
     process_image: bool = True,
     output_size: tuple = (224, 224),
+    depth_clip: tuple[float, float] = (0.01, 2.0),
 ) -> torch.Tensor:
     """Images of a specific datatype from the camera sensor.
 
@@ -216,18 +217,24 @@ def process_image(
     data-types:
 
     - "rgb": Scales the image to (0, 1) and subtracts with the mean of the current image batch.
-    - "depth" or "distance_to_camera" or "distance_to_plane": Replaces infinity values with zero.
+    - "depth" or "distance_to_camera" or "distance_to_image_plane": replaces inf/nan with ``depth_clip[1]``,
+      clips to ``depth_clip``, and normalizes to [0, 1].
 
     Args:
         env: The environment the cameras are placed within.
         sensor_cfg: The desired sensor to read from. Defaults to SceneEntityCfg("tiled_camera").
         data_type: The data type to pull from the desired camera. Defaults to "rgb".
         process_image: Whether to normalize the image. Defaults to True.
+        depth_clip: (min, max) meters for depth clipping/normalization. Ignored for rgb.
 
     Returns:
         The images produced at the last time-step
     """
-    assert data_type == "rgb", "Only RGB images are supported for now."
+    assert data_type in ("rgb", "depth", "distance_to_camera", "distance_to_image_plane"), (
+        f"Unsupported data_type: {data_type}"
+    )
+    is_depth = data_type != "rgb"
+
     # extract the used quantities (to enable type-hinting)
     sensor: TiledCamera | Camera | RayCasterCamera = env.scene.sensors[sensor_cfg.name]
 
@@ -238,17 +245,24 @@ def process_image(
     s = start_dims[-1] if len(start_dims) > 0 else -1
     current_size = (images.shape[s + 1], images.shape[s + 2])
 
-    # Convert to float32 and normalize in-place
-    images = images.to(dtype=torch.float32)  # Avoid redundant .float() and .type() calls
-    images.div_(255.0).clamp_(0.0, 1.0)  # Normalize and clip in-place
+    # Convert to float32 and normalize based on modality
+    images = images.to(dtype=torch.float32)
+    if is_depth:
+        d_min, d_max = depth_clip
+        # Replace inf/nan with d_max (no-return pixels), then clip and normalize to [0, 1]
+        images = torch.nan_to_num(images, nan=d_max, posinf=d_max, neginf=d_max)
+        images.clamp_(d_min, d_max).sub_(d_min).div_(d_max - d_min)
+    else:
+        images.div_(255.0).clamp_(0.0, 1.0)
     images = images.permute(start_dims + [s + 3, s + 1, s + 2])
 
     if current_size != output_size:
         # Perform resize operation
         images = F.interpolate(images, size=output_size, mode="bilinear", antialias=True)
 
-    # rgb/depth image normalization
+    # Skip normalization path: only valid for rgb (uint8 serialization)
     if not process_image:
+        assert not is_depth, "process_image=False (uint8 path) is only supported for rgb"
         # Reverse the permutation
         reverse_dims = torch.argsort(torch.tensor(start_dims + [s + 3, s + 1, s + 2]))
         images = images.permute(reverse_dims.tolist())

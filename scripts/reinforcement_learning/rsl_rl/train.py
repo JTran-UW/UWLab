@@ -106,6 +106,16 @@ from isaaclab.utils.io import dump_yaml
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 
+# Inject UWLab distillation classes into rsl_rl's distillation_runner module so
+# the runner's eval(class_name) lookup resolves them.
+import rsl_rl.runners.distillation_runner as _distillation_runner_module
+
+from uwlab_rl.rsl_rl.distillation_dagger import DistillationDAgger
+from uwlab_rl.rsl_rl.student_teacher_vision import StudentTeacherVision
+
+_distillation_runner_module.StudentTeacherVision = StudentTeacherVision
+_distillation_runner_module.DistillationDAgger = DistillationDAgger
+
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
 from isaaclab.utils.assets import retrieve_file_path
