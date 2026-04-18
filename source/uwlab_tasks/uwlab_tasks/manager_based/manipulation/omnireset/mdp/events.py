@@ -35,6 +35,7 @@ from uwlab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActi
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
 
 from ..assembly_keypoints import Offset
+from .success_classifier import SuccessClassifier
 from .success_monitor import SuccessMonitor
 from .success_monitor_cfg import SuccessMonitorCfg
 
@@ -2265,6 +2266,9 @@ class MultiResetManager(ManagerTermBase):
         if self.is_multitask:
             self.task_type_ids = torch.arange(env.num_envs, device=env.device) % self.num_task_types
             self.task_names = [utils.object_name_from_usd(p) for p in insertive_usd_paths]
+        else:
+            self.task_type_ids = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+            self.task_names = [utils.object_name_from_usd(insertive_usd_paths[0])]
 
         self.pair_datasets: list[list] = []
         self.pair_num_states: list[list[int]] = []
@@ -2325,6 +2329,39 @@ class MultiResetManager(ManagerTermBase):
             self.flat_offsets = torch.tensor(
                 [sum(self.flat_num_states[:i]) for i in range(self.num_task_types)],
                 dtype=torch.long, device=env.device,
+            )
+
+        # Success classifier (trained critic-style by the runner after each PPO update).
+        # Feature per flat state: joint_position (all robot joints) + ins root_pose (7) + rec root_pose (7).
+        self.use_classifier: bool = cfg.params.get("use_classifier", False)
+        if self.use_classifier:
+            if self.curriculum_target is None:
+                raise ValueError("use_classifier=True requires curriculum_target to be set")
+            self.flat_features: list[torch.Tensor] = []
+            for tt_idx in range(self.num_task_types):
+                init = self.flat_datasets[tt_idx]["initial_state"]
+                joints = init["articulation"]["robot"]["joint_position"].to(env.device)
+                ins_pose = init["rigid_object"]["insertive_object"]["root_pose"].to(env.device)
+                rec_pose = init["rigid_object"]["receptive_object"]["root_pose"].to(env.device)
+                feats = torch.cat([joints, ins_pose, rec_pose], dim=-1)
+                self.flat_features.append(feats)
+            feat_dim = self.flat_features[0].shape[-1]
+            self.classifier = SuccessClassifier(
+                input_dim=feat_dim,
+                hidden_dim=int(cfg.params.get("classifier_hidden_dim", 64)),
+                lr=float(cfg.params.get("classifier_lr", 1e-3)),
+                device=str(env.device),
+            )
+            # Per-env cache of the feature vector used at the last reset (label pairs at next reset).
+            self.last_reset_features = torch.zeros(env.num_envs, feat_dim, device=env.device)
+            # Per-rollout pending batch, cleared by runner via classifier_update().
+            self.classifier_batch: list[tuple[torch.Tensor, torch.Tensor]] = []
+            # First-ever reset has no prior episode to label — skip until env has been reset once.
+            self.has_been_reset = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+            print(
+                f"[MultiResetManager] Success classifier enabled. feat_dim={feat_dim}, "
+                f"hidden={cfg.params.get('classifier_hidden_dim', 64)}, "
+                f"total flat states={sum(self.flat_num_states)}"
             )
 
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
@@ -2407,6 +2444,9 @@ class MultiResetManager(ManagerTermBase):
         curriculum_target: float | None = None,
         curriculum_kappa: float = 2.0,
         curriculum_temperature: float = 2.0,
+        use_classifier: bool = False,
+        classifier_hidden_dim: int = 64,
+        classifier_lr: float = 1e-3,
     ) -> None:
         self._lazy_init()
 
@@ -2421,9 +2461,19 @@ class MultiResetManager(ManagerTermBase):
                 monitor_ids = self.task_id[env_ids]
             self.success_monitor.success_update(monitor_ids, success_mask)
 
-            if hasattr(self, "curriculum_monitor") and self.is_multitask:
+            if hasattr(self, "curriculum_monitor"):
                 cur_monitor_ids = self.flat_offsets[self.task_type_ids[env_ids]] + self.state_id[env_ids]
                 self.curriculum_monitor.success_update(cur_monitor_ids, success_mask)
+
+            # Stash (feats, label) pairs for envs that had a prior episode; runner trains at update time.
+            if self.use_classifier:
+                prior_mask = self.has_been_reset[env_ids]
+                if prior_mask.any():
+                    finished_ids = env_ids[prior_mask]
+                    self.classifier_batch.append((
+                        self.last_reset_features[finished_ids].detach().clone(),
+                        success_mask[prior_mask].detach().clone(),
+                    ))
 
             success_rates = self.success_monitor.get_success_rate()
             if "log" not in self._env.extras:
@@ -2452,7 +2502,7 @@ class MultiResetManager(ManagerTermBase):
             ep_lengths = self._env.episode_length_buf[env_ids].float()
             self._env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
 
-        if self.curriculum_target is not None and hasattr(self, "curriculum_monitor") and self.is_multitask:
+        if self.curriculum_target is not None and hasattr(self, "curriculum_monitor"):
             state_indices = torch.empty(len(env_ids), dtype=torch.int64, device=self.device)
             env_task_types = self.task_type_ids[env_ids]
 
@@ -2465,7 +2515,10 @@ class MultiResetManager(ManagerTermBase):
                     continue
                 offset = self.flat_offsets[tt_idx].item()
                 n = self.flat_num_states[tt_idx]
-                tt_rates = self.curriculum_monitor.success_rate[offset : offset + n]
+                if self.use_classifier:
+                    tt_rates = self.classifier.predict(self.flat_features[tt_idx])
+                else:
+                    tt_rates = self.curriculum_monitor.success_rate[offset : offset + n]
                 choices, sampling_probs = SuccessMonitor.sample_by_target_rate_from_rates(
                     tt_rates, int(tt_mask.sum()),
                     self.curriculum_target, self.curriculum_kappa, self.curriculum_temperature,
@@ -2499,7 +2552,13 @@ class MultiResetManager(ManagerTermBase):
                 self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
                 self.task_id[current_env_ids] = self.flat_rt_labels[tt_idx][current_state_indices]
 
+                # Cache features of newly-chosen reset for this env — paired with label at next reset.
+                if self.use_classifier:
+                    self.last_reset_features[current_env_ids] = self.flat_features[tt_idx][current_state_indices]
+
             self.state_id[env_ids] = state_indices
+            if self.use_classifier:
+                self.has_been_reset[env_ids] = True
 
         else:
             reset_type_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
@@ -2536,6 +2595,54 @@ class MultiResetManager(ManagerTermBase):
 
         if not self._reset_sanity_done:
             self._log_reset_sanity(env_ids)
+
+    def classifier_update(
+        self, n_epochs: int = 4, minibatch_size: int = 256
+    ) -> dict[str, float]:
+        """Train the success classifier on the current rollout's reset-outcome pairs.
+
+        Called by the runner right after PPO's policy update. Consumes and clears the
+        accumulated ``classifier_batch``. Returns a metrics dict merged into the iter log.
+        """
+        metrics: dict[str, float] = {}
+        if not self.use_classifier or not hasattr(self, "classifier"):
+            return metrics
+
+        if self.classifier_batch:
+            feats = torch.cat([b[0] for b in self.classifier_batch], dim=0)
+            labels = torch.cat([b[1] for b in self.classifier_batch], dim=0)
+        else:
+            feats = torch.zeros(0, self.last_reset_features.shape[-1], device=self.device)
+            labels = torch.zeros(0, device=self.device)
+        self.classifier_batch.clear()
+
+        train_metrics = self.classifier.train_on_pairs(feats, labels, n_epochs, minibatch_size)
+        metrics["Classifier/update_loss"] = train_metrics["update_loss"]
+        metrics["Classifier/samples_per_iter"] = float(train_metrics["samples_per_iter"])
+
+        # Eval metrics: compare classifier predictions against the empirical curriculum monitor.
+        all_preds = []
+        for tt_idx in range(self.num_task_types):
+            all_preds.append(self.classifier.predict(self.flat_features[tt_idx]))
+        preds = torch.cat(all_preds, dim=0)
+        metrics["Classifier/mean_predicted_rate"] = preds.mean().item()
+
+        if hasattr(self, "curriculum_monitor"):
+            empirical = self.curriculum_monitor.success_rate
+            visited = self.curriculum_monitor.success_size > 0
+            metrics["Classifier/visited_frac"] = visited.float().mean().item()
+            if visited.any():
+                p = preds[visited]
+                e = empirical[visited]
+                metrics["Classifier/pred_empirical_mse"] = ((p - e) ** 2).mean().item()
+                p_c = p - p.mean()
+                e_c = e - e.mean()
+                denom = p_c.norm() * e_c.norm()
+                metrics["Classifier/pred_empirical_corr"] = (
+                    (p_c * e_c).sum().item() / denom.item() if denom.item() > 1e-8 else 0.0
+                )
+
+        return metrics
 
     def _reset_to(
         self,

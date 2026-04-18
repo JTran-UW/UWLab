@@ -93,6 +93,10 @@ class Base_DAggerRunnerCfg(Base_PPORunnerCfg):
 class SharedEncoder128PPORunnerCfg(Base_PPORunnerCfg):
     """128-pt PC with shared MLP encoder (both objects concatenated)."""
 
+    class_name: str = "OnPolicyRunnerWithClassifier"
+    classifier_num_epochs: int = 4
+    classifier_minibatch_size: int = 256
+
     obs_groups = {
         "policy": ["proprio", "pointcloud"],
         "critic": ["proprio", "pointcloud"],

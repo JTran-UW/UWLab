@@ -259,6 +259,9 @@ class ZeroGGPSEventCfg:
             "curriculum_target": 0.33,
             "curriculum_kappa": 2.0,
             "curriculum_temperature": 2.0,
+            "use_classifier": True,
+            "classifier_hidden_dim": 64,
+            "classifier_lr": 1e-3,
         },
     )
 
