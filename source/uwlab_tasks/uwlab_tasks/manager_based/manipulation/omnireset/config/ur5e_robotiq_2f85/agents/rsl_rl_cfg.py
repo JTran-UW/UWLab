@@ -109,16 +109,22 @@ class Depth_DAggerRunnerCfg(RslRlBaseRunnerCfg):
 
 @configclass
 class Depth_DAggerSplitRunnerCfg(Depth_DAggerRunnerCfg):
-    """Fixed-mask split variant: first ``student_fraction`` of envs are student-driven, rest teacher-driven.
+    """Fixed-mask split variant with optional held-out eval pool.
+
+    * ``student_fraction``: of the *train* envs, what fraction run student actions.
+    * ``eval_fraction``: fraction of all envs reserved as student-driven, no-grad
+      eval — contamination-free success signal even at tight train cadences
+      (``num_steps_per_env=1``) where same-step gradients create echo-of-teacher bias.
 
     Disables β annealing (mutually exclusive with the split mask) and emits
-    ``Metrics/success_student_only`` / ``Metrics/success_teacher_only`` from
-    the reset event for clean attribution.
+    ``Metrics/success_student_train`` / ``Metrics/success_teacher_train`` /
+    ``Metrics/success_student_eval`` for clean per-pool attribution.
     """
 
     class_name: str = "DistillationRunnerSplit"
     experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_split"
     student_fraction: float = 0.5
+    eval_fraction: float = 0.0
     algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(beta_anneal_iters=0)
 
 
@@ -150,6 +156,7 @@ class State_DAggerSplitRunnerCfg(RslRlBaseRunnerCfg):
     save_interval: int = 100
     experiment_name: str = "ur5e_robotiq_2f85_state_dagger_split"
     student_fraction: float = 0.5
+    eval_fraction: float = 0.0
     obs_groups: dict = {
         "policy": ["teacher"],
         "teacher": ["teacher"],
@@ -174,6 +181,10 @@ class State_DAggerFastRunnerCfg(State_DAggerSplitRunnerCfg):
     num_steps_per_env: int = 1
     # ~8× the prior max_iterations to match env-step volume (8 env steps/iter → 1)
     max_iterations: int = 40000
+    # Reserve 10% of envs as held-out eval (student-driven, no-grad) by default.
+    # Tight cadence (1 step/iter, grad_length=1) applies same-step gradients on
+    # train envs' transitions; eval envs give a contamination-free student signal.
+    eval_fraction: float = 0.1
     algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(
         beta_anneal_iters=0,
         num_learning_epochs=1,

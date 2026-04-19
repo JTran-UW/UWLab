@@ -37,46 +37,73 @@ from rsl_rl.utils import resolve_obs_groups
 
 
 class DistillationRunnerSplit(DistillationRunner):
-    """DistillationRunner that fixes a per-env student/teacher pool split."""
+    """DistillationRunner that fixes a per-env student/teacher/eval pool split.
+
+    Env layout along the batch axis:
+
+    * envs ``[0, num_eval)``           — eval-only: student drives; transitions
+      **excluded from gradient update**. Pure inference signal even at tight
+      train cadences where same-step gradients create echo-of-teacher bias.
+    * envs ``[num_eval, num_eval+num_student_train)`` — train-student: student
+      drives; transitions in gradient.
+    * envs ``[num_eval+num_student_train, num_envs)`` — train-teacher: teacher
+      drives; transitions in gradient.
+    """
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         # Strip split-only keys before the parent sees the cfg.
         self.student_fraction = float(train_cfg.pop("student_fraction", 0.5))
+        self.eval_fraction = float(train_cfg.pop("eval_fraction", 0.0))
         if not 0.0 <= self.student_fraction <= 1.0:
             raise ValueError(f"student_fraction must be in [0, 1]; got {self.student_fraction}")
+        if not 0.0 <= self.eval_fraction <= 1.0:
+            raise ValueError(f"eval_fraction must be in [0, 1]; got {self.eval_fraction}")
 
-        # DistillationRunner's __init__ builds the algorithm. We need the mask ready
-        # before _construct_algorithm is called so DistillationDAgger sees it. The
-        # mask depends on env.num_envs which is available right away.
         num_envs = env.num_envs
-        num_student = round(num_envs * self.student_fraction)
-        mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
-        mask[:num_student] = True
-        self.student_mask = mask
-        self.num_student = num_student
-        self.num_teacher = num_envs - num_student
+        num_eval = round(num_envs * self.eval_fraction)
+        num_train = num_envs - num_eval
+        # student_fraction applies to the *train* envs; eval envs are always student-driven.
+        num_student_train = round(num_train * self.student_fraction)
+        num_teacher = num_train - num_student_train
 
-        # Expose mask to the env for the reset event's per-pool success logging.
-        # Event-side ops are on env.device, runner-side ops on `device`; push a
-        # per-device copy to avoid cross-device indexing failures.
-        env.unwrapped.pool_mask = mask.to(env.unwrapped.device)
+        # student_mask routes actions (student vs teacher) per env.
+        # Eval envs are student-driven, so they're True in student_mask.
+        student_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        student_mask[: num_eval + num_student_train] = True
 
-        # Inject student_mask into the algorithm cfg so _construct_algorithm
-        # passes it to DistillationDAgger.__init__.
+        # eval_mask flags envs whose transitions are masked out of the BC gradient.
+        eval_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        eval_mask[:num_eval] = True
+
+        self.student_mask = student_mask
+        self.eval_mask = eval_mask
+        self.num_eval = num_eval
+        self.num_student_train = num_student_train
+        self.num_teacher = num_teacher
+
+        # Inject masks into the algorithm cfg so _construct_algorithm passes them
+        # to DistillationDAgger.__init__.
         train_cfg["algorithm"] = dict(train_cfg["algorithm"])
-        train_cfg["algorithm"]["student_mask"] = mask
+        train_cfg["algorithm"]["student_mask"] = student_mask
+        train_cfg["algorithm"]["eval_mask"] = eval_mask
+
+        # Expose pool mask to the env for the reset event's per-pool success logging
+        # (legacy; may be partially wiped by ManagerBasedRLEnv._reset_idx on certain
+        # cadences — this runner also tracks per-pool success internally below).
+        env.unwrapped.pool_mask = student_mask.to(env.unwrapped.device)
 
         super().__init__(env, train_cfg, log_dir=log_dir, device=device)
 
-        # Rolling per-pool success buffers (cadence-independent). Populated in
-        # the rollout loop below, logged to SummaryWriter each iteration.
+        # Rolling per-pool success buffers (cadence-independent).
         self._pool_buf_len = 1024
-        self._student_success_buf: deque[float] = deque(maxlen=self._pool_buf_len)
+        self._student_train_success_buf: deque[float] = deque(maxlen=self._pool_buf_len)
         self._teacher_success_buf: deque[float] = deque(maxlen=self._pool_buf_len)
+        self._student_eval_success_buf: deque[float] = deque(maxlen=self._pool_buf_len)
 
         print(
-            f"[DistillationRunnerSplit] pool split: {num_student} student / "
-            f"{self.num_teacher} teacher (fraction={self.student_fraction})"
+            f"[DistillationRunnerSplit] pool split: {num_eval} eval (student, no-grad) / "
+            f"{num_student_train} student-train / {num_teacher} teacher-train "
+            f"(student_fraction={self.student_fraction}, eval_fraction={self.eval_fraction})"
         )
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:  # type: ignore[override]
@@ -134,15 +161,20 @@ class DistillationRunnerSplit(DistillationRunner):
                     self.alg.process_env_step(obs, rewards, dones, extras)
 
                     # Per-pool success tracking (cadence-independent).
+                    # Three categories: eval-only (student, no-grad), student-train, teacher-train.
                     if progress_term is not None:
                         done_ids = dones.view(-1).nonzero(as_tuple=False).view(-1)
                         if done_ids.numel() > 0:
                             succ = progress_term.success[done_ids].float()
-                            is_student_done = self.student_mask.to(dones.device)[done_ids]
-                            student_succ = succ[is_student_done].detach().cpu().tolist()
-                            teacher_succ = succ[~is_student_done].detach().cpu().tolist()
-                            self._student_success_buf.extend(student_succ)
-                            self._teacher_success_buf.extend(teacher_succ)
+                            eval_m = self.eval_mask.to(dones.device)[done_ids]
+                            student_m = self.student_mask.to(dones.device)[done_ids]
+                            # is_student_train: student drives AND not eval-only.
+                            student_train_m = student_m & ~eval_m
+                            # is_teacher_train: teacher drives (implies not eval, since eval is all student).
+                            teacher_train_m = ~student_m
+                            self._student_eval_success_buf.extend(succ[eval_m].detach().cpu().tolist())
+                            self._student_train_success_buf.extend(succ[student_train_m].detach().cpu().tolist())
+                            self._teacher_success_buf.extend(succ[teacher_train_m].detach().cpu().tolist())
 
                     if self.log_dir is not None:
                         if "episode" in extras:
@@ -172,13 +204,17 @@ class DistillationRunnerSplit(DistillationRunner):
                 # other Metrics/* keys (rsl_rl's log() uses the first ep_info's keys
                 # as the schema, so inject into every entry for safety).
                 pool_extras = {}
-                if len(self._student_success_buf) > 0:
-                    pool_extras["Metrics/success_student_only"] = sum(self._student_success_buf) / len(
-                        self._student_success_buf
+                if len(self._student_train_success_buf) > 0:
+                    pool_extras["Metrics/success_student_train"] = sum(self._student_train_success_buf) / len(
+                        self._student_train_success_buf
                     )
                 if len(self._teacher_success_buf) > 0:
-                    pool_extras["Metrics/success_teacher_only"] = sum(self._teacher_success_buf) / len(
+                    pool_extras["Metrics/success_teacher_train"] = sum(self._teacher_success_buf) / len(
                         self._teacher_success_buf
+                    )
+                if len(self._student_eval_success_buf) > 0:
+                    pool_extras["Metrics/success_student_eval"] = sum(self._student_eval_success_buf) / len(
+                        self._student_eval_success_buf
                     )
                 if pool_extras:
                     if not ep_infos:
