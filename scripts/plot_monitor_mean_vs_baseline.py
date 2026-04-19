@@ -13,31 +13,16 @@ import wandb
 api = wandb.Api()
 
 # (label, project, run_id, color, linestyle, linewidth)
+PROJ = "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-v0"
 RUNS = [
-    (
-        "Empirical GPS + monitor_mean (34692434)",
-        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-v0",
-        "zpfkjdkr",
-        "#CC79A7",
-        "-",
-        1.8,
-    ),
-    (
-        "Classifier GPS + monitor_mean (34692435)",
-        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-v0",
-        "4kputdiu",
-        "#0072B2",
-        "-",
-        1.8,
-    ),
-    (
-        "V_success GPS + monitor_mean (34692438)",
-        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-v0",
-        "pvjnai3t",
-        "#D55E00",
-        "-",
-        1.8,
-    ),
+    # current: GPS + monitor_mean (solid)
+    ("Empirical GPS + monitor_mean (34692434)", PROJ, "zpfkjdkr", "#CC79A7", "-", 1.8),
+    ("Classifier GPS + monitor_mean (34692435)", PROJ, "4kputdiu", "#0072B2", "-", 1.8),
+    ("V_success GPS + monitor_mean (34692438)", PROJ, "pvjnai3t", "#D55E00", "-", 1.8),
+    # prior: GPS + mean gravity (dashdot, same hue family)
+    ("Empirical GPS + mean (34674405)", PROJ, "gsr6b2x6", "#CC79A7", "-.", 1.3),
+    ("Classifier GPS + mean (34675161)", PROJ, "c8pkhvv5", "#0072B2", "-.", 1.3),
+    # baseline: uniform routing + mean (dashed black)
     (
         "Uniform baseline (34590465)",
         "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-TerminateSuccess-HighSuccess-v0",
@@ -88,7 +73,7 @@ for ax in axes:
     ax.set_xlabel("iteration")
     ax.grid(alpha=0.3)
 axes[0].legend(fontsize=8, loc="upper left")
-fig.suptitle("Monitor_mean gravity — 3 GPS modes vs uniform baseline (single-task peg ZeroG)", fontsize=11)
+fig.suptitle("GPS + monitor_mean (solid) vs GPS + mean (dashdot) vs uniform+mean baseline (dashed) — peg ZeroG", fontsize=11)
 fig.tight_layout()
 
 out = Path("scripts/monitor_mean_vs_baseline.png")
