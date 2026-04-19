@@ -125,6 +125,17 @@ gym.register(
     },
 )
 
+# State-only (no PC) + uniform routing (no GPS) — gravity-reduction ablations.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:StatePPORunnerCfg",
+    },
+)
+
 # Multi-task ZeroG: peg + leg + ScenePC 512pt + GPS + terminate on success
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-MultiTask-GPS-v0",

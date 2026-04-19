@@ -91,6 +91,13 @@ class Base_DAggerRunnerCfg(Base_PPORunnerCfg):
 
 
 @configclass
+class StatePPORunnerCfg(Base_PPORunnerCfg):
+    """Plain PPO on state-only obs. One ``policy`` group for actor + critic."""
+
+    obs_groups = {"policy": ["policy"], "critic": ["policy"]}
+
+
+@configclass
 class SharedEncoder128PPORunnerCfg(Base_PPORunnerCfg):
     """128-pt PC with shared MLP encoder (both objects concatenated)."""
 

@@ -198,6 +198,54 @@ class ScenePCObsCfg:
     success_classifier: SuccessClassifierCfg = SuccessClassifierCfg()
 
 
+@configclass
+class StateObsCfg:
+    """State-only obs (no PC): proprio + object poses. Single ``policy`` group for both actor and critic."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        insertive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        receptive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        insertive_asset_in_receptive_asset_frame = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("receptive_object"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+
+
 # ===========================================================================
 # Actions
 # ===========================================================================
@@ -395,6 +443,28 @@ class ZeroGBaseCfg(ManagerBasedRLEnvCfg):
 @configclass
 class ZeroGGPSScenePCTrainCfg(ZeroGBaseCfg):
     observations: ScenePCObsCfg = ScenePCObsCfg()
+
+
+# ===========================================================================
+# State-only (no PC) + uniform routing (no GPS). Use for gravity-reduction ablations.
+# ===========================================================================
+@configclass
+class ZeroGStateTrainCfg(ZeroGBaseCfg):
+    """State obs + uniform reset-type sampling. Gravity reduction via Hydra override.
+
+    Default ``reduction="mean"`` (per-env ±1 counter). Override
+    ``env.curriculum.gravity_curriculum.params.reduction=monitor_mean`` for the
+    threshold-gated variant.
+    """
+
+    observations: StateObsCfg = StateObsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Disable GPS routing → uniform multinomial over reset types.
+        self.events.reset_from_states.params["curriculum_target"] = None
+        self.events.reset_from_states.params["use_classifier"] = False
+        self.events.reset_from_states.params["use_success_critic"] = False
 
 
 # ===========================================================================
