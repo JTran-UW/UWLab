@@ -31,6 +31,13 @@ class GravityCurriculum(ManagerTermBase):
       ``difficulty_frac`` is the ``min`` of per-bucket counters divided by
       ``max_difficulty`` — gravity ramps only when the slowest bucket is
       accumulating net wins. Decouples gravity from reset-sampling distribution.
+    - ``monitor_mean``: reads the per-state success rates maintained by
+      ``SuccessMonitor`` (uniform across all tracked reset states — not biased
+      by GPS sampling distribution). Mean over every state is compared to
+      ``monitor_threshold`` (default 0.8); if above, bump ``difficulty_frac``
+      up by ``1 / max_difficulty``; if below, bump down. Unvisited states
+      have success_rate=0 and drag the mean down, which is intentional —
+      forces GPS to spread coverage before gravity ramps.
 
     Sets the physics scene gravity to ``(0, 0, full_gravity * difficulty_frac)``
     each call. Returns the current ``difficulty_frac`` for wandb logging.
@@ -70,9 +77,12 @@ class GravityCurriculum(ManagerTermBase):
         max_difficulty: int = 10,
         full_gravity: float = -9.81,
         reduction: str = "mean",
+        monitor_threshold: float = 0.8,
     ) -> dict[str, float]:
-        if reduction not in ("mean", "min_per_bucket"):
-            raise ValueError(f"Unknown reduction '{reduction}', expected 'mean' or 'min_per_bucket'")
+        if reduction not in ("mean", "min_per_bucket", "monitor_mean"):
+            raise ValueError(
+                f"Unknown reduction '{reduction}', expected 'mean', 'min_per_bucket', or 'monitor_mean'"
+            )
 
         log: dict[str, float] = {}
 
@@ -88,7 +98,7 @@ class GravityCurriculum(ManagerTermBase):
                 ).clamp(min=0, max=max_difficulty)
                 self.difficulty_frac = self.current_difficulties.mean().item() / max(max_difficulty, 1)
 
-            else:  # min_per_bucket
+            elif reduction == "min_per_bucket":
                 if self._reset_manager is None:
                     self._reset_manager = self._find_reset_manager(env)
                 if self._reset_manager is None or not hasattr(self._reset_manager, "task_id"):
@@ -120,6 +130,24 @@ class GravityCurriculum(ManagerTermBase):
                         log[f"gravity_bucket_{k}_frac"] = (
                             self.bucket_difficulties[k].item() / max(max_difficulty, 1)
                         )
+
+            else:  # monitor_mean
+                if self._reset_manager is None:
+                    self._reset_manager = self._find_reset_manager(env)
+                monitor = getattr(self._reset_manager, "success_monitor", None) if self._reset_manager else None
+                if monitor is None:
+                    # Reset manager / monitor not ready yet. Hold difficulty_frac.
+                    pass
+                else:
+                    mean_rate = monitor.success_rate.mean().item()
+                    visited_frac = (monitor.success_size > 0).float().mean().item()
+                    step = 1.0 / max(max_difficulty, 1)
+                    if mean_rate > monitor_threshold:
+                        self.difficulty_frac = min(self.difficulty_frac + step, 1.0)
+                    elif mean_rate < monitor_threshold:
+                        self.difficulty_frac = max(self.difficulty_frac - step, 0.0)
+                    log["monitor_mean_rate"] = mean_rate
+                    log["monitor_visited_frac"] = visited_frac
 
         # Set gravity based on current difficulty
         import carb
