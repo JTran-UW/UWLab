@@ -80,9 +80,11 @@ import rsl_rl.runners.distillation_runner as _distillation_runner_module
 
 from uwlab_rl.rsl_rl.distillation_dagger import DistillationDAgger
 from uwlab_rl.rsl_rl.distillation_runner_split import DistillationRunnerSplit
+from uwlab_rl.rsl_rl.student_teacher_mlp import StudentTeacherMLP
 from uwlab_rl.rsl_rl.student_teacher_vision import StudentTeacherVision
 
 _distillation_runner_module.StudentTeacherVision = StudentTeacherVision
+_distillation_runner_module.StudentTeacherMLP = StudentTeacherMLP
 _distillation_runner_module.DistillationDAgger = DistillationDAgger
 _distillation_runner_module.DistillationRunnerSplit = DistillationRunnerSplit
 

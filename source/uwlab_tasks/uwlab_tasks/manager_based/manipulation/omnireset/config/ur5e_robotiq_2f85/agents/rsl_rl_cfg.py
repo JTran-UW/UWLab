@@ -123,6 +123,65 @@ class Depth_DAggerSplitRunnerCfg(Depth_DAggerRunnerCfg):
 
 
 @configclass
+class StudentTeacherMLPPolicyCfg:
+    """Policy cfg for an MLP student + JIT teacher (state→state DAgger)."""
+
+    class_name: str = "StudentTeacherMLP"
+    teacher_jit_path: str = ""
+    student_hidden_dims: list[int] = MISSING
+    activation: str = "elu"
+    init_noise_std: float = 0.1
+    noise_std_type: str = "scalar"
+    student_obs_normalization: bool = True
+
+
+@configclass
+class State_DAggerSplitRunnerCfg(RslRlBaseRunnerCfg):
+    """State→state DAgger sanity check: MLP student reads the 215d teacher obs.
+
+    Uses the same split-pool runner + DAgger algorithm as the depth variant so
+    ``Metrics/success_student_only`` / ``Metrics/success_teacher_only`` remain
+    directly comparable. Student hidden dims mirror the state PPO actor.
+    """
+
+    class_name: str = "DistillationRunnerSplit"
+    num_steps_per_env: int = 8
+    max_iterations: int = 5000
+    save_interval: int = 100
+    experiment_name: str = "ur5e_robotiq_2f85_state_dagger_split"
+    student_fraction: float = 0.5
+    obs_groups: dict = {
+        "policy": ["teacher"],
+        "teacher": ["teacher"],
+    }
+    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(beta_anneal_iters=0)
+    policy: StudentTeacherMLPPolicyCfg = StudentTeacherMLPPolicyCfg(
+        student_hidden_dims=[512, 256, 128, 64],
+    )
+
+
+@configclass
+class State_DAggerFastRunnerCfg(State_DAggerSplitRunnerCfg):
+    """DEXTRAH-cadence-matched state→state DAgger: 1 env step → 1 gradient step, no buffer replay.
+
+    Matches ``DEXTRAH/dextrah_lab/distillation/distillation.py``:
+    ``num_steps_per_env=1``, ``num_learning_epochs=1``, ``gradient_length=1``.
+    Override ``agent.student_fraction`` on launch to ablate 0.5 (split-pool) vs
+    1.0 (pure student rollouts, DEXTRAH's β=0 regime).
+    """
+
+    experiment_name: str = "ur5e_robotiq_2f85_state_dagger_fast"
+    num_steps_per_env: int = 1
+    # ~8× the prior max_iterations to match env-step volume (8 env steps/iter → 1)
+    max_iterations: int = 40000
+    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(
+        beta_anneal_iters=0,
+        num_learning_epochs=1,
+        gradient_length=1,
+    )
+
+
+@configclass
 class Base_DAggerRunnerCfg(Base_PPORunnerCfg):
     algorithm = RslRlFancyPpoAlgorithmCfg(
         value_loss_coef=1.0,
