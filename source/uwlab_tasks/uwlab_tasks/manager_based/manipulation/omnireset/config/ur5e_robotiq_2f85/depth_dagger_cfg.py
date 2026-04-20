@@ -463,3 +463,29 @@ class Ur5eRobotiq2f85RgbDAggerWristSideCfg(Ur5eRobotiq2f85RgbDAggerRelCartesianO
     def __post_init__(self):
         super().__post_init__()
         # super() flips side_camera to RGB; wrist_camera already set to RGB in scene cfg.
+
+
+# ---------------------------------------------------------------------------
+# Recurrent-student variant: proprio single-frame (LSTM supplies temporal context).
+# Everything else identical to ``Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg``.
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class DepthDAggerRecurrentObservationsCfg(DepthDAggerObservationsCfg):
+    """Same obs groups as depth DAgger, but proprio ``history_length=1``."""
+
+    @configclass
+    class ProprioSingleFrameCfg(DepthDAggerObservationsCfg.ProprioCfg):
+        def __post_init__(self):
+            super().__post_init__()
+            self.history_length = 1
+
+    proprio: ProprioSingleFrameCfg = ProprioSingleFrameCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerRecurrentCfg(Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg):
+    """Depth DAgger env with single-frame proprio (for LSTM student)."""
+
+    observations: DepthDAggerRecurrentObservationsCfg = DepthDAggerRecurrentObservationsCfg()

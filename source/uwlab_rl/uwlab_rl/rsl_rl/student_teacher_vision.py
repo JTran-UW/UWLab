@@ -132,6 +132,8 @@ class StudentTeacherVision(StudentTeacher):
         aux_enabled: bool = False,
         aux_target_group: str = "aux_target",
         aux_hidden_dims: tuple[int, ...] | list[int] = (256, 128),
+        predict_std: bool = False,
+        teacher_returns_std: bool = False,
         **kwargs,
     ) -> None:
         # Bypass StudentTeacher.__init__ (it asserts 1D obs and builds an MLP teacher).
@@ -215,6 +217,25 @@ class StudentTeacherVision(StudentTeacher):
         else:
             raise ValueError(f"noise_std_type must be 'scalar' or 'log'; got {self.noise_std_type}")
 
+        # Optional state-dependent std head. When enabled, overrides the scalar/log
+        # noise above for DAgger-time std supervision (DEXTRAH-style weighted loss).
+        # Outputs log-std, exp'd on read.
+        self.predict_std = bool(predict_std)
+        std_head_in_dim = num_proprio + vision_feat_dim
+        if self.predict_std:
+            self.std_head = nn.Linear(std_head_in_dim, num_actions)
+            # Initialize so exp(log_std) ≈ init_noise_std at init (stable start).
+            nn.init.zeros_(self.std_head.weight)
+            nn.init.constant_(self.std_head.bias, float(torch.log(torch.tensor(init_noise_std)).item()))
+            print(f"Std head ({std_head_in_dim} -> {num_actions}) enabled; log-std output")
+        else:
+            self.std_head = None
+
+        # Teacher contract: if JIT returns (mean, std) tuple, callers can fetch both
+        # via ``evaluate_with_std``; ``evaluate`` still returns mean-only for
+        # legacy callers (e.g. ``DistillationDAgger.act`` for action routing).
+        self.teacher_returns_std = bool(teacher_returns_std)
+
         self.distribution = None
 
     def _encode_student(self, obs: TensorDict) -> torch.Tensor:
@@ -264,7 +285,35 @@ class StudentTeacherVision(StudentTeacher):
     def evaluate(self, obs: TensorDict) -> torch.Tensor:
         teacher_obs = self._encode_teacher(obs)
         with torch.no_grad():
-            return self.teacher(teacher_obs)
+            out = self.teacher(teacher_obs)
+        if isinstance(out, tuple):  # teacher_returns_std=True: (mean, std)
+            return out[0]
+        return out
+
+    def evaluate_with_std(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (mean, std) from the teacher JIT. Requires ``teacher_returns_std=True``."""
+        if not self.teacher_returns_std:
+            raise RuntimeError(
+                "evaluate_with_std called but teacher_returns_std=False; "
+                "re-export the teacher JIT with --std and set teacher_returns_std=True."
+            )
+        teacher_obs = self._encode_teacher(obs)
+        with torch.no_grad():
+            out = self.teacher(teacher_obs)
+        assert isinstance(out, tuple) and len(out) == 2, (
+            f"teacher_returns_std=True but JIT returned {type(out)}"
+        )
+        return out
+
+    def act_inference_with_std(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (mean, std) from the student. Requires ``predict_std=True``."""
+        if not self.predict_std:
+            raise RuntimeError("act_inference_with_std called but predict_std=False")
+        feat = self._encode_student(obs)
+        mean = self.student(feat)
+        log_std = self.std_head(feat)
+        std = torch.exp(log_std)
+        return mean, std
 
     def get_student_obs(self, obs: TensorDict) -> torch.Tensor:
         return self._encode_student(obs)

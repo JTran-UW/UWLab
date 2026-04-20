@@ -250,6 +250,60 @@ class Rgb_DAggerWristSidePretrainedRunnerCfg(Depth_DAggerSplitRunnerCfg):
 
 
 @configclass
+class Depth_DAggerPretrainedRecurrentRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """1-cam depth, ImageNet ResNet18 + LSTM student, DEXTRAH-style 1-step BPTT.
+
+    Uses ``class_name='StudentTeacherVisionRecurrent'`` — the class is
+    monkey-patched into the rsl_rl runner namespace by ``train.py`` / ``play.py``.
+    Training cadence unchanged from Fast recipe (num_steps_per_env=1,
+    num_learning_epochs=1, gradient_length=1): the LSTM's hidden state persists
+    across iters, detached each step so gradient only flows through the current
+    cell. Zeroed on ``done`` in the rollout loop via ``process_env_step``.
+    """
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_pretrained_recurrent"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+    )
+
+    def __post_init__(self) -> None:
+        # Mark the policy as recurrent so ``_construct_runner`` picks the right class.
+        self.policy.class_name = "StudentTeacherVisionRecurrent"
+
+
+@configclass
+class Depth_DAggerPretrainedWeightedRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """1-cam depth, ImageNet ResNet18 + DEXTRAH-style weighted-L2 loss.
+
+    Student predicts (μ, σ); teacher JIT exports (μ, σ) via the gSDE formula
+    (see ``scripts_v2/tools/convert_state_expert_to_jit.py --std``).
+    Loss: ``weighted_l2(μ_s, μ_t, weights=(1/σ_t)²) + l2(σ_s, σ_t)``.
+    """
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_pretrained_weighted"
+    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(
+        beta_anneal_iters=0,
+        num_learning_epochs=1,
+        gradient_length=1,
+    )
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+        predict_std=True,
+        teacher_returns_std=True,
+    )
+
+    def __post_init__(self) -> None:
+        # Swap algorithm class to the weighted-loss variant.
+        self.algorithm.class_name = "DistillationDAggerWeighted"
+
+
+@configclass
 class Depth_DAggerPretrainedAux10xRunnerCfg(Depth_DAggerSplitRunnerCfg):
     """1-cam depth ImageNet ResNet18 + aux head at aux_coeff=10.0.
 

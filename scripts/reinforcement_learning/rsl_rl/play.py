@@ -79,13 +79,17 @@ from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
 import rsl_rl.runners.distillation_runner as _distillation_runner_module
 
 from uwlab_rl.rsl_rl.distillation_dagger import DistillationDAgger
+from uwlab_rl.rsl_rl.distillation_dagger_weighted import DistillationDAggerWeighted
 from uwlab_rl.rsl_rl.distillation_runner_split import DistillationRunnerSplit
 from uwlab_rl.rsl_rl.student_teacher_mlp import StudentTeacherMLP
 from uwlab_rl.rsl_rl.student_teacher_vision import StudentTeacherVision
+from uwlab_rl.rsl_rl.student_teacher_vision_recurrent import StudentTeacherVisionRecurrent
 
 _distillation_runner_module.StudentTeacherVision = StudentTeacherVision
+_distillation_runner_module.StudentTeacherVisionRecurrent = StudentTeacherVisionRecurrent
 _distillation_runner_module.StudentTeacherMLP = StudentTeacherMLP
 _distillation_runner_module.DistillationDAgger = DistillationDAgger
+_distillation_runner_module.DistillationDAggerWeighted = DistillationDAggerWeighted
 _distillation_runner_module.DistillationRunnerSplit = DistillationRunnerSplit
 
 import isaaclab_tasks  # noqa: F401
