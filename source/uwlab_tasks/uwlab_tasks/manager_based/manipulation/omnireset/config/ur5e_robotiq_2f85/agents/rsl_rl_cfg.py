@@ -224,6 +224,58 @@ class Rgb_DAgger2CamSplitRunnerCfg(Depth_DAggerSplitRunnerCfg):
 
 
 @configclass
+class Rgb_DAgger2CamPretrainedRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """2-camera RGB (side + front) with ImageNet-pretrained ResNet18 encoder."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_rgb_dagger_2cam_pretrained"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_rgb", "front_rgb"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+    )
+
+
+@configclass
+class Rgb_DAggerWristSidePretrainedRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """2-camera RGB (side + wrist) with ImageNet-pretrained ResNet18 encoder."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_rgb_dagger_wristside_pretrained"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_rgb", "wrist_rgb"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+    )
+
+
+@configclass
+class Depth_DAggerPretrainedAux10xRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """1-cam depth ImageNet ResNet18 + aux head at aux_coeff=10.0.
+
+    Rationale: with ``aux_coeff=1.0`` the aux loss (~0.64) contributes only ~3%
+    of the summed loss because BC loss (~20) dominates the 30:1 ratio. Bumping
+    to 10× gives aux ~25% contribution so features actually get shaped by
+    object-pose supervision.
+    """
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_pretrained_aux10x"
+    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(
+        beta_anneal_iters=0,
+        num_learning_epochs=1,
+        gradient_length=1,
+        aux_coeff=10.0,
+    )
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+        aux_enabled=True,
+    )
+
+
+@configclass
 class StudentTeacherMLPPolicyCfg:
     """Policy cfg for an MLP student + JIT teacher (state→state DAgger)."""
 

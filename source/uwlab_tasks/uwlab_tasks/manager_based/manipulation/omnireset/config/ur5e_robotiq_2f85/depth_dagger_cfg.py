@@ -403,3 +403,63 @@ class Ur5eRobotiq2f85RgbDAgger2CamCfg(Ur5eRobotiq2f85DepthDAgger2CamCfg):
         super().__post_init__()
         self.scene.side_camera.data_types = ["rgb"]
         self.scene.front_camera.data_types = ["rgb"]
+
+
+# ---------------------------------------------------------------------------
+# 2-camera variant: side + wrist (wrist parented to robotiq_base_link).
+# Wrist pose/focal copied from data_collection_rgb_cfg.py; we set
+# ``update_latest_camera_pose=True`` because the link moves every step
+# (otherwise the cached scene-creation pose is reused and render goes all-inf).
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class DAggerWristSideSceneCfg(DepthDAggerSceneCfg):
+    """Base DAgger scene + a wrist TiledCamera parented to the gripper base link."""
+
+    wrist_camera = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/robotiq_base_link/rgb_wrist_camera",
+        update_period=0,
+        height=RENDER_H,
+        width=RENDER_W,
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.0182505, -0.00408447, -0.0689107),
+            rot=(0.34254336, -0.61819255, -0.6160212, 0.347879),
+            convention="opengl",
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(focal_length=24.55),
+        update_latest_camera_pose=True,
+    )
+
+
+@configclass
+class RgbDAggerWristSideObservationsCfg:
+    """2-camera RGB (side + wrist) obs layout. Other groups identical to 1cam RGB."""
+
+    @configclass
+    class WristRgbCfg(ObsGroup):
+        image = _rgb_obs_term("wrist_camera")
+
+        def __post_init__(self):
+            self.concatenate_terms = True
+
+    proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
+    side_rgb: RgbDAggerObservationsCfg.SideRgbCfg = RgbDAggerObservationsCfg.SideRgbCfg()
+    wrist_rgb: WristRgbCfg = WristRgbCfg()
+    teacher: DepthDAggerObservationsCfg.TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg()
+    aux_target: DepthDAggerObservationsCfg.AuxTargetCfg = DepthDAggerObservationsCfg.AuxTargetCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RgbDAggerWristSideCfg(Ur5eRobotiq2f85RgbDAggerRelCartesianOSCCfg):
+    """2-camera RGB DAgger with a wrist camera (parented to gripper base link) + side cam."""
+
+    scene: DAggerWristSideSceneCfg = DAggerWristSideSceneCfg(
+        num_envs=256, env_spacing=1.5, replicate_physics=True
+    )
+    observations: RgbDAggerWristSideObservationsCfg = RgbDAggerWristSideObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # super() flips side_camera to RGB; wrist_camera already set to RGB in scene cfg.

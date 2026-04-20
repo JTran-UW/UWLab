@@ -217,6 +217,39 @@ gym.register(
     },
 )
 
+# 2-camera RGB DAgger (side + front) + ImageNet-pretrained ResNet18
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-2Cam-Pretrained-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85RgbDAgger2CamCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Rgb_DAgger2CamPretrainedRunnerCfg",
+    },
+)
+
+# 2-camera RGB DAgger (side + wrist) + ImageNet-pretrained ResNet18
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85RgbDAggerWristSideCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Rgb_DAggerWristSidePretrainedRunnerCfg",
+    },
+)
+
+# 1-cam depth + ImageNet ResNet18 + aux head @ aux_coeff=10.0 (BC:aux parity)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Aux10x-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerPretrainedAux10xRunnerCfg",
+    },
+)
+
 # State→state DAgger sanity check: same obs for student and teacher (no cameras)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-DAgger-Split-v0",

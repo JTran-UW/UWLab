@@ -11,12 +11,16 @@ ENTITY = "patyin"
 
 RUNS = {
     # label: (wandb project name, wandb run name / SLURM job id)
-    "Depth 1cam ResNet18 scratch":    ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-ResNet18-v0",   "34715161"),
-    "Depth 2cam ResNet18 scratch":    ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-2Cam-Split-v0", "34718157"),
-    "Depth 1cam ResNet18 + aux":      ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Aux-v0",        "34718859"),
-    "Depth 1cam ResNet18 + ImageNet": ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-v0", "34718756"),
-    "RGB   1cam ResNet18 scratch":    ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-ResNet18-v0",     "34715162"),
-    "RGB   2cam ResNet18 scratch":    ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-2Cam-Split-v0",   "34718194"),
+    # Scratch baselines (no pretrain, no aux)
+    "Depth 1cam scratch":                 ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-ResNet18-v0",   "34715161"),
+    "RGB   1cam scratch":                 ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-ResNet18-v0",     "34715162"),
+    # Single-lever ablations
+    "Depth 1cam + aux":                   ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Aux-v0",        "34718859"),
+    "Depth 1cam + ImageNet":              ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-v0", "34718756"),
+    # New (2026-04-20): combined levers
+    "Depth 2cam + ImageNet":              ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-2Cam-Split-v0", "34722264"),
+    "RGB   1cam + ImageNet":              ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-Split-v0",        "34722265"),
+    "Depth 1cam + ImageNet + aux":        ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Aux-v0",        "34722266"),
 }
 
 METRICS = [
@@ -25,8 +29,8 @@ METRICS = [
     ("Loss/aux",                                            "Aux pose loss (MSE on GT poses)",        True,  None,          True),
     ("Metrics/task_command/end_of_episode_pos_align_error", "EOE position align error (m)",           False, (0.0, 0.40),   False),
     ("Metrics/task_command/end_of_episode_rot_align_error", "EOE rotation align error (rad)",         False, (0.0, 3.20),   False),
-    ("Metrics/success_student_eval",                        "Student success (eval pool)",            False, (0.0, 0.20),   True),
-    ("Metrics/success_student_train",                       "Student success (train pool)",           False, (0.0, 0.30),   True),
+    ("Metrics/success_student_eval",                        "Student success (eval pool)",            False, None,          True),
+    ("Metrics/success_student_train",                       "Student success (train pool)",           False, None,          True),
 ]
 
 
