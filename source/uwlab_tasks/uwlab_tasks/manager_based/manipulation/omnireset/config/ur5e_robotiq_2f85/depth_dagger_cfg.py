@@ -32,8 +32,8 @@ from .actions import Ur5eRobotiq2f85RelativeOSCEvalAction
 from .rl_state_cfg import FinetuneEvalEventCfg, RlStateSceneCfg, Ur5eRobotiq2f85RlStateCfg
 
 DEPTH_CLIP = (0.01, 2.0)
-IMG_H, IMG_W = 120, 160
-RENDER_H, RENDER_W = 240, 320
+IMG_H, IMG_W = 224, 224
+RENDER_H, RENDER_W = 224, 224
 
 
 @configclass
@@ -102,6 +102,18 @@ def _depth_obs_term(sensor_name: str) -> ObsTerm:
     )
 
 
+def _rgb_obs_term(sensor_name: str) -> ObsTerm:
+    return ObsTerm(
+        func=task_mdp.process_image,
+        params={
+            "sensor_cfg": SceneEntityCfg(sensor_name),
+            "data_type": "rgb",
+            "process_image": True,
+            "output_size": (IMG_H, IMG_W),
+        },
+    )
+
+
 @configclass
 class DepthDAggerObservationsCfg:
     """Three obs groups: ``proprio`` (student scalars), per-camera depth, ``teacher`` (state expert input)."""
@@ -124,6 +136,7 @@ class DepthDAggerObservationsCfg:
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
+            self.history_length = 5
 
     @configclass
     class SideDepthCfg(ObsGroup):
@@ -187,9 +200,48 @@ class DepthDAggerObservationsCfg:
             self.concatenate_terms = True
             self.history_length = 5
 
+    @configclass
+    class AuxTargetCfg(ObsGroup):
+        """Ground-truth object poses for CNN aux loss.
+
+        Three pose terms: peg↔wrist, hole↔wrist, peg↔hole. Single-frame,
+        no history, no corruption — this is the target a CNN aux head
+        regresses to, forcing image features to be pose-aware.
+        """
+
+        insertive_in_wrist = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        receptive_in_wrist = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        insertive_in_receptive = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("receptive_object"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     proprio: ProprioCfg = ProprioCfg()
     side_depth: SideDepthCfg = SideDepthCfg()
     teacher: TeacherCfg = TeacherCfg()
+    aux_target: AuxTargetCfg = AuxTargetCfg()
 
 
 @configclass
@@ -237,3 +289,117 @@ class Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg(Ur5eRobotiq2f85RlStateCfg):
         self.sim.render.enable_dl_denoiser = False
         self.sim.render_interval = self.decimation
         self.num_rerenders_on_reset = 1
+
+
+@configclass
+class RgbDAggerObservationsCfg:
+    """RGB variant: swap ``side_depth`` for ``side_rgb`` (3×H×W). Proprio + teacher unchanged."""
+
+    ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg
+    TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg
+
+    @configclass
+    class SideRgbCfg(ObsGroup):
+        image = _rgb_obs_term("side_camera")
+
+        def __post_init__(self):
+            self.concatenate_terms = True
+
+    proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
+    side_rgb: SideRgbCfg = SideRgbCfg()
+    teacher: DepthDAggerObservationsCfg.TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg()
+    aux_target: DepthDAggerObservationsCfg.AuxTargetCfg = DepthDAggerObservationsCfg.AuxTargetCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RgbDAggerRelCartesianOSCCfg(Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg):
+    """RGB DAgger env: side camera renders RGB instead of depth. Everything else identical."""
+
+    observations: RgbDAggerObservationsCfg = RgbDAggerObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Swap the side camera from depth to rgb.
+        self.scene.side_camera.data_types = ["rgb"]
+
+
+# ---------------------------------------------------------------------------
+# 2-camera variants: side + front (front offset from data_collection_rgb_cfg.py)
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class DepthDAgger2CamSceneCfg(DepthDAggerSceneCfg):
+    """Base DAgger scene + a front TiledCamera (pose copied from data_collection_rgb_cfg)."""
+
+    front_camera = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/depth_front_camera",
+        update_period=0,
+        height=RENDER_H,
+        width=RENDER_W,
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(1.0770121, -0.1679045, 0.4486344),
+            rot=(0.70564552, 0.46613815, 0.25072644, 0.47107948),
+            convention="opengl",
+        ),
+        data_types=["distance_to_camera"],
+        spawn=sim_utils.PinholeCameraCfg(focal_length=13.20, clipping_range=DEPTH_CLIP),
+    )
+
+
+@configclass
+class DepthDAgger2CamObservationsCfg:
+    """2-camera depth: side_depth + front_depth + proprio + teacher."""
+
+    @configclass
+    class FrontDepthCfg(ObsGroup):
+        image = _depth_obs_term("front_camera")
+
+        def __post_init__(self):
+            self.concatenate_terms = True
+
+    proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
+    side_depth: DepthDAggerObservationsCfg.SideDepthCfg = DepthDAggerObservationsCfg.SideDepthCfg()
+    front_depth: FrontDepthCfg = FrontDepthCfg()
+    teacher: DepthDAggerObservationsCfg.TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg()
+    aux_target: DepthDAggerObservationsCfg.AuxTargetCfg = DepthDAggerObservationsCfg.AuxTargetCfg()
+
+
+@configclass
+class RgbDAgger2CamObservationsCfg:
+    """2-camera rgb: side_rgb + front_rgb + proprio + teacher."""
+
+    @configclass
+    class FrontRgbCfg(ObsGroup):
+        image = _rgb_obs_term("front_camera")
+
+        def __post_init__(self):
+            self.concatenate_terms = True
+
+    proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
+    side_rgb: RgbDAggerObservationsCfg.SideRgbCfg = RgbDAggerObservationsCfg.SideRgbCfg()
+    front_rgb: FrontRgbCfg = FrontRgbCfg()
+    teacher: DepthDAggerObservationsCfg.TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg()
+    aux_target: DepthDAggerObservationsCfg.AuxTargetCfg = DepthDAggerObservationsCfg.AuxTargetCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAgger2CamCfg(Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg):
+    """2-camera depth DAgger: adds a front depth cam alongside the side depth cam."""
+
+    scene: DepthDAgger2CamSceneCfg = DepthDAgger2CamSceneCfg(
+        num_envs=256, env_spacing=1.5, replicate_physics=True
+    )
+    observations: DepthDAgger2CamObservationsCfg = DepthDAgger2CamObservationsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RgbDAgger2CamCfg(Ur5eRobotiq2f85DepthDAgger2CamCfg):
+    """2-camera RGB DAgger: both side + front cameras render RGB."""
+
+    observations: RgbDAgger2CamObservationsCfg = RgbDAgger2CamObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.side_camera.data_types = ["rgb"]
+        self.scene.front_camera.data_types = ["rgb"]

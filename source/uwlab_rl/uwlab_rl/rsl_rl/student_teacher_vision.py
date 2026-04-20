@@ -32,9 +32,13 @@ def _conv_out(hw: tuple[int, int], k: int, s: int) -> tuple[int, int]:
 
 
 class DepthCNN(nn.Module):
-    """4-layer conv encoder adapted from DEXTRAH's ``CustomCNN``.
+    """4-layer conv encoder. Slim variant of DEXTRAH's ``CustomCNN``.
 
-    Input: ``(B, in_channels, H, W)`` depth image already normalized to [0, 1].
+    Channels halved (8→16→32→64 vs DEXTRAH's 16→32→64→128) and LayerNorm
+    removed. ``flatten → Linear`` head preserves per-pixel spatial info —
+    needed for 6D pose regression where localization matters.
+
+    Input:  ``(B, in_channels, H, W)`` depth image already normalized to [0, 1].
     Output: ``(B, embed_dim)`` feature vector.
     """
 
@@ -48,20 +52,16 @@ class DepthCNN(nn.Module):
         h4, w4 = _conv_out((h3, w3), 4, 2)
 
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=6, stride=2),
+            nn.Conv2d(in_channels, 8, kernel_size=6, stride=2),
             nn.ReLU(),
-            nn.LayerNorm([16, h1, w1]),
+            nn.Conv2d(8, 16, kernel_size=4, stride=2),
+            nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.LayerNorm([32, h2, w2]),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.LayerNorm([64, h3, w3]),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.LayerNorm([128, h4, w4]),
         )
-        self.flat_dim = 128 * h4 * w4
+        self.flat_dim = 64 * h4 * w4
         self.head = nn.Sequential(
             nn.Linear(self.flat_dim, embed_dim),
             nn.ReLU(),
@@ -69,6 +69,44 @@ class DepthCNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.conv(x).flatten(1))
+
+
+class ResNet18Encoder(nn.Module):
+    """Torchvision ResNet18 backbone + linear projection to ``embed_dim``.
+
+    If ``pretrained_path`` is set, loads ImageNet weights from that file before
+    replacing conv1 (so all other layers keep the pretrained values). Scratch
+    init otherwise.
+    """
+
+    def __init__(self, in_channels: int, embed_dim: int = 128, pretrained_path: str = ""):
+        super().__init__()
+        import torchvision.models as tvm
+
+        backbone = tvm.resnet18(weights=None)
+        if pretrained_path:
+            state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=True)
+            backbone.load_state_dict(state_dict, strict=True)
+            print(f"[ResNet18Encoder] loaded ImageNet weights from {pretrained_path}")
+        if in_channels != 3:
+            # Replace first conv to accept non-RGB input. If pretrained, initialize
+            # the new conv1 by averaging the original RGB weights across channels
+            # (standard technique — preserves low-level filter structure for depth).
+            new_conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            if pretrained_path:
+                with torch.no_grad():
+                    avg_w = backbone.conv1.weight.mean(dim=1, keepdim=True)  # (64, 1, 7, 7)
+                    if in_channels == 1:
+                        new_conv1.weight.copy_(avg_w)
+                    else:
+                        new_conv1.weight.copy_(avg_w.expand(-1, in_channels, -1, -1))
+            backbone.conv1 = new_conv1
+        self.backbone = nn.Sequential(*list(backbone.children())[:-1])
+        self.proj = nn.Linear(512, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        f = self.backbone(x).flatten(1)
+        return torch.relu(self.proj(f))
 
 
 class StudentTeacherVision(StudentTeacher):
@@ -89,6 +127,11 @@ class StudentTeacherVision(StudentTeacher):
         init_noise_std: float = 0.1,
         noise_std_type: str = "scalar",
         student_obs_normalization: bool = True,
+        encoder_type: str = "depth_cnn",
+        encoder_pretrained_path: str = "",
+        aux_enabled: bool = False,
+        aux_target_group: str = "aux_target",
+        aux_hidden_dims: tuple[int, ...] | list[int] = (256, 128),
         **kwargs,
     ) -> None:
         # Bypass StudentTeacher.__init__ (it asserts 1D obs and builds an MLP teacher).
@@ -115,14 +158,37 @@ class StudentTeacherVision(StudentTeacher):
                 f"all vision groups must share shape; {g} has {obs[g].shape} vs {first_img.shape}"
             )
 
-        # Shared depth encoder across cameras.
-        self.depth_encoder = DepthCNN(in_channels, H, W, embed_dim=embed_dim)
+        # Shared image encoder across cameras.
+        if encoder_type == "depth_cnn":
+            self.depth_encoder = DepthCNN(in_channels, H, W, embed_dim=embed_dim)
+        elif encoder_type == "resnet18":
+            self.depth_encoder = ResNet18Encoder(in_channels, embed_dim=embed_dim, pretrained_path=encoder_pretrained_path)
+        else:
+            raise ValueError(f"Unknown encoder_type: {encoder_type}")
         vision_feat_dim = len(self.vision_groups) * embed_dim
 
-        # Action head: [proprio ; 3 × depth features] → num_actions.
+        # Action head: [proprio ; per-cam image features] → num_actions.
         self.student = MLP(num_proprio + vision_feat_dim, num_actions, list(student_hidden_dims), activation)
         print(f"Student (proprio={num_proprio}, vision_feat={vision_feat_dim}): {self.student}")
-        print(f"DepthCNN (C={in_channels}, H={H}, W={W}, embed={embed_dim})")
+        print(f"Encoder[{encoder_type}] (C={in_channels}, H={H}, W={W}, embed={embed_dim})")
+
+        # Optional aux head: regresses object-pose targets from vision features only.
+        # Forces the CNN to learn pose-aware features (per DEXTRAH).
+        self.aux_enabled = bool(aux_enabled)
+        self.aux_target_group = aux_target_group
+        if self.aux_enabled:
+            if aux_target_group not in obs:
+                raise ValueError(
+                    f"aux_enabled=True but obs has no '{aux_target_group}' group; "
+                    f"got keys: {list(obs.keys())}"
+                )
+            aux_dim = obs[aux_target_group].shape[-1]
+            self.aux_head = MLP(vision_feat_dim, aux_dim, list(aux_hidden_dims), activation)
+            self.aux_target_dim = aux_dim
+            print(f"Aux head (vision_feat={vision_feat_dim} -> {aux_dim}): {self.aux_head}")
+        else:
+            self.aux_head = None
+            self.aux_target_dim = 0
 
         # Normalize proprio (images already in [0,1] from process_image).
         self.student_obs_normalization = student_obs_normalization
@@ -156,6 +222,24 @@ class StudentTeacherVision(StudentTeacher):
         proprio = self.student_obs_normalizer(proprio)
         img_feats = [self.depth_encoder(obs[g]) for g in self.vision_groups]
         return torch.cat([proprio] + img_feats, dim=-1)
+
+    def forward_with_aux(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Single forward pass that shares CNN features between action head and aux head.
+
+        Calling ``act_inference`` + ``evaluate_aux`` separately runs the encoder
+        twice, doubling peak VRAM. Use this when the aux loss is active.
+        """
+        proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)
+        proprio = self.student_obs_normalizer(proprio)
+        img_feats = torch.cat([self.depth_encoder(obs[g]) for g in self.vision_groups], dim=-1)
+        action = self.student(torch.cat([proprio, img_feats], dim=-1))
+        aux_pred = self.aux_head(img_feats) if self.aux_enabled else None
+        return action, aux_pred
+
+    def get_aux_target(self, obs: TensorDict) -> torch.Tensor:
+        if not self.aux_enabled:
+            raise RuntimeError("get_aux_target called but aux head is not enabled")
+        return obs[self.aux_target_group]
 
     def _encode_teacher(self, obs: TensorDict) -> torch.Tensor:
         return torch.cat([obs[g] for g in self.obs_groups["teacher"]], dim=-1)

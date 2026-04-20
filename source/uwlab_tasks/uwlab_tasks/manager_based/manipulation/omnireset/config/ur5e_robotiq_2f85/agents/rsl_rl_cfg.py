@@ -67,6 +67,7 @@ class DistillationDAggerAlgorithmCfg:
     optimizer: str = "adam"
     loss_type: str = "mse"
     beta_anneal_iters: int = 0
+    aux_coeff: float = 1.0
 
 
 @configclass
@@ -83,6 +84,11 @@ class StudentTeacherVisionPolicyCfg:
     init_noise_std: float = 0.1
     noise_std_type: str = "scalar"
     student_obs_normalization: bool = True
+    encoder_type: str = "depth_cnn"  # "depth_cnn" (slim 4-conv) or "resnet18"
+    encoder_pretrained_path: str = ""  # path to ImageNet weights (.pth) for resnet18
+    aux_enabled: bool = False  # train an aux pose-regression head on vision features
+    aux_target_group: str = "aux_target"
+    aux_hidden_dims: list[int] = [256, 128]
 
 
 @configclass
@@ -116,16 +122,105 @@ class Depth_DAggerSplitRunnerCfg(Depth_DAggerRunnerCfg):
       eval — contamination-free success signal even at tight train cadences
       (``num_steps_per_env=1``) where same-step gradients create echo-of-teacher bias.
 
-    Disables β annealing (mutually exclusive with the split mask) and emits
-    ``Metrics/success_student_train`` / ``Metrics/success_teacher_train`` /
-    ``Metrics/success_student_eval`` for clean per-pool attribution.
+    Defaults match the state→state DAgger recipe that succeeded on 2026-04-19
+    (``student_fraction=1.0`` pure-student rollouts + DEXTRAH-matched Fast cadence
+    ``num_steps_per_env=1``, ``num_learning_epochs=1``, ``gradient_length=1``).
     """
 
     class_name: str = "DistillationRunnerSplit"
     experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_split"
-    student_fraction: float = 0.5
-    eval_fraction: float = 0.0
-    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(beta_anneal_iters=0)
+    num_steps_per_env: int = 1
+    max_iterations: int = 200000
+    student_fraction: float = 1.0
+    eval_fraction: float = 0.1
+    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(
+        beta_anneal_iters=0,
+        num_learning_epochs=1,
+        gradient_length=1,
+    )
+
+
+@configclass
+class Rgb_DAggerSplitRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """RGB variant of the split DAgger runner. Only ``vision_groups`` differs."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_rgb_dagger_split"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_rgb"],
+        student_hidden_dims=[512, 256],
+    )
+
+
+@configclass
+class Depth_DAggerResNet18RunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """1-cam depth split runner with ResNet18 student encoder (scratch)."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_resnet18"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+    )
+
+
+@configclass
+class Rgb_DAggerResNet18RunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """1-cam rgb split runner with ResNet18 student encoder (scratch)."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_rgb_dagger_resnet18"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_rgb"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+    )
+
+
+@configclass
+class Depth_DAggerAuxRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """1-cam depth split runner, ResNet18 encoder + aux pose-regression head."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_aux"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        aux_enabled=True,
+    )
+
+
+@configclass
+class Depth_DAggerPretrainedRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """1-cam depth split runner, ImageNet-pretrained ResNet18 encoder (no aux)."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_pretrained"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+    )
+
+
+@configclass
+class Depth_DAgger2CamSplitRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """2-camera depth: shared CNN over side + front depth streams (concat features)."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_2cam_split"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth", "front_depth"],
+        student_hidden_dims=[512, 256],
+    )
+
+
+@configclass
+class Rgb_DAgger2CamSplitRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """2-camera RGB: shared CNN over side + front rgb streams (concat features)."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_rgb_dagger_2cam_split"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_rgb", "front_rgb"],
+        student_hidden_dims=[512, 256],
+    )
 
 
 @configclass

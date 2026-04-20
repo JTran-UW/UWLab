@@ -43,6 +43,7 @@ class DistillationDAgger(Distillation):
         beta_anneal_iters: int = 0,
         student_mask: torch.Tensor | None = None,
         eval_mask: torch.Tensor | None = None,
+        aux_coeff: float = 1.0,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -53,6 +54,7 @@ class DistillationDAgger(Distillation):
         if eval_mask is not None:
             eval_mask = eval_mask.to(self.device).bool()
         self.eval_mask = eval_mask
+        self.aux_coeff = float(aux_coeff)
 
     @property
     def beta(self) -> float:
@@ -85,31 +87,58 @@ class DistillationDAgger(Distillation):
         """BC update, excluding eval-pool envs from the gradient.
 
         Copied from ``Distillation.update`` because we need to mask rows
-        (eval-pool envs) out of each minibatch before the MSE, which isn't
-        reachable via the parent's single-path loss.
+        (eval-pool envs) out of each minibatch before the MSE (parent uses
+        a single-path loss), AND to optionally add an aux-pose loss via
+        ``policy.evaluate_aux`` + ``policy.get_aux_target`` when the student
+        has an aux head.
         """
-        if self.eval_mask is None:
-            # Fast path — identical to parent, just add aux keys afterward.
+        aux_enabled = bool(getattr(self.policy, "aux_enabled", False))
+        use_custom = (self.eval_mask is not None) or aux_enabled
+
+        if not use_custom:
             loss_dict = super().update()
         else:
             self.num_updates += 1
             mean_behavior_loss = 0.0
+            mean_aux_loss = 0.0
             loss = 0
             cnt = 0
 
-            train_mask = (~self.eval_mask).to(self.device)
+            train_mask = (~self.eval_mask).to(self.device) if self.eval_mask is not None else None
 
             for epoch in range(self.num_learning_epochs):
                 self.policy.reset(hidden_states=self.last_hidden_states)
                 self.policy.detach_hidden_states()
                 for obs, _, privileged_actions, dones in self.storage.generator():
-                    actions = self.policy.act_inference(obs)
-                    # Mask eval-pool envs out of the BC loss.
-                    actions_m = actions[train_mask]
-                    privileged_m = privileged_actions[train_mask]
+                    if aux_enabled:
+                        actions, aux_pred = self.policy.forward_with_aux(obs)
+                        aux_target = self.policy.get_aux_target(obs)
+                    else:
+                        actions = self.policy.act_inference(obs)
+                        aux_pred = None
+
+                    if train_mask is not None:
+                        actions_m = actions[train_mask]
+                        privileged_m = privileged_actions[train_mask]
+                    else:
+                        actions_m = actions
+                        privileged_m = privileged_actions
                     behavior_loss = self.loss_fn(actions_m, privileged_m)
-                    loss = loss + behavior_loss
+                    step_loss = behavior_loss
                     mean_behavior_loss += behavior_loss.item()
+
+                    if aux_enabled:
+                        if train_mask is not None:
+                            aux_pred_m = aux_pred[train_mask]
+                            aux_target_m = aux_target[train_mask]
+                        else:
+                            aux_pred_m = aux_pred
+                            aux_target_m = aux_target
+                        aux_loss = self.loss_fn(aux_pred_m, aux_target_m)
+                        step_loss = step_loss + self.aux_coeff * aux_loss
+                        mean_aux_loss += aux_loss.item()
+
+                    loss = loss + step_loss
                     cnt += 1
 
                     if cnt % self.gradient_length == 0:
@@ -127,10 +156,13 @@ class DistillationDAgger(Distillation):
                     self.policy.detach_hidden_states(dones.view(-1))
 
             mean_behavior_loss /= cnt
+            mean_aux_loss = mean_aux_loss / cnt if aux_enabled else 0.0
             self.storage.clear()
             self.last_hidden_states = self.policy.get_hidden_states()
             self.policy.detach_hidden_states()
             loss_dict = {"behavior": mean_behavior_loss}
+            if aux_enabled:
+                loss_dict["aux"] = mean_aux_loss
 
         if self.student_mask is None:
             loss_dict["beta"] = self.beta
