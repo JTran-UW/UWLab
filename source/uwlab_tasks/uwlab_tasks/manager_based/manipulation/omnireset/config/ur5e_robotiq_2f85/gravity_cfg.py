@@ -355,6 +355,7 @@ class ZeroGGPSEventCfg:
             "classifier_lr": 1e-3,
             "use_success_critic": False,
             "curriculum_monitor_history_len": 100,
+            "success_monitor_history_len": 100,
         },
     )
 
@@ -464,6 +465,23 @@ class ZeroGStateTrainCfg(ZeroGBaseCfg):
         super().__post_init__()
         # Disable GPS routing → uniform multinomial over reset types.
         self.events.reset_from_states.params["curriculum_target"] = None
+        self.events.reset_from_states.params["use_classifier"] = False
+        self.events.reset_from_states.params["use_success_critic"] = False
+
+
+@configclass
+class ZeroGStateGPSTrainCfg(ZeroGBaseCfg):
+    """State obs + empirical GPS routing (no classifier / critic).
+
+    Matches ``ZeroGStateTrainCfg`` for obs/reward/scene, but keeps GPS enabled
+    (target=0.5 by default, empirical per-state monitor). Intended for
+    ablations that combine monitor-based gravity with GPS routing.
+    """
+
+    observations: StateObsCfg = StateObsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
         self.events.reset_from_states.params["use_classifier"] = False
         self.events.reset_from_states.params["use_success_critic"] = False
 

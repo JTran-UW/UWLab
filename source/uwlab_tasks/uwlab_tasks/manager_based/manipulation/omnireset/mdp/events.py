@@ -2295,8 +2295,9 @@ class MultiResetManager(ManagerTermBase):
         num_monitored = self.num_task_types * self.num_reset_types if self.is_multitask else self.num_reset_types
 
         if cfg.params.get("success") is not None:
+            sm_hist_len = int(cfg.params.get("success_monitor_history_len", 100))
             success_monitor_cfg = SuccessMonitorCfg(
-                monitored_history_len=100, num_monitored_data=num_monitored, device=env.device
+                monitored_history_len=sm_hist_len, num_monitored_data=num_monitored, device=env.device
             )
             self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
 
@@ -2482,6 +2483,7 @@ class MultiResetManager(ManagerTermBase):
         classifier_lr: float = 1e-3,
         use_success_critic: bool = False,
         curriculum_monitor_history_len: int = 100,
+        success_monitor_history_len: int = 100,
     ) -> None:
         self._lazy_init()
 
