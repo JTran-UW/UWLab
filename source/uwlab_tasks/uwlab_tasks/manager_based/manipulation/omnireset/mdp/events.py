@@ -2322,8 +2322,9 @@ class MultiResetManager(ManagerTermBase):
 
         if self.curriculum_target is not None:
             total_states = sum(self.flat_num_states)
+            cur_hist_len = int(cfg.params.get("curriculum_monitor_history_len", 100))
             curriculum_monitor_cfg = SuccessMonitorCfg(
-                monitored_history_len=100, num_monitored_data=total_states, device=env.device
+                monitored_history_len=cur_hist_len, num_monitored_data=total_states, device=env.device
             )
             self.curriculum_monitor = curriculum_monitor_cfg.class_type(curriculum_monitor_cfg)
             self.flat_offsets = torch.tensor(
@@ -2480,6 +2481,7 @@ class MultiResetManager(ManagerTermBase):
         classifier_hidden_dim: int = 64,
         classifier_lr: float = 1e-3,
         use_success_critic: bool = False,
+        curriculum_monitor_history_len: int = 100,
     ) -> None:
         self._lazy_init()
 

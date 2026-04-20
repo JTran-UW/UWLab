@@ -354,6 +354,7 @@ class ZeroGGPSEventCfg:
             "classifier_hidden_dim": 64,
             "classifier_lr": 1e-3,
             "use_success_critic": False,
+            "curriculum_monitor_history_len": 100,
         },
     )
 
