@@ -78,11 +78,16 @@ class GravityCurriculum(ManagerTermBase):
         full_gravity: float = -9.81,
         reduction: str = "mean",
         monitor_threshold: float = 0.8,
+        floor: float = 0.0,
     ) -> dict[str, float]:
         if reduction not in ("mean", "min_per_bucket", "monitor_mean"):
             raise ValueError(
                 f"Unknown reduction '{reduction}', expected 'mean', 'min_per_bucket', or 'monitor_mean'"
             )
+
+        if not getattr(self, "_floor_applied", False):
+            self.difficulty_frac = max(self.difficulty_frac, float(floor))
+            self._floor_applied = True
 
         log: dict[str, float] = {}
 
@@ -145,9 +150,12 @@ class GravityCurriculum(ManagerTermBase):
                     if mean_rate > monitor_threshold:
                         self.difficulty_frac = min(self.difficulty_frac + step, 1.0)
                     elif mean_rate < monitor_threshold:
-                        self.difficulty_frac = max(self.difficulty_frac - step, 0.0)
+                        self.difficulty_frac = max(self.difficulty_frac - step, float(floor))
                     log["monitor_mean_rate"] = mean_rate
                     log["monitor_visited_frac"] = visited_frac
+
+        # Enforce floor across all reductions: never demote below `floor`.
+        self.difficulty_frac = max(self.difficulty_frac, float(floor))
 
         # Set gravity based on current difficulty
         import carb
