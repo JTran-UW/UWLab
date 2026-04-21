@@ -1,8 +1,10 @@
 """Winning config (uniform + monitor_mean + floor=0.1) across peg / leg / drawer.
 
-Peg solved by iter ~1349 (a88ojkt0). Drawer solved by iter ~700 (ottu8izh). Leg is stuck:
-rt1 plateaus below 0.85 and rt0 never cracks, so monitor_mean never crosses 0.8 and
-gravity stays pinned at the 0.1 floor.
+Yaw-fix relaunches (commit 86c1ee2): every success/orientation site now sums
+|wrap_to_pi(e_x)|+|wrap_to_pi(e_y)|+|wrap_to_pi(e_z)| instead of dropping yaw. Peg loses
+its cylindrical free pass; drawer/leg gain correct orientation supervision.
+
+Pre-fix runs are kept for reference as dashed lines.
 """
 
 from pathlib import Path
@@ -14,11 +16,16 @@ api = wandb.Api()
 
 PROJ = "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-v0"
 
-# (label, run_id, color)
+# (label, run_id, color, linestyle)
 RUNS = [
-    ("Peg (34722401)",    "a88ojkt0", "#0072B2"),
-    ("Leg (34741091)",    "dtud7prh", "#D55E00"),
-    ("Drawer (34745030)", "ottu8izh", "#009E73"),
+    # Yaw-fix relaunches (commit 86c1ee2) — currently running
+    ("Peg yaw-fix (34753110)",    "4icjogy3", "#0072B2", "-"),
+    ("Leg yaw-fix (34754745)",    "rmp8ftoo", "#D55E00", "-"),
+    ("Drawer yaw-fix (34752658)", "lxh3nxve", "#009E73", "-"),
+    # Pre-fix runs (yaw-symmetric success), kept for context
+    ("Peg pre-fix (34722401)",    "a88ojkt0", "#0072B2", "--"),
+    ("Leg pre-fix (34741091)",    "dtud7prh", "#D55E00", "--"),
+    ("Drawer pre-fix (34745030)", "ottu8izh", "#009E73", "--"),
 ]
 
 KEYS = [
@@ -37,7 +44,7 @@ def fetch(run_id: str):
 
 
 parsed = {}
-for label, rid, _ in RUNS:
+for label, rid, _c, _ls in RUNS:
     df, state = fetch(rid)
     parsed[label] = df
     last = df.iloc[-1]
@@ -50,12 +57,14 @@ for label, rid, _ in RUNS:
     )
 
 fig, axes = plt.subplots(1, 4, figsize=(20, 4.5), sharex=True)
-for label, rid, color in RUNS:
+for label, rid, color, ls in RUNS:
     df = parsed[label]
-    axes[0].plot(df["_step"], df["Metrics/task_0_success_rate"], label=label, color=color, lw=1.8)
-    axes[1].plot(df["_step"], df["Metrics/task_1_success_rate"], label=label, color=color, lw=1.8)
-    axes[2].plot(df["_step"], df["Curriculum/gravity_curriculum/gravity_frac"], label=label, color=color, lw=1.8)
-    axes[3].plot(df["_step"], df["Curriculum/gravity_curriculum/monitor_mean_rate"], label=label, color=color, lw=1.8)
+    lw = 1.8 if ls == "-" else 1.2
+    alpha = 1.0 if ls == "-" else 0.55
+    axes[0].plot(df["_step"], df["Metrics/task_0_success_rate"], label=label, color=color, lw=lw, ls=ls, alpha=alpha)
+    axes[1].plot(df["_step"], df["Metrics/task_1_success_rate"], label=label, color=color, lw=lw, ls=ls, alpha=alpha)
+    axes[2].plot(df["_step"], df["Curriculum/gravity_curriculum/gravity_frac"], label=label, color=color, lw=lw, ls=ls, alpha=alpha)
+    axes[3].plot(df["_step"], df["Curriculum/gravity_curriculum/monitor_mean_rate"], label=label, color=color, lw=lw, ls=ls, alpha=alpha)
 
 axes[0].axhline(0.8, color="gray", ls=":", lw=0.8)
 axes[3].axhline(0.8, color="gray", ls=":", lw=0.8, label="monitor gate=0.8")
@@ -71,11 +80,12 @@ for ax in axes:
     ax.set_xlabel("iteration")
     ax.grid(alpha=0.3)
 axes[0].set_ylabel("success rate")
-axes[0].legend(fontsize=9, loc="lower right")
-axes[3].legend(fontsize=8, loc="lower right")
+axes[0].legend(fontsize=8, loc="lower right")
+axes[3].legend(fontsize=7, loc="lower right")
 
 fig.suptitle(
-    "Uniform + monitor_mean + floor=0.1 across OmniReset insertions (state-only, 80K envs)",
+    "Uniform + monitor_mean + floor=0.1 across OmniReset insertions (state-only, 80K envs) "
+    "— solid: yaw-fix (commit 86c1ee2), dashed: pre-fix",
     fontsize=12,
 )
 fig.tight_layout()
