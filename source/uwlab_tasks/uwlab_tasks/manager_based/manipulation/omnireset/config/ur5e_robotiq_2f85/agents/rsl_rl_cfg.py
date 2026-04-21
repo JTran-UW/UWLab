@@ -89,6 +89,13 @@ class StudentTeacherVisionPolicyCfg:
     aux_enabled: bool = False  # train an aux pose-regression head on vision features
     aux_target_group: str = "aux_target"
     aux_hidden_dims: list[int] = [256, 128]
+    # Recurrent student params (only used when class_name="StudentTeacherVisionRecurrent")
+    rnn_type: str = "lstm"
+    rnn_hidden_dim: int = 128
+    rnn_num_layers: int = 1
+    # DEXTRAH-style (μ, σ) weighted-loss params
+    predict_std: bool = False  # adds a student std_head (log_std output, exp'd on read)
+    teacher_returns_std: bool = False  # teacher JIT returns (mean, std) tuple
 
 
 @configclass
