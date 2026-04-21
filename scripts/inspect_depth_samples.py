@@ -95,6 +95,11 @@ def main() -> None:
         if args_cli.modality == "both":
             env_cfg.scene.front_camera.height = 240
             env_cfg.scene.front_camera.width = 320
+    if hasattr(env_cfg.scene, "wrist_camera") and env_cfg.scene.wrist_camera is not None:
+        env_cfg.scene.wrist_camera.data_types = data_types
+        if args_cli.modality == "both":
+            env_cfg.scene.wrist_camera.height = 240
+            env_cfg.scene.wrist_camera.width = 320
 
     # If rgb-only, swap the obs term's data_type so the obs manager is happy.
     if args_cli.modality == "rgb":
