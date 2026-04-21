@@ -51,36 +51,9 @@ def _l2(model: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 class DistillationDAggerWeighted(DistillationDAgger):
     """DAgger with inverse-variance-weighted L2 on mean + L2 on std."""
 
-    def act(self, obs: TensorDict) -> torch.Tensor:
-        """Rollout: same routing logic as parent, but evaluate teacher (μ, σ)
-        and stash ``teacher_std`` in the transition's observation dict so the
-        update loop can recover it without re-running the teacher JIT."""
-        student_action = self.policy.act(obs).detach()
-        teacher_mean, teacher_std = self.policy.evaluate_with_std(obs)
-        teacher_mean = teacher_mean.detach()
-        teacher_std = teacher_std.detach()
-
-        if self.student_mask is not None:
-            mask = self.student_mask.unsqueeze(-1)
-            action = torch.where(mask, student_action, teacher_mean)
-        else:
-            beta = self.beta
-            if beta > 0.0:
-                num_envs = student_action.shape[0]
-                use_teacher = torch.rand(num_envs, device=student_action.device) < beta
-                action = torch.where(use_teacher.unsqueeze(-1), teacher_mean, student_action)
-            else:
-                action = student_action
-
-        self.transition.actions = action
-        self.transition.privileged_actions = teacher_mean
-        # Stash teacher std alongside the obs so the update-loop replay can use it.
-        # ``observations`` is a TensorDict; adding a ``_teacher_std`` key is safe
-        # since obs_groups only inspect specific group names.
-        obs_with_std = obs
-        obs_with_std["_teacher_std"] = teacher_std
-        self.transition.observations = obs_with_std
-        return action
+    # Uses parent's ``act`` unchanged — teacher mean is stored as ``privileged_actions``.
+    # Teacher std is re-computed on demand in ``update`` via a fresh ``evaluate_with_std``
+    # call (teacher JIT is frozen + small, cheap per-step forward).
 
     def update(self) -> dict[str, float]:
         """Weighted BC update. Mirrors the aux-branch of :class:`DistillationDAgger.update`
@@ -115,7 +88,9 @@ class DistillationDAggerWeighted(DistillationDAgger):
                     )
                 student_mu, student_sigma = self.policy.act_inference_with_std(obs)
 
-                teacher_sigma = obs["_teacher_std"]
+                # Re-run teacher to get σ (teacher μ is already in privileged_actions).
+                # Frozen JIT forward — cheap (215d → 7d MLP + gSDE head).
+                _, teacher_sigma = self.policy.evaluate_with_std(obs)
                 teacher_mu = privileged_mu
 
                 # Apply eval mask (mask rows out of the gradient).
