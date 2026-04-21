@@ -239,6 +239,17 @@ gym.register(
     },
 )
 
+# 2-camera depth DAgger (side + wrist) + ImageNet-pretrained ResNet18
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSideCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedRunnerCfg",
+    },
+)
+
 # 1-cam depth + ImageNet ResNet18 + aux head @ aux_coeff=10.0 (BC:aux parity)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Aux10x-v0",

@@ -257,6 +257,19 @@ class Rgb_DAggerWristSidePretrainedRunnerCfg(Depth_DAggerSplitRunnerCfg):
 
 
 @configclass
+class Depth_DAggerWristSidePretrainedRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """2-camera depth (side + wrist) with ImageNet-pretrained ResNet18 encoder."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_wristside_pretrained"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth", "wrist_depth"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+    )
+
+
+@configclass
 class Depth_DAggerPretrainedRecurrentRunnerCfg(Depth_DAggerSplitRunnerCfg):
     """1-cam depth, ImageNet ResNet18 + LSTM student, DEXTRAH-style 1-step BPTT.
 
