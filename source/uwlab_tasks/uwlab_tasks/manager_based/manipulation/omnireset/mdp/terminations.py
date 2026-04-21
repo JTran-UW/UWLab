@@ -445,11 +445,15 @@ class check_reset_state_success(ManagerTermBase):
             ins_pos_w, ins_quat_w = self.insertive_asset_offset.apply(self.insertive_asset)
             rec_pos_w, rec_quat_w = self.receptive_asset_offset.apply(self.receptive_asset)
             rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
-            e_x, e_y, _ = math_utils.euler_xyz_from_quat(rel_quat)
-            euler_xy_dist = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
+            e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_quat)
+            euler_dist = (
+                math_utils.wrap_to_pi(e_x).abs()
+                + math_utils.wrap_to_pi(e_y).abs()
+                + math_utils.wrap_to_pi(e_z).abs()
+            )
             xyz_dist = torch.norm(rel_pos, dim=1)
-            within_max = (xyz_dist < self.assembly_pos_threshold) & (euler_xy_dist < self.assembly_ori_threshold)
-            beyond_min = (xyz_dist > self.assembly_pos_min_threshold) | (euler_xy_dist > self.assembly_ori_min_threshold)
+            within_max = (xyz_dist < self.assembly_pos_threshold) & (euler_dist < self.assembly_ori_threshold)
+            beyond_min = (xyz_dist > self.assembly_pos_min_threshold) | (euler_dist > self.assembly_ori_min_threshold)
             assembly_success = within_max & beyond_min
             assembly_match = torch.where(self.require_assembly_success, assembly_success, ~assembly_success)
             reset_success = reset_success & assembly_match
@@ -827,11 +831,15 @@ class success_termination(ManagerTermBase):
             rec_pos_w, rec_quat_w = tc.receptive_asset_offset.apply(tc.receptive_asset)
 
         rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
-        e_x, e_y, _ = math_utils.euler_xyz_from_quat(rel_quat)
-        euler_xy_distance = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
+        e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_quat)
+        euler_distance = (
+            math_utils.wrap_to_pi(e_x).abs()
+            + math_utils.wrap_to_pi(e_y).abs()
+            + math_utils.wrap_to_pi(e_z).abs()
+        )
         xyz_distance = torch.norm(rel_pos, dim=1)
 
-        return (xyz_distance < success_pos_thresh) & (euler_xy_distance < success_ori_thresh)
+        return (xyz_distance < success_pos_thresh) & (euler_distance < success_ori_thresh)
 
 
 def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes: int = 10):

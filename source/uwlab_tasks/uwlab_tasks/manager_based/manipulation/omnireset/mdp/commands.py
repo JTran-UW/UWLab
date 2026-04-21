@@ -134,7 +134,7 @@ class TaskCommand(TaskDependentCommand):
 
         self.orientation_aligned = torch.zeros((self._env.num_envs), dtype=torch.bool, device=self._env.device)
         self.position_aligned = torch.zeros((self._env.num_envs), dtype=torch.bool, device=self._env.device)
-        self.euler_xy_distance = torch.zeros((self._env.num_envs), device=self._env.device)
+        self.euler_distance = torch.zeros((self._env.num_envs), device=self._env.device)
         self.xyz_distance = torch.zeros((self._env.num_envs), device=self._env.device)
 
     @property
@@ -162,7 +162,7 @@ class TaskCommand(TaskDependentCommand):
 
     def _update_metrics(self):
         reset_env = self._env.episode_length_buf == 0
-        self.metrics["end_of_episode_rot_align_error"][reset_env] = self.euler_xy_distance[reset_env]
+        self.metrics["end_of_episode_rot_align_error"][reset_env] = self.euler_distance[reset_env]
         self.metrics["end_of_episode_pos_align_error"][reset_env] = self.xyz_distance[reset_env]
         last_episode_success = (self.orientation_aligned & self.position_aligned)[reset_env]
         self.metrics["end_of_episode_success_rate"][reset_env] = last_episode_success.float()
@@ -190,12 +190,16 @@ class TaskCommand(TaskDependentCommand):
                 insertive_asset_alignment_quat_w,
             )
         )
-        e_x, e_y, _ = math_utils.euler_xyz_from_quat(insertive_asset_in_receptive_asset_frame_quat)
-        self.euler_xy_distance[:] = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
+        e_x, e_y, e_z = math_utils.euler_xyz_from_quat(insertive_asset_in_receptive_asset_frame_quat)
+        self.euler_distance[:] = (
+            math_utils.wrap_to_pi(e_x).abs()
+            + math_utils.wrap_to_pi(e_y).abs()
+            + math_utils.wrap_to_pi(e_z).abs()
+        )
         self.xyz_distance[:] = torch.norm(insertive_asset_in_receptive_asset_frame_pos, dim=1)
         self.position_aligned[:] = self.xyz_distance < self.success_position_threshold
-        self.orientation_aligned[:] = self.euler_xy_distance < self.success_orientation_threshold
-        self.metrics["average_rot_align_error"][:] = self.euler_xy_distance
+        self.orientation_aligned[:] = self.euler_distance < self.success_orientation_threshold
+        self.metrics["average_rot_align_error"][:] = self.euler_distance
         self.metrics["average_pos_align_error"][:] = self.xyz_distance
 
     def _resample_command(self, env_ids: Sequence[int]):

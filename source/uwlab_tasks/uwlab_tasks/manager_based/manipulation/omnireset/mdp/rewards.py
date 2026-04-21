@@ -128,7 +128,7 @@ class ProgressContext(ManagerTermBase):
 
         self.orientation_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
         self.position_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
-        self.euler_xy_distance = torch.zeros((env.num_envs), device=env.device)
+        self.euler_distance = torch.zeros((env.num_envs), device=env.device)
         self.xyz_distance = torch.zeros((env.num_envs), device=env.device)
         self.success = torch.zeros((self._env.num_envs), dtype=torch.bool, device=self._env.device)
         self.continuous_success_counter = torch.zeros((self._env.num_envs), dtype=torch.int32, device=self._env.device)
@@ -185,11 +185,15 @@ class ProgressContext(ManagerTermBase):
                 insertive_asset_alignment_quat_w,
             )
         )
-        e_x, e_y, _ = math_utils.euler_xyz_from_quat(insertive_asset_in_receptive_asset_frame_quat)
-        self.euler_xy_distance[:] = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
+        e_x, e_y, e_z = math_utils.euler_xyz_from_quat(insertive_asset_in_receptive_asset_frame_quat)
+        self.euler_distance[:] = (
+            math_utils.wrap_to_pi(e_x).abs()
+            + math_utils.wrap_to_pi(e_y).abs()
+            + math_utils.wrap_to_pi(e_z).abs()
+        )
         self.xyz_distance[:] = torch.norm(insertive_asset_in_receptive_asset_frame_pos, dim=1)
         self.position_aligned[:] = self.xyz_distance < success_position_threshold
-        self.orientation_aligned[:] = self.euler_xy_distance < success_orientation_threshold
+        self.orientation_aligned[:] = self.euler_distance < success_orientation_threshold
         self.success[:] = self.orientation_aligned & self.position_aligned
 
         self.continuous_success_counter[:] = torch.where(
@@ -206,7 +210,7 @@ class ProgressContext(ManagerTermBase):
 def dense_success_reward(env: ManagerBasedRLEnv, std: float, context: str = "progress_context") -> torch.Tensor:
 
     context_term: ManagerTermBase = env.reward_manager.get_term_cfg(context).func  # type: ignore
-    angle_diff: torch.Tensor = getattr(context_term, "euler_xy_distance")
+    angle_diff: torch.Tensor = getattr(context_term, "euler_distance")
     xyz_distance: torch.Tensor = getattr(context_term, "xyz_distance")
 
     # Normalize the distances by std
