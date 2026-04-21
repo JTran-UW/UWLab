@@ -18,11 +18,13 @@ RUNS = {
     "Depth 1cam + ImageNet + aux (1x)":      ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Aux-v0",                "34722266"),
     # Launched 2026-04-20 mid-day
     "RGB   2cam + ImageNet (side+front)":    ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-2Cam-Pretrained-v0",      "34729126"),
-    "RGB   2cam + ImageNet (side+wrist)":    ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-v0", "34729148"),
     "Depth 1cam + ImageNet + aux (10x)":     ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Aux10x-v0",  "34729151"),
     # Launched 2026-04-20 evening — DEXTRAH gap ablations
     "Depth 1cam + ImageNet + recurrent":     ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Recurrent-v0", "34738654"),
     "Depth 1cam + ImageNet + weighted":      ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Weighted-v0",  "34741084"),
+    # Launched 2026-04-21 AM — wrist-cam fixed WristSide pretrained pair
+    "RGB   2cam + ImageNet (side+wrist*)":   ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-v0",   "34744482"),
+    "Depth 2cam + ImageNet (side+wrist*)":   ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-v0", "34744483"),
 }
 
 METRICS = [
