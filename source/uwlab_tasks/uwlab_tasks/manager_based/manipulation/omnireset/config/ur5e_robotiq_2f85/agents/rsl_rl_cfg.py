@@ -86,6 +86,7 @@ class StudentTeacherVisionPolicyCfg:
     student_obs_normalization: bool = True
     encoder_type: str = "depth_cnn"  # "depth_cnn" (slim 4-conv) or "resnet18"
     encoder_pretrained_path: str = ""  # path to ImageNet weights (.pth) for resnet18
+    encoder_freeze_iters: int = 0  # DEXTRAH-style warmup: freeze ResNet18 backbone for first N algorithm updates
     aux_enabled: bool = False  # train an aux pose-regression head on vision features
     aux_target_group: str = "aux_target"
     aux_hidden_dims: list[int] = [256, 128]
@@ -290,6 +291,53 @@ class Depth_DAggerWristSidePretrainedWeightedRunnerCfg(Depth_DAggerSplitRunnerCf
 
     def __post_init__(self) -> None:
         self.algorithm.class_name = "DistillationDAggerWeighted"
+
+
+@configclass
+class Depth_DAggerWristSidePretrainedWeightedFreeze5kRunnerCfg(
+    Depth_DAggerWristSidePretrainedWeightedRunnerCfg
+):
+    """Wrist+side depth + ImageNet ResNet18 + weighted L2 + frozen backbone for first 5k iters.
+
+    DEXTRAH warmup recipe: conv1..conv5_x requires_grad=False until iter 5000,
+    then unfrozen. Lets the action head + std head + proj + std_head converge
+    against ImageNet features before those features get perturbed by BC grads.
+    """
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_wristside_pretrained_weighted_freeze5k"
+
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_depth", "wrist_depth"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+        encoder_freeze_iters=5000,
+        predict_std=True,
+        teacher_returns_std=True,
+    )
+
+
+@configclass
+class Depth_DAggerWristSidePretrainedWeightedRecurrentRunnerCfg(
+    Depth_DAggerWristSidePretrainedWeightedRunnerCfg
+):
+    """Wrist+side depth + ImageNet ResNet18 + weighted L2 + recurrent LSTM student."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_wristside_pretrained_weighted_recurrent"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.policy.class_name = "StudentTeacherVisionRecurrent"
+
+
+@configclass
+class Depth_DAggerWristSidePretrainedWeightedSplit50RunnerCfg(
+    Depth_DAggerWristSidePretrainedWeightedRunnerCfg
+):
+    """Wrist+side depth + ImageNet ResNet18 + weighted L2, 50/50 student/teacher split."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_depth_dagger_wristside_pretrained_weighted_split50"
+    student_fraction: float = 0.5
 
 
 @configclass

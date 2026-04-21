@@ -95,6 +95,11 @@ class DistillationDAgger(Distillation):
         aux_enabled = bool(getattr(self.policy, "aux_enabled", False))
         use_custom = (self.eval_mask is not None) or aux_enabled
 
+        # Unfreeze vision backbone once the warmup window ends (no-op if
+        # ``encoder_freeze_iters <= 0`` or already unfrozen).
+        if hasattr(self.policy, "maybe_unfreeze_backbone"):
+            self.policy.maybe_unfreeze_backbone(self.num_updates + 1)
+
         if not use_custom:
             loss_dict = super().update()
         else:

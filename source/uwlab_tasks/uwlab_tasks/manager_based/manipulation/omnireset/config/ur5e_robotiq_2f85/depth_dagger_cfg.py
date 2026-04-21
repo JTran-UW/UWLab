@@ -605,3 +605,26 @@ class Ur5eRobotiq2f85DepthDAggerRecurrentCfg(Ur5eRobotiq2f85DepthDAggerRelCartes
     """Depth DAgger env with single-frame proprio (for LSTM student)."""
 
     observations: DepthDAggerRecurrentObservationsCfg = DepthDAggerRecurrentObservationsCfg()
+
+
+# ---------------------------------------------------------------------------
+# Wrist+Side + recurrent-student variant: wrist+side scene + single-frame proprio.
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class DepthDAggerWristSideRecurrentObservationsCfg(DepthDAggerWristSideObservationsCfg):
+    """Wrist+side obs layout with proprio ``history_length=1`` for LSTM students."""
+
+    proprio: DepthDAggerRecurrentObservationsCfg.ProprioSingleFrameCfg = (
+        DepthDAggerRecurrentObservationsCfg.ProprioSingleFrameCfg()
+    )
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSideRecurrentCfg(Ur5eRobotiq2f85DepthDAggerWristSideCfg):
+    """Wrist+side depth DAgger env with single-frame proprio (for LSTM student)."""
+
+    observations: DepthDAggerWristSideRecurrentObservationsCfg = (
+        DepthDAggerWristSideRecurrentObservationsCfg()
+    )

@@ -129,6 +129,7 @@ class StudentTeacherVision(StudentTeacher):
         student_obs_normalization: bool = True,
         encoder_type: str = "depth_cnn",
         encoder_pretrained_path: str = "",
+        encoder_freeze_iters: int = 0,
         aux_enabled: bool = False,
         aux_target_group: str = "aux_target",
         aux_hidden_dims: tuple[int, ...] | list[int] = (256, 128),
@@ -168,6 +169,16 @@ class StudentTeacherVision(StudentTeacher):
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
         vision_feat_dim = len(self.vision_groups) * embed_dim
+
+        # DEXTRAH-style frozen-backbone warmup. If > 0, backbone starts with
+        # ``requires_grad=False`` and is unfrozen once the algorithm hits
+        # ``encoder_freeze_iters`` updates (see ``maybe_unfreeze_backbone``).
+        # proj/std_head/aux_head/student MLP always stay trainable.
+        self.encoder_freeze_iters = int(encoder_freeze_iters)
+        self._backbone_frozen = self.encoder_freeze_iters > 0 and encoder_type == "resnet18"
+        if self._backbone_frozen:
+            self._set_backbone_requires_grad(False)
+            print(f"[StudentTeacherVision] froze ResNet18 backbone for first {self.encoder_freeze_iters} iters")
 
         # Action head: [proprio ; per-cam image features] → num_actions.
         self.student = MLP(num_proprio + vision_feat_dim, num_actions, list(student_hidden_dims), activation)
@@ -237,6 +248,31 @@ class StudentTeacherVision(StudentTeacher):
         self.teacher_returns_std = bool(teacher_returns_std)
 
         self.distribution = None
+
+    def _set_backbone_requires_grad(self, flag: bool) -> None:
+        """Toggle ``requires_grad`` on the pretrained conv trunk only.
+
+        ``ResNet18Encoder.backbone`` holds conv1..conv5_x (the ImageNet stack);
+        ``proj`` (512→embed_dim linear) stays trainable so vision features can
+        adapt to the action space even during the freeze window. No-op for
+        ``DepthCNN`` (nothing pretrained to preserve).
+        """
+        if isinstance(self.depth_encoder, ResNet18Encoder):
+            for p in self.depth_encoder.backbone.parameters():
+                p.requires_grad = flag
+
+    def maybe_unfreeze_backbone(self, num_updates: int) -> None:
+        """Unfreeze the ResNet18 backbone once ``num_updates >= encoder_freeze_iters``.
+
+        Called by the DAgger algorithm at the top of each ``update()`` step.
+        No-op if already unfrozen or if freeze was never requested.
+        """
+        if not self._backbone_frozen:
+            return
+        if num_updates >= self.encoder_freeze_iters:
+            self._set_backbone_requires_grad(True)
+            self._backbone_frozen = False
+            print(f"[StudentTeacherVision] unfroze ResNet18 backbone at iter {num_updates}")
 
     def _encode_student(self, obs: TensorDict) -> torch.Tensor:
         proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)

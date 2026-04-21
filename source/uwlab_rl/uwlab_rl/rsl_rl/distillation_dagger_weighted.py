@@ -64,6 +64,10 @@ class DistillationDAggerWeighted(DistillationDAgger):
         ``(μ_s, σ_s)``; cannot reuse ``privileged_actions`` alone since σ
         supervision needs both ends.
         """
+        # Unfreeze vision backbone once the warmup window ends.
+        if hasattr(self.policy, "maybe_unfreeze_backbone"):
+            self.policy.maybe_unfreeze_backbone(self.num_updates + 1)
+
         self.num_updates += 1
         mean_mu_loss = 0.0
         mean_sigma_loss = 0.0
