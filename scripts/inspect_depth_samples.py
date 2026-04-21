@@ -113,8 +113,9 @@ def main() -> None:
 
     os.makedirs(args_cli.out_dir, exist_ok=True)
 
-    # Auto-detect all TiledCameras in the scene so 2-cam envs render front+side.
-    cam_names = [n for n in ("side_camera", "front_camera") if n in env.unwrapped.scene.sensors]
+    # Auto-detect all TiledCameras in the scene so 2-cam envs render front+side,
+    # or wrist-side.
+    cam_names = [n for n in ("side_camera", "front_camera", "wrist_camera") if n in env.unwrapped.scene.sensors]
     print(f"Active cameras: {cam_names}")
     depth_clip_hi = 2.0
     RGB_H, RGB_W = 224, 224
@@ -134,7 +135,7 @@ def main() -> None:
         print(f"\n=== step {step} ===")
 
         for cam_name in cam_names:
-            short = cam_name.split("_", 1)[0]  # "side" / "front"
+            short = cam_name.split("_", 1)[0]  # "side" / "front" / "wrist"
             sensor = env.unwrapped.scene.sensors[cam_name]
 
             if render_depth:

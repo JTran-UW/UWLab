@@ -11,16 +11,18 @@ ENTITY = "patyin"
 
 RUNS = {
     # label: (wandb project name, wandb run name / SLURM job id)
-    # Scratch baselines (no pretrain, no aux)
-    "Depth 1cam scratch":                 ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-ResNet18-v0",   "34715161"),
-    "RGB   1cam scratch":                 ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-ResNet18-v0",     "34715162"),
-    # Single-lever ablations
-    "Depth 1cam + aux":                   ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Aux-v0",        "34718859"),
-    "Depth 1cam + ImageNet":              ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-v0", "34718756"),
-    # New (2026-04-20): combined levers
-    "Depth 2cam + ImageNet":              ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-2Cam-Split-v0", "34722264"),
-    "RGB   1cam + ImageNet":              ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-Split-v0",        "34722265"),
-    "Depth 1cam + ImageNet + aux":        ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Aux-v0",        "34722266"),
+    # Live ablations as of 2026-04-20 (scratch runs killed, replaced by pretrained variants)
+    "Depth 1cam + ImageNet":                 ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-v0",         "34718756"),
+    "Depth 2cam + ImageNet (side+front)":    ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-2Cam-Split-v0",         "34722264"),
+    "RGB   1cam + ImageNet":                 ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-Split-v0",                "34722265"),
+    "Depth 1cam + ImageNet + aux (1x)":      ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Aux-v0",                "34722266"),
+    # Launched 2026-04-20 mid-day
+    "RGB   2cam + ImageNet (side+front)":    ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-2Cam-Pretrained-v0",      "34729126"),
+    "RGB   2cam + ImageNet (side+wrist)":    ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-v0", "34729148"),
+    "Depth 1cam + ImageNet + aux (10x)":     ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Aux10x-v0",  "34729151"),
+    # Launched 2026-04-20 evening — DEXTRAH gap ablations
+    "Depth 1cam + ImageNet + recurrent":     ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Recurrent-v0", "34738654"),
+    "Depth 1cam + ImageNet + weighted":      ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Weighted-v0",  "34741084"),
 }
 
 METRICS = [
@@ -74,7 +76,20 @@ def main():
     fig, axes = plt.subplots(nrows, ncols, figsize=(14, 3.2 * nrows), sharex=False)
     axes = axes.flatten()
 
-    colors = plt.cm.tab10(range(len(data)))
+    # Wong's 8-color palette (colorblind-safe, Nature Methods 2011); skip yellow (#F0E442)
+    # which is too light on white backgrounds for line plots.
+    CB_COLORS = [
+        "#0072B2",  # blue
+        "#E69F00",  # orange
+        "#009E73",  # bluish green
+        "#CC79A7",  # reddish purple
+        "#56B4E9",  # sky blue
+        "#D55E00",  # vermillion
+        "#000000",  # black
+    ]
+    # Second channel: linestyle + marker, so curves remain distinguishable in grayscale.
+    LINESTYLES = ["-", "-", "-", "--", ":", ":", "-."]
+    MARKERS    = ["o", "s", "D", "^", "v", "P", "X"]
 
     SMOOTH = 200  # rolling-mean window in iterations (smooths noisy per-iter metrics)
     for ax_idx, (key, title, use_log, ylim, show_raw) in enumerate(METRICS):
@@ -89,9 +104,18 @@ def main():
                 y_smooth = y.rolling(SMOOTH, min_periods=1).mean()
             else:
                 y_smooth = y
+            color = CB_COLORS[i % len(CB_COLORS)]
+            ls = LINESTYLES[i % len(LINESTYLES)]
+            marker = MARKERS[i % len(MARKERS)]
             if show_raw:
-                ax.plot(x, y, color=colors[i], alpha=0.15, linewidth=0.8)
-            ax.plot(x, y_smooth, label=label, color=colors[i], linewidth=2.0)
+                ax.plot(x, y, color=color, alpha=0.12, linewidth=0.8, linestyle=ls)
+            # Sparse markers (~10 across the curve) as a second perceptual channel.
+            n = max(len(x) // 10, 1)
+            ax.plot(
+                x, y_smooth, label=label, color=color, linewidth=2.0,
+                linestyle=ls, marker=marker, markevery=n, markersize=5,
+                markeredgecolor="white", markeredgewidth=0.6,
+            )
             any_plotted = True
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("iteration")

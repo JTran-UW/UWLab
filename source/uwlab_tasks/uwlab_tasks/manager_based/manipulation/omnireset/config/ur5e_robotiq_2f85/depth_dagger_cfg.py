@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
@@ -414,14 +415,69 @@ class Ur5eRobotiq2f85RgbDAgger2CamCfg(Ur5eRobotiq2f85DepthDAgger2CamCfg):
 
 
 @configclass
-class DAggerWristSideSceneCfg(DepthDAggerSceneCfg):
-    """Base DAgger scene + a wrist TiledCamera parented to the gripper base link."""
+class DAggerWristSideSceneCfg(RlStateSceneCfg):
+    """Flat scene class (no deep inheritance) with curtains + side + wrist cameras.
 
-    wrist_camera = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/robotiq_base_link/rgb_wrist_camera",
+    Mirrors ``DataCollectionRGBObjectSceneCfg`` structure — declaring all scene
+    entities at the same class level avoids a configclass MRO/field-ordering
+    gotcha where nesting the wrist camera under a child scene produced a
+    degenerate sky view.
+    """
+
+    # Background curtains (copied from DepthDAggerSceneCfg for black-backdrop consistency).
+    curtain_left = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/CurtainLeft",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, -0.68, 0.519), rot=(0.707, 0.0, 0.0, -0.707)),
+        spawn=sim_utils.CuboidCfg(
+            size=(0.01, 1.0, 1.125),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0)),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+        ),
+    )
+
+    curtain_back = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/CurtainBack",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.15, 0.0, 0.519), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=sim_utils.CuboidCfg(
+            size=(0.01, 1.3, 1.125),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0)),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+        ),
+    )
+
+    curtain_right = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/CurtainRight",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, 0.68, 0.519), rot=(0.707, 0.0, 0.0, -0.707)),
+        spawn=sim_utils.CuboidCfg(
+            size=(0.01, 1.0, 1.125),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0)),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+        ),
+    )
+
+    side_camera = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/depth_side_camera",
         update_period=0,
         height=RENDER_H,
         width=RENDER_W,
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.8323904, 0.5877843, 0.2805111),
+            rot=(0.29008842, 0.22122445, 0.51336143, 0.77676798),
+            convention="opengl",
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(focal_length=20.10),
+    )
+
+    wrist_camera = TiledCameraCfg(
+        # Match DataCollection RGB cfg exactly — height/width=240/320, no flag override.
+        prim_path="{ENV_REGEX_NS}/Robot/robotiq_base_link/rgb_wrist_camera",
+        update_period=0,
+        height=240,
+        width=320,
         offset=TiledCameraCfg.OffsetCfg(
             pos=(0.0182505, -0.00408447, -0.0689107),
             rot=(0.34254336, -0.61819255, -0.6160212, 0.347879),
@@ -429,7 +485,6 @@ class DAggerWristSideSceneCfg(DepthDAggerSceneCfg):
         ),
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(focal_length=24.55),
-        update_latest_camera_pose=True,
     )
 
 
@@ -452,6 +507,32 @@ class RgbDAggerWristSideObservationsCfg:
 
 
 @configclass
+class WristSideEventCfg(FinetuneEvalEventCfg):
+    """FinetuneEval events + a reset-mode call to ``randomize_tiled_cameras`` with
+    zero deltas for the wrist camera.
+
+    Why: USD's ``reset_scene_to_default`` (part of ``BaseEventCfg``) resets the
+    wrist camera's local XformOps on every reset, which undoes the
+    ``TiledCameraCfg.OffsetCfg`` rotation and leaves the camera pointing at the
+    sky. DataCollection RGB works because it has a ``randomize_wrist_camera``
+    reset event that re-writes the correct base pose every reset. We copy that
+    pattern with zero delta ranges (no randomization, just pose restoration).
+    """
+
+    reset_wrist_camera_pose = EventTerm(
+        func=task_mdp.randomize_tiled_cameras,
+        mode="reset",
+        params={
+            "camera_path_template": "/World/envs/env_{}/Robot/robotiq_base_link/rgb_wrist_camera",
+            "base_position": (0.0182505, -0.00408447, -0.0689107),
+            "base_rotation": (0.34254336, -0.61819255, -0.6160212, 0.347879),
+            "position_deltas": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+            "euler_deltas": {"pitch": (0.0, 0.0), "yaw": (0.0, 0.0), "roll": (0.0, 0.0)},
+        },
+    )
+
+
+@configclass
 class Ur5eRobotiq2f85RgbDAggerWristSideCfg(Ur5eRobotiq2f85RgbDAggerRelCartesianOSCCfg):
     """2-camera RGB DAgger with a wrist camera (parented to gripper base link) + side cam."""
 
@@ -459,10 +540,10 @@ class Ur5eRobotiq2f85RgbDAggerWristSideCfg(Ur5eRobotiq2f85RgbDAggerRelCartesianO
         num_envs=256, env_spacing=1.5, replicate_physics=True
     )
     observations: RgbDAggerWristSideObservationsCfg = RgbDAggerWristSideObservationsCfg()
+    events: WristSideEventCfg = WristSideEventCfg()
 
     def __post_init__(self):
         super().__post_init__()
-        # super() flips side_camera to RGB; wrist_camera already set to RGB in scene cfg.
 
 
 # ---------------------------------------------------------------------------
