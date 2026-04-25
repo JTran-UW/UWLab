@@ -137,7 +137,12 @@ def main(env_cfg, agent_cfg) -> None:
                     # Find minimum distance to any previously recorded pose
                     min_pos_dists = torch.min(pos_dists, dim=1)[0]  # (N,)
                     min_ori_dists = torch.min(ori_dists, dim=1)[0]  # (N,)
-                    new_pose_mask = (min_pos_dists > args_cli.pos_similarity_threshold) & (
+                    # Two poses are duplicates only if BOTH pos AND ori match (within thresholds).
+                    # So a pose is NEW if EITHER pos differs OR ori differs (not both must differ).
+                    # The previous AND logic incorrectly dropped same-pos-different-ori poses,
+                    # which silently broke multi-canonical seed gen for objects with multiple
+                    # valid orientations sharing the same insertive root position.
+                    new_pose_mask = (min_pos_dists > args_cli.pos_similarity_threshold) | (
                         min_ori_dists > args_cli.ori_similarity_threshold
                     )
                 else:

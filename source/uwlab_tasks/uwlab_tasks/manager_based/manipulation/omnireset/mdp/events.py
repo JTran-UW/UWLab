@@ -2303,14 +2303,26 @@ class assembly_sampling_event(ManagerTermBase):
         insertive_metadata = utils.read_metadata_from_usd_directory(self.insertive_object.cfg.spawn.usd_path)
         receptive_metadata = utils.read_metadata_from_usd_directory(self.receptive_object.cfg.spawn.usd_path)
 
-        # Insertive metadata stays singular `assembled_offset`; receptive uses canonical (first)
-        # entry of plural `assembled_offsets` for spawning.
-        rec_canonical_pos, rec_canonical_quat = utils.get_canonical_assembled_offset(receptive_metadata)
+        # Insertive metadata stays singular `assembled_offset`. Receptive uses the full
+        # `assembled_offsets` list — at spawn time, env i is round-robin-routed to canonical
+        # (i % K). Combined with `--num_envs K` and `--num_trajectories K` in
+        # record_partial_assemblies.py, this gives exactly 1 perturbation rollout per success
+        # configuration, generalizing across single-canonical (drawer/leg) and multi-canonical
+        # (cylindrical peg, multi-slot receptacles, etc.) cases.
+        rec_offsets = utils.get_assembled_offsets(receptive_metadata)
         self.insertive_assembled_offset = Offset(
             pos=insertive_metadata.get("assembled_offset").get("pos"),
             quat=insertive_metadata.get("assembled_offset").get("quat"),
         )
-        self.receptive_assembled_offset = Offset(pos=rec_canonical_pos, quat=rec_canonical_quat)
+        # Canonical (first) for backward-compat fallback
+        self.receptive_assembled_offset = Offset(pos=rec_offsets[0][0], quat=rec_offsets[0][1])
+        # Tensor stack of all receptive offsets, indexed at __call__ time per env
+        self.rec_offsets_pos = torch.tensor(
+            [o[0] for o in rec_offsets], dtype=torch.float32, device=env.device
+        )  # (K, 3)
+        self.rec_offsets_quat = torch.tensor(
+            [o[1] for o in rec_offsets], dtype=torch.float32, device=env.device
+        )  # (K, 4)
 
     def __call__(
         self,
@@ -2325,8 +2337,15 @@ class assembly_sampling_event(ManagerTermBase):
         receptive_pos = self.receptive_object.data.root_pos_w[env_ids]
         receptive_quat = self.receptive_object.data.root_quat_w[env_ids]
 
-        # Apply receptive assembled offset to get target position
-        target_pos, target_quat = self.receptive_assembled_offset.combine(receptive_pos, receptive_quat)
+        # Round-robin route env i to receptive offset (i mod K). With num_envs=K and
+        # num_trajectories=K (1 trajectory per env), each canonical gets exactly 1 rollout.
+        K = self.rec_offsets_pos.shape[0]
+        idx = env_ids % K
+        rec_off_pos_per_env = self.rec_offsets_pos[idx]
+        rec_off_quat_per_env = self.rec_offsets_quat[idx]
+        # target = receptive_root ⊗ chosen_offset (per env)
+        target_pos = receptive_pos + math_utils.quat_apply(receptive_quat, rec_off_pos_per_env)
+        target_quat = math_utils.quat_mul(receptive_quat, rec_off_quat_per_env)
 
         # Handle position and orientation separately
         # Offset quat is in insertive object's frame: target_quat = insertive_quat * offset_quat

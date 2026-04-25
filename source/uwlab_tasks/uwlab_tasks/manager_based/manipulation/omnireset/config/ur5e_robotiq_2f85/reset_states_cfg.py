@@ -674,11 +674,10 @@ class ZeroGPartialAssemblyEventCfg(ResetStatesBaseEventCfg):
                 "pitch": (0.0, 0.0),
                 "yaw": (0.0, 0.0),
             },
-            # Routing ON + scale=8 at both pre-classifier (here) and success-term (below).
-            # Forces 50% of envs to spawn at "near canonical" seeds (more entries qualify with
-            # scale=8), and the loose success classifier accepts gripper-perturbed states as near.
+            # Routing ON + scale=4: tighter recorded "near" zone (closer to runtime success)
+            # paired with looser runtime ori_thresh (0.1 rad) in metadata.
             "route_by_assembly": True,
-            "assembly_threshold_scale": 8.0,
+            "assembly_threshold_scale": 4.0,
         },
     )
 
@@ -765,12 +764,9 @@ class ZeroGPartialAssemblyResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
         self.terminations.success.params["insertive_asset_cfg"] = SceneEntityCfg("insertive_object")
         self.terminations.success.params["receptive_asset_cfg"] = SceneEntityCfg("receptive_object")
         self.terminations.success.params["assembly_success_prob"] = 0.5
-        # Bumped from 2.0 -> 8.0 because gripper closure perturbs the leg by several mm,
-        # kicking near-spawned states out of a tight 5mm/0.05rad zone. Scale 8 expands to
-        # 20mm/0.2rad, capturing typical post-gripper perturbations and making near
-        # collection viable. Recorded states are still much tighter than runtime success
-        # threshold so the policy still gets useful "near assembled" supervision.
-        self.terminations.success.params["assembly_threshold_scale"] = 8.0
+        # Scale=4 gives 10mm/0.4rad collection zone (with metadata ori=0.1).
+        # Tighter than scale=8 so recorded "near" states sit closer to true runtime success.
+        self.terminations.success.params["assembly_threshold_scale"] = 4.0
 
 
 @configclass
