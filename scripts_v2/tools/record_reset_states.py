@@ -117,6 +117,19 @@ def main(env_cfg, agent_cfg) -> None:
     env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
     env_cfg.recorders.dataset_file_handler_class_type = TorchDatasetFileHandler
 
+    # Balanced near-assembly / far-from-assembly collection: replace the legacy reflip
+    # sampler (`assembly_success_prob`) with a deterministic per-category quota set to
+    # num_reset_states / 2, so the dataset is guaranteed 50/50 regardless of env count.
+    term_params = getattr(env_cfg.terminations, "success", None)
+    if term_params is not None and "assembly_success_prob" in term_params.params:
+        quota = args_cli.num_reset_states // 2
+        term_params.params.pop("assembly_success_prob")
+        term_params.params["quota_per_category"] = quota
+        # Round the loop target down to 2*quota so an odd --num_reset_states doesn't
+        # deadlock the while loop (quota caps at 2*quota; loop waits for num_reset_states).
+        args_cli.num_reset_states = quota * 2
+        print(f"[balanced] quota_per_category={quota} → {quota * 2} total states")
+
     # create environment
     env = cast(ManagerBasedRLEnv, gym.make(args_cli.task, cfg=env_cfg)).unwrapped
     env.reset()

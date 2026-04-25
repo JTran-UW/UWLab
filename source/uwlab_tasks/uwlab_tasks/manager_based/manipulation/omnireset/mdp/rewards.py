@@ -100,16 +100,18 @@ class ProgressContext(ManagerTermBase):
         self.is_multitask = self.num_task_types > 1
 
         if self.is_multitask:
+            # Multitask path uses canonical (first) receptive offset only.
             self.task_type_ids = torch.arange(env.num_envs, device=env.device) % self.num_task_types
             ins_offset_pos, ins_offset_quat = [], []
             rec_offset_pos, rec_offset_quat = [], []
             for ins_path, rec_path in zip(insertive_usd_paths, receptive_usd_paths):
                 im = utils.read_metadata_from_usd_directory(ins_path)
                 rm = utils.read_metadata_from_usd_directory(rec_path)
+                rec_canonical_pos, rec_canonical_quat = utils.get_canonical_assembled_offset(rm)
                 ins_offset_pos.append(im["assembled_offset"]["pos"])
                 ins_offset_quat.append(im["assembled_offset"]["quat"])
-                rec_offset_pos.append(rm["assembled_offset"]["pos"])
-                rec_offset_quat.append(rm["assembled_offset"]["quat"])
+                rec_offset_pos.append(rec_canonical_pos)
+                rec_offset_quat.append(rec_canonical_quat)
             self.ins_offset_pos = torch.tensor(ins_offset_pos, device=env.device, dtype=torch.float32)
             self.ins_offset_quat = torch.tensor(ins_offset_quat, device=env.device, dtype=torch.float32)
             self.rec_offset_pos = torch.tensor(rec_offset_pos, device=env.device, dtype=torch.float32)
@@ -121,9 +123,14 @@ class ProgressContext(ManagerTermBase):
                 pos=tuple(insertive_meta["assembled_offset"]["pos"]),
                 quat=tuple(insertive_meta["assembled_offset"]["quat"]),
             )
-            self.receptive_asset_offset = Offset(
-                pos=tuple(receptive_meta["assembled_offset"]["pos"]),
-                quat=tuple(receptive_meta["assembled_offset"]["quat"]),
+            # Multi-offset receptive support (e.g. cylindrical peg).
+            rec_offsets = utils.get_assembled_offsets(receptive_meta)
+            self.receptive_asset_offset = Offset(pos=tuple(rec_offsets[0][0]), quat=tuple(rec_offsets[0][1]))
+            self.receptive_asset_offsets_pos = torch.tensor(
+                [o[0] for o in rec_offsets], dtype=torch.float32, device=env.device
+            )
+            self.receptive_asset_offsets_quat = torch.tensor(
+                [o[1] for o in rec_offsets], dtype=torch.float32, device=env.device
             )
 
         self.orientation_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
@@ -193,7 +200,36 @@ class ProgressContext(ManagerTermBase):
         )
         self.xyz_distance[:] = torch.norm(insertive_asset_in_receptive_asset_frame_pos, dim=1)
         self.position_aligned[:] = self.xyz_distance < success_position_threshold
-        self.orientation_aligned[:] = self.euler_distance < success_orientation_threshold
+        # Single-task multi-offset support: orientation_aligned is True if rel_quat passes
+        # for ANY receptive offset. Reports euler_distance as MIN error across offsets.
+        if (not self.is_multitask) and self.receptive_asset_offsets_pos.shape[0] > 1:
+            num_envs = env.num_envs
+            ori_aligned = torch.zeros(num_envs, dtype=torch.bool, device=env.device)
+            ins_pos_w = insertive_asset_alignment_pos_w
+            ins_quat_w = insertive_asset_alignment_quat_w
+            rec_root_pos = self.receptive_asset.data.root_pos_w
+            rec_root_quat = self.receptive_asset.data.root_quat_w
+            min_euler = torch.full((num_envs,), float("inf"), device=env.device)
+            for k in range(self.receptive_asset_offsets_pos.shape[0]):
+                off_pos = self.receptive_asset_offsets_pos[k].unsqueeze(0).expand(num_envs, -1)
+                off_quat = self.receptive_asset_offsets_quat[k].unsqueeze(0).expand(num_envs, -1)
+                rec_pos_w_k = rec_root_pos + math_utils.quat_apply(rec_root_quat, off_pos)
+                rec_quat_w_k = math_utils.quat_mul(rec_root_quat, off_quat)
+                _, rel_quat_k = math_utils.subtract_frame_transforms(
+                    rec_pos_w_k, rec_quat_w_k, ins_pos_w, ins_quat_w
+                )
+                ex, ey, ez = math_utils.euler_xyz_from_quat(rel_quat_k)
+                edist_k = (
+                    math_utils.wrap_to_pi(ex).abs()
+                    + math_utils.wrap_to_pi(ey).abs()
+                    + math_utils.wrap_to_pi(ez).abs()
+                )
+                min_euler = torch.minimum(min_euler, edist_k)
+                ori_aligned = ori_aligned | (edist_k < success_orientation_threshold)
+            self.euler_distance[:] = min_euler
+            self.orientation_aligned[:] = ori_aligned
+        else:
+            self.orientation_aligned[:] = self.euler_distance < success_orientation_threshold
         self.success[:] = self.orientation_aligned & self.position_aligned
 
         self.continuous_success_counter[:] = torch.where(

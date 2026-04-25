@@ -255,7 +255,10 @@ class check_reset_state_success(ManagerTermBase):
 
         # Optional assembly alignment filter
         self.assembly_success_prob = cfg.params.get("assembly_success_prob")
-        if self.assembly_success_prob is not None:
+        self.quota_per_category = cfg.params.get("quota_per_category")
+        if self.assembly_success_prob is not None and self.quota_per_category is not None:
+            raise ValueError("Set at most one of `assembly_success_prob` (legacy reflip) or `quota_per_category`.")
+        if self.assembly_success_prob is not None or self.quota_per_category is not None:
             insertive_asset_cfg = cfg.params.get("insertive_asset_cfg")
             receptive_asset_cfg = cfg.params.get("receptive_asset_cfg")
             self.insertive_asset = env.scene[insertive_asset_cfg.name]
@@ -267,10 +270,18 @@ class check_reset_state_success(ManagerTermBase):
                 pos=tuple(insertive_meta.get("assembled_offset").get("pos")),
                 quat=tuple(insertive_meta.get("assembled_offset").get("quat")),
             )
-            self.receptive_asset_offset = Offset(
-                pos=tuple(receptive_meta.get("assembled_offset").get("pos")),
-                quat=tuple(receptive_meta.get("assembled_offset").get("quat")),
+            # Receptive may have multiple valid assembled-pose offsets (e.g. cylindrical peg).
+            # Store as parallel tensors of shape (K, 3) and (K, 4); per-env "near" check ORs
+            # over all K offsets at runtime.
+            rec_offsets = utils.get_assembled_offsets(receptive_meta)
+            self.receptive_asset_offsets_pos = torch.tensor(
+                [o[0] for o in rec_offsets], dtype=torch.float32, device=env.device
             )
+            self.receptive_asset_offsets_quat = torch.tensor(
+                [o[1] for o in rec_offsets], dtype=torch.float32, device=env.device
+            )
+            # Canonical (first entry) used wherever single Offset is required for spawning/etc.
+            self.receptive_asset_offset = Offset(pos=tuple(rec_offsets[0][0]), quat=tuple(rec_offsets[0][1]))
             assembly_threshold_scale = cfg.params.get("assembly_threshold_scale", 1.0)
             assembly_threshold_min_scale = cfg.params.get("assembly_threshold_min_scale", 0.0)
             base_pos = receptive_meta.get("success_thresholds").get("position")
@@ -279,8 +290,18 @@ class check_reset_state_success(ManagerTermBase):
             self.assembly_ori_threshold: float = base_ori * assembly_threshold_scale
             self.assembly_pos_min_threshold: float = base_pos * assembly_threshold_min_scale
             self.assembly_ori_min_threshold: float = base_ori * assembly_threshold_min_scale
-            self.require_assembly_success = torch.rand(env.num_envs, device=env.device) < self.assembly_success_prob
-            self._pending_reflip = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+            if self.assembly_success_prob is not None:
+                self.require_assembly_success = (
+                    torch.rand(env.num_envs, device=env.device) < self.assembly_success_prob
+                )
+                self._pending_reflip = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+            if self.quota_per_category is not None:
+                # Running counts of recorded near-assembly and far-from-assembly successes.
+                # Per-step masking caps each category at `quota_per_category`; an overshoot
+                # batch (e.g. all 8192 envs succeed in one step) is truncated deterministically,
+                # so the final dataset is strictly balanced no matter the env count.
+                self.count_near: int = 0
+                self.count_far: int = 0
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         super().reset(env_ids)
@@ -332,6 +353,7 @@ class check_reset_state_success(ManagerTermBase):
         assembly_threshold_scale: float = 1.0,
         assembly_threshold_min_scale: float = 0.0,
         check_gripper_orientation: bool = True,
+        quota_per_category: int | None = None,
     ) -> torch.Tensor:
 
         # Check time out
@@ -441,23 +463,59 @@ class check_reset_state_success(ManagerTermBase):
                 msg += " | all checks passed"
             logging.info(msg)
 
-        if self.assembly_success_prob is not None:
+        if self.assembly_success_prob is not None or self.quota_per_category is not None:
             ins_pos_w, ins_quat_w = self.insertive_asset_offset.apply(self.insertive_asset)
-            rec_pos_w, rec_quat_w = self.receptive_asset_offset.apply(self.receptive_asset)
-            rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
-            e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_quat)
-            euler_dist = (
-                math_utils.wrap_to_pi(e_x).abs()
-                + math_utils.wrap_to_pi(e_y).abs()
-                + math_utils.wrap_to_pi(e_z).abs()
-            )
-            xyz_dist = torch.norm(rel_pos, dim=1)
-            within_max = (xyz_dist < self.assembly_pos_threshold) & (euler_dist < self.assembly_ori_threshold)
-            beyond_min = (xyz_dist > self.assembly_pos_min_threshold) | (euler_dist > self.assembly_ori_min_threshold)
-            assembly_success = within_max & beyond_min
-            assembly_match = torch.where(self.require_assembly_success, assembly_success, ~assembly_success)
-            reset_success = reset_success & assembly_match
-            self._pending_reflip |= reset_success
+            num_envs = self._env.num_envs
+            assembly_success = torch.zeros(num_envs, dtype=torch.bool, device=self._env.device)
+            # Iterate over each receptive offset; assembly_success = True if rel_pose passes
+            # for ANY one of them. Position is fixed (same xyz_dist) per offset, but each
+            # offset's rel_quat differs.
+            rec_root_pos = self.receptive_asset.data.root_pos_w
+            rec_root_quat = self.receptive_asset.data.root_quat_w
+            num_offsets = self.receptive_asset_offsets_pos.shape[0]
+            for k in range(num_offsets):
+                off_pos = self.receptive_asset_offsets_pos[k].unsqueeze(0).expand(num_envs, -1)
+                off_quat = self.receptive_asset_offsets_quat[k].unsqueeze(0).expand(num_envs, -1)
+                rec_pos_w = rec_root_pos + math_utils.quat_apply(rec_root_quat, off_pos)
+                rec_quat_w = math_utils.quat_mul(rec_root_quat, off_quat)
+                rel_pos, rel_quat = math_utils.subtract_frame_transforms(
+                    rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w
+                )
+                e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_quat)
+                euler_dist = (
+                    math_utils.wrap_to_pi(e_x).abs()
+                    + math_utils.wrap_to_pi(e_y).abs()
+                    + math_utils.wrap_to_pi(e_z).abs()
+                )
+                xyz_dist = torch.norm(rel_pos, dim=1)
+                within_max_k = (xyz_dist < self.assembly_pos_threshold) & (euler_dist < self.assembly_ori_threshold)
+                beyond_min_k = (xyz_dist > self.assembly_pos_min_threshold) | (
+                    euler_dist > self.assembly_ori_min_threshold
+                )
+                assembly_success = assembly_success | (within_max_k & beyond_min_k)
+
+            if self.quota_per_category is not None:
+                # Deterministic per-category quota: overshoot batches are truncated so
+                # count_near and count_far never exceed quota_per_category.
+                near_mask = reset_success & assembly_success
+                far_mask = reset_success & ~assembly_success
+                near_remaining = max(0, self.quota_per_category - self.count_near)
+                far_remaining = max(0, self.quota_per_category - self.count_far)
+                n_near = int(near_mask.sum().item())
+                n_far = int(far_mask.sum().item())
+                if n_near > near_remaining:
+                    near_idx = torch.where(near_mask)[0]
+                    near_mask[near_idx[near_remaining:]] = False
+                if n_far > far_remaining:
+                    far_idx = torch.where(far_mask)[0]
+                    far_mask[far_idx[far_remaining:]] = False
+                self.count_near += min(n_near, near_remaining)
+                self.count_far += min(n_far, far_remaining)
+                reset_success = near_mask | far_mask
+            else:
+                assembly_match = torch.where(self.require_assembly_success, assembly_success, ~assembly_success)
+                reset_success = reset_success & assembly_match
+                self._pending_reflip |= reset_success
 
         return reset_success
 
@@ -826,20 +884,39 @@ class success_termination(ManagerTermBase):
             rec_pos_w, rec_quat_w = tc._apply_offset_multitask(
                 tc.receptive_asset, tc.rec_offset_pos, tc.rec_offset_quat,
             )
-        else:
-            ins_pos_w, ins_quat_w = tc.insertive_asset_offset.apply(tc.insertive_asset)
-            rec_pos_w, rec_quat_w = tc.receptive_asset_offset.apply(tc.receptive_asset)
+            rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
+            e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_quat)
+            euler_distance = (
+                math_utils.wrap_to_pi(e_x).abs()
+                + math_utils.wrap_to_pi(e_y).abs()
+                + math_utils.wrap_to_pi(e_z).abs()
+            )
+            xyz_distance = torch.norm(rel_pos, dim=1)
+            return (xyz_distance < success_pos_thresh) & (euler_distance < success_ori_thresh)
 
-        rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
-        e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_quat)
-        euler_distance = (
-            math_utils.wrap_to_pi(e_x).abs()
-            + math_utils.wrap_to_pi(e_y).abs()
-            + math_utils.wrap_to_pi(e_z).abs()
-        )
-        xyz_distance = torch.norm(rel_pos, dim=1)
-
-        return (xyz_distance < success_pos_thresh) & (euler_distance < success_ori_thresh)
+        # Single-task: support multi-offset receptacles by ORing success across all offsets
+        ins_pos_w, ins_quat_w = tc.insertive_asset_offset.apply(tc.insertive_asset)
+        num_envs = env.num_envs
+        rec_root_pos = tc.receptive_asset.data.root_pos_w
+        rec_root_quat = tc.receptive_asset.data.root_quat_w
+        success = torch.zeros(num_envs, dtype=torch.bool, device=env.device)
+        for k in range(tc.receptive_asset_offsets_pos.shape[0]):
+            off_pos = tc.receptive_asset_offsets_pos[k].unsqueeze(0).expand(num_envs, -1)
+            off_quat = tc.receptive_asset_offsets_quat[k].unsqueeze(0).expand(num_envs, -1)
+            rec_pos_w = rec_root_pos + math_utils.quat_apply(rec_root_quat, off_pos)
+            rec_quat_w = math_utils.quat_mul(rec_root_quat, off_quat)
+            rel_pos, rel_quat = math_utils.subtract_frame_transforms(
+                rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w
+            )
+            e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_quat)
+            euler_distance = (
+                math_utils.wrap_to_pi(e_x).abs()
+                + math_utils.wrap_to_pi(e_y).abs()
+                + math_utils.wrap_to_pi(e_z).abs()
+            )
+            xyz_distance = torch.norm(rel_pos, dim=1)
+            success = success | ((xyz_distance < success_pos_thresh) & (euler_distance < success_ori_thresh))
+        return success
 
 
 def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes: int = 10):

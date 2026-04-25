@@ -386,6 +386,26 @@ def read_metadata_from_usd_directory(usd_path: str) -> dict:
     return metadata_file
 
 
+def get_assembled_offsets(metadata: dict) -> list[tuple[list[float], list[float]]]:
+    """Return list of (pos, quat) tuples from a receptive metadata dict.
+
+    The receptive schema uses ``assembled_offsets`` (plural list). The first entry
+    is treated as canonical wherever a single canonical pose is required (e.g.
+    spawning); all entries are valid for success classification.
+    """
+    if "assembled_offsets" not in metadata:
+        raise KeyError(
+            "metadata is missing 'assembled_offsets' (plural list). Insertive metadata "
+            "still uses singular 'assembled_offset' — check you are passing the receptive metadata."
+        )
+    return [(entry["pos"], entry["quat"]) for entry in metadata["assembled_offsets"]]
+
+
+def get_canonical_assembled_offset(metadata: dict) -> tuple[list[float], list[float]]:
+    """Return the canonical (first) assembled-pose offset as (pos, quat) tuple."""
+    return get_assembled_offsets(metadata)[0]
+
+
 def object_name_from_usd(usd_path: str) -> str:
     """Extract the canonical object name from a USD asset path.
 

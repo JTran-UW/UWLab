@@ -92,6 +92,9 @@ class TaskCommand(TaskDependentCommand):
         self.is_multitask = self.num_task_types > 1
 
         if self.is_multitask:
+            # Multitask path uses canonical (first) receptive offset only. Multi-offset
+            # receptacles (e.g. cylindrical peg) are still treated as single-canonical here;
+            # extend to per-task variable-length offset lists if needed.
             self.task_type_ids = torch.arange(env.num_envs, device=self.device) % self.num_task_types
             ins_offset_pos, ins_offset_quat = [], []
             rec_offset_pos, rec_offset_quat = [], []
@@ -99,10 +102,11 @@ class TaskCommand(TaskDependentCommand):
             for ins_path, rec_path in zip(insertive_usd_paths, receptive_usd_paths):
                 im = utils.read_metadata_from_usd_directory(ins_path)
                 rm = utils.read_metadata_from_usd_directory(rec_path)
+                rec_canonical_pos, rec_canonical_quat = utils.get_canonical_assembled_offset(rm)
                 ins_offset_pos.append(im["assembled_offset"]["pos"])
                 ins_offset_quat.append(im["assembled_offset"]["quat"])
-                rec_offset_pos.append(rm["assembled_offset"]["pos"])
-                rec_offset_quat.append(rm["assembled_offset"]["quat"])
+                rec_offset_pos.append(rec_canonical_pos)
+                rec_offset_quat.append(rec_canonical_quat)
                 pos_thresholds.append(rm["success_thresholds"]["position"])
                 ori_thresholds.append(rm["success_thresholds"]["orientation"])
             self.ins_offset_pos = torch.tensor(ins_offset_pos, device=self.device, dtype=torch.float32)
@@ -112,6 +116,9 @@ class TaskCommand(TaskDependentCommand):
             self._pos_thresholds = torch.tensor(pos_thresholds, device=self.device, dtype=torch.float32)
             self._ori_thresholds = torch.tensor(ori_thresholds, device=self.device, dtype=torch.float32)
             self.task_names = [utils.object_name_from_usd(p) for p in insertive_usd_paths]
+            # Receptive offsets list (multitask = canonical-only for now: shape (T, 1, ...))
+            self.rec_offsets_pos = self.rec_offset_pos.unsqueeze(1)
+            self.rec_offsets_quat = self.rec_offset_quat.unsqueeze(1)
         else:
             insertive_meta = utils.read_metadata_from_usd_directory(insertive_usd_paths[0])
             receptive_meta = utils.read_metadata_from_usd_directory(receptive_usd_paths[0])
@@ -119,9 +126,15 @@ class TaskCommand(TaskDependentCommand):
                 pos=tuple(insertive_meta["assembled_offset"]["pos"]),
                 quat=tuple(insertive_meta["assembled_offset"]["quat"]),
             )
-            self.receptive_asset_offset = Offset(
-                pos=tuple(receptive_meta["assembled_offset"]["pos"]),
-                quat=tuple(receptive_meta["assembled_offset"]["quat"]),
+            # Receptive may have multiple valid assembled-pose offsets. Store list for the
+            # success check; canonical (first) is also stored as Offset for single-pose use.
+            rec_offsets = utils.get_assembled_offsets(receptive_meta)
+            self.receptive_asset_offset = Offset(pos=tuple(rec_offsets[0][0]), quat=tuple(rec_offsets[0][1]))
+            self.receptive_asset_offsets_pos = torch.tensor(
+                [o[0] for o in rec_offsets], dtype=torch.float32, device=self.device
+            )
+            self.receptive_asset_offsets_quat = torch.tensor(
+                [o[1] for o in rec_offsets], dtype=torch.float32, device=self.device
             )
             self._success_position_threshold: float = receptive_meta["success_thresholds"]["position"]
             self._success_orientation_threshold: float = receptive_meta["success_thresholds"]["orientation"]
@@ -198,7 +211,37 @@ class TaskCommand(TaskDependentCommand):
         )
         self.xyz_distance[:] = torch.norm(insertive_asset_in_receptive_asset_frame_pos, dim=1)
         self.position_aligned[:] = self.xyz_distance < self.success_position_threshold
-        self.orientation_aligned[:] = self.euler_distance < self.success_orientation_threshold
+        # For multi-offset receptacles (e.g. cylindrical peg), orientation aligned counts when
+        # rel_quat is within threshold of ANY of the receptive offsets. For single-offset
+        # receptacles, this reduces to the canonical check above.
+        if (not self.is_multitask) and self.receptive_asset_offsets_pos.shape[0] > 1:
+            num_envs = self._env.num_envs
+            ori_aligned = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+            ins_pos_w = insertive_asset_alignment_pos_w
+            ins_quat_w = insertive_asset_alignment_quat_w
+            rec_root_pos = self.receptive_asset.data.root_pos_w
+            rec_root_quat = self.receptive_asset.data.root_quat_w
+            min_euler = torch.full((num_envs,), float("inf"), device=self.device)
+            for k in range(self.receptive_asset_offsets_pos.shape[0]):
+                off_pos = self.receptive_asset_offsets_pos[k].unsqueeze(0).expand(num_envs, -1)
+                off_quat = self.receptive_asset_offsets_quat[k].unsqueeze(0).expand(num_envs, -1)
+                rec_pos_w_k = rec_root_pos + math_utils.quat_apply(rec_root_quat, off_pos)
+                rec_quat_w_k = math_utils.quat_mul(rec_root_quat, off_quat)
+                _, rel_quat_k = math_utils.subtract_frame_transforms(
+                    rec_pos_w_k, rec_quat_w_k, ins_pos_w, ins_quat_w
+                )
+                ex, ey, ez = math_utils.euler_xyz_from_quat(rel_quat_k)
+                edist_k = (
+                    math_utils.wrap_to_pi(ex).abs()
+                    + math_utils.wrap_to_pi(ey).abs()
+                    + math_utils.wrap_to_pi(ez).abs()
+                )
+                min_euler = torch.minimum(min_euler, edist_k)
+                ori_aligned = ori_aligned | (edist_k < self.success_orientation_threshold)
+            self.euler_distance[:] = min_euler  # report MIN error (closest matching offset)
+            self.orientation_aligned[:] = ori_aligned
+        else:
+            self.orientation_aligned[:] = self.euler_distance < self.success_orientation_threshold
         self.metrics["average_rot_align_error"][:] = self.euler_distance
         self.metrics["average_pos_align_error"][:] = self.xyz_distance
 

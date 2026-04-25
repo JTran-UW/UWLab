@@ -674,6 +674,11 @@ class ZeroGPartialAssemblyEventCfg(ResetStatesBaseEventCfg):
                 "pitch": (0.0, 0.0),
                 "yaw": (0.0, 0.0),
             },
+            # Routing ON + scale=8 at both pre-classifier (here) and success-term (below).
+            # Forces 50% of envs to spawn at "near canonical" seeds (more entries qualify with
+            # scale=8), and the loose success classifier accepts gripper-perturbed states as near.
+            "route_by_assembly": True,
+            "assembly_threshold_scale": 8.0,
         },
     )
 
@@ -745,6 +750,10 @@ class ZeroGPartialAssemblyResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
 
     Uses ``assembly_threshold_scale=2.0`` so recorded states cluster tightly near the
     assembled pose — the loose scale=4.0 variant was dropped after R14.
+
+    ``assembly_success_prob=0.5`` is the legacy reflip sampler. The record script
+    rewrites this to ``quota_per_category = num_reset_states // 2`` at load time so
+    collections are deterministically balanced 50/50 regardless of env count.
     """
 
     events: ZeroGPartialAssemblyEventCfg = ZeroGPartialAssemblyEventCfg()
@@ -756,7 +765,12 @@ class ZeroGPartialAssemblyResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
         self.terminations.success.params["insertive_asset_cfg"] = SceneEntityCfg("insertive_object")
         self.terminations.success.params["receptive_asset_cfg"] = SceneEntityCfg("receptive_object")
         self.terminations.success.params["assembly_success_prob"] = 0.5
-        self.terminations.success.params["assembly_threshold_scale"] = 2.0
+        # Bumped from 2.0 -> 8.0 because gripper closure perturbs the leg by several mm,
+        # kicking near-spawned states out of a tight 5mm/0.05rad zone. Scale 8 expands to
+        # 20mm/0.2rad, capturing typical post-gripper perturbations and making near
+        # collection viable. Recorded states are still much tighter than runtime success
+        # threshold so the policy still gets useful "near assembled" supervision.
+        self.terminations.success.params["assembly_threshold_scale"] = 8.0
 
 
 @configclass

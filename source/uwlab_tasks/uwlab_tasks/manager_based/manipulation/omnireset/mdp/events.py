@@ -1342,6 +1342,94 @@ class reset_insertive_object_from_partial_assembly_dataset(ManagerTermBase):
             f" {self.partial_assembly_dataset_path}"
         )
 
+        # Optional: pre-classify each seed entry as near/far assembled so the spawn
+        # event can route per-env to the matching pool. Avoids the slow-tail problem
+        # in `record_reset_states.py` when one category is naturally rare.
+        if self._cfg_param("route_by_assembly", False):
+            scale = self._cfg_param("assembly_threshold_scale", 2.0)
+            ins_meta = utils.read_metadata_from_usd_directory(self.insertive_object.cfg.spawn.usd_path)
+            rec_meta = utils.read_metadata_from_usd_directory(self.receptive_object.cfg.spawn.usd_path)
+            ins_off_pos = torch.tensor(
+                ins_meta["assembled_offset"]["pos"], dtype=torch.float32, device=env.device
+            )
+            ins_off_quat = torch.tensor(
+                ins_meta["assembled_offset"]["quat"], dtype=torch.float32, device=env.device
+            )
+            # Receptive is now a list of valid assembled-pose offsets. A seed is "near"
+            # if it is within threshold of ANY one of them.
+            rec_offsets = utils.get_assembled_offsets(rec_meta)
+            rec_offsets_pos = torch.tensor(
+                [o[0] for o in rec_offsets], dtype=torch.float32, device=env.device
+            )
+            rec_offsets_quat = torch.tensor(
+                [o[1] for o in rec_offsets], dtype=torch.float32, device=env.device
+            )
+            pos_th = float(rec_meta["success_thresholds"]["position"]) * scale
+            ori_th = float(rec_meta["success_thresholds"]["orientation"]) * scale
+
+            # Seed's rel_pose is between RAW root frames (per pose_logging_event).
+            # check_reset_state_success classifies against the assembled-offset frame:
+            # set rec_world = identity, then ins_world = (rel_pos, rel_quat).
+            N = self.rel_positions.shape[0]
+            ins_off_pos_b = ins_off_pos.unsqueeze(0).expand(N, -1)
+            ins_off_quat_b = ins_off_quat.unsqueeze(0).expand(N, -1)
+            ins_off_world_pos = self.rel_positions + math_utils.quat_apply(self.rel_quaternions, ins_off_pos_b)
+            ins_off_world_quat = math_utils.quat_mul(self.rel_quaternions, ins_off_quat_b)
+            # Iterate over each receptive offset; near = within threshold of ANY.
+            is_near = torch.zeros(N, dtype=torch.bool, device=env.device)
+            for k in range(len(rec_offsets_pos)):
+                rec_off_pos_b = rec_offsets_pos[k].unsqueeze(0).expand(N, -1)
+                rec_off_quat_b = rec_offsets_quat[k].unsqueeze(0).expand(N, -1)
+                rel_off_pos, rel_off_quat = math_utils.subtract_frame_transforms(
+                    rec_off_pos_b, rec_off_quat_b, ins_off_world_pos, ins_off_world_quat
+                )
+                e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_off_quat)
+                euler_dist = (
+                    math_utils.wrap_to_pi(e_x).abs()
+                    + math_utils.wrap_to_pi(e_y).abs()
+                    + math_utils.wrap_to_pi(e_z).abs()
+                )
+                xyz_dist = rel_off_pos.norm(dim=1)
+                is_near = is_near | ((xyz_dist < pos_th) & (euler_dist < ori_th))
+            self.near_indices = torch.where(is_near)[0]
+            self.far_indices = torch.where(~is_near)[0]
+            print(
+                f"[seed-routing] near={len(self.near_indices)} far={len(self.far_indices)}"
+                f" (scale={scale}, pos<{pos_th:.4f}m, ori_sum<{ori_th:.3f}rad)"
+            )
+            if len(self.near_indices) == 0:
+                raise ValueError(
+                    f"Seed near pool is empty for {self.partial_assembly_dataset_path}; "
+                    "loosen success_thresholds, lower assembly_threshold_scale, or regenerate seed."
+                )
+            if len(self.far_indices) == 0:
+                raise ValueError(
+                    f"Seed far pool is empty for {self.partial_assembly_dataset_path}; "
+                    "tighten success_thresholds or regenerate seed."
+                )
+        else:
+            self.near_indices = None
+            self.far_indices = None
+
+    def _cfg_param(self, key, default):
+        return self.cfg.params.get(key, default)
+
+    def _get_success_term_lazy(self, env):
+        """Look up the check_reset_state_success terminator on first call.
+        Used by dynamic re-routing to read live quota counts. Returns None if not present."""
+        if hasattr(self, "_cached_success_term"):
+            return self._cached_success_term
+        try:
+            cfg = env.termination_manager.get_term_cfg("success")
+            term_func = cfg.func if hasattr(cfg, "func") else None
+            if term_func is not None and hasattr(term_func, "quota_per_category"):
+                self._cached_success_term = term_func
+                return term_func
+        except Exception:
+            pass
+        self._cached_success_term = None
+        return None
+
     def __call__(
         self,
         env: ManagerBasedEnv,
@@ -1350,15 +1438,47 @@ class reset_insertive_object_from_partial_assembly_dataset(ManagerTermBase):
         insertive_object_cfg: SceneEntityCfg,
         receptive_object_cfg: SceneEntityCfg,
         pose_range_b: dict[str, tuple[float, float]] = dict(),
+        route_by_assembly: bool = False,
+        assembly_threshold_scale: float = 2.0,
     ) -> None:
         """Reset the insertive object from a partial assembly dataset."""
         # Get receptive object pose (world coordinates)
         receptive_pos_w = self.receptive_object.data.root_pos_w[env_ids]
         receptive_quat_w = self.receptive_object.data.root_quat_w[env_ids]
 
-        # Randomly sample partial assembly indices for each environment
+        # Sample partial assembly indices for each environment.
+        # If route_by_assembly is on, deterministically split env_ids by parity into
+        # near/far pools so each env always pulls from one classified pool. Combined
+        # with quota_per_category in check_reset_state_success, this gives a balanced
+        # output dataset without waiting on rare categories.
         num_envs = len(env_ids)
-        assembly_indices = torch.randint(0, len(self.rel_positions), (num_envs,), device=env.device)
+        if route_by_assembly and self.near_indices is not None and self.far_indices is not None:
+            # Dynamic re-routing: read the success terminator's running quota counts and route
+            # ALL envs to whichever pool still needs filling. Avoids the wasted-compute issue
+            # where, after one quota fills, half the envs keep producing soon-to-be-truncated states.
+            success_term = self._get_success_term_lazy(env)
+            quota = getattr(success_term, "quota_per_category", None) if success_term is not None else None
+            count_near = getattr(success_term, "count_near", 0) if success_term is not None else 0
+            count_far = getattr(success_term, "count_far", 0) if success_term is not None else 0
+            if quota is not None and count_near >= quota:
+                # near is full → route all envs to far
+                wants_near = torch.zeros(num_envs, dtype=torch.bool, device=env.device)
+            elif quota is not None and count_far >= quota:
+                # far is full → route all envs to near
+                wants_near = torch.ones(num_envs, dtype=torch.bool, device=env.device)
+            else:
+                # both still filling → 50/50 parity routing
+                wants_near = (env_ids % 2 == 0)
+            # Sample full-size index buffers from each pool, then select per-env via where().
+            near_picks = self.near_indices[
+                torch.randint(len(self.near_indices), (num_envs,), device=env.device)
+            ]
+            far_picks = self.far_indices[
+                torch.randint(len(self.far_indices), (num_envs,), device=env.device)
+            ]
+            assembly_indices = torch.where(wants_near, near_picks, far_picks)
+        else:
+            assembly_indices = torch.randint(0, len(self.rel_positions), (num_envs,), device=env.device)
 
         # Use pre-computed tensors for sampled partial assemblies
         sampled_rel_positions = self.rel_positions[assembly_indices]
@@ -1466,13 +1586,16 @@ class GravityTrickResetManager(ManagerTermBase):
         rel_quat = rel_quat.to(env.device, dtype=torch.float32)
 
         # Split partial assembly dataset into near-success and far based on distance
-        # Use assembled_offset to compute true distance to goal
+        # Use canonical assembled offset (first entry of receptive's assembled_offsets list)
+        # to compute true distance to goal. Multi-offset receptacles still use only canonical
+        # here for simplicity; expand to min-over-offsets if you need it for cylindrical objects.
         insertive_meta = utils.read_metadata_from_usd_directory(insertive_usd_path)
         receptive_meta = utils.read_metadata_from_usd_directory(receptive_usd_path)
+        rec_canonical_pos, rec_canonical_quat = utils.get_canonical_assembled_offset(receptive_meta)
         ins_assembled_pos = torch.tensor(insertive_meta["assembled_offset"]["pos"], device=env.device)
         ins_assembled_quat = torch.tensor(insertive_meta["assembled_offset"]["quat"], device=env.device)
-        rec_assembled_pos = torch.tensor(receptive_meta["assembled_offset"]["pos"], device=env.device)
-        rec_assembled_quat = torch.tensor(receptive_meta["assembled_offset"]["quat"], device=env.device)
+        rec_assembled_pos = torch.tensor(rec_canonical_pos, device=env.device)
+        rec_assembled_quat = torch.tensor(rec_canonical_quat, device=env.device)
 
         # For each partial assembly state, compute distance to assembled state
         # The assembled state in receptive frame: subtract_frame_transforms(rec_offset, ins_offset(rel_pos))
@@ -2180,14 +2303,14 @@ class assembly_sampling_event(ManagerTermBase):
         insertive_metadata = utils.read_metadata_from_usd_directory(self.insertive_object.cfg.spawn.usd_path)
         receptive_metadata = utils.read_metadata_from_usd_directory(self.receptive_object.cfg.spawn.usd_path)
 
+        # Insertive metadata stays singular `assembled_offset`; receptive uses canonical (first)
+        # entry of plural `assembled_offsets` for spawning.
+        rec_canonical_pos, rec_canonical_quat = utils.get_canonical_assembled_offset(receptive_metadata)
         self.insertive_assembled_offset = Offset(
             pos=insertive_metadata.get("assembled_offset").get("pos"),
             quat=insertive_metadata.get("assembled_offset").get("quat"),
         )
-        self.receptive_assembled_offset = Offset(
-            pos=receptive_metadata.get("assembled_offset").get("pos"),
-            quat=receptive_metadata.get("assembled_offset").get("quat"),
-        )
+        self.receptive_assembled_offset = Offset(pos=rec_canonical_pos, quat=rec_canonical_quat)
 
     def __call__(
         self,
