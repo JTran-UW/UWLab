@@ -392,13 +392,20 @@ def get_assembled_offsets(metadata: dict) -> list[tuple[list[float], list[float]
     The receptive schema uses ``assembled_offsets`` (plural list). The first entry
     is treated as canonical wherever a single canonical pose is required (e.g.
     spawning); all entries are valid for success classification.
+
+    Falls back to lifting the legacy singular ``assembled_offset`` (dict) into a
+    1-element list for backward compatibility with stale HF caches that still
+    have pre-migration metadata files.
     """
-    if "assembled_offsets" not in metadata:
-        raise KeyError(
-            "metadata is missing 'assembled_offsets' (plural list). Insertive metadata "
-            "still uses singular 'assembled_offset' — check you are passing the receptive metadata."
-        )
-    return [(entry["pos"], entry["quat"]) for entry in metadata["assembled_offsets"]]
+    if "assembled_offsets" in metadata:
+        return [(entry["pos"], entry["quat"]) for entry in metadata["assembled_offsets"]]
+    if "assembled_offset" in metadata:
+        legacy = metadata["assembled_offset"]
+        return [(legacy["pos"], legacy["quat"])]
+    raise KeyError(
+        "metadata has neither 'assembled_offsets' (plural list) nor 'assembled_offset' "
+        "(legacy singular dict). Check that you are passing the receptive metadata."
+    )
 
 
 def get_canonical_assembled_offset(metadata: dict) -> tuple[list[float], list[float]]:
