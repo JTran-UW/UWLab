@@ -1,10 +1,8 @@
 """Winning config (uniform + monitor_mean + floor=0.1) across peg / leg / drawer.
 
-Yaw-fix relaunches (commit 86c1ee2): every success/orientation site now sums
-|wrap_to_pi(e_x)|+|wrap_to_pi(e_y)|+|wrap_to_pi(e_z)| instead of dropping yaw. Peg loses
-its cylindrical free pass; drawer/leg gain correct orientation supervision.
-
-Pre-fix runs are kept for reference as dashed lines.
+Solid: scale=2 + ori=0.1 + multi-canonical PA dataset (commit 285d668, 2026-04-25
+relaunch with HF cache fix). Dashed: yaw-fix runs (commit 86c1ee2) on the older
+scale=8 dataset, kept for context.
 """
 
 from pathlib import Path
@@ -18,14 +16,14 @@ PROJ = "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-v0"
 
 # (label, run_id, color, linestyle)
 RUNS = [
-    # Yaw-fix relaunches (commit 86c1ee2) — currently running
-    ("Peg yaw-fix (34753110)",    "4icjogy3", "#0072B2", "-"),
-    ("Leg yaw-fix (34754745)",    "rmp8ftoo", "#D55E00", "-"),
-    ("Drawer yaw-fix (34752658)", "lxh3nxve", "#009E73", "-"),
-    # Pre-fix runs (yaw-symmetric success), kept for context
-    ("Peg pre-fix (34722401)",    "a88ojkt0", "#0072B2", "--"),
-    ("Leg pre-fix (34741091)",    "dtud7prh", "#D55E00", "--"),
-    ("Drawer pre-fix (34745030)", "ottu8izh", "#009E73", "--"),
+    # scale=2 + ori=0.1 + multi-canonical (commit 285d668)
+    ("Peg scale=2 (34840064)",    "qxfktiu1", "#0072B2", "-"),
+    ("Leg scale=2 (34840065)",    "c8lwfz9b", "#D55E00", "-"),
+    ("Drawer scale=2 (34840066)", "52qcajzn", "#009E73", "-"),
+    # Yaw-fix on older scale=8 dataset (commit 86c1ee2)
+    ("Peg yaw-fix (34753110)",    "4icjogy3", "#0072B2", "--"),
+    ("Leg yaw-fix (34754745)",    "rmp8ftoo", "#D55E00", "--"),
+    ("Drawer yaw-fix (34752658)", "lxh3nxve", "#009E73", "--"),
 ]
 
 KEYS = [
@@ -38,7 +36,11 @@ KEYS = [
 
 def fetch(run_id: str):
     run = api.run(f"patyin/{PROJ}/{run_id}")
-    df = run.history(keys=KEYS, samples=5000, pandas=True)
+    available = [k for k in KEYS if k in run.summary]
+    df = run.history(keys=available, samples=5000, pandas=True)
+    for k in KEYS:
+        if k not in df.columns:
+            df[k] = float("nan")
     df = df.dropna(subset=["Metrics/task_0_success_rate"]).sort_values("_step")
     return df, run.state
 
@@ -84,8 +86,8 @@ axes[0].legend(fontsize=8, loc="lower right")
 axes[3].legend(fontsize=7, loc="lower right")
 
 fig.suptitle(
-    "Uniform + monitor_mean + floor=0.1 across OmniReset insertions (state-only, 80K envs) "
-    "— solid: yaw-fix (commit 86c1ee2), dashed: pre-fix",
+    "Uniform + monitor_mean + floor=0.1 across OmniReset insertions "
+    "— solid: scale=2 + multi-canonical (commit 285d668), dashed: yaw-fix scale=8",
     fontsize=12,
 )
 fig.tight_layout()
