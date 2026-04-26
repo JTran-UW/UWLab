@@ -32,11 +32,20 @@ from pytorch3d.structures import Meshes
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 
+from isaaclab.sim.spawners.wrappers.wrappers_cfg import MultiAssetSpawnerCfg
+
 from .rigid_object_hasher import RigidObjectHasher
 
 # ---- module-scope caches ----
 _PRIM_SAMPLE_CACHE: dict[tuple[str, int], np.ndarray] = {}  # (prim_hash, num_points) -> (N,3) in root frame
 _FINAL_SAMPLE_CACHE: dict[str, np.ndarray] = {}  # env_hash -> (num_points,3) in root frame
+
+
+def get_usd_paths_from_spawn_cfg(spawn_cfg) -> list[str]:
+    """Extract USD paths from a single UsdFileCfg or a MultiAssetSpawnerCfg."""
+    if isinstance(spawn_cfg, MultiAssetSpawnerCfg):
+        return [asset_cfg.usd_path for asset_cfg in spawn_cfg.assets_cfg]
+    return [spawn_cfg.usd_path]
 
 
 def clear_pointcloud_caches():
@@ -90,7 +99,7 @@ def sample_object_point_cloud(
         else RigidObjectHasher(num_envs, prim_path_pattern, device=device)
     )
 
-    if hasher.num_root == 0:
+    if hasher.num_root == 0 or len(hasher.collider_prims) == 0:
         return None
 
     replicated_env = torch.all(hasher.root_prim_hashes == hasher.root_prim_hashes[0])
@@ -375,6 +384,33 @@ def read_metadata_from_usd_directory(usd_path: str) -> dict:
         metadata_file = yaml.safe_load(f)
 
     return metadata_file
+
+
+def get_assembled_offsets(metadata: dict) -> list[tuple[list[float], list[float]]]:
+    """Return list of (pos, quat) tuples from a receptive metadata dict.
+
+    The receptive schema uses ``assembled_offsets`` (plural list). The first entry
+    is treated as canonical wherever a single canonical pose is required (e.g.
+    spawning); all entries are valid for success classification.
+
+    Falls back to lifting the legacy singular ``assembled_offset`` (dict) into a
+    1-element list for backward compatibility with stale HF caches that still
+    have pre-migration metadata files.
+    """
+    if "assembled_offsets" in metadata:
+        return [(entry["pos"], entry["quat"]) for entry in metadata["assembled_offsets"]]
+    if "assembled_offset" in metadata:
+        legacy = metadata["assembled_offset"]
+        return [(legacy["pos"], legacy["quat"])]
+    raise KeyError(
+        "metadata has neither 'assembled_offsets' (plural list) nor 'assembled_offset' "
+        "(legacy singular dict). Check that you are passing the receptive metadata."
+    )
+
+
+def get_canonical_assembled_offset(metadata: dict) -> tuple[list[float], list[float]]:
+    """Return the canonical (first) assembled-pose offset as (pos, quat) tuple."""
+    return get_assembled_offsets(metadata)[0]
 
 
 def object_name_from_usd(usd_path: str) -> str:

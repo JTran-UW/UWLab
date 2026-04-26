@@ -111,8 +111,11 @@ def main(env_cfg, agent_cfg) -> None:
                 env.step(action)
             for _ in range(5):
                 env.unwrapped.sim.step()
-            success = env.unwrapped.reward_manager.get_term_cfg("progress_context").func.success
-            print("Success: ", success)
+            try:
+                success = env.unwrapped.reward_manager.get_term_cfg("progress_context").func.success
+                print("Success: ", success)
+            except ValueError:
+                pass
 
             # Wait for the specified interval
             time.sleep(args_cli.reset_interval)

@@ -25,6 +25,13 @@ gym.register(
     disable_env_checker=True,
 )
 
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-GripperClose-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": f"{__name__}.gripper_close_cfg:Ur5eRobotiq2f85GripperCloseCfg"},
+    disable_env_checker=True,
+)
+
 # Register reset states environments
 gym.register(
     id="OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEAnywhere-v0",
@@ -61,6 +68,21 @@ gym.register(
     kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ObjectPartiallyAssembledEEGraspedResetStatesCfg"},
 )
 
+# Zero-G approach reset state recording
+gym.register(
+    id="OmniReset-UR5eRobotiq2f85-ZeroGPartialAssembly-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ZeroGPartialAssemblyResetStatesCfg"},
+)
+
+gym.register(
+    id="OmniReset-UR5eRobotiq2f85-ZeroGAnywhere-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ZeroGAnywhereResetStatesCfg"},
+)
+
 # Register SysID env
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-Sysid-v0",
@@ -85,6 +107,54 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# ===========================================================================
+# ZeroG (self-contained in gravity_cfg.py, GPS + truncated success)
+# ===========================================================================
+
+# ScenePC 512pt + GPS + terminate on success (single-task)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-GPS-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGGPSScenePCTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
+    },
+)
+
+# State-only (no PC) + uniform routing (no GPS) — gravity-reduction ablations.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:StatePPORunnerCfg",
+    },
+)
+
+# State-only (no PC) + empirical GPS — GPS + gravity-reduction ablations.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-GPS-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateGPSTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:StatePPORunnerCfg",
+    },
+)
+
+# Multi-task ZeroG: peg + leg + ScenePC 512pt + GPS + terminate on success
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-ZeroG-MultiTask-GPS-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGMultiTaskGPSScenePCTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:SharedEncoder128PPORunnerCfg",
     },
 )
 

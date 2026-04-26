@@ -104,7 +104,8 @@ from isaaclab.envs import (
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 # Inject UWLab distillation classes into rsl_rl's distillation_runner module so
 # the runner's eval(class_name) lookup resolves them.
@@ -126,6 +127,12 @@ _distillation_runner_module.DistillationRunnerSplit = DistillationRunnerSplit
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
+
+import rsl_rl.runners.on_policy_runner as _runner_module
+from uwlab_rl.rsl_rl.actor_critic_encoder import ActorCriticWithEncoder
+from uwlab_rl.rsl_rl.on_policy_runner_with_classifier import OnPolicyRunnerWithClassifier
+from uwlab_rl.rsl_rl.on_policy_runner_with_success_critic import OnPolicyRunnerWithSuccessCritic
+_runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config
@@ -249,6 +256,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name == "OnPolicyRunnerWithClassifier":
+        runner = OnPolicyRunnerWithClassifier(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name == "OnPolicyRunnerWithSuccessCritic":
+        runner = OnPolicyRunnerWithSuccessCritic(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunnerSplit":

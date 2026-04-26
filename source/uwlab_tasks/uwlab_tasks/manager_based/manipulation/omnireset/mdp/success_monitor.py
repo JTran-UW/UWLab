@@ -52,3 +52,38 @@ class SuccessMonitor:
 
     def get_success_rate(self):
         return self.success_rate.clone()
+
+    @staticmethod
+    def sample_by_target_rate_from_rates(
+        rates: torch.Tensor,
+        num_samples: int,
+        target: float = 0.5,
+        kappa: float = 2.0,
+        temperature: float = 2.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample indices preferring success rates near `target` using a Beta-shaped kernel.
+
+        Weight per partition: w(p) = p^(a-1) * (1-p)^(b-1)
+        where a = 1 + kappa*target, b = 1 + kappa*(1-target).
+
+        Args:
+            rates: Success rates for each partition, shape [K].
+            num_samples: Number of indices to draw.
+            target: Desired success rate peak in [0, 1].
+            kappa: Concentration. Larger = tighter around target.
+            temperature: Softmax temperature. Larger = more uniform.
+
+        Returns:
+            (choices, probs): choices shape [num_samples], probs shape [K].
+        """
+        t = float(max(0.0, min(1.0, target)))
+        k = float(max(0.0, kappa))
+        a = 1.0 + k * t
+        b = 1.0 + k * (1.0 - t)
+
+        eps = 1e-8
+        w = ((rates + eps).pow(a - 1.0) * (1.0 - rates + eps).pow(b - 1.0)).clamp_min(eps)
+        logits = torch.log(w + eps)
+        probs = torch.softmax(logits / float(temperature), dim=0)
+        choices = torch.multinomial(probs, num_samples, replacement=True).to(torch.int64)
+        return choices, probs

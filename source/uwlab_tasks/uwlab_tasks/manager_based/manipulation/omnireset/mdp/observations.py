@@ -11,6 +11,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 from isaaclab.managers import ManagerTermBase, ObservationTermCfg, SceneEntityCfg
 from isaaclab.sensors import Camera, RayCasterCamera, TiledCamera
+from pxr import UsdGeom, UsdPhysics
 
 from uwlab_tasks.manager_based.manipulation.omnireset.assembly_keypoints import Offset
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
@@ -313,3 +314,490 @@ def binary_force_contact(
     force_norm = torch.norm(wrench_b[:, :3], dim=-1)  # (N,)
     contact = (force_norm > force_threshold).float()
     return contact.unsqueeze(-1)  # (N, 1)
+
+
+class MeshPointCloud(ManagerTermBase):
+    """Mesh-sampled pointcloud in an arbitrary reference frame.
+
+    Samples canonical points from the object's USD mesh at init, then at
+    runtime transforms them into the reference frame specified by ``ref_cfg``.
+
+    ``ref_cfg`` can be:
+      - An Articulation with ``body_names`` (e.g. wrist link)
+      - An Articulation without ``body_names`` (robot root frame)
+      - A RigidObject (e.g. receptive_object)
+
+    Falls back to legacy ``robot_cfg`` param if ``ref_cfg`` is not provided.
+
+    Returns flattened ``[num_envs, num_points * 3]``.
+    """
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        object_cfg: SceneEntityCfg = cfg.params["object_cfg"]
+        ref_cfg: SceneEntityCfg = cfg.params.get("ref_cfg", cfg.params.get("robot_cfg"))
+        self.num_points: int = cfg.params.get("num_points", 128)
+
+        self.object_asset: RigidObject = env.scene[object_cfg.name]
+        self.ref_asset = env.scene[ref_cfg.name]
+
+        self.ref_body_idx: int | None = None
+        if ref_cfg.body_names and isinstance(self.ref_asset, Articulation):
+            ref_cfg.resolve(env.scene)
+            self.ref_body_idx = ref_cfg.body_ids[0]  # type: ignore
+
+        prim_path_pattern = self.object_asset.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        self.canonical_points = utils.sample_object_point_cloud(
+            num_envs=env.num_envs,
+            num_points=self.num_points,
+            prim_path_pattern=prim_path_pattern,
+            device=str(env.device),
+        )  # [num_envs, num_points, 3] in object local frame
+
+        self._setup_visualization(cfg, env, object_cfg)
+
+    def _get_ref_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (pos_w, quat_w) of the reference frame, shape [N, 3] and [N, 4]."""
+        if self.ref_body_idx is not None:
+            return (
+                self.ref_asset.data.body_pos_w[:, self.ref_body_idx],
+                self.ref_asset.data.body_quat_w[:, self.ref_body_idx],
+            )
+        return self.ref_asset.data.root_pos_w, self.ref_asset.data.root_quat_w
+
+    def _setup_visualization(self, cfg: ObservationTermCfg, env: ManagerBasedEnv, object_cfg: SceneEntityCfg):
+        self.visualize_enabled = cfg.params.get("visualize", False)
+        if not self.visualize_enabled:
+            return
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        self.visualize_env_ids = cfg.params.get("visualize_env_ids", [0])
+        ref_cfg: SceneEntityCfg = cfg.params.get("ref_cfg", cfg.params.get("robot_cfg"))
+        obj_name = object_cfg.name
+        body_suffix = "_" + "_".join(ref_cfg.body_names) if ref_cfg.body_names else ""
+        ref_name = ref_cfg.name + body_suffix
+        self._debug_label = f"{obj_name}_in_{ref_name}"
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path=f"/Visuals/pointcloud_{self._debug_label}",
+            markers={
+                "pt": sim_utils.SphereCfg(
+                    radius=0.003,
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=cfg.params.get("marker_color", (1.0, 0.0, 0.0)),
+                    ),
+                ),
+            },
+        )
+        self._pc_markers = VisualizationMarkers(marker_cfg)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        object_cfg: SceneEntityCfg,
+        ref_cfg: SceneEntityCfg | None = None,
+        robot_cfg: SceneEntityCfg | None = None,
+        num_points: int = 128,
+        visualize: bool = False,
+        visualize_env_ids: list[int] | None = None,
+        marker_color: tuple[float, float, float] = (1.0, 0.0, 0.0),
+    ) -> torch.Tensor:
+        obj_pos_w = self.object_asset.data.root_pos_w
+        obj_quat_w = self.object_asset.data.root_quat_w
+
+        points_w = math_utils.quat_apply(
+            obj_quat_w.unsqueeze(1).expand(-1, self.num_points, -1),
+            self.canonical_points,
+        ) + obj_pos_w.unsqueeze(1)
+
+        if self.visualize_enabled:
+            vis_pts = points_w[self.visualize_env_ids].reshape(-1, 3)
+            self._pc_markers.visualize(translations=vis_pts)
+
+        ref_pos_w, ref_quat_w = self._get_ref_pose_w()
+        ref_quat_w_inv = math_utils.quat_inv(ref_quat_w)
+
+        points_ref = math_utils.quat_apply(
+            ref_quat_w_inv.unsqueeze(1).expand(-1, self.num_points, -1),
+            points_w - ref_pos_w.unsqueeze(1),
+        )
+
+        return points_ref.reshape(env.num_envs, -1)
+
+
+class ScenePointCloud(ManagerTermBase):
+    """Combined pointcloud from robot + insertive + receptive in robot base frame.
+
+    At init: samples canonical points from all robot body meshes, insertive object,
+    and receptive object. Transforms all to world frame using default poses, concatenates,
+    and applies FPS to select ``num_points`` total. Records each selected point's source
+    (robot body index or object) and its local-frame coordinates.
+
+    At runtime: transforms each point from its local frame to world frame using current
+    body/object poses, then transforms all to robot base frame. No runtime FPS — the
+    selected points are fixed for the entire training run.
+
+    Returns flattened ``[num_envs, num_points * 3]``.
+    """
+
+    # Source type constants
+    _SRC_ROBOT = 0
+    _SRC_INSERTIVE = 1
+    _SRC_RECEPTIVE = 2
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        from pytorch3d.ops import sample_farthest_points
+
+        self.num_points: int = cfg.params.get("num_points", 512)
+        oversample: int = cfg.params.get("oversample", 2)
+
+        robot_cfg: SceneEntityCfg = cfg.params["robot_cfg"]
+        ins_cfg: SceneEntityCfg = cfg.params["insertive_cfg"]
+        rec_cfg: SceneEntityCfg = cfg.params["receptive_cfg"]
+
+        self.robot: Articulation = env.scene[robot_cfg.name]
+        self.insertive: RigidObject = env.scene[ins_cfg.name]
+        self.receptive: RigidObject = env.scene[rec_cfg.name]
+
+        device = env.device
+
+        # -- Multi-task detection --
+        ins_usd_paths = utils.get_usd_paths_from_spawn_cfg(self.insertive.cfg.spawn)
+        rec_usd_paths = utils.get_usd_paths_from_spawn_cfg(self.receptive.cfg.spawn)
+        self.num_task_types: int = len(ins_usd_paths)
+        self.is_multitask: bool = self.num_task_types > 1
+        if self.is_multitask:
+            self.task_type_ids = torch.arange(env.num_envs, device=device) % self.num_task_types
+
+        # -- Sample canonical points per robot body (same across tasks; robot is homogeneous) --
+        robot_prim_path_env0 = self.robot.cfg.prim_path.replace("env_.*", "env_0")
+        body_names = self.robot.body_names
+
+        robot_local_parts: list[torch.Tensor] = []
+        robot_body_idx_parts: list[int] = []
+        for body_idx_int, body_name in enumerate(body_names):
+            body_prim_path = f"{robot_prim_path_env0}/{body_name}"
+            try:
+                body_points = self._sample_body_points(
+                    body_prim_path, oversample * 64, 64, device
+                )
+                if body_points is not None and body_points.shape[0] > 0:
+                    robot_local_parts.append(body_points)
+                    robot_body_idx_parts.extend([body_idx_int] * body_points.shape[0])
+            except Exception:
+                continue
+        robot_local = torch.cat(robot_local_parts, dim=0).to(device)  # (n_robot, 3)
+        robot_body_idx = torch.tensor(robot_body_idx_parts, dtype=torch.long, device=device)
+
+        # -- Sample canonical object points (per-env, heterogeneous-aware) --
+        ins_prim_pattern = self.insertive.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        ins_canonical_all = utils.sample_object_point_cloud(
+            num_envs=env.num_envs, num_points=oversample * 128,
+            prim_path_pattern=ins_prim_pattern, device=str(device),
+        )
+        rec_prim_pattern = self.receptive.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        rec_canonical_all = utils.sample_object_point_cloud(
+            num_envs=env.num_envs, num_points=oversample * 128,
+            prim_path_pattern=rec_prim_pattern, device=str(device),
+        )
+
+        # -- Build (num_task_types, num_points, ...) canonical selections via per-task FPS --
+        # For each task type, gather its representative env's object points, concat with robot,
+        # transform to world using that env's poses, run FPS, and store the selection.
+        selected_local_list: list[torch.Tensor] = []
+        selected_source_list: list[torch.Tensor] = []
+        selected_body_idx_list: list[torch.Tensor] = []
+
+        n_robot_pts = robot_local.shape[0]
+        for t in range(self.num_task_types):
+            # Representative env for this task type (first env whose task_type_id == t).
+            if self.is_multitask:
+                rep_env = int((self.task_type_ids == t).nonzero(as_tuple=True)[0][0].item())
+            else:
+                rep_env = 0
+
+            parts_local = [robot_local]
+            parts_source = [torch.full((n_robot_pts,), self._SRC_ROBOT, dtype=torch.long, device=device)]
+            parts_body = [robot_body_idx]
+
+            if ins_canonical_all is not None:
+                ins_pts = ins_canonical_all[rep_env]  # (n_ins, 3) in this env's object-local frame
+                parts_local.append(ins_pts)
+                parts_source.append(torch.full((ins_pts.shape[0],), self._SRC_INSERTIVE, dtype=torch.long, device=device))
+                parts_body.append(torch.full((ins_pts.shape[0],), -1, dtype=torch.long, device=device))
+            if rec_canonical_all is not None:
+                rec_pts = rec_canonical_all[rep_env]
+                parts_local.append(rec_pts)
+                parts_source.append(torch.full((rec_pts.shape[0],), self._SRC_RECEPTIVE, dtype=torch.long, device=device))
+                parts_body.append(torch.full((rec_pts.shape[0],), -1, dtype=torch.long, device=device))
+
+            task_local = torch.cat(parts_local, dim=0)
+            task_source = torch.cat(parts_source, dim=0)
+            task_body = torch.cat(parts_body, dim=0)
+
+            # Transform to world using this task's representative env poses for FPS selection.
+            task_world = self._transform_to_world_env(task_local, task_source, task_body, rep_env)
+            _, fps_indices = sample_farthest_points(task_world.unsqueeze(0), K=self.num_points)
+            sel = fps_indices[0]  # (num_points,)
+
+            selected_local_list.append(task_local[sel])
+            selected_source_list.append(task_source[sel])
+            selected_body_idx_list.append(task_body[sel])
+
+        # Per-task canonical tables: (T, num_points, 3), (T, num_points), (T, num_points)
+        self.selected_local_task = torch.stack(selected_local_list, dim=0)
+        self.selected_source_type_task = torch.stack(selected_source_list, dim=0)
+        self.selected_body_idx_task = torch.stack(selected_body_idx_list, dim=0)
+
+        # Back-compat aliases for single-task runtime path.
+        self.selected_local = self.selected_local_task[0]
+        self.selected_source_type = self.selected_source_type_task[0]
+        self.selected_body_idx = self.selected_body_idx_task[0]
+        self.robot_mask = self.selected_source_type == self._SRC_ROBOT
+        self.ins_mask = self.selected_source_type == self._SRC_INSERTIVE
+        self.rec_mask = self.selected_source_type == self._SRC_RECEPTIVE
+
+        for t in range(self.num_task_types):
+            src = self.selected_source_type_task[t]
+            n_r = (src == self._SRC_ROBOT).sum().item()
+            n_i = (src == self._SRC_INSERTIVE).sum().item()
+            n_re = (src == self._SRC_RECEPTIVE).sum().item()
+            label = f"task {t}" if self.is_multitask else "single-task"
+            print(
+                f"[ScenePointCloud] {label}: {self.num_points} points: "
+                f"robot={n_r}, insertive={n_i}, receptive={n_re}"
+            )
+
+        # -- Visualization --
+        self.visualize_enabled = cfg.params.get("visualize", False)
+        if self.visualize_enabled:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+            self.visualize_env_ids = cfg.params.get("visualize_env_ids", [0])
+            colors = {
+                self._SRC_ROBOT: (0.0, 0.5, 1.0),      # blue for robot
+                self._SRC_INSERTIVE: (1.0, 0.0, 0.0),   # red for insertive
+                self._SRC_RECEPTIVE: (0.0, 1.0, 0.0),   # green for receptive
+            }
+            self._pc_markers = {}
+            for src_type, color in colors.items():
+                label = ["robot", "insertive", "receptive"][src_type]
+                marker_cfg = VisualizationMarkersCfg(
+                    prim_path=f"/Visuals/scene_pc_{label}",
+                    markers={
+                        "pt": sim_utils.SphereCfg(
+                            radius=0.004,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+                        ),
+                    },
+                )
+                self._pc_markers[src_type] = VisualizationMarkers(marker_cfg)
+
+    def _sample_body_points(
+        self, body_prim_path: str, n_oversample: int, n_points: int, device
+    ) -> torch.Tensor | None:
+        """Sample FPS points from all collision meshes under a robot body prim."""
+        from isaaclab.sim import get_all_matching_child_prims
+        from pytorch3d.ops import sample_farthest_points, sample_points_from_meshes
+        from pytorch3d.structures import Meshes
+
+        collider_prims = get_all_matching_child_prims(
+            body_prim_path,
+            lambda p: p.HasAPI(UsdPhysics.CollisionAPI) and (
+                p.IsA(UsdGeom.Mesh) or p.IsA(UsdGeom.Gprim)
+            ),
+        )
+        if not collider_prims:
+            return None
+
+        verts_list, faces_list = [], []
+        for cp in collider_prims:
+            tm = utils.prim_to_trimesh(cp, relative_to_world=False)
+            # Apply collider's local transform relative to body
+            import omni.usd
+            import numpy as np
+            body_prim = omni.usd.get_context().get_stage().GetPrimAtPath(body_prim_path)
+            body_world_tf = np.array(omni.usd.get_world_transform_matrix(body_prim)).T
+            coll_world_tf = np.array(omni.usd.get_world_transform_matrix(cp)).T
+            # Relative transform: body_inv @ collider_world
+            body_inv = np.linalg.inv(body_world_tf)
+            rel_tf = body_inv @ coll_world_tf
+            tm.apply_transform(rel_tf)
+            v = torch.from_numpy(tm.vertices.astype("float32")).to(device)
+            f = torch.from_numpy(tm.faces.astype("int64")).to(device)
+            verts_list.append(v)
+            faces_list.append(f)
+
+        meshes = Meshes(verts=verts_list, faces=faces_list)
+        samp = sample_points_from_meshes(meshes, n_oversample)  # (n_meshes, n_oversample, 3)
+        merged = samp.reshape(1, -1, 3)
+        selected, _ = sample_farthest_points(merged, K=min(n_points, merged.shape[1]))
+        return selected[0]  # (n_points, 3) in body-local frame
+
+    def _transform_to_world_env(
+        self, pts_local: torch.Tensor, source_type: torch.Tensor,
+        body_idx: torch.Tensor, env_id: int,
+    ) -> torch.Tensor:
+        """Transform local points to world frame using a specific env's current poses.
+
+        Used at init for FPS selection. Single-task uses env 0; multi-task uses one
+        representative env per task type so the selection reflects that task's geometry.
+        """
+        pts_world = torch.zeros_like(pts_local)
+
+        # Robot body points
+        robot_mask = source_type == self._SRC_ROBOT
+        if robot_mask.any():
+            for bi in body_idx[robot_mask].unique():
+                mask_bi = robot_mask & (body_idx == bi)
+                pos_w = self.robot.data.body_pos_w[env_id, bi]
+                quat_w = self.robot.data.body_quat_w[env_id, bi]
+                pts_world[mask_bi] = math_utils.quat_apply(
+                    quat_w.unsqueeze(0).expand(mask_bi.sum(), -1),
+                    pts_local[mask_bi],
+                ) + pos_w
+
+        # Insertive object points
+        ins_mask = source_type == self._SRC_INSERTIVE
+        if ins_mask.any():
+            pos_w = self.insertive.data.root_pos_w[env_id]
+            quat_w = self.insertive.data.root_quat_w[env_id]
+            pts_world[ins_mask] = math_utils.quat_apply(
+                quat_w.unsqueeze(0).expand(ins_mask.sum(), -1),
+                pts_local[ins_mask],
+            ) + pos_w
+
+        # Receptive object points
+        rec_mask = source_type == self._SRC_RECEPTIVE
+        if rec_mask.any():
+            pos_w = self.receptive.data.root_pos_w[env_id]
+            quat_w = self.receptive.data.root_quat_w[env_id]
+            pts_world[rec_mask] = math_utils.quat_apply(
+                quat_w.unsqueeze(0).expand(rec_mask.sum(), -1),
+                pts_local[rec_mask],
+            ) + pos_w
+
+        return pts_world
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        robot_cfg: SceneEntityCfg,
+        insertive_cfg: SceneEntityCfg,
+        receptive_cfg: SceneEntityCfg,
+        num_points: int = 512,
+        oversample: int = 2,
+        visualize: bool = False,
+        visualize_env_ids: list[int] | None = None,
+    ) -> torch.Tensor:
+        N = env.num_envs
+        P = self.num_points
+        device = env.device
+
+        if self.is_multitask:
+            # Per-env canonical selections (gathered from per-task tables via task_type_ids).
+            # env_local:       (N, P, 3)
+            # env_source_type: (N, P)
+            # env_body_idx:    (N, P)
+            env_local = self.selected_local_task[self.task_type_ids]
+            env_source_type = self.selected_source_type_task[self.task_type_ids]
+            env_body_idx = self.selected_body_idx_task[self.task_type_ids]
+
+            robot_mask_np = env_source_type == self._SRC_ROBOT  # (N, P)
+            ins_mask_np = env_source_type == self._SRC_INSERTIVE
+            rec_mask_np = env_source_type == self._SRC_RECEPTIVE
+
+            # Per-point robot body transform via gather over body dimension.
+            body_pos_w = self.robot.data.body_pos_w  # (N, B, 3)
+            body_quat_w = self.robot.data.body_quat_w  # (N, B, 4)
+            safe_body_idx = env_body_idx.clamp(min=0)  # non-robot points masked away below
+            pos_per_pt = torch.gather(body_pos_w, 1, safe_body_idx.unsqueeze(-1).expand(-1, -1, 3))
+            quat_per_pt = torch.gather(body_quat_w, 1, safe_body_idx.unsqueeze(-1).expand(-1, -1, 4))
+            robot_world = math_utils.quat_apply(quat_per_pt, env_local) + pos_per_pt
+
+            # Insertive / receptive transforms broadcast per env.
+            ins_pos = self.insertive.data.root_pos_w.unsqueeze(1).expand(-1, P, -1)
+            ins_quat = self.insertive.data.root_quat_w.unsqueeze(1).expand(-1, P, -1)
+            ins_world = math_utils.quat_apply(ins_quat, env_local) + ins_pos
+
+            rec_pos = self.receptive.data.root_pos_w.unsqueeze(1).expand(-1, P, -1)
+            rec_quat = self.receptive.data.root_quat_w.unsqueeze(1).expand(-1, P, -1)
+            rec_world = math_utils.quat_apply(rec_quat, env_local) + rec_pos
+
+            pts_world = torch.zeros(N, P, 3, device=device)
+            pts_world = torch.where(robot_mask_np.unsqueeze(-1), robot_world, pts_world)
+            pts_world = torch.where(ins_mask_np.unsqueeze(-1), ins_world, pts_world)
+            pts_world = torch.where(rec_mask_np.unsqueeze(-1), rec_world, pts_world)
+        else:
+            # Single-task fast path: one canonical table shared across all envs.
+            pts_world = torch.zeros(N, P, 3, device=device)
+
+            if self.robot_mask.any():
+                robot_local = self.selected_local[self.robot_mask]
+                robot_body_ids = self.selected_body_idx[self.robot_mask]
+                for bi in robot_body_ids.unique():
+                    mask_bi = robot_body_ids == bi
+                    n_bi = mask_bi.sum()
+                    local_pts = robot_local[mask_bi]
+                    pos_w = self.robot.data.body_pos_w[:, bi]
+                    quat_w = self.robot.data.body_quat_w[:, bi]
+                    expanded_local = local_pts.unsqueeze(0).expand(N, -1, -1)
+                    expanded_quat = quat_w.unsqueeze(1).expand(-1, n_bi, -1)
+                    world_pts = math_utils.quat_apply(expanded_quat, expanded_local) + pos_w.unsqueeze(1)
+                    robot_indices = torch.where(self.robot_mask)[0]
+                    bi_indices = robot_indices[mask_bi]
+                    pts_world[:, bi_indices] = world_pts
+
+            if self.ins_mask.any():
+                ins_local = self.selected_local[self.ins_mask]
+                n_ins = ins_local.shape[0]
+                pos_w = self.insertive.data.root_pos_w
+                quat_w = self.insertive.data.root_quat_w
+                expanded_local = ins_local.unsqueeze(0).expand(N, -1, -1)
+                expanded_quat = quat_w.unsqueeze(1).expand(-1, n_ins, -1)
+                world_pts = math_utils.quat_apply(expanded_quat, expanded_local) + pos_w.unsqueeze(1)
+                ins_indices = torch.where(self.ins_mask)[0]
+                pts_world[:, ins_indices] = world_pts
+
+            if self.rec_mask.any():
+                rec_local = self.selected_local[self.rec_mask]
+                n_rec = rec_local.shape[0]
+                pos_w = self.receptive.data.root_pos_w
+                quat_w = self.receptive.data.root_quat_w
+                expanded_local = rec_local.unsqueeze(0).expand(N, -1, -1)
+                expanded_quat = quat_w.unsqueeze(1).expand(-1, n_rec, -1)
+                world_pts = math_utils.quat_apply(expanded_quat, expanded_local) + pos_w.unsqueeze(1)
+                rec_indices = torch.where(self.rec_mask)[0]
+                pts_world[:, rec_indices] = world_pts
+
+        # -- Visualize in world frame --
+        if self.visualize_enabled:
+            # Per-env masks because in multi-task, different envs may have different
+            # source_type assignments for the same point index.
+            for src_type, marker in self._pc_markers.items():
+                vis_chunks = []
+                for vid in self.visualize_env_ids:
+                    if self.is_multitask:
+                        env_src = self.selected_source_type_task[self.task_type_ids[vid]]
+                    else:
+                        env_src = self.selected_source_type
+                    mask = env_src == src_type
+                    if mask.any():
+                        indices = torch.where(mask)[0]
+                        vis_chunks.append(pts_world[vid, indices])
+                if vis_chunks:
+                    marker.visualize(translations=torch.cat(vis_chunks, dim=0))
+
+        # -- Transform to robot base frame --
+        base_pos_w = self.robot.data.root_pos_w  # (N, 3)
+        base_quat_w = self.robot.data.root_quat_w  # (N, 4)
+        base_quat_inv = math_utils.quat_inv(base_quat_w)
+
+        pts_base = math_utils.quat_apply(
+            base_quat_inv.unsqueeze(1).expand(-1, P, -1),
+            pts_world - base_pos_w.unsqueeze(1),
+        )
+
+        return pts_base.reshape(N, -1)

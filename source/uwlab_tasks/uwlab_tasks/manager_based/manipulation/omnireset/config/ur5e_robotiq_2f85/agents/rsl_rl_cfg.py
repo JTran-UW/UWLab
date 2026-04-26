@@ -13,7 +13,14 @@ from uwlab_rl.rsl_rl.rl_cfg import (
     OffPolicyAlgorithmCfg,
     RslRlFancyActorCriticCfg,
     RslRlFancyPpoAlgorithmCfg,
+    SuccessCriticCfg,
 )
+
+
+@configclass
+class RslRlActorCriticWithEncoderCfg(RslRlFancyActorCriticCfg):
+    class_name: str = "ActorCriticWithEncoder"
+    encoder_groups: dict = dict()
 
 
 def my_experts_observation_func(env):
@@ -535,3 +542,39 @@ class Base_DAggerRunnerCfg(Base_PPORunnerCfg):
             )
         ),
     )
+
+
+@configclass
+class StatePPORunnerCfg(Base_PPORunnerCfg):
+    """Plain PPO on state-only obs. One ``policy`` group for actor + critic."""
+
+    obs_groups = {"policy": ["policy"], "critic": ["policy"]}
+
+
+@configclass
+class SharedEncoder128PPORunnerCfg(Base_PPORunnerCfg):
+    """128-pt PC with shared MLP encoder (both objects concatenated)."""
+
+    class_name: str = "OnPolicyRunnerWithClassifier"
+    classifier_num_epochs: int = 4
+    classifier_minibatch_size: int = 256
+
+    obs_groups = {
+        "policy": ["proprio", "pointcloud"],
+        "critic": ["proprio", "pointcloud", "time_left"],
+        "success_classifier": ["success_classifier"],
+    }
+    policy = RslRlActorCriticWithEncoderCfg(
+        init_noise_std=1.0,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[512, 256, 128, 64],
+        critic_hidden_dims=[512, 256, 128, 64],
+        activation="elu",
+        noise_std_type="gsde",
+        state_dependent_std=False,
+        encoder_groups={
+            "pointcloud": {"hidden_dims": [256, 128], "output_dim": 32},
+        },
+    )
+    success_critic: SuccessCriticCfg = SuccessCriticCfg()

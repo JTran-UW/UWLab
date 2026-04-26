@@ -26,6 +26,8 @@ from isaaclab.envs.mdp.actions.task_space_actions import DifferentialInverseKine
 from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import FRAME_MARKER_CFG
+
+from .collision_analyzer_cfg import CollisionAnalyzerCfg
 from pxr import Gf, UsdGeom, UsdLux
 
 from uwlab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
@@ -33,6 +35,8 @@ from uwlab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActi
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
 
 from ..assembly_keypoints import Offset
+from .success_classifier import SuccessClassifier
+from .success_monitor import SuccessMonitor
 from .success_monitor_cfg import SuccessMonitorCfg
 
 
@@ -539,6 +543,510 @@ class global_physics_control_event(ManagerTermBase):
                 )
 
 
+class reset_ee_toward_object(ManagerTermBase):
+    """Reset end-effector with approach orientation toward a random mesh surface point.
+
+    1. Sample random EE position in workspace
+    2. Sample random surface point on the target object mesh
+    3. Orient gripper approach axis toward the surface point
+    4. Lerp EE position: ee_final = (1-t)*ee_random + t*(surface_point - gripper_offset), t ~ U(0,1)
+    5. IK solve to (ee_final, approach_quat)
+
+    The gripper always "looks at" the object surface, regardless of where it spawns.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        robot_ik_cfg: SceneEntityCfg = cfg.params.get(
+            "robot_ik_cfg",
+            SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"),
+        )
+        self.robot: Articulation = env.scene[robot_ik_cfg.name]
+        self.target_object: RigidObject = env.scene[cfg.params.get("target_object_cfg", SceneEntityCfg("insertive_object")).name]
+        self.joint_ids: list[int] | slice = robot_ik_cfg.joint_ids
+        self.n_joints: int = self.robot.num_joints if isinstance(self.joint_ids, slice) else len(self.joint_ids)
+
+        # EE workspace range
+        ee_range: dict = cfg.params.get("ee_pose_range", {
+            "x": (0.3, 0.7), "y": (-0.4, 0.4), "z": (0.0, 0.5),
+        })
+        self.ee_range = torch.tensor(
+            [ee_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z"]],
+            device=env.device,
+        )
+
+        # Gripper approach direction from robot metadata (e.g., [0, 0, -1] for Robotiq)
+        robot_metadata = utils.read_metadata_from_usd_directory(self.robot.cfg.spawn.usd_path)
+        self.gripper_approach_dir = torch.tensor(
+            robot_metadata.get("gripper_approach_direction", [0.0, 0.0, -1.0]),
+            device=env.device, dtype=torch.float32,
+        )
+
+        # Gripper offset: IK body (robotiq_base_link) -> fingertip grasp point
+        gripper_offset = robot_metadata.get("gripper_offset", {})
+        self.gripper_offset_pos = torch.tensor(
+            gripper_offset.get("pos", [0.0, 0.0, 0.0]), device=env.device, dtype=torch.float32
+        )
+
+        # Canonical mesh surface points for the target object
+        target_prim_path = self.target_object.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        self.canonical_points = utils.sample_object_point_cloud(
+            num_envs=env.num_envs, num_points=64, prim_path_pattern=target_prim_path, device=str(env.device),
+        )  # [num_envs, 64, 3] in object local frame
+
+        # Gripper joint IDs and pre-recorded close trajectory
+        gripper_joint_names = [
+            "finger_joint", "right_outer_knuckle_joint",
+            "left_inner_knuckle_joint", "right_inner_knuckle_joint",
+            "left_inner_finger_knuckle_joint", "right_inner_finger_knuckle_joint",
+        ]
+        self.gripper_joint_ids: list[int] = [
+            list(self.robot.joint_names).index(n) for n in gripper_joint_names if n in self.robot.joint_names
+        ]
+        # Load gripper close trajectory from file next to robot USD
+        robot_usd_path = self.robot.cfg.spawn.usd_path
+        traj_path = os.path.dirname(robot_usd_path) + "/gripper_close_trajectory.pt"
+        local_path = utils.safe_retrieve_file_path(traj_path)
+        data = torch.load(local_path, map_location="cpu")
+        saved_names = data["joint_names"]
+        saved_positions = data["joint_positions"]
+        result = torch.zeros(saved_positions.shape[0], len(self.gripper_joint_ids), dtype=torch.float32)
+        for i, joint_idx in enumerate(self.gripper_joint_ids):
+            joint_name = self.robot.joint_names[joint_idx]
+            if joint_name in saved_names:
+                result[:, i] = saved_positions[:, saved_names.index(joint_name)]
+        self.gripper_close_states = result.to(env.device)
+
+        # IK solver
+        robot_ik_solver_cfg = DifferentialInverseKinematicsActionCfg(
+            asset_name=robot_ik_cfg.name,
+            joint_names=robot_ik_cfg.joint_names,
+            body_name=robot_ik_cfg.body_names,
+            controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+            scale=1.0,
+        )
+        self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        robot_ik_cfg: SceneEntityCfg | None = None,
+        target_object_cfg: SceneEntityCfg | None = None,
+        ee_pose_range: dict | None = None,
+        ee_roll_range: tuple[float, float] = (0.0, 6.283185),
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+        n = env_ids.numel()
+        device = env.device
+
+        # 1. Get object state and transform all canonical points to world frame
+        obj_pos_w = self.target_object.data.root_pos_w[env_ids]
+        obj_quat_w = self.target_object.data.root_quat_w[env_ids]
+        robot_root_pos = self.robot.data.root_link_pos_w[env_ids]
+        all_pts_world = math_utils.quat_apply(
+            obj_quat_w.unsqueeze(1).expand(-1, self.canonical_points.shape[1], -1),
+            self.canonical_points[env_ids],
+        ) + obj_pos_w.unsqueeze(1)  # [n, 64, 3]
+
+        # 2-3: Sample EE position + entry surface point + approach direction
+        # Resample envs where approach direction isn't within 60° of downward
+        ee_pos_w = torch.zeros(n, 3, device=device)
+        entry_point = torch.zeros(n, 3, device=device)
+        approach_dir = torch.zeros(n, 3, device=device)
+        remaining = torch.ones(n, dtype=torch.bool, device=device)
+
+        for _ in range(20):  # max resample attempts
+            if not remaining.any():
+                break
+            m = remaining.sum()
+
+            # Sample random EE position in workspace
+            ee_samples = math_utils.sample_uniform(
+                self.ee_range[:, 0], self.ee_range[:, 1], (m, 3), device=device
+            )
+            ee_pos_w[remaining] = robot_root_pos[remaining] + ee_samples
+
+            # Sample random surface point as entry
+            pt_idx = torch.randint(0, self.canonical_points.shape[1], (m,), device=device)
+            entry_point[remaining] = all_pts_world[remaining][:, :, :].gather(
+                1, pt_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, 3)
+            ).squeeze(1)
+
+            # Compute approach direction: EE -> entry point
+            d = entry_point[remaining] - ee_pos_w[remaining]
+            d = d / (d.norm(dim=-1, keepdim=True) + 1e-8)
+            approach_dir[remaining] = d
+
+            # Check: approach direction within 60° of downward (z < -0.5)
+            bad = d[:, 2] > -0.5
+            remaining[remaining.clone()] = bad
+
+        # 4. Compute exit depth: project all canonical points onto approach dir
+        #    relative to entry point, find max depth along approach direction
+        offsets = all_pts_world - entry_point.unsqueeze(1)  # [n, 64, 3]
+        projections = (offsets * approach_dir.unsqueeze(1)).sum(dim=-1)  # [n, 64]
+        max_depth = projections.max(dim=1).values.clamp(min=0.001)  # [n]
+
+        # 5. Sample random depth along ray inside object
+        depth = torch.rand(n, device=device) * max_depth  # [n]
+
+        # 6. Compute EE target: entry point + depth along approach - gripper offset
+        ee_quat_w = self._quat_from_approach(approach_dir, device, ee_roll_range)
+        target_pos = entry_point + approach_dir * depth.unsqueeze(-1)  # [n, 3]
+        offset_world = math_utils.quat_apply(ee_quat_w, self.gripper_offset_pos.expand(n, -1))
+        ee_target = target_pos - offset_world
+
+        # 7. IK solve
+        self._solve_ik(env, env_ids, ee_target, ee_quat_w, num_iters=10)
+
+        # 8. Randomize gripper from pre-recorded close trajectory
+        traj_len = self.gripper_close_states.shape[0]
+        indices = torch.randint(0, traj_len, (n,), device=device)
+        sampled_pos = self.gripper_close_states[indices]
+        self.robot.write_joint_state_to_sim(
+            sampled_pos, torch.zeros_like(sampled_pos),
+            joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+        self.robot.set_joint_position_target(
+            sampled_pos, joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+
+        # Update buffers
+        self.robot.update(env.sim.get_physics_dt())
+
+    def _quat_from_approach(
+        self, approach_dir: torch.Tensor, device: torch.device,
+        roll_range: tuple[float, float] = (0.0, 6.283185),
+    ) -> torch.Tensor:
+        """Compute quaternion that aligns the gripper approach axis with the given direction.
+
+        Uses the rotation that maps gripper_approach_dir -> approach_dir, then applies
+        random roll around the approach axis within roll_range.
+        """
+        n = approach_dir.shape[0]
+        src = self.gripper_approach_dir.expand(n, -1)  # [n, 3]
+        dst = approach_dir  # [n, 3]
+
+        # Rotation axis = cross(src, dst), angle = acos(dot(src, dst))
+        cross = torch.cross(src, dst, dim=-1)
+        dot = (src * dst).sum(dim=-1, keepdim=True)  # [n, 1]
+        cross_norm = cross.norm(dim=-1, keepdim=True)  # [n, 1]
+
+        # Handle parallel/anti-parallel cases
+        # For nearly parallel vectors, return identity
+        # For anti-parallel, pick an arbitrary perpendicular axis
+        axis = cross / (cross_norm + 1e-8)
+        angle = torch.atan2(cross_norm, dot)  # [n, 1]
+
+        # Axis-angle to quaternion: q = [cos(a/2), sin(a/2) * axis]
+        half_angle = angle * 0.5
+        quat = torch.cat([
+            torch.cos(half_angle),  # w
+            torch.sin(half_angle) * axis,  # x, y, z
+        ], dim=-1)  # [n, 4]
+
+        # Normalize
+        quat = quat / (quat.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Random roll around approach axis
+        roll_angle = roll_range[0] + (roll_range[1] - roll_range[0]) * torch.rand(n, 1, device=device)
+        roll_half = roll_angle * 0.5
+        roll_quat = torch.cat([
+            torch.cos(roll_half),
+            torch.sin(roll_half) * dst,  # rotate around approach direction
+        ], dim=-1)
+        roll_quat = roll_quat / (roll_quat.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Compose: first align approach, then roll
+        quat = math_utils.quat_mul(roll_quat, quat)
+        return quat
+
+    def _solve_ik(
+        self, env: ManagerBasedEnv, env_ids: torch.Tensor,
+        target_pos_w: torch.Tensor, target_quat_w: torch.Tensor,
+        num_iters: int = 10,
+    ) -> None:
+        """Solve IK with fixed number of iterations."""
+        pos_b, quat_b = self.solver._compute_frame_pose()
+        pos_b[env_ids], quat_b[env_ids] = math_utils.subtract_frame_transforms(
+            self.robot.data.root_link_pos_w[env_ids],
+            self.robot.data.root_link_quat_w[env_ids],
+            target_pos_w, target_quat_w,
+        )
+        self.solver.process_actions(torch.cat([pos_b, quat_b], dim=1))
+        for _ in range(num_iters):
+            self.solver.apply_actions()
+            delta = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            self.robot.write_joint_state_to_sim(
+                position=(delta + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
+                joint_ids=self.joint_ids, env_ids=env_ids,
+            )
+
+
+class reset_ee_convex_hull_approach(ManagerTermBase):
+    """Reset EE by approaching the target object along convex hull surface normals.
+
+    1. Compute convex hull of target object mesh (once, at init)
+    2. Sample random point on convex hull + get outward normal
+    3. Place fingertip at surface_point + normal * d, where d ~ U(-d_range, d_range)
+    4. EE target = fingertip + normal * gripper_offset (back along normal)
+    5. Orient EE approach axis = -normal (pointing inward toward object)
+    6. IK solve
+    7. Randomize gripper open/close from pre-recorded trajectory
+
+    This is geometry-agnostic: the convex hull handles any object shape (rods, bowls, cubes).
+    The gripper_offset and d_range are EE-specific but constant across objects.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        robot_ik_cfg: SceneEntityCfg = cfg.params.get(
+            "robot_ik_cfg",
+            SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"),
+        )
+        self.robot: Articulation = env.scene[robot_ik_cfg.name]
+        self.target_object: RigidObject = env.scene[cfg.params.get("target_object_cfg", SceneEntityCfg("insertive_object")).name]
+        self.joint_ids: list[int] | slice = robot_ik_cfg.joint_ids
+        self.n_joints: int = self.robot.num_joints if isinstance(self.joint_ids, slice) else len(self.joint_ids)
+
+        # Gripper approach direction from robot metadata
+        robot_metadata = utils.read_metadata_from_usd_directory(self.robot.cfg.spawn.usd_path)
+        self.gripper_approach_dir = torch.tensor(
+            robot_metadata.get("gripper_approach_direction", [0.0, 0.0, -1.0]),
+            device=env.device, dtype=torch.float32,
+        )
+
+        # Gripper offset and d_range from params (EE-specific constants)
+        self.gripper_offset = cfg.params.get("gripper_offset", 0.115)
+        self.d_range = cfg.params.get("d_range", 0.025)
+
+        # Optional: receptive object for occlusion filtering at runtime
+        receptive_cfg = cfg.params.get("receptive_object_cfg", None)
+        if receptive_cfg is not None:
+            self.receptive_object: RigidObject | None = env.scene[receptive_cfg.name]
+            # Load receptive mesh for point-in-mesh checks (trimesh)
+            rec_pts = utils.sample_object_point_cloud(
+                num_envs=1, num_points=2048,
+                prim_path_pattern=self.receptive_object.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*"),
+                device="cpu",
+            )[0].numpy()
+            self.receptive_trimesh = trimesh.Trimesh(vertices=rec_pts).convex_hull
+            logging.info(
+                f"[reset_ee_convex_hull_approach] Receptive convex hull: {len(self.receptive_trimesh.vertices)} verts"
+            )
+        else:
+            self.receptive_object = None
+            self.receptive_trimesh = None
+
+        # Build convex hull from target object mesh
+        target_prim_path = self.target_object.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        canonical_pts = utils.sample_object_point_cloud(
+            num_envs=1, num_points=1024, prim_path_pattern=target_prim_path, device="cpu",
+        )  # [1, 1024, 3]
+        pts_np = canonical_pts[0].numpy()
+        mesh = trimesh.Trimesh(vertices=pts_np)
+        hull = mesh.convex_hull
+        self.hull_vertices = torch.tensor(hull.vertices, device=env.device, dtype=torch.float32)  # [V, 3]
+        self.hull_faces = torch.tensor(hull.faces, device=env.device, dtype=torch.long)  # [F, 3]
+        self.hull_face_normals = torch.tensor(hull.face_normals, device=env.device, dtype=torch.float32)  # [F, 3]
+        hull_face_areas = torch.tensor(hull.area_faces, device=env.device, dtype=torch.float32)  # [F]
+        self.hull_face_probs = hull_face_areas / hull_face_areas.sum()
+        logging.info(
+            f"[reset_ee_convex_hull_approach] Convex hull: {len(hull.vertices)} verts, {len(hull.faces)} faces"
+        )
+
+        # Gripper joint IDs and pre-recorded close trajectory
+        gripper_joint_names = [
+            "finger_joint", "right_outer_knuckle_joint",
+            "left_inner_knuckle_joint", "right_inner_knuckle_joint",
+            "left_inner_finger_knuckle_joint", "right_inner_finger_knuckle_joint",
+        ]
+        self.gripper_joint_ids: list[int] = [
+            list(self.robot.joint_names).index(n) for n in gripper_joint_names if n in self.robot.joint_names
+        ]
+        robot_usd_path = self.robot.cfg.spawn.usd_path
+        traj_path = os.path.dirname(robot_usd_path) + "/gripper_close_trajectory.pt"
+        local_path = utils.safe_retrieve_file_path(traj_path)
+        data = torch.load(local_path, map_location="cpu")
+        saved_names = data["joint_names"]
+        saved_positions = data["joint_positions"]
+        result = torch.zeros(saved_positions.shape[0], len(self.gripper_joint_ids), dtype=torch.float32)
+        for i, joint_idx in enumerate(self.gripper_joint_ids):
+            joint_name = self.robot.joint_names[joint_idx]
+            if joint_name in saved_names:
+                result[:, i] = saved_positions[:, saved_names.index(joint_name)]
+        self.gripper_close_states = result.to(env.device)
+
+        # IK solver
+        robot_ik_solver_cfg = DifferentialInverseKinematicsActionCfg(
+            asset_name=robot_ik_cfg.name,
+            joint_names=robot_ik_cfg.joint_names,
+            body_name=robot_ik_cfg.body_names,
+            controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+            scale=1.0,
+        )
+        self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        robot_ik_cfg: SceneEntityCfg | None = None,
+        target_object_cfg: SceneEntityCfg | None = None,
+        receptive_object_cfg: SceneEntityCfg | None = None,
+        gripper_offset: float = 0.115,
+        d_range: float = 0.025,
+        ee_roll_range: tuple[float, float] = (0.0, 6.283185),
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+        n = env_ids.numel()
+        device = env.device
+
+        # 1. Get object state
+        obj_pos_w = self.target_object.data.root_pos_w[env_ids]  # [n, 3]
+        obj_quat_w = self.target_object.data.root_quat_w[env_ids]  # [n, 4]
+
+        # 2. Sample random point on convex hull, reject points inside receptive object
+        surface_pt_w = torch.zeros(n, 3, device=device)
+        assigned = torch.zeros(n, dtype=torch.bool, device=device)
+
+        for _ in range(20):
+            if assigned.all():
+                break
+            m = (~assigned).sum()
+
+            face_indices = torch.multinomial(self.hull_face_probs, m, replacement=True)
+            r1 = torch.rand(m, device=device)
+            r2 = torch.rand(m, device=device)
+            over = r1 + r2 > 1
+            r1[over] = 1 - r1[over]
+            r2[over] = 1 - r2[over]
+
+            faces = self.hull_faces[face_indices]
+            v0 = self.hull_vertices[faces[:, 0]]
+            v1 = self.hull_vertices[faces[:, 1]]
+            v2 = self.hull_vertices[faces[:, 2]]
+
+            sp_local = v0 + r1.unsqueeze(-1) * (v1 - v0) + r2.unsqueeze(-1) * (v2 - v0)
+            sp_w = math_utils.quat_apply(obj_quat_w[~assigned], sp_local) + obj_pos_w[~assigned]
+
+            # Occlusion filter: reject points inside the receptive object
+            if self.receptive_object is not None:
+                rec_pos = self.receptive_object.data.root_pos_w[env_ids[~assigned]]
+                rec_quat = self.receptive_object.data.root_quat_w[env_ids[~assigned]]
+                # Transform surface points to receptive object local frame
+                sp_in_rec = math_utils.quat_apply(
+                    math_utils.quat_conjugate(rec_quat), sp_w - rec_pos
+                )
+                # Check if points are inside the receptive convex hull
+                inside = self.receptive_trimesh.contains(sp_in_rec.detach().cpu().numpy())
+                good = ~torch.tensor(inside, device=device)
+            else:
+                good = torch.ones(m, dtype=torch.bool, device=device)
+
+            unassigned_idx = (~assigned).nonzero(as_tuple=False).squeeze(-1)
+            good_idx = unassigned_idx[good]
+            surface_pt_w[good_idx] = sp_w[good]
+            assigned[good_idx] = True
+
+        # 4. Sample random approach direction within 60° cone of downward (independent of surface normal)
+        approach_dir = torch.zeros(n, 3, device=device)
+        for _ in range(20):
+            remaining = (approach_dir.norm(dim=-1) < 0.5)  # not yet assigned
+            if not remaining.any():
+                break
+            m = remaining.sum()
+            # Random direction on unit sphere
+            dirs = torch.randn(m, 3, device=device)
+            dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-8)
+            # Keep only those within 60° cone of downward (z < -cos(60°) = -0.5)
+            good = dirs[:, 2] < -0.5
+            remaining_idx = remaining.nonzero(as_tuple=False).squeeze(-1)
+            good_idx = remaining_idx[good]
+            approach_dir[good_idx] = dirs[good]
+
+        approach_dir = approach_dir / (approach_dir.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # 5. Sample d ~ U(-d_range, d_range) and compute EE target
+        # EE is placed along the approach direction (not the surface normal)
+        # fingertip at surface_point, offset by d along approach direction
+        d = (2 * torch.rand(n, device=device) - 1) * self.d_range  # [n]
+        fingertip_pos = surface_pt_w - approach_dir * d.unsqueeze(-1)  # [n, 3] (negative because approach points inward)
+        ee_target_pos = fingertip_pos - approach_dir * self.gripper_offset  # [n, 3] (back along approach)
+
+        # 6. Compute EE orientation from approach direction
+        ee_quat_w = self._quat_from_approach(approach_dir, device, ee_roll_range)
+
+        # 7. IK solve
+        self._solve_ik(env, env_ids, ee_target_pos, ee_quat_w, num_iters=10)
+
+        # 8. Gripper starts open — actions during collection will randomize open/close
+        open_pos = torch.zeros(n, len(self.gripper_joint_ids), device=device)
+        self.robot.write_joint_state_to_sim(
+            open_pos, torch.zeros_like(open_pos),
+            joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+        self.robot.set_joint_position_target(
+            open_pos, joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+
+        self.robot.update(env.sim.get_physics_dt())
+
+    def _quat_from_approach(
+        self, approach_dir: torch.Tensor, device: torch.device,
+        roll_range: tuple[float, float] = (0.0, 6.283185),
+    ) -> torch.Tensor:
+        """Compute quaternion that aligns the gripper approach axis with the given direction."""
+        n = approach_dir.shape[0]
+        src = self.gripper_approach_dir.expand(n, -1)
+        dst = approach_dir
+
+        cross = torch.cross(src, dst, dim=-1)
+        dot = (src * dst).sum(dim=-1, keepdim=True)
+        cross_norm = cross.norm(dim=-1, keepdim=True)
+
+        axis = cross / (cross_norm + 1e-8)
+        angle = torch.atan2(cross_norm, dot)
+
+        half_angle = angle * 0.5
+        quat = torch.cat([torch.cos(half_angle), torch.sin(half_angle) * axis], dim=-1)
+        quat = quat / (quat.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # Random roll around approach axis
+        roll_angle = roll_range[0] + (roll_range[1] - roll_range[0]) * torch.rand(n, 1, device=device)
+        roll_half = roll_angle * 0.5
+        roll_quat = torch.cat([torch.cos(roll_half), torch.sin(roll_half) * dst], dim=-1)
+        roll_quat = roll_quat / (roll_quat.norm(dim=-1, keepdim=True) + 1e-8)
+
+        return math_utils.quat_mul(roll_quat, quat)
+
+    def _solve_ik(
+        self, env: ManagerBasedEnv, env_ids: torch.Tensor,
+        target_pos_w: torch.Tensor, target_quat_w: torch.Tensor,
+        num_iters: int = 10,
+    ) -> None:
+        """Solve IK with fixed number of iterations."""
+        pos_b, quat_b = self.solver._compute_frame_pose()
+        pos_b[env_ids], quat_b[env_ids] = math_utils.subtract_frame_transforms(
+            self.robot.data.root_link_pos_w[env_ids],
+            self.robot.data.root_link_quat_w[env_ids],
+            target_pos_w, target_quat_w,
+        )
+        self.solver.process_actions(torch.cat([pos_b, quat_b], dim=1))
+        for _ in range(num_iters):
+            self.solver.apply_actions()
+            delta = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            self.robot.write_joint_state_to_sim(
+                position=(delta + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
+                joint_ids=self.joint_ids, env_ids=env_ids,
+            )
+
+
 class reset_end_effector_round_fixed_asset(ManagerTermBase):
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         fixed_asset_cfg: SceneEntityCfg = cfg.params.get("fixed_asset_cfg")  # type: ignore
@@ -834,6 +1342,94 @@ class reset_insertive_object_from_partial_assembly_dataset(ManagerTermBase):
             f" {self.partial_assembly_dataset_path}"
         )
 
+        # Optional: pre-classify each seed entry as near/far assembled so the spawn
+        # event can route per-env to the matching pool. Avoids the slow-tail problem
+        # in `record_reset_states.py` when one category is naturally rare.
+        if self._cfg_param("route_by_assembly", False):
+            scale = self._cfg_param("assembly_threshold_scale", 2.0)
+            ins_meta = utils.read_metadata_from_usd_directory(self.insertive_object.cfg.spawn.usd_path)
+            rec_meta = utils.read_metadata_from_usd_directory(self.receptive_object.cfg.spawn.usd_path)
+            ins_off_pos = torch.tensor(
+                ins_meta["assembled_offset"]["pos"], dtype=torch.float32, device=env.device
+            )
+            ins_off_quat = torch.tensor(
+                ins_meta["assembled_offset"]["quat"], dtype=torch.float32, device=env.device
+            )
+            # Receptive is now a list of valid assembled-pose offsets. A seed is "near"
+            # if it is within threshold of ANY one of them.
+            rec_offsets = utils.get_assembled_offsets(rec_meta)
+            rec_offsets_pos = torch.tensor(
+                [o[0] for o in rec_offsets], dtype=torch.float32, device=env.device
+            )
+            rec_offsets_quat = torch.tensor(
+                [o[1] for o in rec_offsets], dtype=torch.float32, device=env.device
+            )
+            pos_th = float(rec_meta["success_thresholds"]["position"]) * scale
+            ori_th = float(rec_meta["success_thresholds"]["orientation"]) * scale
+
+            # Seed's rel_pose is between RAW root frames (per pose_logging_event).
+            # check_reset_state_success classifies against the assembled-offset frame:
+            # set rec_world = identity, then ins_world = (rel_pos, rel_quat).
+            N = self.rel_positions.shape[0]
+            ins_off_pos_b = ins_off_pos.unsqueeze(0).expand(N, -1)
+            ins_off_quat_b = ins_off_quat.unsqueeze(0).expand(N, -1)
+            ins_off_world_pos = self.rel_positions + math_utils.quat_apply(self.rel_quaternions, ins_off_pos_b)
+            ins_off_world_quat = math_utils.quat_mul(self.rel_quaternions, ins_off_quat_b)
+            # Iterate over each receptive offset; near = within threshold of ANY.
+            is_near = torch.zeros(N, dtype=torch.bool, device=env.device)
+            for k in range(len(rec_offsets_pos)):
+                rec_off_pos_b = rec_offsets_pos[k].unsqueeze(0).expand(N, -1)
+                rec_off_quat_b = rec_offsets_quat[k].unsqueeze(0).expand(N, -1)
+                rel_off_pos, rel_off_quat = math_utils.subtract_frame_transforms(
+                    rec_off_pos_b, rec_off_quat_b, ins_off_world_pos, ins_off_world_quat
+                )
+                e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_off_quat)
+                euler_dist = (
+                    math_utils.wrap_to_pi(e_x).abs()
+                    + math_utils.wrap_to_pi(e_y).abs()
+                    + math_utils.wrap_to_pi(e_z).abs()
+                )
+                xyz_dist = rel_off_pos.norm(dim=1)
+                is_near = is_near | ((xyz_dist < pos_th) & (euler_dist < ori_th))
+            self.near_indices = torch.where(is_near)[0]
+            self.far_indices = torch.where(~is_near)[0]
+            print(
+                f"[seed-routing] near={len(self.near_indices)} far={len(self.far_indices)}"
+                f" (scale={scale}, pos<{pos_th:.4f}m, ori_sum<{ori_th:.3f}rad)"
+            )
+            if len(self.near_indices) == 0:
+                raise ValueError(
+                    f"Seed near pool is empty for {self.partial_assembly_dataset_path}; "
+                    "loosen success_thresholds, lower assembly_threshold_scale, or regenerate seed."
+                )
+            if len(self.far_indices) == 0:
+                raise ValueError(
+                    f"Seed far pool is empty for {self.partial_assembly_dataset_path}; "
+                    "tighten success_thresholds or regenerate seed."
+                )
+        else:
+            self.near_indices = None
+            self.far_indices = None
+
+    def _cfg_param(self, key, default):
+        return self.cfg.params.get(key, default)
+
+    def _get_success_term_lazy(self, env):
+        """Look up the check_reset_state_success terminator on first call.
+        Used by dynamic re-routing to read live quota counts. Returns None if not present."""
+        if hasattr(self, "_cached_success_term"):
+            return self._cached_success_term
+        try:
+            cfg = env.termination_manager.get_term_cfg("success")
+            term_func = cfg.func if hasattr(cfg, "func") else None
+            if term_func is not None and hasattr(term_func, "quota_per_category"):
+                self._cached_success_term = term_func
+                return term_func
+        except Exception:
+            pass
+        self._cached_success_term = None
+        return None
+
     def __call__(
         self,
         env: ManagerBasedEnv,
@@ -842,15 +1438,47 @@ class reset_insertive_object_from_partial_assembly_dataset(ManagerTermBase):
         insertive_object_cfg: SceneEntityCfg,
         receptive_object_cfg: SceneEntityCfg,
         pose_range_b: dict[str, tuple[float, float]] = dict(),
+        route_by_assembly: bool = False,
+        assembly_threshold_scale: float = 2.0,
     ) -> None:
         """Reset the insertive object from a partial assembly dataset."""
         # Get receptive object pose (world coordinates)
         receptive_pos_w = self.receptive_object.data.root_pos_w[env_ids]
         receptive_quat_w = self.receptive_object.data.root_quat_w[env_ids]
 
-        # Randomly sample partial assembly indices for each environment
+        # Sample partial assembly indices for each environment.
+        # If route_by_assembly is on, deterministically split env_ids by parity into
+        # near/far pools so each env always pulls from one classified pool. Combined
+        # with quota_per_category in check_reset_state_success, this gives a balanced
+        # output dataset without waiting on rare categories.
         num_envs = len(env_ids)
-        assembly_indices = torch.randint(0, len(self.rel_positions), (num_envs,), device=env.device)
+        if route_by_assembly and self.near_indices is not None and self.far_indices is not None:
+            # Dynamic re-routing: read the success terminator's running quota counts and route
+            # ALL envs to whichever pool still needs filling. Avoids the wasted-compute issue
+            # where, after one quota fills, half the envs keep producing soon-to-be-truncated states.
+            success_term = self._get_success_term_lazy(env)
+            quota = getattr(success_term, "quota_per_category", None) if success_term is not None else None
+            count_near = getattr(success_term, "count_near", 0) if success_term is not None else 0
+            count_far = getattr(success_term, "count_far", 0) if success_term is not None else 0
+            if quota is not None and count_near >= quota:
+                # near is full → route all envs to far
+                wants_near = torch.zeros(num_envs, dtype=torch.bool, device=env.device)
+            elif quota is not None and count_far >= quota:
+                # far is full → route all envs to near
+                wants_near = torch.ones(num_envs, dtype=torch.bool, device=env.device)
+            else:
+                # both still filling → 50/50 parity routing
+                wants_near = (env_ids % 2 == 0)
+            # Sample full-size index buffers from each pool, then select per-env via where().
+            near_picks = self.near_indices[
+                torch.randint(len(self.near_indices), (num_envs,), device=env.device)
+            ]
+            far_picks = self.far_indices[
+                torch.randint(len(self.far_indices), (num_envs,), device=env.device)
+            ]
+            assembly_indices = torch.where(wants_near, near_picks, far_picks)
+        else:
+            assembly_indices = torch.randint(0, len(self.rel_positions), (num_envs,), device=env.device)
 
         # Use pre-computed tensors for sampled partial assemblies
         sampled_rel_positions = self.rel_positions[assembly_indices]
@@ -883,6 +1511,739 @@ class reset_insertive_object_from_partial_assembly_dataset(ManagerTermBase):
             ),
             env_ids=env_ids,
         )
+
+
+class GravityTrickResetManager(ManagerTermBase):
+    """Procedural 50-50 reset: ObjectAnywhereEEAnywhere + ObjectPartiallyAssembledEENear.
+
+    Group A (50%): Object random position/orientation + EE random IK pose (fully procedural).
+    Group B (50%): Object from partial assembly dataset (relative to receptive) + EE near object via IK.
+
+    No grasp dataset needed — avoids collision issues from pre-computed grasps.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        dataset_dir: str = cfg.params.get("dataset_dir", "")
+        robot_ik_cfg: SceneEntityCfg = cfg.params.get(
+            "robot_ik_cfg", SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link")
+        )
+
+        self.robot: Articulation = env.scene[robot_ik_cfg.name]
+        self.insertive_object: RigidObject = env.scene["insertive_object"]
+        self.receptive_object: RigidObject = env.scene["receptive_object"]
+        self.joint_ids: list[int] | slice = robot_ik_cfg.joint_ids
+        self.n_joints: int = self.robot.num_joints if isinstance(self.joint_ids, slice) else len(self.joint_ids)
+
+        # -- Object anywhere ranges (position relative to env origin, random orientation) --
+        obj_anywhere_range: dict = cfg.params.get("obj_anywhere_range", {
+            "x": (0.3, 0.55), "y": (-0.1, 0.5), "z": (0.0, 0.3),
+            "roll": (-np.pi, np.pi), "pitch": (-np.pi, np.pi), "yaw": (-np.pi, np.pi),
+        })
+        self.obj_anywhere_range = torch.tensor(
+            [obj_anywhere_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # -- EE anywhere ranges (absolute position in robot base frame) --
+        ee_anywhere_range: dict = cfg.params.get("ee_anywhere_range", {
+            "x": (0.3, 0.7), "y": (-0.4, 0.4), "z": (0.0, 0.5),
+            "roll": (0.0, 0.0), "pitch": (np.pi / 4, 3 * np.pi / 4), "yaw": (np.pi / 2, 3 * np.pi / 2),
+        })
+        self.ee_anywhere_range = torch.tensor(
+            [ee_anywhere_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # -- EE above object ranges (offset relative to insertive object, 10-20cm above) --
+        ee_above_range: dict = cfg.params.get("ee_above_range", {
+            "x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (0.10, 0.20),
+            "roll": (0.0, 0.0), "pitch": (np.pi / 2 - np.pi / 12, np.pi / 2 + np.pi / 12), "yaw": (-np.pi, np.pi),
+        })
+        self.ee_above_range = torch.tensor(
+            [ee_above_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # -- Load partial assembly dataset --
+        insertive_usd_path = self.insertive_object.cfg.spawn.usd_path
+        receptive_usd_path = self.receptive_object.cfg.spawn.usd_path
+        pair = utils.compute_pair_dir(insertive_usd_path, receptive_usd_path)
+        pa_path = f"{dataset_dir}/Resets/{pair}/partial_assemblies.pt"
+        local_path = utils.safe_retrieve_file_path(pa_path)
+        data = torch.load(local_path, map_location="cpu")
+
+        rel_pos = data.get("relative_position")
+        rel_quat = data.get("relative_orientation")
+        if rel_pos is None or rel_quat is None or len(rel_pos) == 0:
+            raise ValueError(f"No partial assembly data found in {pa_path}")
+        if not isinstance(rel_pos, torch.Tensor):
+            rel_pos = torch.as_tensor(rel_pos, dtype=torch.float32)
+        if not isinstance(rel_quat, torch.Tensor):
+            rel_quat = torch.as_tensor(rel_quat, dtype=torch.float32)
+        rel_pos = rel_pos.to(env.device, dtype=torch.float32)
+        rel_quat = rel_quat.to(env.device, dtype=torch.float32)
+
+        # Split partial assembly dataset into near-success and far based on distance
+        # Use canonical assembled offset (first entry of receptive's assembled_offsets list)
+        # to compute true distance to goal. Multi-offset receptacles still use only canonical
+        # here for simplicity; expand to min-over-offsets if you need it for cylindrical objects.
+        insertive_meta = utils.read_metadata_from_usd_directory(insertive_usd_path)
+        receptive_meta = utils.read_metadata_from_usd_directory(receptive_usd_path)
+        rec_canonical_pos, rec_canonical_quat = utils.get_canonical_assembled_offset(receptive_meta)
+        ins_assembled_pos = torch.tensor(insertive_meta["assembled_offset"]["pos"], device=env.device)
+        ins_assembled_quat = torch.tensor(insertive_meta["assembled_offset"]["quat"], device=env.device)
+        rec_assembled_pos = torch.tensor(rec_canonical_pos, device=env.device)
+        rec_assembled_quat = torch.tensor(rec_canonical_quat, device=env.device)
+
+        # For each partial assembly state, compute distance to assembled state
+        # The assembled state in receptive frame: subtract_frame_transforms(rec_offset, ins_offset(rel_pos))
+        # Simplified: compute the position error between dataset state and the assembled relative position
+        # At assembly: insertive_alignment == receptive_alignment, so the relative pose of alignment frames is identity
+        # Dataset stores raw relative pose of insertive w.r.t. receptive root
+        # We need: distance of (ins_offset applied to dataset_rel) from (rec_offset) in receptive frame
+        n_states = len(rel_pos)
+        ins_align_pos, ins_align_quat = math_utils.combine_frame_transforms(
+            rel_pos, rel_quat,
+            ins_assembled_pos.unsqueeze(0).expand(n_states, -1),
+            ins_assembled_quat.unsqueeze(0).expand(n_states, -1),
+        )
+        # Distance of insertive alignment from receptive alignment (at assembly this is ~0)
+        error_pos, _ = math_utils.compute_pose_error(
+            rec_assembled_pos.unsqueeze(0).expand(n_states, -1),
+            rec_assembled_quat.unsqueeze(0).expand(n_states, -1),
+            ins_align_pos, ins_align_quat,
+        )
+        distances = torch.norm(error_pos, dim=1)
+
+        # Split by 2x the actual success threshold so "near" states can realistically reach success
+        near_success_threshold = cfg.params.get("near_success_threshold", None)
+        if near_success_threshold is None:
+            success_pos_thresh = receptive_meta["success_thresholds"]["position"]
+            near_success_threshold = success_pos_thresh * 2
+
+        near_mask = distances <= near_success_threshold
+        far_mask = ~near_mask
+
+        self.pa_near_positions = rel_pos[near_mask]
+        self.pa_near_quaternions = rel_quat[near_mask]
+        self.pa_far_positions = rel_pos[far_mask]
+        self.pa_far_quaternions = rel_quat[far_mask]
+
+        if near_mask.sum() == 0:
+            raise ValueError(
+                f"No partial assembly states within near_success_threshold={near_success_threshold:.4f}. "
+                f"Min distance: {distances.min().item():.4f}. Dataset may not contain near-goal states."
+            )
+
+        print(
+            f"[GravityTrickResetManager] Loaded {n_states} partial assembly states from {pa_path}"
+            f" — {near_mask.sum().item()} near-success (d<={near_success_threshold:.4f}),"
+            f" {far_mask.sum().item()} far (d>{near_success_threshold:.4f})"
+        )
+
+        # -- Bottom offset for insertive object (so it sits on surfaces correctly) --
+        metadata = utils.read_metadata_from_usd_directory(insertive_usd_path)
+        bottom_offset = metadata.get("bottom_offset")
+        if bottom_offset is not None:
+            self.obj_bottom_offset = torch.tensor(bottom_offset.get("pos"), device=env.device).unsqueeze(0)
+        else:
+            self.obj_bottom_offset = torch.zeros(1, 3, device=env.device)
+
+        # -- IK solver --
+        robot_ik_solver_cfg = DifferentialInverseKinematicsActionCfg(
+            asset_name=robot_ik_cfg.name,
+            joint_names=robot_ik_cfg.joint_names,
+            body_name=robot_ik_cfg.body_names,
+            controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+            scale=1.0,
+        )
+        self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)
+
+        # -- Probabilities --
+        probs = cfg.params.get("probs", [0.5, 0.5])
+        self.probs = torch.tensor(probs, device=env.device) / sum(probs)
+
+        # -- Collision analyzer (optional, for rejecting object-in-arm spawns) --
+        collision_analyzer_cfg: CollisionAnalyzerCfg | None = cfg.params.get("collision_analyzer_cfg", None)
+        if collision_analyzer_cfg is not None:
+            self.collision_analyzer = collision_analyzer_cfg.class_type(collision_analyzer_cfg, env)
+            self.max_resample_attempts = cfg.params.get("max_resample_attempts", 10)
+        else:
+            self.collision_analyzer = None
+
+        # -- Partial assembly success fraction (None = sample as-is, 0.5 = 50% near-success) --
+        self.pa_success_fraction: float | None = cfg.params.get("partial_assembly_success_fraction", None)
+
+        # -- Success monitoring --
+        self.task_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        if cfg.params.get("success") is not None:
+            success_monitor_cfg = SuccessMonitorCfg(
+                monitored_history_len=100, num_monitored_data=2, device=env.device
+            )
+            self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        dataset_dir: str,
+        probs: list[float] | None = None,
+        robot_ik_cfg: SceneEntityCfg | None = None,
+        obj_anywhere_range: dict | None = None,
+        ee_anywhere_range: dict | None = None,
+        ee_above_range: dict | None = None,
+        collision_analyzer_cfg: CollisionAnalyzerCfg | None = None,
+        max_resample_attempts: int = 10,
+        near_success_threshold: float | None = None,
+        partial_assembly_success_fraction: float | None = None,
+        success: str | None = None,
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+        env_ids = env_ids.long()
+        if env_ids.numel() == 0:
+            return
+
+        # -- Success monitoring --
+        if success is not None:
+            success_mask = torch.where(eval(success)[env_ids], 1.0, 0.0)
+            self.success_monitor.success_update(self.task_id[env_ids], success_mask)
+            success_rates = self.success_monitor.get_success_rate()
+            if "log" not in env.extras:
+                env.extras["log"] = {}
+            env.extras["log"]["Metrics/anywhere_success_rate"] = success_rates[0].item()
+            env.extras["log"]["Metrics/partial_assembly_success_rate"] = success_rates[1].item()
+            ep_lengths = env.episode_length_buf[env_ids].float()
+            env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
+
+        # -- Split env_ids 50-50 --
+        reset_type_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+        self.task_id[env_ids] = reset_type_indices
+
+        mask_anywhere = reset_type_indices == 0
+        mask_partial = reset_type_indices == 1
+        ids_anywhere = env_ids[mask_anywhere]
+        ids_partial = env_ids[mask_partial]
+
+        # ============================================================
+        # Group A: ObjectAnywhereEEAnywhere (fully procedural)
+        # ============================================================
+        if ids_anywhere.numel() > 0:
+            # First solve EE IK so robot is in its final pose for collision checking
+            n_a = ids_anywhere.numel()
+            ee_samples = math_utils.sample_uniform(
+                self.ee_anywhere_range[:, 0], self.ee_anywhere_range[:, 1], (n_a, 6), device=env.device
+            )
+            ee_pos_w = self.robot.data.root_link_pos_w[ids_anywhere] + ee_samples[:, :3]
+            ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
+            self._solve_ik(env, ids_anywhere, ee_pos_w, ee_quat_w)
+
+            # Sample object pose with collision rejection
+            remaining_ids = ids_anywhere.clone()
+            for attempt in range(self.max_resample_attempts if self.collision_analyzer else 1):
+                if remaining_ids.numel() == 0:
+                    break
+                n_r = remaining_ids.numel()
+
+                obj_samples = math_utils.sample_uniform(
+                    self.obj_anywhere_range[:, 0], self.obj_anywhere_range[:, 1], (n_r, 6), device=env.device
+                )
+                obj_pos = env.scene.env_origins[remaining_ids] + obj_samples[:, :3]
+                obj_pos -= self.obj_bottom_offset.expand(n_r, -1)
+                obj_quat = math_utils.quat_from_euler_xyz(obj_samples[:, 3], obj_samples[:, 4], obj_samples[:, 5])
+
+                self.insertive_object.write_root_pose_to_sim(
+                    torch.cat([obj_pos, obj_quat], dim=-1), env_ids=remaining_ids
+                )
+                self.insertive_object.write_root_velocity_to_sim(
+                    torch.zeros(n_r, 6, device=env.device), env_ids=remaining_ids
+                )
+
+                if self.collision_analyzer is not None:
+                    collision_free = self.collision_analyzer(env, remaining_ids)
+                    remaining_ids = remaining_ids[~collision_free]
+                else:
+                    remaining_ids = remaining_ids[:0]  # empty
+
+        # ============================================================
+        # Group B: ObjectPartiallyAssembled + EE above (dataset + procedural EE)
+        #   50-50 split: near-success states vs far states
+        # ============================================================
+        if ids_partial.numel() > 0:
+            n_b = ids_partial.numel()
+
+            # Object from partial assembly dataset (relative to receptive object)
+            receptive_pos_w = self.receptive_object.data.root_pos_w[ids_partial]
+            receptive_quat_w = self.receptive_object.data.root_quat_w[ids_partial]
+
+            if self.pa_success_fraction is not None:
+                # Split: pa_success_fraction near-success, rest far
+                use_near = torch.rand(n_b, device=env.device) < self.pa_success_fraction
+                near_indices = torch.randint(0, len(self.pa_near_positions), (n_b,), device=env.device)
+                far_indices = torch.randint(0, len(self.pa_far_positions), (n_b,), device=env.device)
+                sampled_rel_pos = torch.where(
+                    use_near.unsqueeze(-1), self.pa_near_positions[near_indices], self.pa_far_positions[far_indices]
+                )
+                sampled_rel_quat = torch.where(
+                    use_near.unsqueeze(-1), self.pa_near_quaternions[near_indices], self.pa_far_quaternions[far_indices]
+                )
+            else:
+                # Sample uniformly from the full dataset
+                all_positions = torch.cat([self.pa_near_positions, self.pa_far_positions], dim=0)
+                all_quaternions = torch.cat([self.pa_near_quaternions, self.pa_far_quaternions], dim=0)
+                indices = torch.randint(0, len(all_positions), (n_b,), device=env.device)
+                sampled_rel_pos = all_positions[indices]
+                sampled_rel_quat = all_quaternions[indices]
+
+            ins_pos_w, ins_quat_w = math_utils.combine_frame_transforms(
+                receptive_pos_w, receptive_quat_w, sampled_rel_pos, sampled_rel_quat
+            )
+
+            self.insertive_object.write_root_pose_to_sim(
+                torch.cat([ins_pos_w, ins_quat_w], dim=-1), env_ids=ids_partial
+            )
+            self.insertive_object.write_root_velocity_to_sim(
+                torch.zeros(n_b, 6, device=env.device), env_ids=ids_partial
+            )
+
+            # EE above object via IK (10-20cm above, pointing down — avoids collision)
+            ee_samples = math_utils.sample_uniform(
+                self.ee_above_range[:, 0], self.ee_above_range[:, 1], (n_b, 6), device=env.device
+            )
+            ee_pos_w = ins_pos_w + ee_samples[:, :3]
+            ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
+
+            self._solve_ik(env, ids_partial, ee_pos_w, ee_quat_w)
+
+        # Zero joint velocities for all reset envs
+        self.robot.set_joint_velocity_target(torch.zeros_like(self.robot.data.joint_vel[env_ids]), env_ids=env_ids)
+
+    def _solve_ik(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        target_pos_w: torch.Tensor,
+        target_quat_w: torch.Tensor,
+    ) -> None:
+        """Solve IK for the given target pose and write joint states."""
+        pos_b, quat_b = self.solver._compute_frame_pose()
+        pos_b[env_ids], quat_b[env_ids] = math_utils.subtract_frame_transforms(
+            self.robot.data.root_link_pos_w[env_ids],
+            self.robot.data.root_link_quat_w[env_ids],
+            target_pos_w,
+            target_quat_w,
+        )
+        self.solver.process_actions(torch.cat([pos_b, quat_b], dim=1))
+
+        for _ in range(10):
+            self.solver.apply_actions()
+            delta_joint_pos = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            self.robot.write_joint_state_to_sim(
+                position=(delta_joint_pos + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
+                joint_ids=self.joint_ids,
+                env_ids=env_ids,
+            )
+
+
+class IKCurriculumResetManager(ManagerTermBase):
+    """Procedural 50-50 reset: ObjectAnywhere + ObjectPartiallyAssembled.
+
+    Group A (50%): Object random position/orientation, EE random IK pose, lerp EE toward object.
+    Group B (50%): Object from partial assembly dataset (relative to receptive), EE random IK pose,
+                   lerp EE toward object.
+
+    Both groups use the same EE strategy: random EE → IK solve → lerp toward object.
+    On collision resample, envs stay in their assigned group.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        dataset_dir: str = cfg.params.get("dataset_dir", "")
+        self._dataset_dir = dataset_dir
+        robot_ik_cfg: SceneEntityCfg = cfg.params.get(
+            "robot_ik_cfg",
+            SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"),
+        )
+
+        self.robot: Articulation = env.scene[robot_ik_cfg.name]
+        self.insertive_object: RigidObject = env.scene["insertive_object"]
+        self.receptive_object: RigidObject = env.scene["receptive_object"]
+        self.joint_ids: list[int] | slice = robot_ik_cfg.joint_ids
+        self.n_joints: int = self.robot.num_joints if isinstance(self.joint_ids, slice) else len(self.joint_ids)
+
+        # Object anywhere ranges
+        obj_range: dict = cfg.params.get("obj_anywhere_range", {
+            "x": (0.3, 0.55), "y": (-0.1, 0.5), "z": (0.0, 0.3),
+            "roll": (-np.pi, np.pi), "pitch": (-np.pi, np.pi), "yaw": (-np.pi, np.pi),
+        })
+        self.obj_range = torch.tensor(
+            [obj_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # EE anywhere ranges (for initial random pose)
+        ee_range: dict = cfg.params.get("ee_anywhere_range", {
+            "x": (0.3, 0.7), "y": (-0.4, 0.4), "z": (0.0, 0.5),
+            "roll": (0.0, 0.0), "pitch": (np.pi / 4, 3 * np.pi / 4), "yaw": (np.pi / 2, 3 * np.pi / 2),
+        })
+        self.ee_range = torch.tensor(
+            [ee_range.get(k, (0.0, 0.0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+            device=env.device,
+        )
+
+        # Bottom offset for insertive object
+        insertive_usd_path = self.insertive_object.cfg.spawn.usd_path
+        metadata = utils.read_metadata_from_usd_directory(insertive_usd_path)
+        bottom_offset = metadata.get("bottom_offset")
+        if bottom_offset is not None:
+            self.obj_bottom_offset = torch.tensor(bottom_offset.get("pos"), device=env.device).unsqueeze(0)
+        else:
+            self.obj_bottom_offset = torch.zeros(1, 3, device=env.device)
+
+        # Canonical mesh surface points for insertive object (used as EE targets)
+        ins_prim_path = self.insertive_object.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        self.ins_canonical_points = utils.sample_object_point_cloud(
+            num_envs=env.num_envs,
+            num_points=64,
+            prim_path_pattern=ins_prim_path,
+            device=str(env.device),
+        )  # [num_envs, 64, 3] in object local frame
+
+        # -- Load partial assembly dataset --
+        receptive_usd_path = self.receptive_object.cfg.spawn.usd_path
+        pair = utils.compute_pair_dir(insertive_usd_path, receptive_usd_path)
+        pa_path = f"{dataset_dir}/Resets/{pair}/partial_assemblies.pt"
+        local_path = utils.safe_retrieve_file_path(pa_path)
+        data = torch.load(local_path, map_location="cpu")
+
+        rel_pos = data.get("relative_position")
+        rel_quat = data.get("relative_orientation")
+        if rel_pos is None or rel_quat is None or len(rel_pos) == 0:
+            raise ValueError(f"No partial assembly data found in {pa_path}")
+        if not isinstance(rel_pos, torch.Tensor):
+            rel_pos = torch.as_tensor(rel_pos, dtype=torch.float32)
+        if not isinstance(rel_quat, torch.Tensor):
+            rel_quat = torch.as_tensor(rel_quat, dtype=torch.float32)
+        self.pa_positions = rel_pos.to(env.device, dtype=torch.float32)
+        self.pa_quaternions = rel_quat.to(env.device, dtype=torch.float32)
+
+        print(
+            f"[IKCurriculumResetManager] Loaded {len(self.pa_positions)} partial assembly states from {pa_path}"
+        )
+
+        # IK solver
+        robot_ik_solver_cfg = DifferentialInverseKinematicsActionCfg(
+            asset_name=robot_ik_cfg.name,
+            joint_names=robot_ik_cfg.joint_names,
+            body_name=robot_ik_cfg.body_names,
+            controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls"),
+            scale=1.0,
+        )
+        self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)
+
+        # Collision checking and resample params
+        self.max_resample_attempts: int = cfg.params.get("max_resample_attempts", 10)
+        self.ee_lerp_range: tuple[float, float] = tuple(cfg.params.get("ee_lerp_range", (0.0, 1.0)))
+        self.pa_ee_lerp_range: tuple[float, float] = tuple(cfg.params.get("pa_ee_lerp_range", (0.0, 1.0)))
+        # Mesh-based collision check (lazy-init on first call to avoid USD race in distributed)
+        self.collision_num_points: int = cfg.params.get("collision_num_points", 128)
+        self.collision_max_dist: float = cfg.params.get("collision_max_dist", 0.3)
+        self.collision_min_dist: float = cfg.params.get("collision_min_dist", 0.0)
+        self.grasp_collision_analyzer = None
+
+        # Gripper offset: IK body (robotiq_base_link) → fingertip grasp point
+        robot_usd_path = self.robot.cfg.spawn.usd_path
+        robot_metadata = utils.read_metadata_from_usd_directory(robot_usd_path)
+        gripper_offset = robot_metadata.get("gripper_offset", {})
+        self.gripper_offset_pos = torch.tensor(
+            gripper_offset.get("pos", [0.0, 0.0, 0.0]), device=env.device, dtype=torch.float32
+        )
+        self.gripper_offset_quat = torch.tensor(
+            gripper_offset.get("quat", [1.0, 0.0, 0.0, 0.0]), device=env.device, dtype=torch.float32
+        )
+
+        # Gripper close: load pre-recorded trajectory of joint positions from open to closed
+        gripper_joint_names = [
+            "finger_joint", "right_outer_knuckle_joint",
+            "left_inner_knuckle_joint", "right_inner_knuckle_joint",
+            "left_inner_finger_knuckle_joint", "right_inner_finger_knuckle_joint",
+        ]
+        self.gripper_joint_ids: list[int] = [
+            list(self.robot.joint_names).index(n) for n in gripper_joint_names if n in self.robot.joint_names
+        ]
+        # Load gripper close trajectory from pre-recorded file (next to robot USD)
+        self.gripper_close_states = self._load_gripper_close_states(env)
+
+        # Group assignment: 0 = anywhere, 1 = partial assembly
+        self.group_id = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+        # Success monitoring
+        success_monitor_cfg = SuccessMonitorCfg(
+            monitored_history_len=100, num_monitored_data=2, device=env.device
+        )
+        self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        dataset_dir: str = "",
+        robot_ik_cfg: SceneEntityCfg | None = None,
+        obj_anywhere_range: dict | None = None,
+        ee_anywhere_range: dict | None = None,
+        max_resample_attempts: int = 10,
+        ee_lerp_range: tuple[float, float] = (0.0, 1.0),
+        pa_ee_lerp_range: tuple[float, float] = (0.0, 1.0),
+        collision_num_points: int = 128,
+        collision_max_dist: float = 0.3,
+        collision_min_dist: float = 0.0,
+        curriculum_target: float | None = None,
+        curriculum_kappa: float = 2.0,
+        curriculum_temperature: float = 2.0,
+        partial_assembly_fraction: float = 0.5,
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+        env_ids = env_ids.long()
+        if env_ids.numel() == 0:
+            return
+
+        # -- Success monitoring --
+        # NOTE: termination_manager.compute() runs BEFORE reward_manager.compute() in IsaacLab,
+        # so get_term("success") returns the PREVIOUS step's ProgressContext.success.
+        # Read ProgressContext.success directly — it's updated in the current step's reward computation.
+        context_term = env.reward_manager.get_term_cfg("progress_context").func
+        success_mask = getattr(context_term, "success")[env_ids].float()
+        self.success_monitor.success_update(self.group_id[env_ids], success_mask)
+        success_rates = self.success_monitor.get_success_rate()
+        if "log" not in env.extras:
+            env.extras["log"] = {}
+        env.extras["log"]["Metrics/anywhere_success_rate"] = success_rates[0].item()
+        env.extras["log"]["Metrics/partial_assembly_success_rate"] = success_rates[1].item()
+
+        # -- Group assignment: GPS or fraction-based --
+        n = env_ids.numel()
+        if curriculum_target is not None:
+            group, probs = SuccessMonitor.sample_by_target_rate_from_rates(
+                success_rates, n, target=curriculum_target, kappa=curriculum_kappa, temperature=curriculum_temperature
+            )
+            env.extras["log"]["Metrics/group_anywhere_prob"] = probs[0].item()
+            env.extras["log"]["Metrics/group_partial_assembly_prob"] = probs[1].item()
+        else:
+            # group 0 = anywhere, group 1 = partial assembly
+            group = (torch.rand(n, device=env.device) < partial_assembly_fraction).long()
+        self.group_id[env_ids] = group
+
+        ids_anywhere = env_ids[group == 0]
+        ids_partial = env_ids[group == 1]
+
+        # -- Group A: ObjectAnywhere --
+        if ids_anywhere.numel() > 0:
+            self._reset_anywhere(env, ids_anywhere)
+
+        # -- Group B: ObjectPartiallyAssembled --
+        if ids_partial.numel() > 0:
+            self._reset_partial_assembly(env, ids_partial)
+
+        # -- EE reset for all envs: random EE → IK solve → lerp toward object --
+        self._reset_ee(env, env_ids)
+
+        # -- Close gripper to random state from trajectory (open to fully closed) --
+        self._close_gripper(env, env_ids)
+
+        # -- Collision check + resample loop --
+        remaining_ids = env_ids.clone()
+        for _ in range(self.max_resample_attempts):
+            if remaining_ids.numel() == 0:
+                break
+            self.robot.update(env.sim.get_physics_dt())
+            collision_free = self._check_collision(env, remaining_ids)
+            colliding = remaining_ids[~collision_free]
+            if colliding.numel() == 0:
+                break
+            # Resample full pose + re-close gripper
+            col_anywhere = colliding[self.group_id[colliding] == 0]
+            col_partial = colliding[self.group_id[colliding] == 1]
+            if col_anywhere.numel() > 0:
+                self._reset_anywhere(env, col_anywhere)
+            if col_partial.numel() > 0:
+                self._reset_partial_assembly(env, col_partial)
+            self._reset_ee(env, colliding)
+            self._close_gripper(env, colliding)
+            remaining_ids = colliding
+
+        # Zero joint velocities
+        self.robot.set_joint_velocity_target(
+            torch.zeros_like(self.robot.data.joint_vel[env_ids]), env_ids=env_ids
+        )
+
+    def _reset_anywhere(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
+        """Sample random object pose in workspace."""
+        n = env_ids.numel()
+        obj_samples = math_utils.sample_uniform(
+            self.obj_range[:, 0], self.obj_range[:, 1], (n, 6), device=env.device
+        )
+        obj_pos = env.scene.env_origins[env_ids] + obj_samples[:, :3]
+        obj_pos -= self.obj_bottom_offset.expand(n, -1)
+        obj_quat = math_utils.quat_from_euler_xyz(obj_samples[:, 3], obj_samples[:, 4], obj_samples[:, 5])
+
+        self.insertive_object.write_root_pose_to_sim(
+            torch.cat([obj_pos, obj_quat], dim=-1), env_ids=env_ids
+        )
+        self.insertive_object.write_root_velocity_to_sim(
+            torch.zeros(n, 6, device=env.device), env_ids=env_ids
+        )
+
+    def _reset_partial_assembly(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
+        """Sample object from partial assembly dataset relative to receptive object."""
+        n = env_ids.numel()
+        receptive_pos_w = self.receptive_object.data.root_pos_w[env_ids]
+        receptive_quat_w = self.receptive_object.data.root_quat_w[env_ids]
+
+        indices = torch.randint(0, len(self.pa_positions), (n,), device=env.device)
+        sampled_rel_pos = self.pa_positions[indices]
+        sampled_rel_quat = self.pa_quaternions[indices]
+
+        ins_pos_w, ins_quat_w = math_utils.combine_frame_transforms(
+            receptive_pos_w, receptive_quat_w, sampled_rel_pos, sampled_rel_quat
+        )
+
+        self.insertive_object.write_root_pose_to_sim(
+            torch.cat([ins_pos_w, ins_quat_w], dim=-1), env_ids=env_ids
+        )
+        self.insertive_object.write_root_velocity_to_sim(
+            torch.zeros(n, 6, device=env.device), env_ids=env_ids
+        )
+
+    def _reset_ee(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
+        """Random EE pose → IK solve → lerp toward object."""
+        n = env_ids.numel()
+        device = env.device
+
+        # 1. Sample random EE pose and solve IK
+        ee_samples = math_utils.sample_uniform(
+            self.ee_range[:, 0], self.ee_range[:, 1], (n, 6), device=device
+        )
+        ee_pos_w = self.robot.data.root_link_pos_w[env_ids] + ee_samples[:, :3]
+        ee_quat_w = math_utils.quat_from_euler_xyz(ee_samples[:, 3], ee_samples[:, 4], ee_samples[:, 5])
+        self._solve_ik(env, env_ids, ee_pos_w, ee_quat_w, num_iters=10)
+
+        # 2. Interpolate EE toward object: t ~ Uniform(t_min, t_max), per-group ranges
+        t_min = torch.full((n, 1), self.ee_lerp_range[0], device=device)
+        t_max = torch.full((n, 1), self.ee_lerp_range[1], device=device)
+        pa_mask = self.group_id[env_ids] == 1
+        t_min[pa_mask] = self.pa_ee_lerp_range[0]
+        t_max[pa_mask] = self.pa_ee_lerp_range[1]
+        t = t_min + (t_max - t_min) * torch.rand(n, 1, device=device)
+        robot_ik_body_idx = self.solver._body_idx
+        current_ee_pos = self.robot.data.body_pos_w[env_ids, robot_ik_body_idx]
+        current_ee_quat = self.robot.data.body_quat_w[env_ids, robot_ik_body_idx]
+
+        # Compute IK target: sample 2 random mesh surface points, target their midpoint.
+        # Approximates antipodal grasping — works for rods, spheres, arbitrary geometry.
+        obj_pos_w = self.insertive_object.data.root_pos_w[env_ids]
+        obj_quat_w = self.insertive_object.data.root_quat_w[env_ids]
+        num_pts = self.ins_canonical_points.shape[1]
+        idx1 = torch.randint(0, num_pts, (n,), device=device)
+        idx2 = torch.randint(0, num_pts, (n,), device=device)
+        pt1_local = self.ins_canonical_points[env_ids, idx1]  # [n, 3]
+        pt2_local = self.ins_canonical_points[env_ids, idx2]  # [n, 3]
+        midpoint_local = (pt1_local + pt2_local) * 0.5
+        midpoint_w = math_utils.quat_apply(obj_quat_w, midpoint_local) + obj_pos_w  # [n, 3]
+        offset_world = math_utils.quat_apply(current_ee_quat, self.gripper_offset_pos.expand(n, -1))
+        grasp_ik_target = midpoint_w - offset_world
+        target_pos_w = (1 - t) * current_ee_pos + t * grasp_ik_target
+        target_quat_w = current_ee_quat
+
+        # 3. Solve IK to interpolated target
+        self._solve_ik(env, env_ids, target_pos_w, target_quat_w, num_iters=10)
+
+        # Update data buffers so collision checker sees current positions
+        self.robot.update(env.sim.get_physics_dt())
+        self.insertive_object.update(env.sim.get_physics_dt())
+
+    def _solve_ik(
+        self, env: ManagerBasedEnv, env_ids: torch.Tensor,
+        target_pos_w: torch.Tensor, target_quat_w: torch.Tensor,
+        num_iters: int = 10,
+    ) -> None:
+        """Solve IK with fixed number of iterations."""
+        pos_b, quat_b = self.solver._compute_frame_pose()
+        pos_b[env_ids], quat_b[env_ids] = math_utils.subtract_frame_transforms(
+            self.robot.data.root_link_pos_w[env_ids],
+            self.robot.data.root_link_quat_w[env_ids],
+            target_pos_w, target_quat_w,
+        )
+        self.solver.process_actions(torch.cat([pos_b, quat_b], dim=1))
+        for _ in range(num_iters):
+            self.solver.apply_actions()
+            delta = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            self.robot.write_joint_state_to_sim(
+                position=(delta + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
+                joint_ids=self.joint_ids, env_ids=env_ids,
+            )
+
+    def _load_gripper_close_states(self, env: ManagerBasedEnv) -> torch.Tensor:
+        """Load pre-recorded gripper close trajectory from dataset directory.
+
+        Expected file: {dataset_dir}/GripperClose/{robot_name}/gripper_close_trajectory.pt
+        Contains dict with 'joint_names' (list[str]) and 'joint_positions' (Tensor of shape (N, J)).
+        We reorder columns to match self.gripper_joint_ids ordering.
+        """
+        robot_usd_path = self.robot.cfg.spawn.usd_path
+        traj_path = os.path.dirname(robot_usd_path) + "/gripper_close_trajectory.pt"
+        local_path = utils.safe_retrieve_file_path(traj_path)
+        data = torch.load(local_path, map_location="cpu")
+
+        saved_names = data["joint_names"]
+        saved_positions = data["joint_positions"]  # (N, J)
+
+        # Reorder to match self.gripper_joint_ids
+        result = torch.zeros(saved_positions.shape[0], len(self.gripper_joint_ids), dtype=torch.float32)
+        for i, joint_idx in enumerate(self.gripper_joint_ids):
+            joint_name = self.robot.joint_names[joint_idx]
+            if joint_name in saved_names:
+                src_col = saved_names.index(joint_name)
+                result[:, i] = saved_positions[:, src_col]
+
+        result = result.to(env.device)
+        print(
+            f"[IKCurriculumResetManager] Loaded {result.shape[0]} gripper close states from {traj_path}. "
+            f"finger_joint range: [{result[:, 0].min():.4f}, {result[:, 0].max():.4f}]"
+        )
+        return result
+
+    def _check_collision(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> torch.Tensor:
+        """Check robot-object mesh collision (0.5mm clearance). Lazy-inits CollisionAnalyzer on first call."""
+        if self.grasp_collision_analyzer is None:
+            grasp_collision_cfg = CollisionAnalyzerCfg(
+                num_points=self.collision_num_points,
+                max_dist=self.collision_max_dist,
+                min_dist=self.collision_min_dist,
+                asset_cfg=SceneEntityCfg("robot"),
+                obstacle_cfgs=[SceneEntityCfg("insertive_object")],
+            )
+            self.grasp_collision_analyzer = grasp_collision_cfg.class_type(grasp_collision_cfg, env)
+        return self.grasp_collision_analyzer(env, env_ids)
+
+    def _close_gripper(self, env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
+        """Teleport gripper joints to a random state from the pre-recorded close trajectory."""
+        traj_len = self.gripper_close_states.shape[0]
+        indices = torch.randint(0, traj_len, (env_ids.numel(),), device=env.device)
+        sampled_pos = self.gripper_close_states[indices]
+        self.robot.write_joint_state_to_sim(
+            sampled_pos, torch.zeros_like(sampled_pos),
+            joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+        self.robot.set_joint_position_target(
+            sampled_pos, joint_ids=self.gripper_joint_ids, env_ids=env_ids,
+        )
+
 
 
 class pose_logging_event(ManagerTermBase):
@@ -942,14 +2303,26 @@ class assembly_sampling_event(ManagerTermBase):
         insertive_metadata = utils.read_metadata_from_usd_directory(self.insertive_object.cfg.spawn.usd_path)
         receptive_metadata = utils.read_metadata_from_usd_directory(self.receptive_object.cfg.spawn.usd_path)
 
+        # Insertive metadata stays singular `assembled_offset`. Receptive uses the full
+        # `assembled_offsets` list — at spawn time, env i is round-robin-routed to canonical
+        # (i % K). Combined with `--num_envs K` and `--num_trajectories K` in
+        # record_partial_assemblies.py, this gives exactly 1 perturbation rollout per success
+        # configuration, generalizing across single-canonical (drawer/leg) and multi-canonical
+        # (cylindrical peg, multi-slot receptacles, etc.) cases.
+        rec_offsets = utils.get_assembled_offsets(receptive_metadata)
         self.insertive_assembled_offset = Offset(
             pos=insertive_metadata.get("assembled_offset").get("pos"),
             quat=insertive_metadata.get("assembled_offset").get("quat"),
         )
-        self.receptive_assembled_offset = Offset(
-            pos=receptive_metadata.get("assembled_offset").get("pos"),
-            quat=receptive_metadata.get("assembled_offset").get("quat"),
-        )
+        # Canonical (first) for backward-compat fallback
+        self.receptive_assembled_offset = Offset(pos=rec_offsets[0][0], quat=rec_offsets[0][1])
+        # Tensor stack of all receptive offsets, indexed at __call__ time per env
+        self.rec_offsets_pos = torch.tensor(
+            [o[0] for o in rec_offsets], dtype=torch.float32, device=env.device
+        )  # (K, 3)
+        self.rec_offsets_quat = torch.tensor(
+            [o[1] for o in rec_offsets], dtype=torch.float32, device=env.device
+        )  # (K, 4)
 
     def __call__(
         self,
@@ -964,8 +2337,15 @@ class assembly_sampling_event(ManagerTermBase):
         receptive_pos = self.receptive_object.data.root_pos_w[env_ids]
         receptive_quat = self.receptive_object.data.root_quat_w[env_ids]
 
-        # Apply receptive assembled offset to get target position
-        target_pos, target_quat = self.receptive_assembled_offset.combine(receptive_pos, receptive_quat)
+        # Round-robin route env i to receptive offset (i mod K). With num_envs=K and
+        # num_trajectories=K (1 trajectory per env), each canonical gets exactly 1 rollout.
+        K = self.rec_offsets_pos.shape[0]
+        idx = env_ids % K
+        rec_off_pos_per_env = self.rec_offsets_pos[idx]
+        rec_off_quat_per_env = self.rec_offsets_quat[idx]
+        # target = receptive_root ⊗ chosen_offset (per env)
+        target_pos = receptive_pos + math_utils.quat_apply(receptive_quat, rec_off_pos_per_env)
+        target_quat = math_utils.quat_mul(receptive_quat, rec_off_quat_per_env)
 
         # Handle position and orientation separately
         # Offset quat is in insertive object's frame: target_quat = insertive_quat * offset_quat
@@ -993,9 +2373,22 @@ class assembly_sampling_event(ManagerTermBase):
 
 
 class MultiResetManager(ManagerTermBase):
+    _lazy_initialized: bool = False
+
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
+        self._lazy_initialized = False
 
+    def _lazy_init(self):
+        """Deferred init — called on first __call__ since IsaacLab's EventManager
+        does not instantiate ManagerTermBase class terms for 'reset' mode before
+        the simulation starts."""
+        if self._lazy_initialized:
+            return
+        self._lazy_initialized = True
+
+        cfg = self.cfg
+        env = self._env
         dataset_dir: str = cfg.params.get("dataset_dir", "")
         reset_types: list[str] = cfg.params.get("reset_types", [])
         probabilities: list[float] = cfg.params.get("probs", [])
@@ -1004,74 +2397,267 @@ class MultiResetManager(ManagerTermBase):
             raise ValueError("No reset_types provided")
         if len(reset_types) != len(probabilities):
             raise ValueError("Number of reset_types must match number of probabilities")
+        self.reset_types: list[str] = list(reset_types)
 
-        # Derive pair directory from scene objects
-        insertive_usd_path = env.scene["insertive_object"].cfg.spawn.usd_path
-        receptive_usd_path = env.scene["receptive_object"].cfg.spawn.usd_path
-        pair = utils.compute_pair_dir(insertive_usd_path, receptive_usd_path)
+        insertive_usd_paths = utils.get_usd_paths_from_spawn_cfg(env.scene["insertive_object"].cfg.spawn)
+        receptive_usd_paths = utils.get_usd_paths_from_spawn_cfg(env.scene["receptive_object"].cfg.spawn)
+        self.num_task_types = len(insertive_usd_paths)
+        self.is_multitask = self.num_task_types > 1
+        self.num_reset_types = len(reset_types)
 
-        # Generate dataset paths from pair directory and reset types
-        dataset_files = []
-        for rt in reset_types:
-            dataset_files.append(f"{dataset_dir}/Resets/{pair}/resets_{rt}.pt")
+        if self.is_multitask:
+            self.task_type_ids = torch.arange(env.num_envs, device=env.device) % self.num_task_types
+            self.task_names = [utils.object_name_from_usd(p) for p in insertive_usd_paths]
+        else:
+            self.task_type_ids = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+            self.task_names = [utils.object_name_from_usd(insertive_usd_paths[0])]
 
-        # Load all datasets
-        self.datasets = []
-        num_states = []
-        for dataset_file in dataset_files:
-            local_file_path = utils.safe_retrieve_file_path(dataset_file)
+        self.pair_datasets: list[list] = []
+        self.pair_num_states: list[list[int]] = []
 
-            # Check if local file exists (after potential download)
-            if not os.path.exists(local_file_path):
-                raise FileNotFoundError(f"Dataset file {dataset_file} could not be accessed or downloaded.")
+        for ins_path, rec_path in zip(insertive_usd_paths, receptive_usd_paths):
+            pair = utils.compute_pair_dir(ins_path, rec_path)
+            task_datasets = []
+            task_num_states = []
+            for rt in reset_types:
+                dataset_file = f"{dataset_dir}/Resets/{pair}/resets_{rt}.pt"
+                local_file_path = utils.safe_retrieve_file_path(dataset_file)
+                if not os.path.exists(local_file_path):
+                    raise FileNotFoundError(f"Dataset file {dataset_file} could not be accessed or downloaded.")
+                dataset = torch.load(local_file_path)
+                n = len(dataset["initial_state"]["articulation"]["robot"]["joint_position"])
+                task_num_states.append(n)
+                init_indices = torch.arange(n, device=env.device)
+                task_datasets.append(sample_state_data_set(dataset, init_indices, env.device))
+            self.pair_datasets.append(task_datasets)
+            self.pair_num_states.append(task_num_states)
 
-            dataset = torch.load(local_file_path)
-            num_states.append(len(dataset["initial_state"]["articulation"]["robot"]["joint_position"]))
-            init_indices = torch.arange(num_states[-1], device=env.device)
-            self.datasets.append(sample_state_data_set(dataset, init_indices, env.device))
-
-        # Normalize probabilities and store dataset lengths
         self.probs = torch.tensor(probabilities, device=env.device) / sum(probabilities)
-        self.num_states = torch.tensor(num_states, device=env.device)
-        self.num_tasks = len(self.datasets)
+        self.num_tasks = self.num_reset_types
+        num_monitored = self.num_task_types * self.num_reset_types if self.is_multitask else self.num_reset_types
 
-        # Initialize success monitor
         if cfg.params.get("success") is not None:
+            sm_hist_len = int(cfg.params.get("success_monitor_history_len", 100))
             success_monitor_cfg = SuccessMonitorCfg(
-                monitored_history_len=100, num_monitored_data=self.num_tasks, device=env.device
+                monitored_history_len=sm_hist_len, num_monitored_data=num_monitored, device=env.device
             )
             self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
 
+        self.curriculum_target: float | None = cfg.params.get("curriculum_target", None)
+        self.curriculum_kappa: float = cfg.params.get("curriculum_kappa", 2.0)
+        self.curriculum_temperature: float = cfg.params.get("curriculum_temperature", 2.0)
+
+        self.flat_datasets: list[dict] = []
+        self.flat_num_states: list[int] = []
+        self.flat_rt_labels: list[torch.Tensor] = []
+        for tt_idx in range(self.num_task_types):
+            all_states = []
+            all_rt_labels = []
+            offset = 0
+            for rt_idx in range(self.num_reset_types):
+                n = self.pair_num_states[tt_idx][rt_idx]
+                all_states.append(self.pair_datasets[tt_idx][rt_idx])
+                all_rt_labels.append(torch.full((n,), rt_idx, dtype=torch.long, device=env.device))
+                offset += n
+            self.flat_datasets.append(concat_nested_dicts(all_states))
+            self.flat_num_states.append(offset)
+            self.flat_rt_labels.append(torch.cat(all_rt_labels))
+
+        if self.curriculum_target is not None:
+            total_states = sum(self.flat_num_states)
+            cur_hist_len = int(cfg.params.get("curriculum_monitor_history_len", 100))
+            curriculum_monitor_cfg = SuccessMonitorCfg(
+                monitored_history_len=cur_hist_len, num_monitored_data=total_states, device=env.device
+            )
+            self.curriculum_monitor = curriculum_monitor_cfg.class_type(curriculum_monitor_cfg)
+            self.flat_offsets = torch.tensor(
+                [sum(self.flat_num_states[:i]) for i in range(self.num_task_types)],
+                dtype=torch.long, device=env.device,
+            )
+
+        # Success classifier (trained critic-style by the runner after each PPO update).
+        # Feature per flat state: joint_position (all robot joints) + ins root_pose (7) + rec root_pose (7).
+        self.use_classifier: bool = cfg.params.get("use_classifier", False)
+        if self.use_classifier:
+            if self.curriculum_target is None:
+                raise ValueError("use_classifier=True requires curriculum_target to be set")
+            self.flat_features: list[torch.Tensor] = []
+            for tt_idx in range(self.num_task_types):
+                init = self.flat_datasets[tt_idx]["initial_state"]
+                joints = init["articulation"]["robot"]["joint_position"].to(env.device)
+                ins_pose = init["rigid_object"]["insertive_object"]["root_pose"].to(env.device)
+                rec_pose = init["rigid_object"]["receptive_object"]["root_pose"].to(env.device)
+                feats = torch.cat([joints, ins_pose, rec_pose], dim=-1)
+                self.flat_features.append(feats)
+            feat_dim = self.flat_features[0].shape[-1]
+            self.classifier = SuccessClassifier(
+                input_dim=feat_dim,
+                hidden_dim=int(cfg.params.get("classifier_hidden_dim", 64)),
+                lr=float(cfg.params.get("classifier_lr", 1e-3)),
+                device=str(env.device),
+            )
+            # Per-env cache of the feature vector used at the last reset (label pairs at next reset).
+            self.last_reset_features = torch.zeros(env.num_envs, feat_dim, device=env.device)
+            # Per-rollout pending batch, cleared by runner via classifier_update().
+            self.classifier_batch: list[tuple[torch.Tensor, torch.Tensor]] = []
+            # First-ever reset has no prior episode to label — skip until env has been reset once.
+            self.has_been_reset = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+            print(
+                f"[MultiResetManager] Success classifier enabled. feat_dim={feat_dim}, "
+                f"hidden={cfg.params.get('classifier_hidden_dim', 64)}, "
+                f"total flat states={sum(self.flat_num_states)}"
+            )
+
+        # V_success auxiliary value head — injected by the runner.
+        # Candidate success_classifier_obs per reset state: matches live obs group
+        # `success_classifier` = [prev_actions=0, joint_pos, ins_pose_in_robot_frame,
+        #                         rec_pose_in_robot_frame, time_left=1.0].
+        self.use_success_critic: bool = cfg.params.get("use_success_critic", False)
+        if self.use_classifier and self.use_success_critic:
+            raise ValueError("use_classifier and use_success_critic are mutually exclusive")
+        if self.use_success_critic:
+            if self.curriculum_target is None:
+                raise ValueError("use_success_critic=True requires curriculum_target to be set")
+            num_actions = int(env.action_manager.total_action_dim)
+            # Robot base is assumed at world origin — standard for these OmniReset envs.
+            # The live obs uses target_asset_pose_in_root_asset_frame with rotation_repr="quaternion",
+            # which yields 7d (pos+quat). Stored root_pose is 7d in world frame ≈ robot frame when
+            # robot is at origin. Confirm via a log line below; a large residual should surface.
+            self.flat_sc_obs: list[torch.Tensor] = []
+            for tt_idx in range(self.num_task_types):
+                init = self.flat_datasets[tt_idx]["initial_state"]
+                joints = init["articulation"]["robot"]["joint_position"].to(env.device)
+                ins_pose = init["rigid_object"]["insertive_object"]["root_pose"].to(env.device)
+                rec_pose = init["rigid_object"]["receptive_object"]["root_pose"].to(env.device)
+                n = joints.shape[0]
+                prev_actions = torch.zeros(n, num_actions, device=env.device)
+                time_left = torch.ones(n, 1, device=env.device)
+                sc_obs = torch.cat([prev_actions, joints, ins_pose, rec_pose, time_left], dim=-1)
+                self.flat_sc_obs.append(sc_obs)
+            self.success_critic = None  # injected by runner via set_success_critic()
+            print(
+                f"[MultiResetManager] V_success GPS enabled. sc_obs_dim={self.flat_sc_obs[0].shape[-1]}, "
+                f"total flat states={sum(self.flat_num_states)}"
+            )
+
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
+        self.state_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # One-shot reset-write sanity check: after the first reset, compare the realized
+        # insertive/receptive poses against the dataset we sampled from. Catches silent
+        # failures in MultiAsset heterogeneous writes (e.g. peg states landing in leg envs).
+        self._reset_sanity_done = False
+
+    def _get_monitor_id(self, task_type_idx: int, reset_type_idx: torch.Tensor) -> torch.Tensor:
+        """Composite index for the success monitor: task_type * num_reset_types + reset_type."""
+        if self.is_multitask:
+            return task_type_idx * self.num_reset_types + reset_type_idx
+        return reset_type_idx
+
+    def _log_reset_sanity(self, env_ids: torch.Tensor) -> None:
+        """One-shot sanity check: read back realized object poses after reset and verify that
+        each env lands near one of the states in its own task-type dataset. Logs per-task
+        mean position error to catch silent cross-asset mis-writes."""
+        if self._reset_sanity_done:
+            return
+        env = self._env
+        ins = env.scene["insertive_object"]
+        rec = env.scene["receptive_object"]
+        # Force a sim write so data buffers reflect the writes from _reset_to.
+        env.scene.write_data_to_sim()
+        ins_pos_local = ins.data.root_pos_w[env_ids] - env.scene.env_origins[env_ids]
+        rec_pos_local = rec.data.root_pos_w[env_ids] - env.scene.env_origins[env_ids]
+
+        print("[MultiResetManager] reset-write sanity check:")
+        for tt_idx in range(self.num_task_types):
+            if self.is_multitask:
+                tt_mask = self.task_type_ids[env_ids] == tt_idx
+            else:
+                tt_mask = torch.ones(env_ids.shape[0], dtype=torch.bool, device=env_ids.device)
+            if not tt_mask.any():
+                continue
+            tt_name = self.task_names[tt_idx] if self.is_multitask else "task_0"
+            ins_sample = ins_pos_local[tt_mask]
+            rec_sample = rec_pos_local[tt_mask]
+
+            # Compare to dataset distribution for this task: min distance from each realized
+            # pose to the closest dataset state for the matching reset type (use PA index 1).
+            rt_idx = min(1, self.num_reset_types - 1)
+            init = self.pair_datasets[tt_idx][rt_idx]["initial_state"]
+            dataset_ins = init["rigid_object"]["insertive_object"]["root_pose"][:, :3]
+            dataset_rec = init["rigid_object"]["receptive_object"]["root_pose"][:, :3]
+            n_sample = min(64, ins_sample.shape[0])
+            ins_sample_k = ins_sample[:n_sample]
+            # Nearest-neighbor distance for each realized env to the dataset.
+            d = torch.cdist(ins_sample_k, dataset_ins)
+            min_d, _ = d.min(dim=1)
+            print(
+                f"  [{tt_name}] n_envs={int(tt_mask.sum())} "
+                f"realized ins_pos mean={ins_sample.mean(dim=0).tolist()} "
+                f"rec_pos mean={rec_sample.mean(dim=0).tolist()}"
+            )
+            print(
+                f"  [{tt_name}] dataset({rt_idx}={self.reset_types[rt_idx]}) "
+                f"ins_pos mean={dataset_ins.mean(dim=0).tolist()} "
+                f"min-NN-dist over {n_sample} envs: mean={min_d.mean().item():.4f} "
+                f"max={min_d.max().item():.4f}"
+            )
+            if min_d.mean().item() > 0.2:
+                print(
+                    f"  [{tt_name}] WARNING: realized object positions are far from the sampled "
+                    f"dataset — reset write may not be landing on the right envs."
+                )
+        self._reset_sanity_done = True
 
     def __call__(
         self,
         env: ManagerBasedEnv,
         env_ids: torch.Tensor,
-        dataset_dir: str,
-        reset_types: list[str],
-        probs: list[float],
+        dataset_dir: str = "",
+        reset_types: list[str] | None = None,
+        probs: list[float] | None = None,
         success: str | None = None,
+        curriculum_target: float | None = None,
+        curriculum_kappa: float = 2.0,
+        curriculum_temperature: float = 2.0,
+        use_classifier: bool = False,
+        classifier_hidden_dim: int = 64,
+        classifier_lr: float = 1e-3,
+        use_success_critic: bool = False,
+        curriculum_monitor_history_len: int = 100,
+        success_monitor_history_len: int = 100,
     ) -> None:
+        self._lazy_init()
+
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self._env.device)
 
-        # Log current data
         if success is not None:
             raw_success = eval(success)
             success_mask = torch.where(raw_success[env_ids], 1.0, 0.0)
-            self.success_monitor.success_update(self.task_id[env_ids], success_mask)
+            if getattr(self, "is_multitask", False):
+                monitor_ids = self._get_monitor_id(self.task_type_ids[env_ids], self.task_id[env_ids])
+            else:
+                monitor_ids = self.task_id[env_ids]
+            self.success_monitor.success_update(monitor_ids, success_mask)
 
-            # Log metrics for each task
+            if hasattr(self, "curriculum_monitor"):
+                cur_monitor_ids = self.flat_offsets[self.task_type_ids[env_ids]] + self.state_id[env_ids]
+                self.curriculum_monitor.success_update(cur_monitor_ids, success_mask)
+
+            # Stash (feats, label) pairs for envs that had a prior episode; runner trains at update time.
+            if getattr(self, "use_classifier", False):
+                prior_mask = self.has_been_reset[env_ids]
+                if prior_mask.any():
+                    finished_ids = env_ids[prior_mask]
+                    self.classifier_batch.append((
+                        self.last_reset_features[finished_ids].detach().clone(),
+                        success_mask[prior_mask].detach().clone(),
+                    ))
+
             success_rates = self.success_monitor.get_success_rate()
             if "log" not in self._env.extras:
                 self._env.extras["log"] = {}
-            for task_idx in range(self.num_tasks):
-                self._env.extras["log"].update({
-                    f"Metrics/task_{task_idx}_success_rate": success_rates[task_idx].item(),
-                    f"Metrics/task_{task_idx}_prob": self.probs[task_idx].item(),
-                    f"Metrics/task_{task_idx}_normalized_prob": self.probs[task_idx].item(),
-                })
 
             # Per-pool success logging for split student/teacher DAgger.
             # Runner sets ``env.pool_mask`` (bool, True=student pool). Without it
@@ -1095,30 +2681,188 @@ class MultiResetManager(ManagerTermBase):
                 if self._teacher_success_buf.numel() > 0:
                     self._env.extras["log"]["Metrics/success_teacher_only"] = self._teacher_success_buf.mean().item()
 
+            if getattr(self, "is_multitask", False):
+                for tt_idx in range(self.num_task_types):
+                    task_name = self.task_names[tt_idx]
+                    tt_mask = self.task_type_ids[env_ids] == tt_idx
+                    if tt_mask.any():
+                        tt_success = success_mask[tt_mask]
+                        self._env.extras["log"][f"Metrics/{task_name}_success_rate"] = tt_success.mean().item()
+                    for rt_idx in range(self.num_reset_types):
+                        mid = tt_idx * self.num_reset_types + rt_idx
+                        self._env.extras["log"][f"Metrics/{task_name}_rt{rt_idx}_success_rate"] = (
+                            success_rates[mid].item()
+                        )
+            else:
+                for task_idx in range(self.num_tasks):
+                    self._env.extras["log"].update({
+                        f"Metrics/task_{task_idx}_success_rate": success_rates[task_idx].item(),
+                        f"Metrics/task_{task_idx}_prob": self.probs[task_idx].item(),
+                        f"Metrics/task_{task_idx}_normalized_prob": self.probs[task_idx].item(),
+                    })
+
             # Log episode length at reset
             ep_lengths = self._env.episode_length_buf[env_ids].float()
             self._env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
 
-        # Sample which dataset to use for each environment
-        dataset_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
-        self.task_id[env_ids] = dataset_indices
+        if self.curriculum_target is not None and hasattr(self, "curriculum_monitor"):
+            state_indices = torch.empty(len(env_ids), dtype=torch.int64, device=self.device)
+            env_task_types = self.task_type_ids[env_ids]
 
-        # Process each dataset's environments
-        for dataset_idx in range(self.num_tasks):
-            mask = dataset_indices == dataset_idx
-            if not mask.any():
-                continue
+            if "log" not in self._env.extras:
+                self._env.extras["log"] = {}
 
-            current_env_ids = env_ids[mask]
-            state_indices = torch.randint(
-                0, self.num_states[dataset_idx], (len(current_env_ids),), device=self._env.device
-            )
-            states_to_reset_from = sample_from_nested_dict(self.datasets[dataset_idx], state_indices)
-            self._reset_to(states_to_reset_from["initial_state"], env_ids=current_env_ids, is_relative=True)
+            for tt_idx in range(self.num_task_types):
+                tt_mask = env_task_types == tt_idx
+                if not tt_mask.any():
+                    continue
+                offset = self.flat_offsets[tt_idx].item()
+                n = self.flat_num_states[tt_idx]
+                if self.use_classifier:
+                    tt_rates = self.classifier.predict(self.flat_features[tt_idx])
+                elif self.use_success_critic:
+                    tt_rates = self.success_critic_predict(tt_idx)
+                else:
+                    tt_rates = self.curriculum_monitor.success_rate[offset : offset + n]
+                choices, sampling_probs = SuccessMonitor.sample_by_target_rate_from_rates(
+                    tt_rates, int(tt_mask.sum()),
+                    self.curriculum_target, self.curriculum_kappa, self.curriculum_temperature,
+                )
+                state_indices[tt_mask] = choices
 
-        # Reset velocities
+                task_name = self.task_names[tt_idx]
+                rt_labels = self.flat_rt_labels[tt_idx]
+                chosen_rt = rt_labels[choices]
+                for rt_idx in range(self.num_reset_types):
+                    rt_mask = rt_labels == rt_idx
+                    rt_rates = tt_rates[rt_mask]
+                    self._env.extras["log"][f"Curriculum/{task_name}_rt{rt_idx}_mean_rate"] = (
+                        rt_rates.mean().item() if rt_mask.any() else 0.0
+                    )
+                    self._env.extras["log"][f"Curriculum/{task_name}_rt{rt_idx}_sampled_frac"] = (
+                        (chosen_rt == rt_idx).float().mean().item()
+                    )
+                    rt_probs = sampling_probs[rt_mask]
+                    self._env.extras["log"][f"Curriculum/{task_name}_rt{rt_idx}_prob_mass"] = (
+                        rt_probs.sum().item() if rt_mask.any() else 0.0
+                    )
+
+            for tt_idx in range(self.num_task_types):
+                tt_mask = env_task_types == tt_idx
+                if not tt_mask.any():
+                    continue
+                current_env_ids = env_ids[tt_mask]
+                current_state_indices = state_indices[tt_mask]
+                states = sample_from_nested_dict(self.flat_datasets[tt_idx], current_state_indices)
+                self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
+                self.task_id[current_env_ids] = self.flat_rt_labels[tt_idx][current_state_indices]
+
+                # Cache features of newly-chosen reset for this env — paired with label at next reset.
+                if self.use_classifier:
+                    self.last_reset_features[current_env_ids] = self.flat_features[tt_idx][current_state_indices]
+
+            self.state_id[env_ids] = state_indices
+            if self.use_classifier:
+                self.has_been_reset[env_ids] = True
+
+        else:
+            reset_type_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+            self.task_id[env_ids] = reset_type_indices
+
+            if self.is_multitask:
+                env_task_types = self.task_type_ids[env_ids]
+                for tt_idx in range(self.num_task_types):
+                    tt_mask = env_task_types == tt_idx
+                    if not tt_mask.any():
+                        continue
+                    for rt_idx in range(self.num_reset_types):
+                        combined_mask = tt_mask & (reset_type_indices == rt_idx)
+                        if not combined_mask.any():
+                            continue
+                        current_env_ids = env_ids[combined_mask]
+                        n_states = self.pair_num_states[tt_idx][rt_idx]
+                        rand_state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
+                        states = sample_from_nested_dict(self.pair_datasets[tt_idx][rt_idx], rand_state_indices)
+                        self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
+            else:
+                for dataset_idx in range(self.num_tasks):
+                    mask = reset_type_indices == dataset_idx
+                    if not mask.any():
+                        continue
+                    current_env_ids = env_ids[mask]
+                    n_states = self.pair_num_states[0][dataset_idx]
+                    rand_state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
+                    states = sample_from_nested_dict(self.pair_datasets[0][dataset_idx], rand_state_indices)
+                    self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
+
         robot: Articulation = self._env.scene["robot"]
         robot.set_joint_velocity_target(torch.zeros_like(robot.data.joint_vel[env_ids]), env_ids=env_ids)
+
+        if not self._reset_sanity_done:
+            self._log_reset_sanity(env_ids)
+
+    def classifier_update(
+        self, n_epochs: int = 4, minibatch_size: int = 256
+    ) -> dict[str, float]:
+        """Train the success classifier on the current rollout's reset-outcome pairs.
+
+        Called by the runner right after PPO's policy update. Consumes and clears the
+        accumulated ``classifier_batch``. Returns a metrics dict merged into the iter log.
+        """
+        metrics: dict[str, float] = {}
+        if not self.use_classifier or not hasattr(self, "classifier"):
+            return metrics
+
+        if self.classifier_batch:
+            feats = torch.cat([b[0] for b in self.classifier_batch], dim=0)
+            labels = torch.cat([b[1] for b in self.classifier_batch], dim=0)
+        else:
+            feats = torch.zeros(0, self.last_reset_features.shape[-1], device=self.device)
+            labels = torch.zeros(0, device=self.device)
+        self.classifier_batch.clear()
+
+        train_metrics = self.classifier.train_on_pairs(feats, labels, n_epochs, minibatch_size)
+        metrics["Classifier/update_loss"] = train_metrics["update_loss"]
+        metrics["Classifier/samples_per_iter"] = float(train_metrics["samples_per_iter"])
+
+        # Eval metrics: compare classifier predictions against the empirical curriculum monitor.
+        all_preds = []
+        for tt_idx in range(self.num_task_types):
+            all_preds.append(self.classifier.predict(self.flat_features[tt_idx]))
+        preds = torch.cat(all_preds, dim=0)
+        metrics["Classifier/mean_predicted_rate"] = preds.mean().item()
+
+        if hasattr(self, "curriculum_monitor"):
+            empirical = self.curriculum_monitor.success_rate
+            visited = self.curriculum_monitor.success_size > 0
+            metrics["Classifier/visited_frac"] = visited.float().mean().item()
+            if visited.any():
+                p = preds[visited]
+                e = empirical[visited]
+                metrics["Classifier/pred_empirical_mse"] = ((p - e) ** 2).mean().item()
+                p_c = p - p.mean()
+                e_c = e - e.mean()
+                denom = p_c.norm() * e_c.norm()
+                metrics["Classifier/pred_empirical_corr"] = (
+                    (p_c * e_c).sum().item() / denom.item() if denom.item() > 1e-8 else 0.0
+                )
+
+        return metrics
+
+    def set_success_critic(self, critic) -> None:
+        """Runner-side injection: attach the trained V_success module for GPS scoring."""
+        self.success_critic = critic
+
+    @torch.no_grad()
+    def success_critic_predict(self, tt_idx: int) -> torch.Tensor:
+        """Score all candidate reset states of task-type ``tt_idx`` with V_success.
+
+        Returns per-state P(success) in [0, 1]. Before the runner has injected the
+        critic (first rollout), returns uniform 0.5 so the beta kernel is near-uniform.
+        """
+        if getattr(self, "success_critic", None) is None:
+            return torch.full((self.flat_num_states[tt_idx],), 0.5, device=self.device)
+        return self.success_critic.predict(self.flat_sc_obs[tt_idx])
 
     def _reset_to(
         self,
@@ -1214,6 +2958,20 @@ def sample_from_nested_dict(nested_dict: dict, idx) -> dict:
         else:
             raise TypeError(f"Unsupported type in nested dictionary: {type(value)}")
     return sampled_dict
+
+
+def concat_nested_dicts(list_of_dicts: list[dict]) -> dict:
+    """Concatenate tensors at matching keys across a list of nested dicts (dim=0)."""
+    result = {}
+    for key in list_of_dicts[0]:
+        values = [d[key] for d in list_of_dicts]
+        if isinstance(values[0], dict):
+            result[key] = concat_nested_dicts(values)
+        elif isinstance(values[0], torch.Tensor):
+            result[key] = torch.cat(values, dim=0)
+        else:
+            raise TypeError(f"Unsupported type in nested dictionary: {type(values[0])}")
+    return result
 
 
 class reset_root_states_uniform(ManagerTermBase):

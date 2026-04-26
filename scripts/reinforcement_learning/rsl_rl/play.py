@@ -70,7 +70,8 @@ from isaaclab.envs import (
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
 
@@ -94,6 +95,11 @@ _distillation_runner_module.DistillationRunnerSplit = DistillationRunnerSplit
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
+
+import rsl_rl.runners.on_policy_runner as _runner_module
+from uwlab_rl.rsl_rl.actor_critic_encoder import ActorCriticWithEncoder
+_runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
+
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config
 
@@ -213,11 +219,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
-        if args_cli.video:
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+
+        timestep += 1
+        if args_cli.video and timestep >= args_cli.video_length:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
