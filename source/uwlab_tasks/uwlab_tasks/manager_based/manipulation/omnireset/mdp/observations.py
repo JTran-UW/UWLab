@@ -211,7 +211,6 @@ def process_image(
     process_image: bool = True,
     output_size: tuple = (224, 224),
     depth_clip: tuple[float, float] = (0.01, 2.0),
-    depth_aug_enabled: bool = False,
 ) -> torch.Tensor:
     """Images of a specific datatype from the camera sensor.
 
@@ -251,17 +250,8 @@ def process_image(
     images = images.to(dtype=torch.float32)
     if is_depth:
         d_min, d_max = depth_clip
-        # Replace inf/nan with d_max (no-return pixels)
+        # Replace inf/nan with d_max (no-return pixels), then clip and normalize to [0, 1]
         images = torch.nan_to_num(images, nan=d_max, posinf=d_max, neginf=d_max)
-        if depth_aug_enabled:
-            # Warp kernels expect 3D contiguous (B, H, W) raw-meters depth.
-            # Camera sensor output is (B, H, W, 1); squeeze the trailing channel.
-            from .depth_aug import DepthAug
-
-            squeezed = images.squeeze(-1).contiguous()
-            DepthAug.get(str(squeezed.device)).apply(squeezed, d_min, d_max)
-            images = squeezed.unsqueeze(-1)
-        # Clip and normalize to [0, 1]
         images.clamp_(d_min, d_max).sub_(d_min).div_(d_max - d_min)
     else:
         images.div_(255.0).clamp_(0.0, 1.0)

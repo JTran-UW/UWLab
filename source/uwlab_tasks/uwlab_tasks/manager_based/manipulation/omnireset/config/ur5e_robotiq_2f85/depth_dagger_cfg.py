@@ -103,18 +103,6 @@ def _depth_obs_term(sensor_name: str) -> ObsTerm:
     )
 
 
-def _rgb_obs_term(sensor_name: str) -> ObsTerm:
-    return ObsTerm(
-        func=task_mdp.process_image,
-        params={
-            "sensor_cfg": SceneEntityCfg(sensor_name),
-            "data_type": "rgb",
-            "process_image": True,
-            "output_size": (IMG_H, IMG_W),
-        },
-    )
-
-
 @configclass
 class DepthDAggerObservationsCfg:
     """Three obs groups: ``proprio`` (student scalars), per-camera depth, ``teacher`` (state expert input)."""
@@ -292,120 +280,6 @@ class Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg(Ur5eRobotiq2f85RlStateCfg):
         self.num_rerenders_on_reset = 1
 
 
-@configclass
-class RgbDAggerObservationsCfg:
-    """RGB variant: swap ``side_depth`` for ``side_rgb`` (3×H×W). Proprio + teacher unchanged."""
-
-    ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg
-    TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg
-
-    @configclass
-    class SideRgbCfg(ObsGroup):
-        image = _rgb_obs_term("side_camera")
-
-        def __post_init__(self):
-            self.concatenate_terms = True
-
-    proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
-    side_rgb: SideRgbCfg = SideRgbCfg()
-    teacher: DepthDAggerObservationsCfg.TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg()
-    aux_target: DepthDAggerObservationsCfg.AuxTargetCfg = DepthDAggerObservationsCfg.AuxTargetCfg()
-
-
-@configclass
-class Ur5eRobotiq2f85RgbDAggerRelCartesianOSCCfg(Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg):
-    """RGB DAgger env: side camera renders RGB instead of depth. Everything else identical."""
-
-    observations: RgbDAggerObservationsCfg = RgbDAggerObservationsCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-        # Swap the side camera from depth to rgb.
-        self.scene.side_camera.data_types = ["rgb"]
-
-
-# ---------------------------------------------------------------------------
-# 2-camera variants: side + front (front offset from data_collection_rgb_cfg.py)
-# ---------------------------------------------------------------------------
-
-
-@configclass
-class DepthDAgger2CamSceneCfg(DepthDAggerSceneCfg):
-    """Base DAgger scene + a front TiledCamera (pose copied from data_collection_rgb_cfg)."""
-
-    front_camera = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/depth_front_camera",
-        update_period=0,
-        height=RENDER_H,
-        width=RENDER_W,
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(1.0770121, -0.1679045, 0.4486344),
-            rot=(0.70564552, 0.46613815, 0.25072644, 0.47107948),
-            convention="opengl",
-        ),
-        data_types=["distance_to_camera"],
-        spawn=sim_utils.PinholeCameraCfg(focal_length=13.20, clipping_range=DEPTH_CLIP),
-    )
-
-
-@configclass
-class DepthDAgger2CamObservationsCfg:
-    """2-camera depth: side_depth + front_depth + proprio + teacher."""
-
-    @configclass
-    class FrontDepthCfg(ObsGroup):
-        image = _depth_obs_term("front_camera")
-
-        def __post_init__(self):
-            self.concatenate_terms = True
-
-    proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
-    side_depth: DepthDAggerObservationsCfg.SideDepthCfg = DepthDAggerObservationsCfg.SideDepthCfg()
-    front_depth: FrontDepthCfg = FrontDepthCfg()
-    teacher: DepthDAggerObservationsCfg.TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg()
-    aux_target: DepthDAggerObservationsCfg.AuxTargetCfg = DepthDAggerObservationsCfg.AuxTargetCfg()
-
-
-@configclass
-class RgbDAgger2CamObservationsCfg:
-    """2-camera rgb: side_rgb + front_rgb + proprio + teacher."""
-
-    @configclass
-    class FrontRgbCfg(ObsGroup):
-        image = _rgb_obs_term("front_camera")
-
-        def __post_init__(self):
-            self.concatenate_terms = True
-
-    proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
-    side_rgb: RgbDAggerObservationsCfg.SideRgbCfg = RgbDAggerObservationsCfg.SideRgbCfg()
-    front_rgb: FrontRgbCfg = FrontRgbCfg()
-    teacher: DepthDAggerObservationsCfg.TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg()
-    aux_target: DepthDAggerObservationsCfg.AuxTargetCfg = DepthDAggerObservationsCfg.AuxTargetCfg()
-
-
-@configclass
-class Ur5eRobotiq2f85DepthDAgger2CamCfg(Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg):
-    """2-camera depth DAgger: adds a front depth cam alongside the side depth cam."""
-
-    scene: DepthDAgger2CamSceneCfg = DepthDAgger2CamSceneCfg(
-        num_envs=256, env_spacing=1.5, replicate_physics=True
-    )
-    observations: DepthDAgger2CamObservationsCfg = DepthDAgger2CamObservationsCfg()
-
-
-@configclass
-class Ur5eRobotiq2f85RgbDAgger2CamCfg(Ur5eRobotiq2f85DepthDAgger2CamCfg):
-    """2-camera RGB DAgger: both side + front cameras render RGB."""
-
-    observations: RgbDAgger2CamObservationsCfg = RgbDAgger2CamObservationsCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.scene.side_camera.data_types = ["rgb"]
-        self.scene.front_camera.data_types = ["rgb"]
-
-
 # ---------------------------------------------------------------------------
 # 2-camera variant: side + wrist (wrist parented to robotiq_base_link).
 # Wrist pose/focal copied from data_collection_rgb_cfg.py; we set
@@ -489,24 +363,6 @@ class DAggerWristSideSceneCfg(RlStateSceneCfg):
 
 
 @configclass
-class RgbDAggerWristSideObservationsCfg:
-    """2-camera RGB (side + wrist) obs layout. Other groups identical to 1cam RGB."""
-
-    @configclass
-    class WristRgbCfg(ObsGroup):
-        image = _rgb_obs_term("wrist_camera")
-
-        def __post_init__(self):
-            self.concatenate_terms = True
-
-    proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
-    side_rgb: RgbDAggerObservationsCfg.SideRgbCfg = RgbDAggerObservationsCfg.SideRgbCfg()
-    wrist_rgb: WristRgbCfg = WristRgbCfg()
-    teacher: DepthDAggerObservationsCfg.TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg()
-    aux_target: DepthDAggerObservationsCfg.AuxTargetCfg = DepthDAggerObservationsCfg.AuxTargetCfg()
-
-
-@configclass
 class WristSideEventCfg(FinetuneEvalEventCfg):
     """FinetuneEval events + a reset-mode call to ``randomize_tiled_cameras`` with
     zero deltas for the wrist camera.
@@ -530,20 +386,6 @@ class WristSideEventCfg(FinetuneEvalEventCfg):
             "euler_deltas": {"pitch": (0.0, 0.0), "yaw": (0.0, 0.0), "roll": (0.0, 0.0)},
         },
     )
-
-
-@configclass
-class Ur5eRobotiq2f85RgbDAggerWristSideCfg(Ur5eRobotiq2f85RgbDAggerRelCartesianOSCCfg):
-    """2-camera RGB DAgger with a wrist camera (parented to gripper base link) + side cam."""
-
-    scene: DAggerWristSideSceneCfg = DAggerWristSideSceneCfg(
-        num_envs=256, env_spacing=1.5, replicate_physics=True
-    )
-    observations: RgbDAggerWristSideObservationsCfg = RgbDAggerWristSideObservationsCfg()
-    events: WristSideEventCfg = WristSideEventCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
 
 
 @configclass
@@ -579,72 +421,6 @@ class Ur5eRobotiq2f85DepthDAggerWristSideCfg(Ur5eRobotiq2f85DepthDAggerRelCartes
         # Scene cfg defaults to rgb for the shared DAggerWristSideSceneCfg — flip to depth here.
         self.scene.side_camera.data_types = ["distance_to_camera"]
         self.scene.wrist_camera.data_types = ["distance_to_camera"]
-
-
-# ---------------------------------------------------------------------------
-# Recurrent-student variant: proprio single-frame (LSTM supplies temporal context).
-# Everything else identical to ``Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg``.
-# ---------------------------------------------------------------------------
-
-
-@configclass
-class DepthDAggerRecurrentObservationsCfg(DepthDAggerObservationsCfg):
-    """Same obs groups as depth DAgger, but proprio ``history_length=1``."""
-
-    @configclass
-    class ProprioSingleFrameCfg(DepthDAggerObservationsCfg.ProprioCfg):
-        def __post_init__(self):
-            super().__post_init__()
-            self.history_length = 1
-
-    proprio: ProprioSingleFrameCfg = ProprioSingleFrameCfg()
-
-
-@configclass
-class Ur5eRobotiq2f85DepthDAggerRecurrentCfg(Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg):
-    """Depth DAgger env with single-frame proprio (for LSTM student)."""
-
-    observations: DepthDAggerRecurrentObservationsCfg = DepthDAggerRecurrentObservationsCfg()
-
-
-# ---------------------------------------------------------------------------
-# Wrist+Side + recurrent-student variant: wrist+side scene + single-frame proprio.
-# ---------------------------------------------------------------------------
-
-
-@configclass
-class DepthDAggerWristSideRecurrentObservationsCfg(DepthDAggerWristSideObservationsCfg):
-    """Wrist+side obs layout with proprio ``history_length=1`` for LSTM students."""
-
-    proprio: DepthDAggerRecurrentObservationsCfg.ProprioSingleFrameCfg = (
-        DepthDAggerRecurrentObservationsCfg.ProprioSingleFrameCfg()
-    )
-
-
-@configclass
-class Ur5eRobotiq2f85DepthDAggerWristSideRecurrentCfg(Ur5eRobotiq2f85DepthDAggerWristSideCfg):
-    """Wrist+side depth DAgger env with single-frame proprio (for LSTM student)."""
-
-    observations: DepthDAggerWristSideRecurrentObservationsCfg = (
-        DepthDAggerWristSideRecurrentObservationsCfg()
-    )
-
-
-# ---------------------------------------------------------------------------
-# Wrist+Side + DEXTRAH-style depth augmentation: targets the train-eval gap.
-# Same scene/obs layout as the Weighted leader; flips ``depth_aug_enabled=True``
-# on both depth obs term params so warp kernels apply per-step DR.
-# ---------------------------------------------------------------------------
-
-
-@configclass
-class Ur5eRobotiq2f85DepthDAggerWristSideDepthAugCfg(Ur5eRobotiq2f85DepthDAggerWristSideCfg):
-    """Wrist+side depth DAgger with per-step warp depth augmentation."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.observations.side_depth.image.params["depth_aug_enabled"] = True
-        self.observations.wrist_depth.image.params["depth_aug_enabled"] = True
 
 
 # ---------------------------------------------------------------------------

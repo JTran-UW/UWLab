@@ -201,138 +201,13 @@ gym.register(
 )
 
 
-# Depth DAgger env: distill state RL expert → depth CNN student
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerRunnerCfg",
-    },
-)
+# ============================================================================
+# Depth DAgger envs — ImageNet-pretrained ResNet18 + DEXTRAH weighted-L2 loss
+# (μ, σ). Wrist+side depth obs. 50-50 student/teacher split via Hydra override
+# `agent.student_fraction=0.5` on the same task; default = 100/0 pure student.
+# ============================================================================
 
-# Depth DAgger with fixed per-env student/teacher pool split
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Split-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerSplitRunnerCfg",
-    },
-)
-
-# RGB DAgger with fixed per-env student/teacher pool split
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-Split-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85RgbDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Rgb_DAggerSplitRunnerCfg",
-    },
-)
-
-# 1-camera ResNet18 variants (depth + rgb)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-ResNet18-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerResNet18RunnerCfg",
-    },
-)
-
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-ResNet18-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85RgbDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Rgb_DAggerResNet18RunnerCfg",
-    },
-)
-
-# Depth ResNet18 + aux pose head (ablation: does aux loss bootstrap CNN?)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Aux-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerAuxRunnerCfg",
-    },
-)
-
-# Depth ResNet18 + ImageNet pretrained (ablation: does ImageNet prior help depth?)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerPretrainedRunnerCfg",
-    },
-)
-
-# 2-camera depth DAgger (side + front)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-2Cam-Split-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAgger2CamCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAgger2CamSplitRunnerCfg",
-    },
-)
-
-# 2-camera RGB DAgger (side + front)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-2Cam-Split-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85RgbDAgger2CamCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Rgb_DAgger2CamSplitRunnerCfg",
-    },
-)
-
-# 2-camera RGB DAgger (side + front) + ImageNet-pretrained ResNet18
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-2Cam-Pretrained-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85RgbDAgger2CamCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Rgb_DAgger2CamPretrainedRunnerCfg",
-    },
-)
-
-# 2-camera RGB DAgger (side + wrist) + ImageNet-pretrained ResNet18
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85RgbDAggerWristSideCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Rgb_DAggerWristSidePretrainedRunnerCfg",
-    },
-)
-
-# 2-camera depth DAgger (side + wrist) + ImageNet-pretrained ResNet18
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSideCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedRunnerCfg",
-    },
-)
-
-# 2-camera depth DAgger (side + wrist) + ImageNet ResNet18 + DEXTRAH weighted-L2 loss
+# Base wrist+side weighted DAgger (used as parent of 4Canonical variants).
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -343,87 +218,8 @@ gym.register(
     },
 )
 
-# 2-camera RGB DAgger (side + wrist) + ImageNet ResNet18 + DEXTRAH weighted-L2 loss
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-Weighted-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85RgbDAggerWristSideCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Rgb_DAggerWristSidePretrainedWeightedRunnerCfg",
-    },
-)
-
-# 1-cam depth + ImageNet ResNet18 + aux head @ aux_coeff=10.0 (BC:aux parity)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Aux10x-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerPretrainedAux10xRunnerCfg",
-    },
-)
-
-# 1-cam depth + ImageNet ResNet18 + recurrent (LSTM) student
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Recurrent-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRecurrentCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerPretrainedRecurrentRunnerCfg",
-    },
-)
-
-# 2-cam depth (side+wrist) + ImageNet ResNet18 + weighted L2 + frozen backbone first 5k iters
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-Freeze5k-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSideCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedFreeze5kRunnerCfg",
-    },
-)
-
-# 2-cam depth (side+wrist) + ImageNet ResNet18 + weighted L2 + recurrent LSTM student
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-Recurrent-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSideRecurrentCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRecurrentRunnerCfg",
-    },
-)
-
-# 2-cam depth (side+wrist) + ImageNet ResNet18 + weighted L2, 50/50 student/teacher split
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-Split50-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSideCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedSplit50RunnerCfg",
-    },
-)
-
-# 2-cam depth (side+wrist) + ImageNet ResNet18 + weighted L2 + per-step warp depth aug
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-DepthAug-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSideDepthAugCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
-    },
-)
-
-# 2-cam depth (side+wrist) + ImageNet ResNet18 + weighted L2 paired with the
-# 4-canonical-trained state teacher from pat/gravity (43d single-frame obs,
-# IMPLICIT actuator, training action scales). Runtime success math uses the
-# 4-yaw OR (cylindrical-symmetry-aware) via the merged ProgressContext.
+# 4-canonical peg DAgger paired with pat/gravity's 4-yaw symmetric state teacher.
+# Runtime success math uses the cylindrical-symmetry OR via merged ProgressContext.
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -434,10 +230,8 @@ gym.register(
     },
 )
 
-# Drawer DAgger control (single-canonical task) for the symmetry hypothesis.
-# Same recipe as the 4-canonical peg env, but drawer USDs swapped in.
-# ProgressContext multi-offset code falls through to single-canonical path
-# since drawer_box metadata has only one assembled_offset.
+# Drawer variant of the 4-canonical pipeline (drawer has one assembled_offset
+# so multi-offset code falls through to single-canonical path).
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-Drawer-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -448,29 +242,8 @@ gym.register(
     },
 )
 
-# 1-cam depth + ImageNet ResNet18 + DEXTRAH-style weighted-L2 loss on (μ, σ)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-Pretrained-Weighted-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerPretrainedWeightedRunnerCfg",
-    },
-)
-
-# State→state DAgger sanity check: same obs for student and teacher (no cameras)
-gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-DAgger-Split-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.state_dagger_cfg:Ur5eRobotiq2f85StateDAggerRelCartesianOSCCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:State_DAggerSplitRunnerCfg",
-    },
-)
-
-# State→state DAgger with DEXTRAH-matched cadence (1 env step → 1 gradient step)
+# State→state DAgger orthogonal sanity check (MLP student reads teacher obs;
+# DEXTRAH-cadence 1 env step → 1 grad step).
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-DAgger-Fast-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
