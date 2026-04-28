@@ -136,6 +136,18 @@ gym.register(
     },
 )
 
+# Same as ZeroG-State-v0 but adds arm sysid + OSC gain DR (widened friction)
+# for sim-to-real-robust state teachers we'll DAgger from.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-Sysid-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateSysidTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:StatePPORunnerCfg",
+    },
+)
+
 # State-only (no PC) + empirical GPS — GPS + gravity-reduction ablations.
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-GPS-v0",
@@ -394,6 +406,45 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSideCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedSplit50RunnerCfg",
+    },
+)
+
+# 2-cam depth (side+wrist) + ImageNet ResNet18 + weighted L2 + per-step warp depth aug
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-DepthAug-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSideDepthAugCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
+# 2-cam depth (side+wrist) + ImageNet ResNet18 + weighted L2 paired with the
+# 4-canonical-trained state teacher from pat/gravity (43d single-frame obs,
+# IMPLICIT actuator, training action scales). Runtime success math uses the
+# 4-yaw OR (cylindrical-symmetry-aware) via the merged ProgressContext.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
+# Drawer DAgger control (single-canonical task) for the symmetry hypothesis.
+# Same recipe as the 4-canonical peg env, but drawer USDs swapped in.
+# ProgressContext multi-offset code falls through to single-canonical path
+# since drawer_box metadata has only one assembled_offset.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-Drawer-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalDrawerCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
     },
 )
 

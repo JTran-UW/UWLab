@@ -628,3 +628,189 @@ class Ur5eRobotiq2f85DepthDAggerWristSideRecurrentCfg(Ur5eRobotiq2f85DepthDAgger
     observations: DepthDAggerWristSideRecurrentObservationsCfg = (
         DepthDAggerWristSideRecurrentObservationsCfg()
     )
+
+
+# ---------------------------------------------------------------------------
+# Wrist+Side + DEXTRAH-style depth augmentation: targets the train-eval gap.
+# Same scene/obs layout as the Weighted leader; flips ``depth_aug_enabled=True``
+# on both depth obs term params so warp kernels apply per-step DR.
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSideDepthAugCfg(Ur5eRobotiq2f85DepthDAggerWristSideCfg):
+    """Wrist+side depth DAgger with per-step warp depth augmentation."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.side_depth.image.params["depth_aug_enabled"] = True
+        self.observations.wrist_depth.image.params["depth_aug_enabled"] = True
+
+
+# ---------------------------------------------------------------------------
+# 4-canonical peg DAgger: matches a state teacher trained on
+# ``OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-v0`` (pat/gravity).
+# Three deltas vs the existing wristside env:
+#   1. Actuator: IMPLICIT_UR5E_ROBOTIQ_2F85 (the ZeroG-State-v0 default), not EXPLICIT.
+#   2. Action:   Ur5eRobotiq2f85RelativeOSCAction (training scales), not Eval.
+#   3. Teacher:  43d single-frame obs (history=1), term order = source-code order
+#                (NO first-annotated insertive-in-receptive trick).
+# Runtime success math is auto-aware of the 4 receptive offsets via the merged
+# ``ProgressContext`` (rewards.py): ``orientation_aligned`` is True if rel_quat
+# matches ANY of the 4 yaw offsets in the peghole metadata.
+# ---------------------------------------------------------------------------
+
+
+from uwlab_assets.robots.ur5e_robotiq_gripper import IMPLICIT_UR5E_ROBOTIQ_2F85  # noqa: E402
+
+from .actions import Ur5eRobotiq2f85RelativeOSCAction  # noqa: E402
+
+
+@configclass
+class Teacher4CanonicalCfg(ObsGroup):
+    """43d single-frame obs matching ZeroGStateTrainCfg.StateObsCfg.PolicyCfg.
+
+    Term order = source-code declaration order (all bare attributes, no
+    annotated overrides). The new state teacher (model_3700.pt from gravity
+    SLURM 34840064) was trained on this exact layout with history_length=1.
+    """
+
+    prev_actions = ObsTerm(func=task_mdp.last_action)
+    joint_pos = ObsTerm(func=task_mdp.joint_pos)
+    end_effector_pose = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "root_asset_cfg": SceneEntityCfg("robot"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+    insertive_asset_pose = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+    receptive_asset_pose = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("receptive_object"),
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+    insertive_asset_in_receptive_asset_frame = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_cfg": SceneEntityCfg("receptive_object"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = True
+        self.concatenate_terms = True
+        self.history_length = 1
+
+
+@configclass
+class DepthDAggerWristSide4CanonicalObservationsCfg(DepthDAggerWristSideObservationsCfg):
+    """Wrist+side depth obs with the 4-canonical TeacherCfg (43d single-frame)."""
+
+    teacher: Teacher4CanonicalCfg = Teacher4CanonicalCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalCfg(Ur5eRobotiq2f85DepthDAggerWristSideCfg):
+    """Wrist+side depth DAgger paired with a 4-canonical-trained state teacher."""
+
+    observations: DepthDAggerWristSide4CanonicalObservationsCfg = (
+        DepthDAggerWristSide4CanonicalObservationsCfg()
+    )
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Match ZeroGStateTrainCfg's actuator (the env that trained model_3700.pt).
+        self.scene.robot = IMPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # Match the teacher's training-time stiff terminal OSC Kp. Without this,
+        # FinetuneEvalEventCfg.randomize_osc_gains falls back to the action's
+        # soft pre-train _kp_default=(200, 200, 200, 3, 3, 3), underdriving the
+        # controller 5x and producing zero successes (verified via 50/50 split).
+        self.events.randomize_osc_gains.params["terminal_kp"] = (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0)
+        self.events.randomize_osc_gains.params["terminal_damping_ratio"] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+        # Match the teacher's training-time reset distribution: ZeroG-recorded
+        # anywhere placements (loaded from dataset), not procedural ObjectAnywhere.
+        self.events.reset_from_reset_states.params["reset_types"] = ["ZeroGAnywhere"]
+        self.events.reset_from_reset_states.params["probs"] = [1.0]
+
+
+# ---------------------------------------------------------------------------
+# Drawer DAgger control (single-canonical, non-symmetric task).
+# Symmetry-hypothesis test: if drawer easily breaks 31% under the same recipe,
+# then the peg ceiling is symmetry-specific (not modality / arch / scaffolding).
+#
+# Drawer assets have a single ``assembled_offset`` in metadata, so the merged
+# ProgressContext.multi-offset code falls through to the single-canonical path
+# (``shape[0] > 1`` check is False). No additional cfg changes needed beyond
+# swapping the scene's insertive/receptive USDs.
+# ---------------------------------------------------------------------------
+
+
+from isaaclab.assets import RigidObjectCfg as _RigidObjectCfg  # noqa: E402
+
+
+def _make_drawer_insertive() -> _RigidObjectCfg:
+    """Drawer bottom (rigid, has gravity) — to be inserted into the drawer box."""
+    return _RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/InsertiveObject",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd",
+            scale=(1, 1, 1),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+                disable_gravity=False,
+                kinematic_enabled=False,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.02),
+        ),
+        init_state=_RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+
+def _make_drawer_receptive() -> _RigidObjectCfg:
+    """Drawer box (kinematic, the receptacle)."""
+    return _RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/ReceptiveObject",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd",
+            scale=(1, 1, 1),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+                disable_gravity=False,
+                kinematic_enabled=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
+        ),
+        init_state=_RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+
+from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR  # noqa: E402
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalDrawerCfg(
+    Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalCfg
+):
+    """Drawer variant: same recipe as 4-canonical peg, but with drawer USDs swapped in."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.insertive_object = _make_drawer_insertive()
+        self.scene.receptive_object = _make_drawer_receptive()

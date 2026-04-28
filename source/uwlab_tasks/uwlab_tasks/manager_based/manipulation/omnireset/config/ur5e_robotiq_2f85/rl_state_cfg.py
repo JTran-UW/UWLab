@@ -233,7 +233,44 @@ class BaseEventCfg:
 
 @configclass
 class TrainEventCfg(BaseEventCfg):
-    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
+    """Training events: full DR (material + mass + arm sysid + OSC gains) from iter 0 + 4-path resets.
+
+    Single-stage: skips the legacy Stage-1 → Stage-2 curriculum. Uses the ``*_fixed``
+    sysid + OSC-gain variants so ``scale_progress=1`` from iter 0 (no warmup ramp).
+    Arm friction range widened to ``U(0, 1.5×sysid)`` for sim-to-real robustness;
+    armature + delays + OSC gains stay at the calibrated ``U(0.8, 1.2)`` window.
+    """
+
+    randomize_arm_sysid = EventTerm(
+        func=task_mdp.randomize_arm_from_sysid_fixed,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "joint_names": [
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ],
+            "actuator_name": "arm",
+            "scale_range": (0.8, 1.2),
+            "friction_scale_range": (0.0, 1.5),
+            "delay_range": (0, 1),
+        },
+    )
+
+    randomize_osc_gains = EventTerm(
+        func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
+        mode="reset",
+        params={
+            "action_name": "arm",
+            "scale_range": (0.8, 1.2),
+            "terminal_kp": (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0),
+            "terminal_damping_ratio": (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+        },
+    )
 
     reset_from_reset_states = EventTerm(
         func=task_mdp.MultiResetManager,
@@ -716,12 +753,19 @@ class Ur5eRobotiq2f85RlStateCfg(ManagerBasedRLEnvCfg):
         self.sim.render.enable_dl_denoiser = True
 
 
-# Training configuration (Stage 1: no curriculum, implicit actuator, no sysid DR)
+# Training configuration: single-stage, full DR (material + mass + arm sysid + OSC gains)
+# from iter 0, EXPLICIT actuator (required for OSC gain randomization), 0.02 action scales.
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
 
     events: TrainEventCfg = TrainEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Required for ``randomize_rel_cartesian_osc_gains_fixed`` to take effect
+        # (OSC gain knobs live on the explicit actuator).
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 
 # Finetune configuration (Stage 2: explicit actuator, curriculum ramps sysid + gains + scales)
@@ -747,13 +791,14 @@ class Ur5eRobotiq2f85RelCartesianOSCEvalCfg(Ur5eRobotiq2f85RlStateCfg):
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 
-# Evaluation configuration (after Stage 2: explicit actuator, stiff gains, fixed sysid)
+# Evaluation configuration (after Stage 2): explicit actuator, stiff gains, fixed sysid.
+# Action space matches training (0.02 scales) so distillation-time scales match RL-time scales.
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
-    """Eval after Stage 2: explicit actuator, stiff gains, small action scale, fixed sysid + OSC gains."""
+    """Eval after Stage 2: explicit actuator, stiff gains, training (0.02) action scales, fixed sysid + OSC gains."""
 
     events: FinetuneEvalEventCfg = FinetuneEvalEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
     def __post_init__(self):
         super().__post_init__()

@@ -3303,25 +3303,27 @@ class randomize_arm_from_sysid(ManagerTermBase):
         scale_range: tuple[float, float] = (0.8, 1.2),
         delay_range: tuple[int, int] = (0, 2),
         initial_scale_progress: float = 0.0,
+        friction_scale_range: tuple[float, float] | None = None,
     ):
         if env_ids is None:
             env_ids = torch.arange(env.scene.num_envs, device=self.robot.device)
         N = len(env_ids)
         n_joints = len(self.joint_ids)
         lo, hi = scale_range
+        flo, fhi = friction_scale_range if friction_scale_range is not None else scale_range
         device = self.robot.device
         p = self.scale_progress
 
-        def _scale(nominal):
+        def _scale(nominal, lo_=lo, hi_=hi):
             val = torch.as_tensor(nominal, device=device, dtype=torch.float32)
-            return val * (lo + torch.rand(N, n_joints, device=device) * (hi - lo))
+            return val * (lo_ + torch.rand(N, n_joints, device=device) * (hi_ - lo_))
 
         # Armature and friction: scaled by ADR progress (0 → sysid)
         arm_vals = _scale(self.armature) * p
-        sfric_vals = _scale(self.static_friction) * p
-        dratio_vals = _scale(self.dynamic_ratio) * p
+        sfric_vals = _scale(self.static_friction, flo, fhi) * p
+        dratio_vals = _scale(self.dynamic_ratio, flo, fhi) * p
         dfric_vals = torch.minimum(dratio_vals * sfric_vals, sfric_vals)
-        vfric_vals = _scale(self.viscous_friction) * p
+        vfric_vals = _scale(self.viscous_friction, flo, fhi) * p
 
         self.robot.write_joint_armature_to_sim(arm_vals, joint_ids=self.joint_ids, env_ids=env_ids)
         self.robot.write_joint_friction_coefficient_to_sim(

@@ -27,6 +27,11 @@ ALL_RUNS = {
     "RGB   2cam + ImageNet (side+wrist*)":   ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-v0",   "34744482"),
     "Depth 2cam + ImageNet (side+wrist*)":   ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-v0", "34744483"),
     "Depth 2cam + ImageNet + weighted (side+wrist*)": ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-v0", "34745402"),
+    # Launched 2026-04-21 — weighted + one-extra-lever ablations
+    "RGB   2cam + ImageNet + weighted (side+wrist*)":            ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-Weighted-v0",              "34753744"),
+    "Depth 2cam + ImageNet + weighted + recurrent (side+wrist*)":("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-Recurrent-v0",  "34753761"),
+    "Depth 2cam + ImageNet + weighted + split50 (side+wrist*)":  ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-Split50-v0",    "34753762"),
+    "Depth 2cam + ImageNet + weighted + freeze5k (side+wrist*)": ("OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-Freeze5k-v0",   "34754067"),
 }
 
 NON_WEIGHTED_LABELS = [
@@ -45,6 +50,10 @@ WEIGHTED_LABELS = [
     "Depth 1cam + ImageNet (baseline)",  # aliased from "Depth 1cam + ImageNet"
     "Depth 1cam + ImageNet + weighted",
     "Depth 2cam + ImageNet + weighted (side+wrist*)",
+    "RGB   2cam + ImageNet + weighted (side+wrist*)",
+    "Depth 2cam + ImageNet + weighted + recurrent (side+wrist*)",
+    "Depth 2cam + ImageNet + weighted + split50 (side+wrist*)",
+    "Depth 2cam + ImageNet + weighted + freeze5k (side+wrist*)",
 ]
 # Aliases for the weighted plot: remap labels so the baseline is marked as such.
 WEIGHTED_ALIASES = {

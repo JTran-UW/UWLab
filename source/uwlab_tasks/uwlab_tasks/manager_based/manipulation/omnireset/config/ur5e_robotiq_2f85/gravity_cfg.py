@@ -488,6 +488,69 @@ class ZeroGStateGPSTrainCfg(ZeroGBaseCfg):
 
 
 # ===========================================================================
+# State-only + DR for sim-to-real teacher distillation
+# Retains pat/gravity's ZeroG resets + gravity curriculum + IMPLICIT actuator.
+# Adds: arm sysid DR (armature/delays U(0.8,1.2), friction widened to U(0,1.5))
+#       + OSC gain DR (U(0.8,1.2) around terminal_kp=(1000,1000,1000,50,50,50)).
+# ===========================================================================
+@configclass
+class ZeroGGPSSysidEventCfg(ZeroGGPSEventCfg):
+    """ZeroG GPS resets + arm sysid DR + OSC gain DR (widened arm friction).
+
+    Uses the ``*_fixed`` randomizer variants so DR is full-strength from iter 0
+    (no curriculum warmup — gravity curriculum already provides easier-to-harder
+    progression on its own axis).
+    """
+
+    randomize_arm_sysid = EventTerm(
+        func=task_mdp.randomize_arm_from_sysid_fixed,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "joint_names": [
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ],
+            "actuator_name": "arm",
+            "scale_range": (0.8, 1.2),
+            "friction_scale_range": (0.0, 1.5),
+            "delay_range": (0, 1),
+        },
+    )
+
+    randomize_osc_gains = EventTerm(
+        func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
+        mode="reset",
+        params={
+            "action_name": "arm",
+            "scale_range": (0.8, 1.2),
+            "terminal_kp": (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0),
+            "terminal_damping_ratio": (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+        },
+    )
+
+
+@configclass
+class ZeroGStateSysidTrainCfg(ZeroGStateTrainCfg):
+    """ZeroGStateTrainCfg + arm sysid DR + OSC gain DR layered on the events.
+
+    Identical to ``ZeroGStateTrainCfg`` (uniform sampling, IMPLICIT actuator,
+    gravity curriculum, ZeroG resets) plus the dynamics randomization needed
+    for the eventual depth student to be exposed to the same dynamics
+    distribution at distillation time.
+
+    Same Hydra knobs apply (e.g. ``env.curriculum.gravity_curriculum.params.\
+reduction=monitor_mean env.curriculum.gravity_curriculum.params.floor=0.1``).
+    """
+
+    events: ZeroGGPSSysidEventCfg = ZeroGGPSSysidEventCfg()
+
+
+# ===========================================================================
 # Multi-task ZeroG: peg + leg via MultiAssetSpawner
 # ===========================================================================
 @configclass
