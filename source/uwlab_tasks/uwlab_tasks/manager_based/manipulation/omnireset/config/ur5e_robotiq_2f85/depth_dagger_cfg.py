@@ -534,6 +534,44 @@ class Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalCfg(Ur5eRobotiq2f85DepthDAgge
         self.events.reset_from_reset_states.params["probs"] = [1.0]
 
 
+@configclass
+class _DepthDAggerWristSide4CanonicalNoCamObsCfg:
+    """For camera-presence A/B test: just `teacher` (43d). State_DAggerFastRunnerCfg
+    sets `obs_groups[policy] = teacher`, so no `proprio` group is needed."""
+
+    teacher: Teacher4CanonicalCfg = Teacher4CanonicalCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalNoCamCfg(
+    Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalCfg
+):
+    """4-canonical with cameras + curtains REMOVED — A/B test for sim2sim gap.
+
+    Same env as 4-canonical except the scene drops side_camera, wrist_camera,
+    and the 3 curtains. Used to measure teacher rate without camera-induced
+    physics perturbation. If teacher rate jumps from ~0.25 to ~0.95 here,
+    the cameras are the sim2sim gap source.
+    """
+
+    observations: _DepthDAggerWristSide4CanonicalNoCamObsCfg = (
+        _DepthDAggerWristSide4CanonicalNoCamObsCfg()
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Drop scene cameras + curtains. Setting attribute to None removes from
+        # the scene cfg (configclass tolerates None for these RigidObject/Sensor slots).
+        self.scene.side_camera = None
+        self.scene.wrist_camera = None
+        self.scene.curtain_left = None
+        self.scene.curtain_back = None
+        self.scene.curtain_right = None
+        # Drop the wrist-camera reset event since the camera no longer exists.
+        if hasattr(self.events, "reset_wrist_camera_pose"):
+            self.events.reset_wrist_camera_pose = None
+
+
 # ---------------------------------------------------------------------------
 # Drawer DAgger control (single-canonical, non-symmetric task).
 # Symmetry-hypothesis test: if drawer easily breaks 31% under the same recipe,

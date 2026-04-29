@@ -230,6 +230,20 @@ gym.register(
     },
 )
 
+# A/B test env: 4-canonical with cameras + curtains removed. For diagnosing
+# whether camera/curtain sim presence is the source of the teacher sim2sim gap
+# (~0.25 in DAgger vs ~0.98 in training). Uses State_DAggerFastRunnerCfg
+# (state-only MLP student over teacher obs) so no vision groups are required.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-NoCam-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalNoCamCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:State_DAggerFastRunnerCfg",
+    },
+)
+
 # Drawer variant of the 4-canonical pipeline (drawer has one assembled_offset
 # so multi-offset code falls through to single-canonical path).
 gym.register(
