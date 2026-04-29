@@ -113,7 +113,9 @@ class Depth_DAggerRunnerCfg(RslRlBaseRunnerCfg):
     class_name: str = "DistillationRunner"
     num_steps_per_env: int = 8
     max_iterations: int = 30000
-    save_interval: int = 100
+    # 5000 not 100: each ckpt is ~134MB (ResNet18 + AdamW state); at 100 we
+    # accumulated 50GB+ per 30k-iter run and filled the cluster's 17TB disk.
+    save_interval: int = 5000
     # Leave empirical_normalization as MISSING so IsaacLab's deprecated-cfg shim
     # skips the auto-migration (it assumes actor/critic-style policies).
     experiment_name: str = "ur5e_robotiq_2f85_depth_dagger"
