@@ -235,6 +235,19 @@ class DepthDAggerObservationsCfg:
 
 @configclass
 class DepthDAggerTerminationsCfg:
+    """Termination criteria for DAgger envs.
+
+    `success` matches the state-RL training env's `success_termination` (single
+    trigger from `progress_context.success`), not the prior 5-consecutive
+    requirement. The 5-consecutive criterion was capping teacher rate in DAgger
+    (~27% peg, ~41% drawer) vs training (~98%) since teacher policies often
+    reach the success state momentarily then drift back from gripper jitter /
+    OSC oscillation. Matching training removes this artificial gap.
+
+    `early_success` retained for the runner's reset-on-early-success behavior;
+    its 5-consecutive setting is a different (no-grad) signal for the runner,
+    not the training termination metric.
+    """
 
     time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
@@ -242,10 +255,7 @@ class DepthDAggerTerminationsCfg:
         func=task_mdp.early_success_termination,
         params={"num_consecutive_successes": 5, "min_episode_length": 10},
     )
-    success = DoneTerm(
-        func=task_mdp.consecutive_success_state_with_min_length,
-        params={"num_consecutive_successes": 5, "min_episode_length": 10},
-    )
+    success = DoneTerm(func=task_mdp.success_termination, time_out=False)
 
 
 @configclass
