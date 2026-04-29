@@ -588,6 +588,46 @@ class ZeroGStateSysidDAggerIdenticalCfg(ZeroGStateSysidTrainCfg):
 
 
 # ===========================================================================
+# Sim2sim debug ladder variants. Each layers ONE class of DAgger feature on
+# top of ZeroGStateSysidDAggerIdenticalCfg to bisect which one breaks teacher
+# rate. Pair with Hydra overrides where finer-grained changes suffice.
+#
+# Inheritance chains skip ZeroGStateTrainCfg.__post_init__ where it would
+# touch a non-existent ``reset_from_states`` (the param name on ZeroGGPSEvent;
+# FinetuneEvalEventCfg uses ``reset_from_reset_states`` instead). Inheriting
+# from ZeroGBaseCfg directly avoids that crash.
+# ===========================================================================
+from .rl_state_cfg import FinetuneEvalEventCfg as _FinetuneEvalEventCfg  # noqa: E402
+
+
+@configclass
+class ZeroGStateSysidDAggerEvalEventsCfg(ZeroGBaseCfg):
+    """V_events: DAggerIdentical scene + curriculum, but events from FinetuneEvalEventCfg.
+
+    Tests whether replacing ZeroGGPSSysidEventCfg (sysid arm friction widening,
+    GPS routing on ZeroGAnywhere+ZeroGPartialAssembly) with FinetuneEvalEventCfg
+    (eval-grade arm sysid randomization, uniform-over-ZeroGAnywhere reset) drops
+    the teacher rate. Mirrors 4Canonical's __post_init__ for terminal_kp +
+    reset_types so the only delta from the existing 4Canonical run is the
+    scene/cameras/curtains/terminations.
+    """
+
+    observations: _StateObsAsTeacherCfg = _StateObsAsTeacherCfg()
+    events: _FinetuneEvalEventCfg = _FinetuneEvalEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Full gravity from iter 0 (matches DAggerIdentical).
+        self.curriculum.gravity_curriculum.params["floor"] = 1.0
+        # 4Canonical's reset distribution: ZeroGAnywhere only (matches teacher's training).
+        self.events.reset_from_reset_states.params["reset_types"] = ["ZeroGAnywhere"]
+        self.events.reset_from_reset_states.params["probs"] = [1.0]
+        # 4Canonical's stiff terminal Kp; FinetuneEvalEventCfg leaves these unset.
+        self.events.randomize_osc_gains.params["terminal_kp"] = (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0)
+        self.events.randomize_osc_gains.params["terminal_damping_ratio"] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+
+
+# ===========================================================================
 # Multi-task ZeroG: peg + leg via MultiAssetSpawner
 # ===========================================================================
 @configclass

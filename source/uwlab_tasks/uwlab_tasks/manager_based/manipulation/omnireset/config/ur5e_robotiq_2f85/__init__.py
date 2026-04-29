@@ -162,6 +162,20 @@ gym.register(
     },
 )
 
+# Sim2sim debug variant: events swapped to FinetuneEvalEventCfg (matches
+# 4Canonical's events base) on the ZeroG scene. Tests whether the events delta
+# (sysid arm friction widening + GPS routing + ZeroGPartialAssembly resets)
+# accounts for the teacher rate gap.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-Sysid-DAggerEvalEvents-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateSysidDAggerEvalEventsCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:State_DAggerFastRunnerCfg",
+    },
+)
+
 # State-only (no PC) + empirical GPS — GPS + gravity-reduction ablations.
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-GPS-v0",
