@@ -176,6 +176,19 @@ gym.register(
     },
 )
 
+# Sim2sim debug variant: V0 + DAgger scene additions (curtains + 2 cameras +
+# wrist-cam pose reset event). Keeps ZeroG events/curriculum/terminations.
+# Tests whether visual entities perturb physics enough to drop teacher rate.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-Sysid-DAggerWithScene-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateSysidDAggerWithSceneCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:State_DAggerFastRunnerCfg",
+    },
+)
+
 # State-only (no PC) + empirical GPS — GPS + gravity-reduction ablations.
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-GPS-v0",

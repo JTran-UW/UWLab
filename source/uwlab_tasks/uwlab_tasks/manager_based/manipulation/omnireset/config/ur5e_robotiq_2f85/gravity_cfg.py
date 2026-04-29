@@ -627,6 +627,122 @@ class ZeroGStateSysidDAggerEvalEventsCfg(ZeroGBaseCfg):
         self.events.randomize_osc_gains.params["terminal_damping_ratio"] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# V_scene: V0 + curtains + side/wrist cameras (matches 4Canonical scene-add
+# delta). Keeps ZeroG events/curriculum/terminations. Tests the camera/
+# curtain visual-entity contribution to the teacher rate gap.
+# ---------------------------------------------------------------------------
+import isaaclab.sim as _sim_utils  # noqa: E402
+from isaaclab.assets import RigidObjectCfg as _RigidObjCfg2  # noqa: E402
+from isaaclab.managers import EventTermCfg as _EventTermV  # noqa: E402
+from isaaclab.sensors import TiledCameraCfg as _TiledCameraCfg  # noqa: E402
+
+_DEPTH_CLIP_V = (0.01, 2.0)
+_RENDER_HW_V = 224
+
+
+@configclass
+class _ZeroGDAggerSceneCfg(ZeroGSceneCfg):
+    """ZeroGSceneCfg + curtains + side + wrist cameras (mirrors 4Canonical scene)."""
+
+    curtain_left = _RigidObjCfg2(
+        prim_path="{ENV_REGEX_NS}/CurtainLeft",
+        init_state=_RigidObjCfg2.InitialStateCfg(pos=(0.4, -0.68, 0.519), rot=(0.707, 0.0, 0.0, -0.707)),
+        spawn=_sim_utils.CuboidCfg(
+            size=(0.01, 1.0, 1.125),
+            rigid_props=_sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            visual_material=_sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0)),
+            collision_props=_sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+        ),
+    )
+    curtain_back = _RigidObjCfg2(
+        prim_path="{ENV_REGEX_NS}/CurtainBack",
+        init_state=_RigidObjCfg2.InitialStateCfg(pos=(-0.15, 0.0, 0.519), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=_sim_utils.CuboidCfg(
+            size=(0.01, 1.3, 1.125),
+            rigid_props=_sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            visual_material=_sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0)),
+            collision_props=_sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+        ),
+    )
+    curtain_right = _RigidObjCfg2(
+        prim_path="{ENV_REGEX_NS}/CurtainRight",
+        init_state=_RigidObjCfg2.InitialStateCfg(pos=(0.4, 0.68, 0.519), rot=(0.707, 0.0, 0.0, -0.707)),
+        spawn=_sim_utils.CuboidCfg(
+            size=(0.01, 1.0, 1.125),
+            rigid_props=_sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            visual_material=_sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0)),
+            collision_props=_sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+        ),
+    )
+    side_camera = _TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/depth_side_camera",
+        update_period=0,
+        height=_RENDER_HW_V,
+        width=_RENDER_HW_V,
+        offset=_TiledCameraCfg.OffsetCfg(
+            pos=(0.8323904, 0.5877843, 0.2805111),
+            rot=(0.29008842, 0.22122445, 0.51336143, 0.77676798),
+            convention="opengl",
+        ),
+        data_types=["distance_to_camera"],
+        spawn=_sim_utils.PinholeCameraCfg(focal_length=20.10, clipping_range=_DEPTH_CLIP_V),
+    )
+    wrist_camera = _TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/robotiq_base_link/rgb_wrist_camera",
+        update_period=0,
+        height=_RENDER_HW_V,
+        width=_RENDER_HW_V,
+        offset=_TiledCameraCfg.OffsetCfg(
+            pos=(0.0182505, -0.00408447, -0.0689107),
+            rot=(0.34254336, -0.61819255, -0.6160212, 0.347879),
+            convention="opengl",
+        ),
+        data_types=["distance_to_camera"],
+        spawn=_sim_utils.PinholeCameraCfg(focal_length=24.55, clipping_range=_DEPTH_CLIP_V),
+    )
+
+
+@configclass
+class _ZeroGGPSSysidWristResetEventCfg(ZeroGGPSSysidEventCfg):
+    """ZeroGGPSSysidEventCfg + reset_wrist_camera_pose (required when wrist cam exists)."""
+
+    reset_wrist_camera_pose = _EventTermV(
+        func=task_mdp.randomize_tiled_cameras,
+        mode="reset",
+        params={
+            "camera_path_template": "/World/envs/env_{}/Robot/robotiq_base_link/rgb_wrist_camera",
+            "base_position": (0.0182505, -0.00408447, -0.0689107),
+            "base_rotation": (0.34254336, -0.61819255, -0.6160212, 0.347879),
+            "position_deltas": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+            "euler_deltas": {"pitch": (0.0, 0.0), "yaw": (0.0, 0.0), "roll": (0.0, 0.0)},
+        },
+    )
+
+
+@configclass
+class ZeroGStateSysidDAggerWithSceneCfg(ZeroGStateSysidDAggerIdenticalCfg):
+    """V_scene: V0 + DAgger curtains + side/wrist cameras + wrist-cam reset event.
+
+    Tests whether the visual-entity additions (kinematic curtains + 2 TiledCameras)
+    perturb teacher rate independent of the events change. If teacher rate matches
+    V0 here, scene additions are physics-neutral and the gap is in events.
+    """
+
+    scene: _ZeroGDAggerSceneCfg = _ZeroGDAggerSceneCfg(num_envs=32, env_spacing=1.5)
+    events: _ZeroGGPSSysidWristResetEventCfg = _ZeroGGPSSysidWristResetEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Match 4Canonical's render-light settings (with cameras present, dlssg
+        # is undesirable since denoiser/AO can mess depth output).
+        self.sim.render.enable_dlssg = False
+        self.sim.render.enable_ambient_occlusion = False
+        self.sim.render.enable_reflections = False
+        self.sim.render.enable_dl_denoiser = False
+        self.sim.render_interval = self.decimation
+
+
 # ===========================================================================
 # Multi-task ZeroG: peg + leg via MultiAssetSpawner
 # ===========================================================================
