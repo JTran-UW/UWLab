@@ -148,6 +148,20 @@ gym.register(
     },
 )
 
+# DAgger-identical baseline: bit-for-bit ZeroGStateSysidTrainCfg, but obs group
+# renamed `teacher` for State_DAggerFastRunnerCfg routing. Curriculum floor=1.0
+# (full gravity from iter 0). If teacher rate << ~95% here, the gap is NOT in
+# the DAgger scaffolding (cameras/curtains/event/actuator) — re-investigate.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-Sysid-DAggerIdentical-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateSysidDAggerIdenticalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:State_DAggerFastRunnerCfg",
+    },
+)
+
 # State-only (no PC) + empirical GPS — GPS + gravity-reduction ablations.
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-GPS-v0",

@@ -551,6 +551,43 @@ reduction=monitor_mean env.curriculum.gravity_curriculum.params.floor=0.1``).
 
 
 # ===========================================================================
+# DAgger-identical baseline: bit-for-bit ZeroGStateSysidTrainCfg, only the
+# obs group is renamed `teacher` so State_DAggerFastRunnerCfg can route a JIT
+# teacher into it. Curriculum floor pinned to 1.0 (full gravity) so the JIT
+# teacher's converged training-time regime is reproduced from iter 0 — the
+# teacher saw difficulty_frac~1 at the end of training, and student-driven
+# eval would otherwise read the curriculum-warmup floor.
+# ===========================================================================
+@configclass
+class _StateObsAsTeacherCfg:
+    """Wraps StateObsCfg.PolicyCfg under the group name `teacher`.
+
+    State_DAggerFastRunnerCfg expects ``obs_groups[policy/teacher] = ['teacher']``.
+    """
+
+    teacher: StateObsCfg.PolicyCfg = StateObsCfg.PolicyCfg()
+
+
+@configclass
+class ZeroGStateSysidDAggerIdenticalCfg(ZeroGStateSysidTrainCfg):
+    """ZeroGStateSysidTrainCfg with the obs group renamed `teacher`.
+
+    Used as the known-good baseline for the sim2sim debug ladder: if the JIT
+    teacher hits ~95% here but degrades when DAgger features (cameras,
+    curtains, FinetuneEvalEvent, EXPLICIT actuator, DAgger termination set,
+    eval-action scales) are layered on, the offender is in the delta.
+    """
+
+    observations: _StateObsAsTeacherCfg = _StateObsAsTeacherCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Force full gravity from iter 0 — match the converged regime the
+        # teacher trained in. Default floor=0.0 starts at zero gravity.
+        self.curriculum.gravity_curriculum.params["floor"] = 1.0
+
+
+# ===========================================================================
 # Multi-task ZeroG: peg + leg via MultiAssetSpawner
 # ===========================================================================
 @configclass
