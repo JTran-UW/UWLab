@@ -1,0 +1,292 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train RL (Peg, 1 GPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/rsl_rl/train.py",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-v0",
+                "--num_envs", "1",
+                "--logger", "wandb",
+                "--headless",
+                "env.scene.insertive_object=peg",
+                "env.scene.receptive_object=peghole"
+            ]
+        },
+        {
+            "name": "Train RL Reaching (1 GPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/rsl_rl/train.py",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Reaching-v0",
+                "--num_envs", "4",
+                "--logger", "wandb",
+                "--headless",
+                "--run_name", "reaching_test"
+            ]
+        },
+        {
+            "name": "Play RL Policy (Peg)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/rsl_rl/play.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0",
+                "--num_envs", "1",
+                "--checkpoint", "peg_state_rl_expert.pt",
+                "env.scene.insertive_object=peg",
+                "env.scene.receptive_object=peghole"
+            ]
+        },
+        {
+            "name": "Play Holosoma FastSAC (Peg)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/holosoma/play.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0",
+                "--num_envs", "1",
+                "--checkpoint", "peg_state_rl_expert_seed42.pt",
+                "--transitions_output", "expert_rb/expert_transitions.pt",
+                "--record_transitions", "10000",
+                "env.scene.insertive_object=peg",
+                "env.scene.receptive_object=peghole"
+            ]
+        },
+        {
+            "name": "Train Holosoma FastSAC + Expert BC (Peg Easy)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/holosoma/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Easy-OffPolicy-v0",
+                "--num_envs", "2048",
+                "--logger", "wandb",
+                "--headless",
+                "--expert_checkpoint", "peg_state_rl_expert_seed42.pt",
+                "env.scene.insertive_object=peg",
+                "env.scene.receptive_object=peghole"
+            ]
+        },
+        {
+            "name": "Train Holosoma FastSAC",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/holosoma/train.py",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-v0",
+                "--num_envs", "1",
+                "--logger", "wandb",
+                "--headless",
+                "--expert_transitions",  "expert_rb/expert_transitions.pt", // "logs/rsl_rl/expert_buffer.pt",
+                "env.scene.insertive_object=peg",
+                "env.scene.receptive_object=peghole"
+            ]
+        },
+        {
+            "name": "Train Holosoma FastSAC + Expert (Reaching OffPolicy)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/holosoma/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Reaching-OffPolicy-v0",
+                "--num_envs", "4",
+                "--logger", "wandb",
+                "--headless",
+                "--expert_transitions", "logs/rsl_rl/ur5e_robotiq_2f85_omnireset_agent/PPO-Reaching-Anywhere-Fixed/play_transitions.pt"
+            ]
+        },
+        {
+            "name": "Train Holosoma FastSAC Cartpole (1 GPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--nnodes", "1",
+                "--nproc_per_node", "1",
+                "scripts/reinforcement_learning/holosoma/train.py",
+                "--task", "Isaac-Cartpole-FastSAC-v0",
+                "--num_envs", "2048",
+                "--logger", "wandb",
+                "--headless"
+            ]
+        },
+        {
+            "name": "Train Holosoma train_agent FastSAC (G1)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/../holosoma/src/holosoma/holosoma/train_agent.py",
+            "python": "/home/joshuat26/.holosoma_deps/miniconda3/envs/hssim/bin/python",
+            "cwd": "${workspaceFolder}/../holosoma",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/.holosoma_deps/miniconda3/envs/hssim/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "hssim",
+                "OMNI_KIT_ACCEPT_EULA": "1"
+            },
+            "args": [
+                "exp:g1-29dof-fast-sac",
+                "simulator:isaacsim",
+                "logger:wandb",
+                "--training.seed", "1"
+            ]
+        },
+        {
+            "name": "Train Holosoma FastSAC + Expert (Peg Easy, 100 envs)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/holosoma/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Easy-OffPolicy-v0",
+                "--num_envs", "100",
+                "--logger", "wandb",
+                "--expert_checkpoint", "peg_state_rl_expert_seed42.pt",
+                "env.scene.insertive_object=peg",
+                "env.scene.receptive_object=peghole"
+            ]
+        },
+        {
+            "name": "Train Holosoma FastSAC Easy (Resume Isolate-Critic)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/holosoma/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Easy-OffPolicy-v0",
+                "--num_envs", "1",
+                "--logger", "wandb",
+                "--headless",
+                "--load_run", "Isolate-Critic-Learning-2026-04-20_03-49-05",
+                "--checkpoint", "model_0041600.pt",
+                "--expert_checkpoint", "peg_state_rl_expert_seed42.pt",
+                "env.scene.insertive_object=peg",
+                "env.scene.receptive_object=peghole"
+            ]
+        },
+        {
+            "name": "Compare Buffers (PPO vs FastSAC Reaching)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/holosoma/compare_buffers.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "ppo_control.pt",
+                "fastsac_control.pt"
+            ]
+        },
+        {
+            "name": "Visualize All Resets Single Image (env_uwlab)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/joshuat26/miniforge3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts_v2/tools/visualize_all_resets_single_image.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/joshuat26/miniforge3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task",
+                "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0",
+                "--num_envs",
+                "1",
+                "--dataset_dir",
+                "./reset_state_vis/ObjectAnywhereEEAnywhere",
+                "env.scene.insertive_object=peg",
+                "env.scene.receptive_object=peghole",
+                "--debug_clone_pose"
+            ]
+        }
+    ]
+}

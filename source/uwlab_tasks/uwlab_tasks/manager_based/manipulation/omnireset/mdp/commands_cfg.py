@@ -10,7 +10,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
-from .commands import TaskCommand, TaskDependentCommand
+from .commands import TaskCommand, TaskCommandReaching, TaskDependentCommand
 
 
 @configclass
@@ -29,3 +29,16 @@ class TaskCommandCfg(TaskDependentCommandCfg):
     insertive_asset_cfg: SceneEntityCfg = MISSING
 
     receptive_asset_cfg: SceneEntityCfg = MISSING
+
+
+@configclass
+class TaskCommandReachingCfg(TaskDependentCommandCfg):
+    class_type: type = TaskCommandReaching
+
+    ee_asset_cfg: SceneEntityCfg = MISSING
+
+    target_asset_cfg: SceneEntityCfg = MISSING
+
+    success_position_threshold: float = 0.03
+
+    success_orientation_threshold: float = 0.2

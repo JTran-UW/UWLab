@@ -8,7 +8,7 @@
 set -e
 
 # Set tab-spaces
-tabs 4
+tabs 4 2>/dev/null || true
 
 # get script directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
@@ -77,7 +77,7 @@ submit_job() {
 
     case $CLUSTER_JOB_SCHEDULER in
         "SLURM")
-            job_script_file=submit_job_slurm.sh
+            job_script_file=submit_job_slurm_${CLUSTER_NAME}.sh
             ;;
         "PBS")
             job_script_file=submit_job_pbs.sh
@@ -88,22 +88,30 @@ submit_job() {
             ;;
     esac
 
-    ssh $CLUSTER_LOGIN "cd $CLUSTER_UWLAB_DIR && bash $CLUSTER_UWLAB_DIR/docker/cluster/$job_script_file \"$CLUSTER_UWLAB_DIR\" \"uw-lab-$profile\" ${@}"
+    # We copy the cluster-specific env file to .env.cluster on the remote side
+    # so that run_singularity.sh works without modification.
+    ssh $CLUSTER_LOGIN "cd $CLUSTER_UWLAB_DIR && \
+        cp docker/cluster/.env.${CLUSTER_NAME} docker/cluster/.env.cluster && \
+        NODES=${NODES} GPUS_PER_NODE=${GPUS_PER_NODE} \
+        PARTITION=${PARTITION} ACCOUNT=${ACCOUNT} TIME=${TIME} \
+        CPUS_PER_TASK=${CPUS_PER_TASK} MEM_PER_GPU=${MEM_PER_GPU} CONST=${CONSTRAINT} \
+        CLUSTER_PYTHON_EXECUTABLE=${CLUSTER_PYTHON_EXECUTABLE} \
+        bash $CLUSTER_UWLAB_DIR/docker/cluster/$job_script_file \"$CLUSTER_UWLAB_DIR\" \"uw-lab-$profile\" ${@}"
 }
 
 #==
 # Main
 #==
 
-#!/bin/bash
-
 help() {
-    echo -e "\nusage: $(basename "$0") [-h] <command> [<profile>] [<job_args>...] -- Utility for interfacing between UWLab and compute clusters."
+    echo -e "\nusage: $(basename "$0") [-h] [--cluster <name>] <command> [<profile>] [<job_args>...] -- Utility for interfacing between UWLab and compute clusters."
     echo -e "\noptions:"
     echo -e "  -h              Display this help message."
+    echo -e "  --cluster       Specify the cluster configuration to use (e.g. hyak). Defaults to 'hyak'."
     echo -e "\ncommands:"
     echo -e "  push [<profile>]              Push the docker image to the cluster."
     echo -e "  job [<profile>] [<job_args>]  Submit a job to the cluster."
+    echo -e "  sync-assets                   Sync cloud assets to the cluster for offline use."
     echo -e "\nwhere:"
     echo -e "  <profile>  is the optional container profile specification. Defaults to 'base'."
     echo -e "  <job_args> are optional arguments specific to the job command."
@@ -111,20 +119,27 @@ help() {
 }
 
 # Parse options
-while getopts ":h" opt; do
-    case ${opt} in
-        h )
+CLUSTER_NAME="hyak"
+CLI_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cluster)
+            CLUSTER_NAME="$2"
+            shift 2
+            ;;
+        -h|--help)
             help
             exit 0
             ;;
-        \? )
-            echo "Invalid option: -$OPTARG" >&2
-            help
-            exit 1
+        *)
+            CLI_ARGS+=("$1")
+            shift
             ;;
     esac
 done
-shift $((OPTIND -1))
+
+# Restore positional arguments
+set -- "${CLI_ARGS[@]}"
 
 # Check for command
 if [ $# -lt 1 ]; then
@@ -136,6 +151,8 @@ fi
 command=$1
 shift
 profile="base"
+
+echo "[INFO] Using cluster configuration: $CLUSTER_NAME"
 
 case $command in
     push)
@@ -157,16 +174,19 @@ case $command in
         # Check docker and apptainer version
         check_docker_version
         # source env file to get cluster login and path information
-        source $SCRIPT_DIR/.env.cluster
+        if [ -f "$SCRIPT_DIR/.env.$CLUSTER_NAME" ]; then
+            source "$SCRIPT_DIR/.env.$CLUSTER_NAME"
+        else
+            echo "[ERROR] Environment file for cluster '$CLUSTER_NAME' not found at $SCRIPT_DIR/.env.$CLUSTER_NAME"
+            exit 1
+        fi
         # make sure exports directory exists
         mkdir -p /$SCRIPT_DIR/exports
         # clear old exports for selected profile
         rm -rf /$SCRIPT_DIR/exports/uw-lab-$profile*
-        # create singularity image
-        # NOTE: we create the singularity image as non-root user to allow for more flexibility. If this causes
-        # issues, remove the --fakeroot flag and open an issue on the UWLab repository.
+        # create singularity image as a single .sif file (no --sandbox to avoid noexec issues on some clusters)
         cd /$SCRIPT_DIR/exports
-        APPTAINER_NOHTTPS=1 apptainer build --sandbox --fakeroot uw-lab-$profile.sif docker-daemon://uw-lab-$profile:latest
+        APPTAINER_NOHTTPS=1 apptainer build --fakeroot uw-lab-$profile.sif docker-daemon://uw-lab-$profile:latest
         # tar image (faster to send single file as opposed to directory with many files)
         tar -cvf /$SCRIPT_DIR/exports/uw-lab-$profile.tar uw-lab-$profile.sif
         # make sure target directory exists
@@ -186,7 +206,15 @@ case $command in
         echo "[INFO] Executing job command"
         [ -n "$profile" ] && echo -e "\tUsing profile: $profile"
         [ -n "$job_args" ] && echo -e "\tJob arguments: $job_args"
-        source $SCRIPT_DIR/.env.cluster
+
+        # source env file
+        if [ -f "$SCRIPT_DIR/.env.$CLUSTER_NAME" ]; then
+            source "$SCRIPT_DIR/.env.$CLUSTER_NAME"
+        else
+            echo "[ERROR] Environment file for cluster '$CLUSTER_NAME' not found at $SCRIPT_DIR/.env.$CLUSTER_NAME"
+            exit 1
+        fi
+
         # Get current date and time
         current_datetime=$(date +"%Y%m%d_%H%M%S")
         # Append current date and time to CLUSTER_UWLAB_DIR
@@ -197,11 +225,52 @@ case $command in
         ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_UWLAB_DIR"
         # Sync UW Lab code
         echo "[INFO] Syncing UW Lab code..."
-        rsync -rh  --exclude="*.git*" --filter=':- .dockerignore'  /$SCRIPT_DIR/../.. $CLUSTER_LOGIN:$CLUSTER_UWLAB_DIR
+        rsync -rh --exclude="*.git*" --filter=':- .dockerignore' /$SCRIPT_DIR/../.. $CLUSTER_LOGIN:$CLUSTER_UWLAB_DIR
+        # Sync rsl_rl if configured
+        if [ -n "$LOCAL_RSL_RL_DIR" ] && [ -n "$CLUSTER_RSL_RL_DIR" ]; then
+            echo "[INFO] Syncing rsl_rl code..."
+            ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_RSL_RL_DIR"
+            rsync -rh --exclude="*.git*" --exclude="__pycache__" --exclude="*.pyc" \
+                --exclude="logs/" \
+                "$LOCAL_RSL_RL_DIR/" "$CLUSTER_LOGIN:$CLUSTER_RSL_RL_DIR/"
+        fi
+        # Sync holosoma if configured
+        if [ -n "$LOCAL_HOLOSOMA_DIR" ] && [ -n "$CLUSTER_HOLOSOMA_DIR" ]; then
+            echo "[INFO] Syncing holosoma code..."
+            ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_HOLOSOMA_DIR"
+            rsync -rh --exclude="*.git*" --exclude="__pycache__" --exclude="*.pyc" \
+                --exclude=".wandb" --exclude="logs/" \
+                "$LOCAL_HOLOSOMA_DIR/" "$CLUSTER_LOGIN:$CLUSTER_HOLOSOMA_DIR/"
+        fi
         # execute job script
         echo "[INFO] Executing job script..."
-        # check whether the second argument is a profile or a job argument
         submit_job $job_args
+        ;;
+    sync-assets)
+        # source env file
+        if [ -f "$SCRIPT_DIR/.env.$CLUSTER_NAME" ]; then
+            source "$SCRIPT_DIR/.env.$CLUSTER_NAME"
+        else
+            echo "[ERROR] Environment file for cluster '$CLUSTER_NAME' not found at $SCRIPT_DIR/.env.$CLUSTER_NAME"
+            exit 1
+        fi
+        if [ -z "$CLUSTER_CLOUD_ASSETS_DIR" ]; then
+            echo "[ERROR] CLUSTER_CLOUD_ASSETS_DIR is not set in .env.$CLUSTER_NAME"
+            exit 1
+        fi
+        LOCAL_SRC="${1:-$LOCAL_CLOUD_ASSETS_DIR}"
+        if [ -z "$LOCAL_SRC" ] || [ ! -d "$LOCAL_SRC" ]; then
+            echo "[ERROR] Provide a local assets directory to sync from."
+            echo "Usage:  $(basename "$0") --cluster $CLUSTER_NAME sync-assets /path/to/local/cloud_assets"
+            echo "   or:  set LOCAL_CLOUD_ASSETS_DIR in your environment"
+            exit 1
+        fi
+        echo "[INFO] Syncing cloud assets to cluster..."
+        echo "[INFO]   Source: $LOCAL_SRC"
+        echo "[INFO]   Dest:   $CLUSTER_LOGIN:$CLUSTER_CLOUD_ASSETS_DIR"
+        ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_CLOUD_ASSETS_DIR"
+        rsync -ahP "$LOCAL_SRC/" "$CLUSTER_LOGIN:$CLUSTER_CLOUD_ASSETS_DIR/"
+        echo "[INFO] Asset sync complete."
         ;;
     *)
         echo "Error: Invalid command: $command" >&2

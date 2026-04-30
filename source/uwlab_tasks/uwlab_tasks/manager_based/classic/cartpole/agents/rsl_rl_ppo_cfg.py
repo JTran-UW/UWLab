@@ -5,7 +5,7 @@
 
 import isaaclab_tasks.manager_based.classic.cartpole.mdp.symmetry as symmetry
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg, RslRlSymmetryCfg
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlOffPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg, RslRlSymmetryCfg, RslRlFastSACAlgorithmCfg, RslRlFastSACActorCriticCfg
 
 
 @configclass
@@ -36,6 +36,16 @@ class CartpolePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class CartpoleFastSACRunnerCfg(RslRlOffPolicyRunnerCfg):
+    save_interval = 100
+    resume = False
+    experiment_name = "cartpole_fastsac"
+    wandb_project = "cartpole_fastsac"
+    policy = RslRlFastSACActorCriticCfg()
+    algorithm = RslRlFastSACAlgorithmCfg()
 
 
 @configclass
