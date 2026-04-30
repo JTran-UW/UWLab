@@ -638,3 +638,87 @@ class Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalDrawerCfg(
         super().__post_init__()
         self.scene.insertive_object = _make_drawer_insertive()
         self.scene.receptive_object = _make_drawer_receptive()
+
+
+# ---------------------------------------------------------------------------
+# LEAN DAgger envs (peg + drawer): training-events only, no BaseEventCfg DRs.
+# Built after sim2sim ladder bisection (2026-04-29) showed the existing 4Canonical
+# inherits BaseEventCfg's 9 extra DR terms (mass/material/gripper) which the
+# state teachers never saw at training time -> abnormal_robot trip 0.006 -> 0.585,
+# teacher rate 0.985 -> 0.224. These lean envs swap WristSideEventCfg for a ZeroG
+# events sibling so the existing peg_sysid_mean.pt / drawer_sysid_full.pt
+# teachers experience the same DR distribution they trained under.
+#
+# Inheritance NOTE: cannot extend Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalCfg
+# directly — its __post_init__ touches `self.events.reset_from_reset_states`
+# (FinetuneEvalEventCfg's param name), which does not exist on ZeroG events
+# (param is `reset_from_states`). Inheriting from the 4Canonical's parent
+# (DepthDAggerWristSideCfg) and re-doing the 4Canonical-specific overrides
+# (IMPLICIT actuator, training-action scales, 4-canonical 43d teacher obs)
+# avoids that crash.
+# ---------------------------------------------------------------------------
+
+from .gravity_cfg import ZeroGGPSSysidEventCfg as _ZeroGGPSSysidEventCfg  # noqa: E402
+
+
+@configclass
+class _ZeroGSysidWristSideEventCfg(_ZeroGGPSSysidEventCfg):
+    """ZeroGGPSSysidEventCfg + reset_wrist_camera_pose (rewrites wrist cam offset
+    after USD reset_scene_to_default zeroes its local XformOps)."""
+
+    reset_wrist_camera_pose = EventTerm(
+        func=task_mdp.randomize_tiled_cameras,
+        mode="reset",
+        params={
+            "camera_path_template": "/World/envs/env_{}/Robot/robotiq_base_link/rgb_wrist_camera",
+            "base_position": (0.0182505, -0.00408447, -0.0689107),
+            "base_rotation": (0.34254336, -0.61819255, -0.6160212, 0.347879),
+            "position_deltas": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+            "euler_deltas": {"pitch": (0.0, 0.0), "yaw": (0.0, 0.0), "roll": (0.0, 0.0)},
+        },
+    )
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalLeanCfg(
+    Ur5eRobotiq2f85DepthDAggerWristSideCfg
+):
+    """Lean 4-canonical DAgger: training events only (no BaseEventCfg DR superset).
+
+    Inherits scene/cameras/curtains from the WristSide parent, overrides events
+    to the ZeroG training event set so the existing `peg_sysid_mean.pt` teacher
+    sees its training dynamics distribution exactly. 4Canonical's IMPLICIT
+    actuator + training-scale OSC action + 43d single-frame teacher obs are
+    re-applied here (since we can't inherit from 4Canonical — see file note).
+    """
+
+    observations: DepthDAggerWristSide4CanonicalObservationsCfg = (
+        DepthDAggerWristSide4CanonicalObservationsCfg()
+    )
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    events: _ZeroGSysidWristSideEventCfg = _ZeroGSysidWristSideEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # 4Canonical actuator (IMPLICIT, not EXPLICIT from grandparent post_init).
+        self.scene.robot = IMPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # Match teacher's training-time reset distribution: ZeroGAnywhere only
+        # (test B confirmed dropping ZeroGPartialAssembly is innocent), uniform
+        # routing (no GPS classifier, since teacher trained without it).
+        self.events.reset_from_states.params["reset_types"] = ["ZeroGAnywhere"]
+        self.events.reset_from_states.params["probs"] = [1.0]
+        self.events.reset_from_states.params["curriculum_target"] = None
+        self.events.reset_from_states.params["use_classifier"] = False
+        self.events.reset_from_states.params["use_success_critic"] = False
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalLeanDrawerCfg(
+    Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalLeanCfg
+):
+    """Lean 4-canonical DAgger, drawer task variant."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.insertive_object = _make_drawer_insertive()
+        self.scene.receptive_object = _make_drawer_receptive()

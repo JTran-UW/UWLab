@@ -551,6 +551,188 @@ reduction=monitor_mean env.curriculum.gravity_curriculum.params.floor=0.1``).
 
 
 # ===========================================================================
+# Full-DR ZeroG training: ZeroGGPSSysidEventCfg + the 9 BaseEventCfg DR terms
+# (mass/material/gripper actuator) + narrowed arm friction. Pairs with a
+# training cfg that drops ZeroGPartialAssembly so reset distribution matches
+# DAgger.
+#
+# Motivation: sim2sim debug (2026-04-29) showed teacher rate 0.985 -> 0.224
+# when DAgger envs swap in BaseEventCfg's extra DRs that the legacy ZeroG
+# training set never included. Long-term fix is to train future teachers on
+# this Full-DR env so any DAgger config (which inherits the same DR set + adds
+# scene cameras/curtains) is a strict SUPERSET only in scene, not DR.
+# ===========================================================================
+@configclass
+class ZeroGGPSSysidFullDREventCfg(ZeroGGPSSysidEventCfg):
+    """ZeroG events + arm sysid + OSC DR + 9 BaseEventCfg DRs + narrowed arm friction.
+
+    Deltas vs ``ZeroGGPSSysidEventCfg``:
+      + 4 material-randomization startup events (robot, insertive, receptive, table)
+      + 4 mass-randomization startup events (robot, insertive, receptive, table)
+      + 1 gripper-actuator-parameter reset event (finger_joint stiffness/damping
+        log-uniform 0.5-2x)
+      ~ randomize_arm_sysid friction range narrowed from (0.0, 1.5) to (0.8, 1.2)
+        (matches the ``randomize_arm_from_sysid_fixed`` defaults that DAgger envs
+         already use; the widened (0.0, 1.5) was a one-off for sim-to-real
+         robustness experiments and overshot what DAgger applies.)
+
+    Default reset_types from ZeroGGPSEventCfg = [ZeroGAnywhere, ZeroGPartialAssembly]
+    50/50; the paired training cfg ``ZeroGStateSysidFullDRTrainCfg`` drops
+    ZeroGPartialAssembly to match DAgger's reset distribution.
+    """
+
+    # ---- Material DR (startup) -------------------------------------------
+    robot_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.3, 1.2),
+            "dynamic_friction_range": (0.2, 1.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("robot"),
+            "make_consistent": True,
+        },
+    )
+    insertive_object_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (1.0, 2.0),
+            "dynamic_friction_range": (0.9, 1.9),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            "make_consistent": True,
+        },
+    )
+    receptive_object_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.2, 0.6),
+            "dynamic_friction_range": (0.15, 0.5),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("receptive_object"),
+            "make_consistent": True,
+        },
+    )
+    table_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.3, 0.6),
+            "dynamic_friction_range": (0.2, 0.5),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("table"),
+            "make_consistent": True,
+        },
+    )
+
+    # ---- Mass DR (startup) -----------------------------------------------
+    randomize_robot_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "mass_distribution_params": (0.7, 1.3),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+    randomize_insertive_object_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            # 20-200g range matches BaseEventCfg.
+            "mass_distribution_params": (0.02, 0.2),
+            "operation": "abs",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+    randomize_receptive_object_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("receptive_object"),
+            "mass_distribution_params": (0.5, 1.5),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+    randomize_table_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("table"),
+            "mass_distribution_params": (0.5, 1.5),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+
+    # ---- Gripper actuator DR (reset) -------------------------------------
+    randomize_gripper_actuator_parameters = EventTerm(
+        func=task_mdp.randomize_actuator_gains,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_joint"]),
+            "stiffness_distribution_params": (0.5, 2.0),
+            "damping_distribution_params": (0.5, 2.0),
+            "operation": "scale",
+            "distribution": "log_uniform",
+        },
+    )
+
+    # ---- Override arm sysid: narrow friction from (0, 1.5) to (0.8, 1.2) -
+    randomize_arm_sysid = EventTerm(
+        func=task_mdp.randomize_arm_from_sysid_fixed,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "joint_names": [
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ],
+            "actuator_name": "arm",
+            "scale_range": (0.8, 1.2),
+            "friction_scale_range": (0.8, 1.2),
+            "delay_range": (0, 1),
+        },
+    )
+
+
+@configclass
+class ZeroGStateSysidFullDRTrainCfg(ZeroGStateTrainCfg):
+    """ZeroG state RL training with full DR + ZeroGAnywhere-only resets.
+
+    Pairs with ``ZeroGGPSSysidFullDREventCfg``. Future teachers trained here
+    see the full DR distribution that depth-DAgger envs apply, so DAgger
+    becomes a strict SUBSET of training (only differs by scene additions:
+    cameras, curtains).
+    """
+
+    events: ZeroGGPSSysidFullDREventCfg = ZeroGGPSSysidFullDREventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Match DAgger reset distribution: ZeroGAnywhere only (drop PartialAssembly).
+        self.events.reset_from_states.params["reset_types"] = ["ZeroGAnywhere"]
+        self.events.reset_from_states.params["probs"] = [1.0]
+
+
+# ===========================================================================
 # DAgger-identical baseline: bit-for-bit ZeroGStateSysidTrainCfg, only the
 # obs group is renamed `teacher` so State_DAggerFastRunnerCfg can route a JIT
 # teacher into it. Curriculum floor pinned to 1.0 (full gravity) so the JIT

@@ -148,6 +148,20 @@ gym.register(
     },
 )
 
+# Long-term sim2sim alignment: ZeroG-State-Sysid plus the 9 BaseEventCfg DRs
+# (mass + material + gripper) that depth-DAgger envs apply. Narrowed arm
+# friction (0.8-1.2) and ZeroGAnywhere-only resets so DAgger envs become a
+# strict SUBSET of this training distribution.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-Sysid-FullDR-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateSysidFullDRTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:StatePPORunnerCfg",
+    },
+)
+
 # DAgger-identical baseline: bit-for-bit ZeroGStateSysidTrainCfg, but obs group
 # renamed `teacher` for State_DAggerFastRunnerCfg routing. Curriculum floor=1.0
 # (full gravity from iter 0). If teacher rate << ~95% here, the gap is NOT in
@@ -293,6 +307,31 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalDrawerCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
+# Lean 4-canonical DAgger envs: training events only (no BaseEventCfg DR
+# superset). Use with existing peg_sysid_mean.pt / drawer_sysid_full.pt
+# teachers — those trained on ZeroGGPSSysidEventCfg, so this env feeds them
+# the same dynamics distribution. Sim2sim ladder (2026-04-29 commits) showed
+# the standard 4Canonical's BaseEventCfg DRs (mass/material/gripper) drop
+# teacher rate from 0.985 to 0.224.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-Lean-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalLeanCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-Lean-Drawer-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalLeanDrawerCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
     },
 )
