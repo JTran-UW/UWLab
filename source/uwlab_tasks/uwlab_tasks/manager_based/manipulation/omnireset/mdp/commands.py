@@ -22,7 +22,7 @@ from . import utils
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
-    from .commands_cfg import TaskCommandCfg, TaskDependentCommandCfg
+    from .commands_cfg import TaskCommandCfg, TaskCommandReachingCfg, TaskDependentCommandCfg
 
 
 class TaskDependentCommand(CommandTerm):
@@ -151,6 +151,79 @@ class TaskCommand(TaskDependentCommand):
         self.xyz_distance[:] = torch.norm(insertive_asset_in_receptive_asset_frame_pos, dim=1)
         self.position_aligned[:] = self.xyz_distance < self.success_position_threshold
         self.orientation_aligned[:] = self.euler_xy_distance < self.success_orientation_threshold
+        self.metrics["average_rot_align_error"][:] = self.euler_xy_distance
+        self.metrics["average_pos_align_error"][:] = self.xyz_distance
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        super()._resample_command(env_ids)
+
+    def _update_command(self):
+        super()._update_command()
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        pass
+
+    def _debug_vis_callback(self, event):
+        pass
+
+
+class TaskCommandReaching(TaskDependentCommand):
+    """Command generator for the reaching task. Tracks EE-link → target-marker pose error.
+
+    Mirrors the metrics produced by :class:`TaskCommand` (peg insertion) so that the same
+    wandb panels (Episode/Metrics/task_command/...) are populated. Reaching success is
+    position-only since the orientation Kp is too weak to track reliably.
+    """
+
+    cfg: TaskCommandReachingCfg
+
+    def __init__(self, cfg: TaskCommandReachingCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        self.ee_asset: Articulation = env.scene[cfg.ee_asset_cfg.name]
+        self.target_asset: RigidObject = env.scene[cfg.target_asset_cfg.name]
+        self.ee_body_idx = (
+            0 if isinstance(cfg.ee_asset_cfg.body_ids, slice) else cfg.ee_asset_cfg.body_ids[0]
+        )
+        self.success_position_threshold: float = cfg.success_position_threshold
+        self.success_orientation_threshold: float = cfg.success_orientation_threshold
+
+        self.metrics["average_rot_align_error"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["average_pos_align_error"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["end_of_episode_rot_align_error"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["end_of_episode_pos_align_error"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["end_of_episode_success_rate"] = torch.zeros(self.num_envs, device=self.device)
+
+        self.orientation_aligned = torch.zeros((self._env.num_envs), dtype=torch.bool, device=self._env.device)
+        self.position_aligned = torch.zeros((self._env.num_envs), dtype=torch.bool, device=self._env.device)
+        self.euler_xy_distance = torch.zeros((self._env.num_envs), device=self._env.device)
+        self.xyz_distance = torch.zeros((self._env.num_envs), device=self._env.device)
+
+    @property
+    def command(self) -> torch.Tensor:
+        return torch.zeros(self.num_envs, 3, device=self.device)
+
+    def _update_metrics(self):
+        # Read terminal-state values from the progress_context reward term.
+        # The reward term runs BEFORE _reset_idx, so its fields reflect the
+        # terminal state of the just-ended episode for envs that just reset.
+        # If we computed pose error from scene assets here, we'd get the
+        # post-reset state for resetting envs (since _update_metrics runs
+        # AFTER reset), which is wrong.
+        progress_ctx = self._env.reward_manager.get_term_cfg("progress_context").func
+
+        # logs end of episode data (uses terminal state from progress_ctx)
+        reset_env = self._env.episode_length_buf == 0
+        self.metrics["end_of_episode_rot_align_error"][reset_env] = progress_ctx.euler_xy_distance[reset_env]
+        self.metrics["end_of_episode_pos_align_error"][reset_env] = progress_ctx.xyz_distance[reset_env]
+        last_episode_success = (progress_ctx.orientation_aligned & progress_ctx.position_aligned)[reset_env]
+        self.metrics["end_of_episode_success_rate"][reset_env] = last_episode_success.float()
+
+        # logs current per-env state (mirrored from progress_ctx)
+        self.euler_xy_distance[:] = progress_ctx.euler_xy_distance
+        self.xyz_distance[:] = progress_ctx.xyz_distance
+        self.position_aligned[:] = progress_ctx.position_aligned
+        self.orientation_aligned[:] = progress_ctx.orientation_aligned
         self.metrics["average_rot_align_error"][:] = self.euler_xy_distance
         self.metrics["average_pos_align_error"][:] = self.xyz_distance
 

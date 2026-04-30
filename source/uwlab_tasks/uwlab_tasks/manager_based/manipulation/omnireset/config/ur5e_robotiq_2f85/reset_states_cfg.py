@@ -173,12 +173,12 @@ class ResetStatesBaseEventCfg:
         mode="reset",
         params={
             "pose_range": {
-                "x": (0.3, 0.55),
-                "y": (-0.1, 0.3),
+                "x": (0.4, 0.4), # (0.3, 0.55),
+                "y": (0.0, 0.0), # (-0.1, 0.3),
                 "z": (0.0, 0.0),
                 "roll": (0.0, 0.0),
                 "pitch": (0.0, 0.0),
-                "yaw": (-np.pi / 12, np.pi / 12),
+                "yaw": (0.0, 0.0), # (-np.pi / 12, np.pi / 12),
             },
             "velocity_range": {},
             "asset_cfgs": {"receptive_object": SceneEntityCfg("receptive_object")},

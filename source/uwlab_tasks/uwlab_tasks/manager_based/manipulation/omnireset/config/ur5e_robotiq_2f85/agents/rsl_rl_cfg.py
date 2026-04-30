@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg, RslRlOffPolicyRunnerCfg, RslRlFastSACAlgorithmCfg, RslRlFastSACActorCriticCfg
 
 from uwlab_rl.rsl_rl.rl_cfg import (
     BehaviorCloningCfg,
@@ -52,6 +52,16 @@ class Base_PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm=1.0,
     )
 
+@configclass
+class Base_FastSACRunnerCfg(RslRlOffPolicyRunnerCfg):
+    save_interval = 100
+    resume = False
+    experiment_name = "ur5e_robotiq_2f85_omnireset_agent"
+    wandb_project = "omnireset_fastsac"
+    policy = RslRlFastSACActorCriticCfg(
+    )
+    algorithm = RslRlFastSACAlgorithmCfg(
+    )
 
 @configclass
 class Base_DAggerRunnerCfg(Base_PPORunnerCfg):

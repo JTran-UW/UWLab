@@ -83,6 +83,11 @@ RUN touch /bin/nvidia-smi && \
     mkdir -p /var/run/nvidia-persistenced && \
     touch /var/run/nvidia-persistenced/socket
 
+# Upgrade pip (but NOT setuptools — 82.x drops pkg_resources which flatdict needs)
+# then pre-install flatdict whose legacy setup.py imports pkg_resources
+RUN ${UWLAB_PATH}/uwlab.sh -p -m pip install --upgrade pip && \
+    ${UWLAB_PATH}/uwlab.sh -p -m pip install --no-build-isolation flatdict==4.0.1
+
 # installing UW Lab dependencies
 # use pip caching to avoid reinstalling large packages
 RUN --mount=type=cache,target=${DOCKER_USER_HOME}/.cache/pip \

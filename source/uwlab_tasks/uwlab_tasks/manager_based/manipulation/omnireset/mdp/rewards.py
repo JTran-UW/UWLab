@@ -83,6 +83,66 @@ class ee_asset_distance_tanh(ManagerTermBase):
         return 1 - torch.tanh(pos_distance / std)
 
 
+
+class ee_pos_distance_tanh(ManagerTermBase):
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.root_asset_cfg = cfg.params.get("root_asset_cfg")
+        self.target_asset_cfg = cfg.params.get("target_cfg")
+        self.std = cfg.params.get("std")
+
+        root_asset_offset_metadata_key: str = cfg.params.get("root_asset_offset_metadata_key")
+        target_asset_offset_metadata_key: str = cfg.params.get("target_asset_offset_metadata_key")
+
+        self.root_asset = env.scene[self.root_asset_cfg.name]
+        root_usd_path = self.root_asset.cfg.spawn.usd_path
+        root_metadata = utils.read_metadata_from_usd_directory(root_usd_path)
+        root_offset_data = root_metadata.get(root_asset_offset_metadata_key)
+        self.root_asset_offset = Offset(pos=root_offset_data.get("pos"), quat=root_offset_data.get("quat"))
+
+        self.target_asset = env.scene[self.target_asset_cfg.name]
+        if target_asset_offset_metadata_key is not None:
+            target_usd_path = self.target_asset.cfg.spawn.usd_path
+            target_metadata = utils.read_metadata_from_usd_directory(target_usd_path)
+            target_offset_data = target_metadata.get(target_asset_offset_metadata_key)
+            self.target_asset_offset = Offset(pos=target_offset_data.get("pos"), quat=target_offset_data.get("quat"))
+        else:
+            self.target_asset_offset = None
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        root_asset_cfg: SceneEntityCfg,
+        target_asset_cfg: SceneEntityCfg,
+        root_asset_offset_metadata_key: str,
+        target_asset_offset_metadata_key: str | None = None,
+        std: float = 0.1,
+    ) -> torch.Tensor:
+        root_asset_alignment_pos_w, root_asset_alignment_quat_w = self.root_asset_offset.combine(
+            self.root_asset.data.body_link_pos_w[:, root_asset_cfg.body_ids].view(-1, 3),
+            self.root_asset.data.body_link_quat_w[:, root_asset_cfg.body_ids].view(-1, 4),
+        )
+        if self.target_asset_offset is None:
+            target_asset_alignment_pos_w = self.target_asset.data.root_pos_w.view(-1, 3)
+            target_asset_alignment_quat_w = self.target_asset.data.root_quat_w.view(-1, 4)
+        else:
+            target_asset_alignment_pos_w, target_asset_alignment_quat_w = self.target_asset_offset.apply(
+                self.target_asset
+            )
+        target_asset_in_root_asset_frame_pos, target_asset_in_root_asset_frame_angle_axis = (
+            math_utils.compute_pose_error(
+                root_asset_alignment_pos_w,
+                root_asset_alignment_quat_w,
+                target_asset_alignment_pos_w,
+                target_asset_alignment_quat_w,
+            )
+        )
+
+        pos_distance = torch.norm(target_asset_in_root_asset_frame_pos, dim=1)
+
+        return 1 - torch.tanh(pos_distance / std)
+
+
 class ProgressContext(ManagerTermBase):
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
@@ -154,6 +214,71 @@ class ProgressContext(ManagerTermBase):
         # Update success monitor
         self.success_monitor.success_update(
             torch.zeros(env.num_envs, dtype=torch.int32, device=env.device), self.success
+        )
+
+        return torch.zeros(env.num_envs, device=env.device)
+
+
+class ProgressContextReaching(ManagerTermBase):
+    """Reaching-task analogue of ProgressContext. Tracks EE-link → target-marker pose error.
+
+    No USD metadata reads, no command lookup -- thresholds and asset cfgs are passed as params.
+    Exposes the same attributes (xyz_distance, euler_xy_distance, position_aligned,
+    orientation_aligned, success, continuous_success_counter) so dense_success_reward and
+    success_reward can read it via context lookup.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.ee_asset_cfg: SceneEntityCfg = cfg.params.get("ee_asset_cfg")
+        self.target_asset_cfg: SceneEntityCfg = cfg.params.get("target_asset_cfg")
+        self.success_position_threshold: float = cfg.params.get("success_position_threshold", 0.03)
+        self.success_orientation_threshold: float = cfg.params.get("success_orientation_threshold", 0.2)
+
+        self.ee_asset: Articulation = env.scene[self.ee_asset_cfg.name]
+        self.target_asset: RigidObject = env.scene[self.target_asset_cfg.name]
+        self.ee_body_idx = (
+            0 if isinstance(self.ee_asset_cfg.body_ids, slice) else self.ee_asset_cfg.body_ids[0]
+        )
+
+        self.orientation_aligned = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+        self.position_aligned = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+        self.euler_xy_distance = torch.zeros((env.num_envs,), device=env.device)
+        self.xyz_distance = torch.zeros((env.num_envs,), device=env.device)
+        self.success = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+        self.continuous_success_counter = torch.zeros((env.num_envs,), dtype=torch.int32, device=env.device)
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        super().reset(env_ids)
+        self.continuous_success_counter[:] = 0
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        ee_asset_cfg: SceneEntityCfg,
+        target_asset_cfg: SceneEntityCfg,
+        success_position_threshold: float = 0.03,
+        success_orientation_threshold: float = 0.2,
+    ) -> torch.Tensor:
+        ee_pos_w = self.ee_asset.data.body_link_pos_w[:, self.ee_body_idx]
+        ee_quat_w = self.ee_asset.data.body_link_quat_w[:, self.ee_body_idx]
+        target_pos_w = self.target_asset.data.root_pos_w
+        target_quat_w = self.target_asset.data.root_quat_w
+
+        ee_in_target_pos, ee_in_target_quat = math_utils.subtract_frame_transforms(
+            target_pos_w, target_quat_w, ee_pos_w, ee_quat_w
+        )
+
+        e_x, e_y, _ = math_utils.euler_xyz_from_quat(ee_in_target_quat)
+        self.euler_xy_distance[:] = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
+        self.xyz_distance[:] = torch.norm(ee_in_target_pos, dim=1)
+        self.position_aligned[:] = self.xyz_distance < self.success_position_threshold
+        # Reaching task: success is position-only (orientation Kp is too weak to track reliably).
+        self.orientation_aligned[:] = True
+        self.success[:] = self.position_aligned
+
+        self.continuous_success_counter[:] = torch.where(
+            self.success, self.continuous_success_counter + 1, torch.zeros_like(self.continuous_success_counter)
         )
 
         return torch.zeros(env.num_envs, device=env.device)

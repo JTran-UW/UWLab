@@ -1,0 +1,27 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../rsl_rl"
+		},
+		{
+			"path": "../obsidian-vault"
+		},
+		{
+			"path": "../holosoma"
+		}
+	],
+	"settings": {
+		"python-envs.defaultEnvManager": "ms-python.python:conda",
+		"python-envs.defaultPackageManager": "ms-python.python:conda",
+		"python-envs.pythonProjects": [
+			{
+				"path": "reset_state_datasets",
+				"envManager": "ms-python.python:conda",
+				"packageManager": "ms-python.python:conda"
+			}
+		]
+	}
+}

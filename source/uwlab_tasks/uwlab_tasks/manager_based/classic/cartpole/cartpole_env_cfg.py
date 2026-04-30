@@ -81,6 +81,22 @@ class ObservationsCfg:
     policy: PolicyCfg = PolicyCfg()
 
 
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Observations for critic group."""
+
+        # observation terms (order preserved)
+        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    # observation groups
+    critic: CriticCfg = CriticCfg()
+
+
 @configclass
 class EventCfg:
     """Configuration for events."""
