@@ -343,6 +343,10 @@ class _BCPPOAlgorithmCfg:
     # scale as PPO terms so it acts as a regularizer, not a dominator.
     cloning_loss_coeff: float = 0.001
     cloning_loss_decay: float = 1.0
+    # "mse" = plain MSE on action means (raw scale ~250 for peg teacher).
+    # "weighted_mse" = DEXTRAH-style inverse-variance-weighted L2 (raw scale ~3-5
+    # since 1/sigma^2 dampens). With weighted_mse, scale up coeff 50-100x.
+    bc_loss_type: str = "mse"
     # Standard PPO knobs.
     value_loss_coef: float = 1.0
     use_clipped_value_loss: bool = True

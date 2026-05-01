@@ -35,6 +35,7 @@ class BCPPO(PPO):
         teacher_obs_groups: list[str],
         cloning_loss_coeff: float = 1.0,
         cloning_loss_decay: float = 1.0,
+        bc_loss_type: str = "mse",
         **kwargs,
     ) -> None:
         super().__init__(policy, **kwargs)
@@ -47,18 +48,36 @@ class BCPPO(PPO):
         self.cloning_loss_decay = float(cloning_loss_decay)
         self._cur_cloning_loss_coeff = self.cloning_loss_coeff
         self._update_count = 0
+        # bc_loss_type: "mse" = MSE on action means (raw scale ~250 for our peg
+        #   teacher, see comments in agents/rsl_rl_cfg.py).
+        # "weighted_mse" = DEXTRAH-style inverse-variance-weighted L2:
+        #   sqrt(sum_i (1/sigma_t,i)^2 (mu_s,i - mu_t,i)^2) per sample, then
+        #   mean over batch. Down-weights action dims where teacher is uncertain.
+        #   Requires the JIT teacher to return (mean, std) tuple.
+        if bc_loss_type not in ("mse", "weighted_mse"):
+            raise ValueError(f"bc_loss_type must be 'mse' or 'weighted_mse'; got {bc_loss_type}")
+        self.bc_loss_type = bc_loss_type
 
-    def _teacher_action(self, obs_batch) -> torch.Tensor:
-        """Build teacher input from obs_batch and run teacher forward (no grad)."""
+    def _teacher_distribution(self, obs_batch) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Build teacher input and return (mean, std). std is None if teacher
+        only returns mean."""
         teacher_obs = torch.cat([obs_batch[g] for g in self.teacher_obs_groups], dim=-1)
         with torch.no_grad():
             out = self.teacher(teacher_obs)
-        # JIT teacher may return either action mean or (mean, std) tuple.
         if isinstance(out, (tuple, list)):
-            mean = out[0]
-        else:
-            mean = out
-        return mean.detach()
+            return out[0].detach(), out[1].detach()
+        return out.detach(), None
+
+    def _bc_loss(self, mu_batch: torch.Tensor, obs_batch) -> torch.Tensor:
+        teacher_mean, teacher_std = self._teacher_distribution(obs_batch)
+        if self.bc_loss_type == "weighted_mse":
+            if teacher_std is None:
+                # Fall back silently if teacher doesn't expose std.
+                return (mu_batch - teacher_mean).pow(2).mean()
+            weights = (1.0 / teacher_std.clamp_min(1e-6)) ** 2
+            return torch.sqrt(torch.sum(weights * (mu_batch - teacher_mean).pow(2), dim=-1)).mean()
+        # default: plain MSE on means
+        return (mu_batch - teacher_mean).pow(2).mean()
 
     def update(self) -> dict[str, float]:
         # Reuse parent PPO's update loop but inject BC into per-minibatch loss.
@@ -143,8 +162,7 @@ class BCPPO(PPO):
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             # BC auxiliary.
-            teacher_mean = self._teacher_action(obs_batch)
-            bc_loss = (mu_batch - teacher_mean).pow(2).mean()
+            bc_loss = self._bc_loss(mu_batch, obs_batch)
 
             loss = (
                 surrogate_loss
