@@ -472,7 +472,7 @@ class TrainReachingEventCfg(BaseReachingEventCfg):
     
 
 @configclass
-class TrainEasyEventCfg(BaseEventWithDRCfg):
+class TrainEasyEventCfg(BaseEventCfg):
     """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
 
     reset_from_reset_states = EventTerm(
@@ -1061,14 +1061,14 @@ class Ur5eRobotiq2f85RlStateCfg(ManagerBasedRLEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventWithDRCfg = MISSING
+    events: BaseEventCfg = MISSING
     commands: CommandsCfg = CommandsCfg()
     viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
     variants = variants
 
     def __post_init__(self):
         self.decimation = 12
-        self.episode_length_s = 4.0 # 16.0
+        self.episode_length_s = 16.0
         # simulation settings
         self.sim.dt = 1 / 120.0
 
