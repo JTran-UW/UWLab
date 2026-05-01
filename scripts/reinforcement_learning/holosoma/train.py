@@ -101,6 +101,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 import gymnasium as gym
 import logging
 import os
+import re
 import torch
 import wandb
 from datetime import datetime
@@ -210,6 +211,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.resume = True
     elif agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    elif int(os.getenv("SLURM_RESTART_COUNT", "0")) > 0:
+        # Job was preempted and requeued by SLURM — auto-resume from latest checkpoint.
+        # Match the most recent run directory for this run_name (or any run if no name set).
+        run_dir_pattern = f".*_{re.escape(agent_cfg.run_name)}" if agent_cfg.run_name else ".*"
+        try:
+            resume_path = get_checkpoint_path(log_root_path, run_dir_pattern)
+            agent_cfg.resume = True
+            print(
+                f"[INFO] SLURM requeue detected (SLURM_RESTART_COUNT={os.getenv('SLURM_RESTART_COUNT')}). "
+                f"Auto-resuming from: {resume_path}"
+            )
+        except ValueError:
+            print(
+                f"[INFO] SLURM requeue detected but no checkpoint found in '{log_root_path}' "
+                f"matching run_name='{agent_cfg.run_name}'. Starting fresh."
+            )
 
     # wrap for video recording
     if args_cli.video:
