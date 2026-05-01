@@ -338,7 +338,10 @@ class _BCPPOAlgorithmCfg:
     class_name: str = "BCPPO"
     teacher_jit_path: str = ""
     teacher_obs_groups: list = ["teacher"]
-    cloning_loss_coeff: float = 1.0
+    # bc_loss is MSE in OSC action space ~200-500 typical magnitude; surrogate
+    # ~0.05-0.5 and value_loss ~0.002-0.5. coeff=0.001 brings BC into the same
+    # scale as PPO terms so it acts as a regularizer, not a dominator.
+    cloning_loss_coeff: float = 0.001
     cloning_loss_decay: float = 1.0
     # Standard PPO knobs.
     value_loss_coef: float = 1.0
@@ -362,13 +365,13 @@ class Depth_BCPPORunnerCfg(RslRlBaseRunnerCfg):
     student-driven rollouts, BC pull toward JIT teacher per minibatch.
 
     Storage: depth obs (224x224 x 1ch x 2 cams) blow GPU memory at large
-    num_envs. Default is small (num_envs override on launch). Each transition
-    holds ~400KB of obs; with num_steps_per_env=24 and num_envs=64, that's
-    ~600MB obs storage, plus PPO update activations.
+    num_envs. Each transition holds ~400KB of obs; with num_steps_per_env=32
+    and num_envs=256, that's ~3.3GB obs storage, plus PPO update activations.
+    Hyak L40/L40s/A40 (48GB) comfortably fit num_envs=256-512 at this cadence.
     """
 
     class_name: str = "OnPolicyRunner"
-    num_steps_per_env: int = 24
+    num_steps_per_env: int = 32
     max_iterations: int = 30000
     save_interval: int = 5000
     experiment_name: str = "ur5e_robotiq_2f85_bcppo"
