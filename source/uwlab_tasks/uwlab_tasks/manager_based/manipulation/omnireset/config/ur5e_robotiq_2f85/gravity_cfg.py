@@ -715,21 +715,27 @@ class ZeroGGPSSysidFullDREventCfg(ZeroGGPSSysidEventCfg):
 
 @configclass
 class ZeroGStateSysidFullDRTrainCfg(ZeroGStateTrainCfg):
-    """ZeroG state RL training with full DR + ZeroGAnywhere-only resets.
+    """ZeroG state RL training with full DR + [ZeroGAnywhere, ZeroGPartialAssembly] resets.
 
     Pairs with ``ZeroGGPSSysidFullDREventCfg``. Future teachers trained here
     see the full DR distribution that depth-DAgger envs apply, so DAgger
-    becomes a strict SUBSET of training (only differs by scene additions:
-    cameras, curtains).
+    becomes a strict SUBSET of training on the DR axis (DAgger only differs
+    by scene additions: cameras, curtains).
+
+    Reset distribution: keeps the parent ``ZeroGGPSEventCfg`` default of
+    ``[ZeroGAnywhere, ZeroGPartialAssembly]`` 50/50. The PartialAssembly
+    near-goal states are essential for cold-start bootstrap — without them,
+    100% of envs start far from goal and the policy never lucks into a
+    success event under sparse reward (verified failure: peg/leg/drawer
+    all sat at task_0=0 for 12h on `ZeroGAnywhere`-only FullDR).
+
+    Note: this means RL training's reset distribution is broader than the
+    deployment-time DAgger env (which uses ZeroGAnywhere only). That's fine
+    for sim2sim — the teacher just needs to be robust to reset states it
+    will see at deployment, and PartialAssembly states are strictly easier.
     """
 
     events: ZeroGGPSSysidFullDREventCfg = ZeroGGPSSysidFullDREventCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-        # Match DAgger reset distribution: ZeroGAnywhere only (drop PartialAssembly).
-        self.events.reset_from_states.params["reset_types"] = ["ZeroGAnywhere"]
-        self.events.reset_from_states.params["probs"] = [1.0]
 
 
 # ===========================================================================
