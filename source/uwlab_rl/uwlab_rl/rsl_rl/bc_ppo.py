@@ -21,6 +21,8 @@ existing rsl_rl ``OnPolicyRunner``.
 
 from __future__ import annotations
 
+from collections import deque
+
 import torch
 from tensordict import TensorDict
 
@@ -36,6 +38,8 @@ class BCPPO(PPO):
         cloning_loss_coeff: float = 1.0,
         cloning_loss_decay: float = 1.0,
         bc_loss_type: str = "mse",
+        eval_fraction: float = 0.0,
+        teacher_eval_fraction: float = 0.5,
         **kwargs,
     ) -> None:
         super().__init__(policy, **kwargs)
@@ -48,15 +52,46 @@ class BCPPO(PPO):
         self.cloning_loss_decay = float(cloning_loss_decay)
         self._cur_cloning_loss_coeff = self.cloning_loss_coeff
         self._update_count = 0
-        # bc_loss_type: "mse" = MSE on action means (raw scale ~250 for our peg
-        #   teacher, see comments in agents/rsl_rl_cfg.py).
-        # "weighted_mse" = DEXTRAH-style inverse-variance-weighted L2:
-        #   sqrt(sum_i (1/sigma_t,i)^2 (mu_s,i - mu_t,i)^2) per sample, then
-        #   mean over batch. Down-weights action dims where teacher is uncertain.
-        #   Requires the JIT teacher to return (mean, std) tuple.
+        # bc_loss_type: "mse" = MSE on action means.
+        # "weighted_mse" = DEXTRAH-style inverse-variance-weighted L2.
         if bc_loss_type not in ("mse", "weighted_mse"):
             raise ValueError(f"bc_loss_type must be 'mse' or 'weighted_mse'; got {bc_loss_type}")
         self.bc_loss_type = bc_loss_type
+
+        # Eval-pool config: a fraction of envs are reserved as eval-only (no
+        # gradient). Half of the eval pool is teacher-driven (measures teacher
+        # success on deployment-env init states), half is student-driven
+        # (measures deterministic student success). Set up in init_storage()
+        # once num_envs is known. Set eval_fraction=0 to disable.
+        self.eval_fraction = float(eval_fraction)
+        self.teacher_eval_fraction = float(teacher_eval_fraction)
+        self.eval_mask: torch.Tensor | None = None
+        self.teacher_drive_mask: torch.Tensor | None = None
+        self._buf_train: deque[float] = deque(maxlen=1024)
+        self._buf_student_eval: deque[float] = deque(maxlen=1024)
+        self._buf_teacher_eval: deque[float] = deque(maxlen=1024)
+        self._progress_term = None  # populated by bind_env
+
+    def bind_env(self, env) -> None:
+        """Called by BCPPORunner post-init so we can track per-env success."""
+        try:
+            self._progress_term = env.unwrapped.reward_manager.get_term_cfg("progress_context").func
+        except Exception:
+            self._progress_term = None
+
+    def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape) -> None:
+        super().init_storage(training_type, num_envs, num_transitions_per_env, obs, actions_shape)
+        if self.eval_fraction > 0:
+            num_eval = round(num_envs * self.eval_fraction)
+            num_teacher_eval = round(num_eval * self.teacher_eval_fraction)
+            self.eval_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+            self.eval_mask[:num_eval] = True
+            self.teacher_drive_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+            self.teacher_drive_mask[:num_teacher_eval] = True
+            print(
+                f"[BCPPO] eval pool: {num_eval}/{num_envs} envs (teacher-driven={num_teacher_eval}, "
+                f"student-driven={num_eval - num_teacher_eval}); train pool: {num_envs - num_eval} envs."
+            )
 
     def _teacher_distribution(self, obs_batch) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Build teacher input and return (mean, std). std is None if teacher
@@ -78,6 +113,57 @@ class BCPPO(PPO):
             return torch.sqrt(torch.sum(weights * (mu_batch - teacher_mean).pow(2), dim=-1)).mean()
         # default: plain MSE on means
         return (mu_batch - teacher_mean).pow(2).mean()
+
+    # ---- Eval-pool: act/process_env_step/compute_returns hooks ----
+    def act(self, obs):
+        actions = super().act(obs)
+        if self.teacher_drive_mask is not None and bool(self.teacher_drive_mask.any()):
+            with torch.no_grad():
+                teacher_obs = torch.cat([obs[g] for g in self.teacher_obs_groups], dim=-1)
+                out = self.teacher(teacher_obs)
+                t_act = out[0] if isinstance(out, (tuple, list)) else out
+            actions = actions.clone()
+            actions[self.teacher_drive_mask] = t_act[self.teacher_drive_mask]
+            # Also override the stored transition.actions so storage records
+            # the actually-taken action (teacher's). Student log-prob is still
+            # computed on student's distribution, which gives a low importance
+            # ratio for these rows; combined with our advantages=0 zero-out,
+            # surrogate gradient is zero on eval rows regardless.
+            self.transition.actions[self.teacher_drive_mask] = t_act[self.teacher_drive_mask].detach()
+        return actions
+
+    def process_env_step(self, obs, rewards, dones, extras) -> None:
+        super().process_env_step(obs, rewards, dones, extras)
+        # Per-pool success tracking on done envs.
+        if self._progress_term is None or self.eval_mask is None:
+            return
+        done_ids = dones.view(-1).nonzero(as_tuple=False).view(-1)
+        if done_ids.numel() == 0:
+            return
+        try:
+            succ = self._progress_term.success[done_ids].float().detach().cpu()
+        except Exception:
+            return
+        eval_m = self.eval_mask[done_ids].cpu()
+        teach_m = self.teacher_drive_mask[done_ids].cpu()
+        train_m = ~eval_m
+        stud_eval_m = eval_m & ~teach_m
+        if train_m.any():
+            self._buf_train.extend(succ[train_m].tolist())
+        if stud_eval_m.any():
+            self._buf_student_eval.extend(succ[stud_eval_m].tolist())
+        if teach_m.any():
+            self._buf_teacher_eval.extend(succ[teach_m].tolist())
+
+    def compute_returns(self, obs) -> None:
+        super().compute_returns(obs)
+        # Zero advantages on eval rows so PPO surrogate gradient is 0 there.
+        # Set returns = values so value loss is also 0. After this, eval envs
+        # contribute no gradient to PPO update. Storage layout: [T, N, 1].
+        if self.eval_mask is not None and self.storage is not None:
+            with torch.no_grad():
+                self.storage.advantages[:, self.eval_mask, :] = 0.0
+                self.storage.returns[:, self.eval_mask, :] = self.storage.values[:, self.eval_mask, :]
 
     def update(self) -> dict[str, float]:
         # Reuse parent PPO's update loop but inject BC into per-minibatch loss.
@@ -194,10 +280,19 @@ class BCPPO(PPO):
 
         self.storage.clear()
 
-        return {
+        out = {
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "bc_loss": mean_bc_loss,
             "bc_coeff": self._cur_cloning_loss_coeff,
         }
+        # Per-pool success metrics (if eval_fraction > 0). Logged as
+        # Loss/success_train, Loss/success_teacher_eval, Loss/success_student_eval.
+        if len(self._buf_train) > 0:
+            out["success_train"] = sum(self._buf_train) / len(self._buf_train)
+        if len(self._buf_teacher_eval) > 0:
+            out["success_teacher_eval"] = sum(self._buf_teacher_eval) / len(self._buf_teacher_eval)
+        if len(self._buf_student_eval) > 0:
+            out["success_student_eval"] = sum(self._buf_student_eval) / len(self._buf_student_eval)
+        return out

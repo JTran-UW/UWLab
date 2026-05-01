@@ -347,6 +347,13 @@ class _BCPPOAlgorithmCfg:
     # "weighted_mse" = DEXTRAH-style inverse-variance-weighted L2 (raw scale ~3-5
     # since 1/sigma^2 dampens). With weighted_mse, scale up coeff 50-100x.
     bc_loss_type: str = "mse"
+    # Eval pool: fraction of envs reserved as eval-only (no gradient).
+    # Half teacher-driven (Loss/success_teacher_eval) -- measures teacher in
+    # the deployment env. Half student-driven (Loss/success_student_eval) --
+    # measures deterministic student. Train pool (1 - eval_fraction) drives
+    # PPO+BC normally and reports Loss/success_train.
+    eval_fraction: float = 0.1
+    teacher_eval_fraction: float = 0.5
     # Standard PPO knobs.
     value_loss_coef: float = 1.0
     use_clipped_value_loss: bool = True
@@ -374,7 +381,7 @@ class Depth_BCPPORunnerCfg(RslRlBaseRunnerCfg):
     Hyak L40/L40s/A40 (48GB) comfortably fit num_envs=256-512 at this cadence.
     """
 
-    class_name: str = "OnPolicyRunner"
+    class_name: str = "BCPPORunner"
     num_steps_per_env: int = 32
     max_iterations: int = 30000
     save_interval: int = 5000
