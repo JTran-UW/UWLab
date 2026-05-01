@@ -308,3 +308,73 @@ class SharedEncoder128PPORunnerCfg(Base_PPORunnerCfg):
         },
     )
     success_critic: SuccessCriticCfg = SuccessCriticCfg()
+
+
+# ===========================================================================
+# BCPPO (PPO + BC auxiliary loss) for depth student.
+# Asymmetric AC: depth-CNN actor on `proprio` + `wrist_depth` + `side_depth`
+# (sees only what a real robot sees), state-only critic on `teacher` group
+# (privileged 43d state for accurate value estimates).
+# Pair with the Lean DAgger env (training events, no extra DR).
+# ===========================================================================
+@configclass
+class _ActorCriticDepthCfg:
+    class_name: str = "ActorCriticDepth"
+    vision_groups: list = ["wrist_depth", "side_depth"]
+    embed_dim: int = 128
+    actor_hidden_dims: list = [512, 256]
+    critic_hidden_dims: list = [256, 256, 256]
+    activation: str = "elu"
+    init_noise_std: float = 0.5
+    noise_std_type: str = "scalar"
+    actor_obs_normalization: bool = True
+    critic_obs_normalization: bool = True
+    encoder_type: str = "depth_cnn"
+    encoder_pretrained_path: str = ""
+
+
+@configclass
+class _BCPPOAlgorithmCfg:
+    class_name: str = "BCPPO"
+    teacher_jit_path: str = ""
+    teacher_obs_groups: list = ["teacher"]
+    cloning_loss_coeff: float = 1.0
+    cloning_loss_decay: float = 1.0
+    # Standard PPO knobs.
+    value_loss_coef: float = 1.0
+    use_clipped_value_loss: bool = True
+    normalize_advantage_per_mini_batch: bool = False
+    clip_param: float = 0.2
+    entropy_coef: float = 0.006
+    num_learning_epochs: int = 5
+    num_mini_batches: int = 4
+    learning_rate: float = 1.0e-4
+    schedule: str = "adaptive"
+    gamma: float = 0.99
+    lam: float = 0.95
+    desired_kl: float = 0.01
+    max_grad_norm: float = 1.0
+
+
+@configclass
+class Depth_BCPPORunnerCfg(RslRlBaseRunnerCfg):
+    """PPO + BC for depth student on Lean env. Reward-bearing PPO update on
+    student-driven rollouts, BC pull toward JIT teacher per minibatch.
+
+    Storage: depth obs (224x224 x 1ch x 2 cams) blow GPU memory at large
+    num_envs. Default is small (num_envs override on launch). Each transition
+    holds ~400KB of obs; with num_steps_per_env=24 and num_envs=64, that's
+    ~600MB obs storage, plus PPO update activations.
+    """
+
+    class_name: str = "OnPolicyRunner"
+    num_steps_per_env: int = 24
+    max_iterations: int = 30000
+    save_interval: int = 5000
+    experiment_name: str = "ur5e_robotiq_2f85_bcppo"
+    obs_groups: dict = {
+        "policy": ["proprio"],
+        "critic": ["teacher"],
+    }
+    policy: _ActorCriticDepthCfg = _ActorCriticDepthCfg()
+    algorithm: _BCPPOAlgorithmCfg = _BCPPOAlgorithmCfg()

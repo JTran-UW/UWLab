@@ -133,6 +133,10 @@ from uwlab_rl.rsl_rl.actor_critic_encoder import ActorCriticWithEncoder
 from uwlab_rl.rsl_rl.on_policy_runner_with_classifier import OnPolicyRunnerWithClassifier
 from uwlab_rl.rsl_rl.on_policy_runner_with_success_critic import OnPolicyRunnerWithSuccessCritic
 _runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
+from uwlab_rl.rsl_rl.actor_critic_depth import ActorCriticDepth
+from uwlab_rl.rsl_rl.bc_ppo import BCPPO
+_runner_module.ActorCriticDepth = ActorCriticDepth
+_runner_module.BCPPO = BCPPO
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config

@@ -99,6 +99,10 @@ import uwlab_tasks  # noqa: F401
 import rsl_rl.runners.on_policy_runner as _runner_module
 from uwlab_rl.rsl_rl.actor_critic_encoder import ActorCriticWithEncoder
 _runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
+from uwlab_rl.rsl_rl.actor_critic_depth import ActorCriticDepth
+from uwlab_rl.rsl_rl.bc_ppo import BCPPO
+_runner_module.ActorCriticDepth = ActorCriticDepth
+_runner_module.BCPPO = BCPPO
 
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config

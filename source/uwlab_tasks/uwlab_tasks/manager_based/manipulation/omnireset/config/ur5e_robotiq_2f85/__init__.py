@@ -326,6 +326,19 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
     },
 )
+
+# BCPPO peg env: same Lean scene/teacher/cameras, but runs PPO+BC instead of
+# DAgger. Reward-bearing PPO loop with BC auxiliary toward JIT teacher
+# pulls the depth student past the DAgger-only ceiling (~50% on peg).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-BCPPO-Lean-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalLeanCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_BCPPORunnerCfg",
+    },
+)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-Lean-Drawer-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
