@@ -722,3 +722,76 @@ class Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalLeanDrawerCfg(
         super().__post_init__()
         self.scene.insertive_object = _make_drawer_insertive()
         self.scene.receptive_object = _make_drawer_receptive()
+
+
+# ---------------------------------------------------------------------------
+# BCPPO env: mirrors teacher's RL training cfg (ZeroGStateSysidTrainCfg) +
+# cameras + 4 obs groups (proprio, wrist_depth, side_depth, teacher).
+#
+# Why a separate env (not the existing Lean DAgger env): Lean inherits
+# RewardsCfg from RlStateCfg with dense shaping rewards (ee_asset_distance,
+# dense_success_reward, weighted progress_context). The teacher trained on
+# ZeroGRewardsCfg (sparse: action regularizers + progress_context=0.1 only
+# for the ProgressContext class to be called by IsaacLab + success_reward=100
+# + fail=-1 on terminations). PPO under shaped rewards on a deployed-by-BC
+# student can reward-hack the shaping signal without ever inserting (the
+# 4-job DAgger sweep showed this -- mean_reward 1.7 with ZERO success
+# events).
+#
+# This env keeps gravity_frac=1.0 from iter 0 (teacher's deployment regime).
+# ---------------------------------------------------------------------------
+
+from .gravity_cfg import (  # noqa: E402
+    ZeroGStateSysidTrainCfg as _ZeroGStateSysidTrainCfg,
+    _ZeroGDAggerSceneCfg,
+    _ZeroGGPSSysidWristResetEventCfg,
+)
+
+
+@configclass
+class _BCPPOObsCfg:
+    """4 obs groups for BCPPO depth student.
+
+    - proprio: 1d student input (prev_action + joint_pos + ee_pose, history=5)
+    - wrist_depth, side_depth: 1-channel 224x224 depth images
+    - teacher: 43d state input matching ZeroG teacher's training obs layout
+      (single-frame, term-order from StateObsCfg.PolicyCfg)
+    """
+
+    proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
+    wrist_depth: DepthDAggerWristSideObservationsCfg.WristDepthCfg = (
+        DepthDAggerWristSideObservationsCfg.WristDepthCfg()
+    )
+    side_depth: DepthDAggerObservationsCfg.SideDepthCfg = DepthDAggerObservationsCfg.SideDepthCfg()
+    teacher: Teacher4CanonicalCfg = Teacher4CanonicalCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85BCPPOSysidCfg(_ZeroGStateSysidTrainCfg):
+    """BCPPO env: ZeroGStateSysidTrainCfg (teacher's RL training cfg) + cameras
+    + 4 obs groups (proprio, wrist_depth, side_depth, teacher).
+
+    Inherits sparse ZeroG rewards/terminations/curriculum/sysid events from
+    parent. Adds DAgger scene (curtains + side/wrist cameras) and the
+    reset_wrist_camera_pose event. Forces full gravity (floor=1.0) since we
+    deploy the trained student at full gravity.
+    """
+
+    scene: _ZeroGDAggerSceneCfg = _ZeroGDAggerSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: _BCPPOObsCfg = _BCPPOObsCfg()
+    events: _ZeroGGPSSysidWristResetEventCfg = _ZeroGGPSSysidWristResetEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Full gravity from iter 0 (deployment regime; teacher trained to convergence at this).
+        self.curriculum.gravity_curriculum.params["floor"] = 1.0
+        # Match teacher training reset distribution: drop GPS routing.
+        self.events.reset_from_states.params["curriculum_target"] = None
+        self.events.reset_from_states.params["use_classifier"] = False
+        self.events.reset_from_states.params["use_success_critic"] = False
+        # Camera-friendly render settings (matches Lean env).
+        self.sim.render.enable_dlssg = False
+        self.sim.render.enable_ambient_occlusion = False
+        self.sim.render.enable_reflections = False
+        self.sim.render.enable_dl_denoiser = False
+        self.sim.render_interval = self.decimation
