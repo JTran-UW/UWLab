@@ -95,6 +95,8 @@ class GRPO(PPO):
         policy,
         kl_coeff: float = 0.04,
         kl_target: float | None = None,
+        kl_coeff_min: float = 1e-6,
+        kl_coeff_max: float = 10.0,
         init_from_dagger_path: str = "",
         clamp_advantage_quantile: float | None = None,
         **kwargs,
@@ -113,6 +115,8 @@ class GRPO(PPO):
         self.reference_policy.eval()
         self.kl_coeff = float(kl_coeff)
         self.kl_target = kl_target  # if set, adapt kl_coeff toward this
+        self.kl_coeff_min = float(kl_coeff_min)
+        self.kl_coeff_max = float(kl_coeff_max)
         # Optional: clamp advantages to a quantile range to stabilize updates
         # when occasional huge returns dominate.
         self.clamp_advantage_quantile = clamp_advantage_quantile
@@ -240,11 +244,15 @@ class GRPO(PPO):
         mean_ref_kl /= n
 
         # Adaptive KL coefficient (DeepSeek-style: target a fixed kl).
+        # Capped to [kl_coeff_min, kl_coeff_max] to prevent runaway growth
+        # when the policy keeps moving despite KL pull (gradient clipping
+        # bounds per-step update, so KL never converges to target if reward
+        # gradient also pushes the policy).
         if self.kl_target is not None:
             if mean_ref_kl > 1.5 * self.kl_target:
-                self.kl_coeff = self.kl_coeff * 1.5
+                self.kl_coeff = min(self.kl_coeff * 1.5, self.kl_coeff_max)
             elif mean_ref_kl < self.kl_target / 1.5:
-                self.kl_coeff = max(self.kl_coeff / 1.5, 1e-6)
+                self.kl_coeff = max(self.kl_coeff / 1.5, self.kl_coeff_min)
 
         self._update_count += 1
         self.storage.clear()
