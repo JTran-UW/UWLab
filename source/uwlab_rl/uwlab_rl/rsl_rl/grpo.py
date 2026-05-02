@@ -110,6 +110,34 @@ class GRPO(PPO):
         if init_from_dagger_path:
             load_dagger_into_policy(self.policy, init_from_dagger_path)
             self.policy.to(self.device)
+        # Freeze the obs normalizer so its running stats don't drift during finetune.
+        # Without this, ``self.policy.actor_obs_normalizer`` keeps updating each env
+        # step (via PPO.process_env_step) while the deepcopied reference's normalizer
+        # stays frozen — causing the *normalized* obs to differ between current and
+        # reference even with identical actor weights, which makes the KL term
+        # explode (~3000 by iter 2 even at lr=1e-5). Freezing keeps both at the
+        # well-trained DAgger normalizer state.
+        for attr in ("actor_obs_normalizer", "critic_obs_normalizer", "student_obs_normalizer"):
+            norm = getattr(self.policy, attr, None)
+            if norm is not None and hasattr(norm, "count") and hasattr(norm, "until"):
+                norm.until = int(norm.count)
+                print(f"[GRPO] Froze policy.{attr} at count={int(norm.count)}.")
+        # Lock depth_encoder to eval mode permanently so BatchNorm uses its
+        # frozen running stats (not per-batch stats). Otherwise the same depth
+        # image yields different encoder outputs in self.policy (train mode,
+        # batch BN) vs reference_policy (eval mode, running BN) — another major
+        # source of unwanted KL inflation.
+        depth_encoder = getattr(self.policy, "depth_encoder", None)
+        if depth_encoder is not None:
+            depth_encoder.eval()
+            # Override .train() so the runner's `train_mode()` call doesn't flip
+            # this back into BN-batch-stat mode. Pretrained ResNet18 + DAgger
+            # converged BN running stats are what we want for both self and ref.
+            def _no_train(self_mod, mode=True):  # noqa: ARG001
+                return self_mod.eval()
+            import types
+            depth_encoder.train = types.MethodType(_no_train, depth_encoder)
+            print("[GRPO] Locked policy.depth_encoder to eval mode (BN frozen, .train() overridden).")
         # Snapshot reference policy (frozen) AFTER potentially loading DAgger.
         self.reference_policy = copy.deepcopy(self.policy)
         for p in self.reference_policy.parameters():
