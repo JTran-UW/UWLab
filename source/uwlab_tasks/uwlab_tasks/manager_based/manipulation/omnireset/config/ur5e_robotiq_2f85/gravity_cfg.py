@@ -551,6 +551,70 @@ reduction=monitor_mean env.curriculum.gravity_curriculum.params.floor=0.1``).
 
 
 # ===========================================================================
+# Leg-DR-isolation events: each disables one suspect (arm friction rand or
+# OSC gain rand) by setting its scale_range to (1.0, 1.0). The event still
+# runs (so OSC kp stays at the spec value (1000,...,50)) but produces no
+# variability. Used to identify which DR specifically prevents leg from
+# training -- prior runs show legacy ZeroG-State-v0 (no DR) trains leg
+# fine, but ZeroG-State-Sysid-v0 (sysid DR added) breaks it.
+# ===========================================================================
+@configclass
+class ZeroGGPSSysidNoArmFricEventCfg(ZeroGGPSSysidEventCfg):
+    """Sysid events but arm friction NOT randomized (held at sysid baseline 1.0x)."""
+
+    randomize_arm_sysid = EventTerm(
+        func=task_mdp.randomize_arm_from_sysid_fixed,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "joint_names": [
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ],
+            "actuator_name": "arm",
+            "scale_range": (0.8, 1.2),
+            "friction_scale_range": (1.0, 1.0),  # disabled
+            "delay_range": (0, 1),
+        },
+    )
+
+
+@configclass
+class ZeroGGPSSysidNoOSCGainEventCfg(ZeroGGPSSysidEventCfg):
+    """Sysid events but OSC gain randomization disabled (terminal_kp still set
+    to the spec value via the event, but scale held at 1.0x)."""
+
+    randomize_osc_gains = EventTerm(
+        func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
+        mode="reset",
+        params={
+            "action_name": "arm",
+            "scale_range": (1.0, 1.0),  # disabled
+            "terminal_kp": (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0),
+            "terminal_damping_ratio": (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+        },
+    )
+
+
+@configclass
+class ZeroGStateSysidNoArmFricTrainCfg(ZeroGStateTrainCfg):
+    """ZeroGStateSysidTrainCfg minus arm friction randomization."""
+
+    events: ZeroGGPSSysidNoArmFricEventCfg = ZeroGGPSSysidNoArmFricEventCfg()
+
+
+@configclass
+class ZeroGStateSysidNoOSCGainTrainCfg(ZeroGStateTrainCfg):
+    """ZeroGStateSysidTrainCfg minus OSC gain randomization."""
+
+    events: ZeroGGPSSysidNoOSCGainEventCfg = ZeroGGPSSysidNoOSCGainEventCfg()
+
+
+# ===========================================================================
 # Full-DR ZeroG training: ZeroGGPSSysidEventCfg + the 9 BaseEventCfg DR terms
 # (mass/material/gripper actuator) + narrowed arm friction. Pairs with a
 # training cfg that drops ZeroGPartialAssembly so reset distribution matches

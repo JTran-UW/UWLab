@@ -148,6 +148,27 @@ gym.register(
     },
 )
 
+# Leg-DR-isolation envs: Sysid env minus one DR term each. Used to identify
+# which DR specifically prevents leg from training.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-Sysid-NoArmFric-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateSysidNoArmFricTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:StatePPORunnerCfg",
+    },
+)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-State-Sysid-NoOSCGain-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateSysidNoOSCGainTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:StatePPORunnerCfg",
+    },
+)
+
 # Long-term sim2sim alignment: ZeroG-State-Sysid plus the 9 BaseEventCfg DRs
 # (mass + material + gripper) that depth-DAgger envs apply. Narrowed arm
 # friction (0.8-1.2) and ZeroGAnywhere-only resets so DAgger envs become a
