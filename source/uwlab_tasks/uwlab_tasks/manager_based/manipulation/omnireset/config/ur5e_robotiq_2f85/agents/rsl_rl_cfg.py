@@ -427,6 +427,11 @@ class _GRPOAlgorithmCfg:
     lam: float = 0.95
     desired_kl: float | None = None
     max_grad_norm: float = 1.0
+    # Real grouped GRPO: K envs/group share a reset state (replicated by
+    # MultiResetManager), per-group baseline isolates action quality from
+    # reset luck. Set group_size > 1 + use the GRPOGroupedRunner.
+    group_size: int = 1
+    normalize_grouped_advantages: bool = False
 
 
 @configclass
@@ -450,3 +455,24 @@ class Depth_GRPORunnerCfg(RslRlBaseRunnerCfg):
     }
     policy: _ActorCriticDepthCfg = _ActorCriticDepthCfg()
     algorithm: _GRPOAlgorithmCfg = _GRPOAlgorithmCfg()
+
+
+@configclass
+class Depth_GRPOGroupedRunnerCfg(Depth_GRPORunnerCfg):
+    """Real grouped GRPO. K envs in each group start each rollout from the same
+    reset state (env-side replication via MultiResetManager.group_size). The
+    GRPOGroupedRunner forces a full env.reset() at the start of every iter so
+    groups stay synchronized; the algorithm uses the per-group return baseline.
+
+    Set ``env.events.gravity_curriculum.params.group_size=K`` (or whichever event
+    name MultiResetManager is registered under) to match the algorithm's
+    ``group_size``.
+    """
+
+    class_name: str = "GRPOGroupedRunner"
+    experiment_name: str = "ur5e_robotiq_2f85_grpo_grouped"
+
+    def __post_init__(self):
+        # Default: 8 envs per group (with num_envs=64 -> 8 groups). Override at launch
+        # by setting both this and the env-side `group_size` param to the same K.
+        self.algorithm.group_size = 8

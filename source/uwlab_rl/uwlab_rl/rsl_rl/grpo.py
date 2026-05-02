@@ -99,6 +99,8 @@ class GRPO(PPO):
         kl_coeff_max: float = 10.0,
         init_from_dagger_path: str = "",
         clamp_advantage_quantile: float | None = None,
+        group_size: int = 1,
+        normalize_grouped_advantages: bool = False,
         **kwargs,
     ) -> None:
         # Force value_loss_coef=0 so critic doesn't train (we don't use V).
@@ -120,38 +122,90 @@ class GRPO(PPO):
         # Optional: clamp advantages to a quantile range to stabilize updates
         # when occasional huge returns dominate.
         self.clamp_advantage_quantile = clamp_advantage_quantile
+        # Real grouped GRPO. group_size > 1 enables per-group baseline:
+        # K envs in a group share a reset state (replicated by MultiResetManager).
+        # Per-env first-episode return R_i is compared to the group mean R_g,
+        # and advantage A_i = R_i - R_g is broadcast to all transitions of env i
+        # within the first episode of the rollout. Subsequent episodes (where the
+        # env has reset to an independent random state) get advantage 0 and
+        # contribute no policy gradient. Setting group_size <= 1 falls back to
+        # the original per-batch baseline path.
+        self.group_size = int(group_size)
+        self.normalize_grouped_advantages = bool(normalize_grouped_advantages)
         self._update_count = 0
         # Logging buffers
         self._buf_traj_return: deque[float] = deque(maxlen=2048)
 
     def compute_returns(self, obs) -> None:
-        """Truncated MC returns. No V bootstrap. Per-batch advantage norm."""
+        """Compute advantages.
+
+        * group_size <= 1: fall back to truncated MC returns + per-batch normalization.
+        * group_size > 1: real grouped GRPO. For each env, sum rewards within the
+          *first* episode of the rollout (the only episode that started from the
+          group-shared reset state). Compute baseline = mean first-episode return
+          across the group. Advantage = R_i - baseline_g, broadcast to all
+          first-episode transitions of env i; zero elsewhere.
+        """
         T = self.storage.num_transitions_per_env
         rewards = self.storage.rewards  # [T, N, 1]
         dones = self.storage.dones.float()  # [T, N, 1]
-        # Backward accumulate. R_t = r_t + gamma * (1 - done_t) * R_{t+1}.
-        R = torch.zeros_like(rewards[0])  # [N, 1]
+        N = rewards.shape[1]
+
+        # Always compute MC returns (used as `returns` field; logged for trajectory diagnostics).
+        R = torch.zeros_like(rewards[0])
         for t in reversed(range(T)):
             R = rewards[t] + self.gamma * (1.0 - dones[t]) * R
             self.storage.returns[t] = R
-        # Track trajectory returns for logging (use only completed episodes).
         with torch.no_grad():
             done_mask = (dones > 0).flatten()
             if done_mask.any():
                 done_returns = self.storage.returns.flatten()[done_mask]
                 self._buf_traj_return.extend(done_returns.detach().cpu().tolist())
-        # Per-batch advantage normalization.
+
         with torch.no_grad():
-            A = self.storage.returns.clone()
-            A_flat = A.flatten()
-            A_mean = A_flat.mean()
-            A_std = A_flat.std() + 1e-8
-            A = (A - A_mean) / A_std
-            if self.clamp_advantage_quantile is not None and 0 < self.clamp_advantage_quantile < 1:
-                lo = torch.quantile(A_flat, self.clamp_advantage_quantile)
-                hi = torch.quantile(A_flat, 1.0 - self.clamp_advantage_quantile)
-                A = A.clamp(min=lo, max=hi)
-            self.storage.advantages = A
+            if self.group_size > 1 and N % self.group_size == 0:
+                K = self.group_size
+                G = N // K
+                # First-episode mask: 1 for steps before the env's first done; 0 from the
+                # done step onward (so steps after the env reset to an out-of-group state
+                # are excluded from both the return sum and the gradient).
+                # prior_dones[t] = number of dones at steps [0, t-1].
+                prior_dones = torch.cat([torch.zeros_like(dones[:1]), dones[:-1]], dim=0).cumsum(dim=0)
+                first_ep_mask = (prior_dones < 1.0).float()  # [T, N, 1]
+                # Per-env sum of rewards in first episode.
+                R_per_env = (rewards * first_ep_mask).sum(dim=0).squeeze(-1)  # [N]
+                # Group baseline: mean over each group.
+                # Layout: env i is in group (i % G); leader is the env (i % G).
+                # Reshape via group index: group_id[i] = i % G.
+                group_id = torch.arange(N, device=R_per_env.device) % G  # [N], values in [0, G)
+                # Sum returns per group, then divide by group size K.
+                R_group_sum = torch.zeros(G, device=R_per_env.device).scatter_add_(
+                    0, group_id, R_per_env
+                )
+                B_per_group = R_group_sum / K  # [G]
+                B_per_env = B_per_group[group_id]  # [N]
+                A_per_env = R_per_env - B_per_env  # [N]
+                if self.normalize_grouped_advantages:
+                    A_per_env = (A_per_env - A_per_env.mean()) / (A_per_env.std() + 1e-8)
+                # Broadcast advantage to first-episode transitions only (zero after).
+                A = (A_per_env.view(1, N, 1) * first_ep_mask)  # [T, N, 1]
+                self.storage.advantages = A
+                # Logging diagnostics.
+                self._last_first_ep_frac = float(first_ep_mask.mean().item())
+                self._last_group_baseline_mean = float(B_per_env.mean().item())
+                self._last_advantage_abs_mean = float(A_per_env.abs().mean().item())
+            else:
+                # Fallback: original per-batch normalization on MC returns.
+                A = self.storage.returns.clone()
+                A_flat = A.flatten()
+                A_mean = A_flat.mean()
+                A_std = A_flat.std() + 1e-8
+                A = (A - A_mean) / A_std
+                if self.clamp_advantage_quantile is not None and 0 < self.clamp_advantage_quantile < 1:
+                    lo = torch.quantile(A_flat, self.clamp_advantage_quantile)
+                    hi = torch.quantile(A_flat, 1.0 - self.clamp_advantage_quantile)
+                    A = A.clamp(min=lo, max=hi)
+                self.storage.advantages = A
 
     def _ref_distribution(self, obs_batch) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (mu_ref, sigma_ref) for KL penalty. No grad."""
@@ -266,4 +320,8 @@ class GRPO(PPO):
         }
         if len(self._buf_traj_return) > 0:
             out["mean_traj_return"] = sum(self._buf_traj_return) / len(self._buf_traj_return)
+        if hasattr(self, "_last_first_ep_frac"):
+            out["first_ep_frac"] = self._last_first_ep_frac
+            out["group_baseline_mean"] = self._last_group_baseline_mean
+            out["advantage_abs_mean"] = self._last_advantage_abs_mean
         return out

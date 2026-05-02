@@ -357,6 +357,11 @@ class ZeroGGPSEventCfg:
             "use_success_critic": False,
             "curriculum_monitor_history_len": 100,
             "success_monitor_history_len": 100,
+            # Real grouped GRPO: K envs in each group share a reset state
+            # (replicated by MultiResetManager). Set via Hydra at launch:
+            #   env.events.reset_from_states.params.group_size=K
+            # 1 disables grouping (per-env independent resets, default behavior).
+            "group_size": 1,
         },
     )
 

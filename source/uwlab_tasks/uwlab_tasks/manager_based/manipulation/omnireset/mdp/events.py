@@ -2609,6 +2609,18 @@ class MultiResetManager(ManagerTermBase):
                 )
         self._reset_sanity_done = True
 
+    def _replicate_within_groups(self, values: torch.Tensor) -> torch.Tensor:
+        """Copy each group leader's value onto its (K-1) followers (grouped GRPO).
+
+        Layout: env i is in group (i % G) where G = num_envs // group_size; the leader
+        is the env with the smallest index in the group, i.e. (i % G). Returns a tensor
+        of the same shape where ``out[i] = values[i % G]``.
+        """
+        K = self._group_size
+        G = self.num_envs // K
+        leader_idx = torch.arange(self.num_envs, device=values.device) % G
+        return values[leader_idx]
+
     def __call__(
         self,
         env: ManagerBasedEnv,
@@ -2626,11 +2638,25 @@ class MultiResetManager(ManagerTermBase):
         use_success_critic: bool = False,
         curriculum_monitor_history_len: int = 100,
         success_monitor_history_len: int = 100,
+        group_size: int = 1,
     ) -> None:
         self._lazy_init()
 
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self._env.device)
+
+        # Group replication for grouped GRPO: when `group_size > 1` and *all* envs are
+        # being reset together (full sync reset issued by the runner at the start of a
+        # rollout), copy the leader env's sampled state index onto its (K-1) followers
+        # so each group of K envs starts the rollout from the same state.
+        # Layout: env i is in group i % G where G = num_envs // K. Leader is the env
+        # with the smallest index in the group (i.e. i < G).
+        self._group_size = int(group_size)
+        self._do_group_replication = (
+            self._group_size > 1
+            and env_ids.numel() == self.num_envs
+            and self.num_envs % self._group_size == 0
+        )
 
         if success is not None:
             raw_success = eval(success)
@@ -2730,6 +2756,9 @@ class MultiResetManager(ManagerTermBase):
                 )
                 state_indices[tt_mask] = choices
 
+            if self._do_group_replication:
+                state_indices = self._replicate_within_groups(state_indices)
+
                 task_name = self.task_names[tt_idx]
                 rt_labels = self.flat_rt_labels[tt_idx]
                 chosen_rt = rt_labels[choices]
@@ -2766,33 +2795,43 @@ class MultiResetManager(ManagerTermBase):
                 self.has_been_reset[env_ids] = True
 
         else:
+            # Two-pass: sample (reset_type, state_index) per env, group-replicate, then dispatch.
+            # Required so followers inherit leader's exact reset state in grouped GRPO.
             reset_type_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+            if self._do_group_replication:
+                reset_type_indices = self._replicate_within_groups(reset_type_indices)
             self.task_id[env_ids] = reset_type_indices
 
-            if self.is_multitask:
-                env_task_types = self.task_type_ids[env_ids]
-                for tt_idx in range(self.num_task_types):
-                    tt_mask = env_task_types == tt_idx
-                    if not tt_mask.any():
+            env_task_types = (
+                self.task_type_ids[env_ids]
+                if self.is_multitask
+                else torch.zeros(len(env_ids), dtype=torch.long, device=self._env.device)
+            )
+            state_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self._env.device)
+            for tt_idx in range(self.num_task_types):
+                for rt_idx in range(self.num_reset_types):
+                    mask = (env_task_types == tt_idx) & (reset_type_indices == rt_idx)
+                    if not mask.any():
                         continue
-                    for rt_idx in range(self.num_reset_types):
-                        combined_mask = tt_mask & (reset_type_indices == rt_idx)
-                        if not combined_mask.any():
-                            continue
-                        current_env_ids = env_ids[combined_mask]
-                        n_states = self.pair_num_states[tt_idx][rt_idx]
-                        rand_state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
-                        states = sample_from_nested_dict(self.pair_datasets[tt_idx][rt_idx], rand_state_indices)
-                        self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
-            else:
-                for dataset_idx in range(self.num_tasks):
-                    mask = reset_type_indices == dataset_idx
+                    n_states = self.pair_num_states[tt_idx][rt_idx]
+                    state_indices[mask] = torch.randint(
+                        0, n_states, (int(mask.sum()),), device=self._env.device
+                    )
+            if self._do_group_replication:
+                # Group replication assumes leader and followers share (task_type, reset_type).
+                # task_type is set by `task_type_ids = arange % num_task_types` and so is shared
+                # iff G = num_envs // group_size is a multiple of num_task_types. We've already
+                # replicated reset_type. For single-task envs this always holds.
+                state_indices = self._replicate_within_groups(state_indices)
+
+            for tt_idx in range(self.num_task_types):
+                for rt_idx in range(self.num_reset_types):
+                    mask = (env_task_types == tt_idx) & (reset_type_indices == rt_idx)
                     if not mask.any():
                         continue
                     current_env_ids = env_ids[mask]
-                    n_states = self.pair_num_states[0][dataset_idx]
-                    rand_state_indices = torch.randint(0, n_states, (len(current_env_ids),), device=self._env.device)
-                    states = sample_from_nested_dict(self.pair_datasets[0][dataset_idx], rand_state_indices)
+                    current_state_indices = state_indices[mask]
+                    states = sample_from_nested_dict(self.pair_datasets[tt_idx][rt_idx], current_state_indices)
                     self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
 
         robot: Articulation = self._env.scene["robot"]

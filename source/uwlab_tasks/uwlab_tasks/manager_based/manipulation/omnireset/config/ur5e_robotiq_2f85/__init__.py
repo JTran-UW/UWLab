@@ -386,6 +386,18 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_GRPORunnerCfg",
     },
 )
+# Real grouped GRPO. Same env as Depth-GRPO-Sysid; pair with the GRPOGroupedRunner
+# (forces full-env reset each iter) + ``env.events.reset_from_states.params.group_size=K``
+# so the reset manager replicates each leader's state to its group followers.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-GRPO-Grouped-Sysid-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85BCPPOSysidCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_GRPOGroupedRunnerCfg",
+    },
+)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-Lean-Drawer-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
