@@ -133,8 +133,13 @@ class GRPO(PPO):
             # Override .train() so the runner's `train_mode()` call doesn't flip
             # this back into BN-batch-stat mode. Pretrained ResNet18 + DAgger
             # converged BN running stats are what we want for both self and ref.
+            # NOTE: must NOT call self_mod.eval() here — eval() calls train(False)
+            # which calls this override → infinite recursion. Set training flag
+            # directly on every submodule instead.
             def _no_train(self_mod, mode=True):  # noqa: ARG001
-                return self_mod.eval()
+                for m in self_mod.modules():
+                    m.training = False
+                return self_mod
             import types
             depth_encoder.train = types.MethodType(_no_train, depth_encoder)
             print("[GRPO] Locked policy.depth_encoder to eval mode (BN frozen, .train() overridden).")
