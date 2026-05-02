@@ -352,6 +352,19 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_BCPPORunnerCfg",
     },
 )
+
+# GRPO finetune for depth peg student (Doorman Phase 3). Reuses the same env
+# as BCPPO-Sysid (sparse rewards + cameras + 4 obs groups). Pair with a DAgger
+# checkpoint via agent.algorithm.init_from_dagger_path=...
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-GRPO-Sysid-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85BCPPOSysidCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_GRPORunnerCfg",
+    },
+)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-Lean-Drawer-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

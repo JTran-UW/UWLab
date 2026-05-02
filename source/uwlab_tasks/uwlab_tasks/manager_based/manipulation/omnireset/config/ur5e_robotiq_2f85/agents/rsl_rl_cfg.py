@@ -392,3 +392,61 @@ class Depth_BCPPORunnerCfg(RslRlBaseRunnerCfg):
     }
     policy: _ActorCriticDepthCfg = _ActorCriticDepthCfg()
     algorithm: _BCPPOAlgorithmCfg = _BCPPOAlgorithmCfg()
+
+
+# ===========================================================================
+# GRPO finetune for depth peg student (Doorman Phase 3).
+# Loads DAgger checkpoint, applies PPO clipped surrogate with per-batch
+# baseline (no V function) + KL anchor against frozen DAgger reference.
+# ===========================================================================
+@configclass
+class _GRPOAlgorithmCfg:
+    class_name: str = "GRPO"
+    # Path to a DAgger student checkpoint (StudentTeacherVision keys).
+    # If empty, GRPO starts from random + still snapshots that as reference.
+    init_from_dagger_path: str = ""
+    # KL penalty coefficient against the frozen reference policy.
+    # DeepSeek default 0.04. Set kl_target>0 to adapt toward a target KL.
+    kl_coeff: float = 0.04
+    kl_target: float | None = 0.01
+    # Optional: clamp per-batch advantages by quantile (0 disables). Helps if
+    # rare huge returns dominate (e.g. one trajectory with success_reward=100
+    # vs everything else 0).
+    clamp_advantage_quantile: float | None = None
+    # Standard PPO knobs (V loss disabled by forcing value_loss_coef=0 in code).
+    value_loss_coef: float = 0.0
+    use_clipped_value_loss: bool = True
+    normalize_advantage_per_mini_batch: bool = False
+    clip_param: float = 0.2
+    entropy_coef: float = 0.006
+    num_learning_epochs: int = 5
+    num_mini_batches: int = 4
+    learning_rate: float = 1.0e-5  # low; finetune from DAgger
+    schedule: str = "fixed"  # don't adapt LR (no KL-LR tradeoff -- KL handled separately)
+    gamma: float = 0.99
+    lam: float = 0.95
+    desired_kl: float | None = None
+    max_grad_norm: float = 1.0
+
+
+@configclass
+class Depth_GRPORunnerCfg(RslRlBaseRunnerCfg):
+    """GRPO finetune of DAgger student. Reuses ActorCriticDepth + BCPPO-Sysid env.
+
+    Init policy from a DAgger checkpoint (set
+    ``agent.algorithm.init_from_dagger_path=...`` on launch). Algorithm
+    snapshots that as the frozen KL reference. Then runs PPO clipped surrogate
+    with per-batch baseline (no V function) + KL anchor.
+    """
+
+    class_name: str = "OnPolicyRunner"
+    num_steps_per_env: int = 32
+    max_iterations: int = 10000
+    save_interval: int = 1000
+    experiment_name: str = "ur5e_robotiq_2f85_grpo"
+    obs_groups: dict = {
+        "policy": ["proprio"],
+        "critic": ["teacher"],
+    }
+    policy: _ActorCriticDepthCfg = _ActorCriticDepthCfg()
+    algorithm: _GRPOAlgorithmCfg = _GRPOAlgorithmCfg()
