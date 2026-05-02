@@ -73,7 +73,12 @@ def load_dagger_into_policy(policy: nn.Module, ckpt_path: str, strict: bool = Fa
             new_sd[k.replace("student_obs_normalizer.", "actor_obs_normalizer.", 1)] = v
         else:
             new_sd[k] = v
-    missing, unexpected = policy.load_state_dict(new_sd, strict=False)
+    # Some policies (e.g. ActorCriticDepth) override load_state_dict to return
+    # a bool instead of the standard _IncompatibleKeys tuple. Bypass via
+    # nn.Module.load_state_dict to always get the tuple back.
+    result = nn.Module.load_state_dict(policy, new_sd, strict=False)
+    missing = list(result.missing_keys) if hasattr(result, "missing_keys") else []
+    unexpected = list(result.unexpected_keys) if hasattr(result, "unexpected_keys") else []
     print(
         f"[GRPO] Loaded DAgger checkpoint '{ckpt_path}': mapped {len(new_sd)} keys, "
         f"skipped {len(skipped)} (teacher/aux/std_head). missing={len(missing)} unexpected={len(unexpected)}"
