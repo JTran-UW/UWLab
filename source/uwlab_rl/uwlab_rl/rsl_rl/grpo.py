@@ -101,6 +101,7 @@ class GRPO(PPO):
         clamp_advantage_quantile: float | None = None,
         group_size: int = 1,
         normalize_grouped_advantages: bool = False,
+        boost_init_std: float | None = None,
         **kwargs,
     ) -> None:
         # Force value_loss_coef=0 so critic doesn't train (we don't use V).
@@ -110,6 +111,21 @@ class GRPO(PPO):
         if init_from_dagger_path:
             load_dagger_into_policy(self.policy, init_from_dagger_path)
             self.policy.to(self.device)
+        # Optionally overwrite the policy std to a larger value to force
+        # exploration. The DAgger checkpoint typically has a narrow std
+        # (~0.10) which means very little exploration around the deterministic
+        # action — on tasks where DAgger has 0% success (e.g. ZeroGAnywhere),
+        # GRPO's per-group baseline is identically 0 and no gradient signal
+        # exists. Boosting std restores exploration so some envs randomly
+        # succeed and a baseline-relative advantage is computable.
+        if boost_init_std is not None and init_from_dagger_path:
+            with torch.no_grad():
+                if hasattr(self.policy, "std"):
+                    self.policy.std.data.fill_(float(boost_init_std))
+                    print(f"[GRPO] Overwrote policy.std → {boost_init_std} (exploration boost).")
+                elif hasattr(self.policy, "log_std"):
+                    self.policy.log_std.data.fill_(float(torch.log(torch.tensor(boost_init_std)).item()))
+                    print(f"[GRPO] Overwrote policy.log_std → log({boost_init_std}).")
         # Freeze the obs normalizer so its running stats don't drift during finetune.
         # Without this, ``self.policy.actor_obs_normalizer`` keeps updating each env
         # step (via PPO.process_env_step) while the deepcopied reference's normalizer
