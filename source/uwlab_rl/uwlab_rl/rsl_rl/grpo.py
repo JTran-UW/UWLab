@@ -102,6 +102,7 @@ class GRPO(PPO):
         group_size: int = 1,
         normalize_grouped_advantages: bool = False,
         boost_init_std: float = 0.0,
+        lock_depth_encoder: bool = True,
         **kwargs,
     ) -> None:
         # Force value_loss_coef=0 so critic doesn't train (we don't use V).
@@ -144,11 +145,18 @@ class GRPO(PPO):
         # batch BN) vs reference_policy (eval mode, running BN) — another major
         # source of unwanted KL inflation.
         depth_encoder = getattr(self.policy, "depth_encoder", None)
-        if depth_encoder is not None:
+        if depth_encoder is not None and lock_depth_encoder:
+            # Lock encoder to eval mode so BN uses running stats not batch stats.
+            # WARNING: if the DAgger ckpt was trained in BN-batch-stats mode (the
+            # default for rsl_rl distillation runner), switching to running stats
+            # at GRPO time changes the feature distribution → policy outputs
+            # different actions → can crash the robot (we observed 83% abnormal
+            # termination in 35001664 with this lock on). Default True for the
+            # KL-explosion fix story; flip to False if the ckpt was trained
+            # train-mode and you'd rather keep the encoder consistent.
             depth_encoder.eval()
             # Override .train() so the runner's `train_mode()` call doesn't flip
-            # this back into BN-batch-stat mode. Pretrained ResNet18 + DAgger
-            # converged BN running stats are what we want for both self and ref.
+            # this back into BN-batch-stat mode.
             # NOTE: must NOT call self_mod.eval() here — eval() calls train(False)
             # which calls this override → infinite recursion. Set training flag
             # directly on every submodule instead.
@@ -159,6 +167,8 @@ class GRPO(PPO):
             import types
             depth_encoder.train = types.MethodType(_no_train, depth_encoder)
             print("[GRPO] Locked policy.depth_encoder to eval mode (BN frozen, .train() overridden).")
+        elif depth_encoder is not None:
+            print("[GRPO] depth_encoder NOT locked (BN remains in train mode, batch-stats).")
         # Snapshot reference policy (frozen) AFTER potentially loading DAgger.
         self.reference_policy = copy.deepcopy(self.policy)
         for p in self.reference_policy.parameters():

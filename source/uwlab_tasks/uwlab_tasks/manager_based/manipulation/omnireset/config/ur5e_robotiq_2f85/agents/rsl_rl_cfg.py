@@ -438,6 +438,11 @@ class _GRPOAlgorithmCfg:
     # ZeroGAnywhere with 0% DAgger success). Setting boost_init_std to 0.5
     # restores exploration so GRPO can find advantage signal on those resets.
     boost_init_std: float = 0.0
+    # Lock depth_encoder.eval() at GRPO start so BN uses running stats and
+    # stays in sync with the deepcopied reference. Default True for the
+    # KL-explosion fix; turn False if the DAgger ckpt was trained in
+    # batch-stats mode and the eval-mode switch corrupts the policy.
+    lock_depth_encoder: bool = True
 
 
 @configclass
