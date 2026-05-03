@@ -398,6 +398,18 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_GRPOGroupedRunnerCfg",
     },
 )
+# Same as above but with GPS curriculum re-enabled (target=0.5). Pairs grouped
+# GRPO's group-baseline mechanism with reset states routed to ~50% success → the
+# K envs in each group get within-group return variance → meaningful advantages.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-GRPO-Grouped-Sysid-Curriculum-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85BCPPOSysidCurriculumCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_GRPOGroupedRunnerCfg",
+    },
+)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-Lean-Drawer-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

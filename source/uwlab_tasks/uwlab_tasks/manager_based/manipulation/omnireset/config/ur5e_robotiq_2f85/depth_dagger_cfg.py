@@ -795,3 +795,20 @@ class Ur5eRobotiq2f85BCPPOSysidCfg(_ZeroGStateSysidTrainCfg):
         self.sim.render.enable_reflections = False
         self.sim.render.enable_dl_denoiser = False
         self.sim.render_interval = self.decimation
+
+
+@configclass
+class Ur5eRobotiq2f85BCPPOSysidCurriculumCfg(Ur5eRobotiq2f85BCPPOSysidCfg):
+    """Same as BCPPOSysidCfg but with GPS curriculum re-enabled (target=0.5).
+
+    Used by grouped GRPO: routes resets to states with ~50% empirical success
+    rate, ensuring within-group return variance so the per-group baseline gives
+    a meaningful advantage signal.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Re-enable GPS curriculum (parent disabled it).
+        self.events.reset_from_states.params["curriculum_target"] = 0.5
+        self.events.reset_from_states.params["curriculum_kappa"] = 2.0
+        self.events.reset_from_states.params["curriculum_temperature"] = 2.0
