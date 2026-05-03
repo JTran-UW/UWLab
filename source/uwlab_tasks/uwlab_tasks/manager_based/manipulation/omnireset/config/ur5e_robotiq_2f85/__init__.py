@@ -373,6 +373,18 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_BCPPORunnerCfg",
     },
 )
+# State→state BCPPO sanity check. Same Sysid env state PPO trained on; student
+# reads 43d teacher obs with no encoder. Confirms BCPPO machinery itself works
+# before pinning depth-specific failure modes.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-BCPPO-Sysid-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateSysidTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:State_BCPPORunnerCfg",
+    },
+)
 
 # GRPO finetune for depth peg student (Doorman Phase 3). Reuses the same env
 # as BCPPO-Sysid (sparse rewards + cameras + 4 obs groups). Pair with a DAgger

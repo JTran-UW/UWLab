@@ -394,6 +394,39 @@ class Depth_BCPPORunnerCfg(RslRlBaseRunnerCfg):
     algorithm: _BCPPOAlgorithmCfg = _BCPPOAlgorithmCfg()
 
 
+@configclass
+class State_BCPPORunnerCfg(RslRlBaseRunnerCfg):
+    """State→state BCPPO sanity check. Student reads same 43d teacher obs as
+    teacher; no encoder, no asymmetry. Tests whether BCPPO algorithm itself is
+    sound vs. depth-specific issues.
+
+    Pair with state expert teacher (peg_sysid_full.pt) on a sysid env where
+    the state PPO is known to converge to ~95% success.
+    """
+
+    class_name: str = "BCPPORunner"
+    num_steps_per_env: int = 32
+    max_iterations: int = 5000
+    save_interval: int = 500
+    experiment_name: str = "ur5e_robotiq_2f85_bcppo_state"
+    # Symmetric obs: actor and critic both read the 43d teacher obs.
+    obs_groups: dict = {
+        "policy": ["teacher"],
+        "critic": ["teacher"],
+    }
+    policy: RslRlFancyActorCriticCfg = RslRlFancyActorCriticCfg(
+        init_noise_std=1.0,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[512, 256, 128, 64],
+        critic_hidden_dims=[512, 256, 128, 64],
+        activation="elu",
+        noise_std_type="gsde",
+        state_dependent_std=False,
+    )
+    algorithm: _BCPPOAlgorithmCfg = _BCPPOAlgorithmCfg()
+
+
 # ===========================================================================
 # GRPO finetune for depth peg student (Doorman Phase 3).
 # Loads DAgger checkpoint, applies PPO clipped surrogate with per-batch
