@@ -136,9 +136,11 @@ _runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
 from uwlab_rl.rsl_rl.actor_critic_depth import ActorCriticDepth
 from uwlab_rl.rsl_rl.bc_ppo import BCPPO
 from uwlab_rl.rsl_rl.grpo import GRPO
+from uwlab_rl.rsl_rl.ppo_pbrs import PPOPBRS
 _runner_module.ActorCriticDepth = ActorCriticDepth
 _runner_module.BCPPO = BCPPO
 _runner_module.GRPO = GRPO
+_runner_module.PPOPBRS = PPOPBRS
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config

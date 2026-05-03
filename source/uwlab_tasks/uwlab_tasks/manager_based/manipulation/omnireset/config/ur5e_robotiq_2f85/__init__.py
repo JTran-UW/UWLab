@@ -385,6 +385,16 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:State_BCPPORunnerCfg",
     },
 )
+# State→state PPO + PBRS using V_expert from state RL expert.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-PPOPBRS-Sysid-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGStateSysidTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:State_PPOPBRSRunnerCfg",
+    },
+)
 
 # GRPO finetune for depth peg student (Doorman Phase 3). Reuses the same env
 # as BCPPO-Sysid (sparse rewards + cameras + 4 obs groups). Pair with a DAgger

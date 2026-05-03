@@ -432,6 +432,71 @@ class State_BCPPORunnerCfg(RslRlBaseRunnerCfg):
     )
 
 
+@configclass
+class _PPOPBRSAlgorithmCfg:
+    """PPO + Potential-Based Reward Shaping using a frozen expert V function."""
+
+    class_name: str = "PPOPBRS"
+    expert_critic_path: str = ""  # path to RL expert ckpt with critic.* keys
+    expert_obs_group: str = "policy"  # obs key fed to V_expert
+    expert_obs_dim: int = 43
+    expert_hidden_dims: list = [512, 256, 128, 64]
+    expert_activation: str = "elu"
+    init_critic_from_expert: bool = False  # also seed policy critic with expert weights
+    pbrs_coef: float = 1.0  # scale on shaping term
+
+    # Standard PPO knobs (rsl_rl PPO default-equivalent)
+    value_loss_coef: float = 1.0
+    use_clipped_value_loss: bool = True
+    normalize_advantage_per_mini_batch: bool = False
+    clip_param: float = 0.2
+    entropy_coef: float = 0.006
+    num_learning_epochs: int = 5
+    num_mini_batches: int = 4
+    learning_rate: float = 1.0e-4
+    schedule: str = "adaptive"
+    gamma: float = 0.99
+    lam: float = 0.95
+    desired_kl: float = 0.01
+    max_grad_norm: float = 1.0
+
+
+@configclass
+class State_PPOPBRSRunnerCfg(RslRlBaseRunnerCfg):
+    """State→state PPO + PBRS sanity check.
+
+    Pure PPO surrogate, no BC term. Reward shaped by V_expert from
+    `teachers/peg_sysid_state_2400.pt`. Symmetric obs (state actor + state
+    critic, both 43d). If this reaches teacher level (~95%), PBRS shaping is
+    a viable alternative to BC and we can move to state→depth where BC was
+    the bottleneck.
+    """
+
+    class_name: str = "OnPolicyRunner"
+    num_steps_per_env: int = 32
+    max_iterations: int = 5000
+    save_interval: int = 500
+    experiment_name: str = "ur5e_robotiq_2f85_ppo_pbrs_state"
+    obs_groups: dict = {
+        "policy": ["policy"],
+        "critic": ["policy"],
+    }
+    policy: RslRlFancyActorCriticCfg = RslRlFancyActorCriticCfg(
+        init_noise_std=1.0,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[512, 256, 128, 64],
+        critic_hidden_dims=[512, 256, 128, 64],
+        activation="elu",
+        noise_std_type="gsde",
+        state_dependent_std=False,
+    )
+    algorithm: _PPOPBRSAlgorithmCfg = _PPOPBRSAlgorithmCfg(
+        expert_critic_path="teachers/peg_sysid_state_2400.pt",
+        expert_obs_group="policy",
+    )
+
+
 # ===========================================================================
 # GRPO finetune for depth peg student (Doorman Phase 3).
 # Loads DAgger checkpoint, applies PPO clipped surrogate with per-batch
