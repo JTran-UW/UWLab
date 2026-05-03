@@ -409,10 +409,13 @@ class State_BCPPORunnerCfg(RslRlBaseRunnerCfg):
     max_iterations: int = 5000
     save_interval: int = 500
     experiment_name: str = "ur5e_robotiq_2f85_bcppo_state"
-    # Symmetric obs: actor and critic both read the 43d teacher obs.
+    # State env exposes a single ``policy`` group containing the 43d state obs
+    # — same input that the teacher JIT also expects. Symmetric: actor+critic
+    # both read it. Override at launch:
+    #   agent.algorithm.teacher_obs_groups=[policy]
     obs_groups: dict = {
-        "policy": ["teacher"],
-        "critic": ["teacher"],
+        "policy": ["policy"],
+        "critic": ["policy"],
     }
     policy: RslRlFancyActorCriticCfg = RslRlFancyActorCriticCfg(
         init_noise_std=1.0,
@@ -424,7 +427,9 @@ class State_BCPPORunnerCfg(RslRlBaseRunnerCfg):
         noise_std_type="gsde",
         state_dependent_std=False,
     )
-    algorithm: _BCPPOAlgorithmCfg = _BCPPOAlgorithmCfg()
+    algorithm: _BCPPOAlgorithmCfg = _BCPPOAlgorithmCfg(
+        teacher_obs_groups=["policy"],
+    )
 
 
 # ===========================================================================
