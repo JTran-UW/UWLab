@@ -70,7 +70,12 @@ class BCPPO(PPO):
         self._buf_train: deque[float] = deque(maxlen=1024)
         self._buf_student_eval: deque[float] = deque(maxlen=1024)
         self._buf_teacher_eval: deque[float] = deque(maxlen=1024)
+        # Per-task buffers (split by reset_type, e.g. task_0=Anywhere, task_1=PA).
+        self._buf_train_task: dict[int, deque[float]] = {}
+        self._buf_student_eval_task: dict[int, deque[float]] = {}
+        self._buf_teacher_eval_task: dict[int, deque[float]] = {}
         self._progress_term = None  # populated by bind_env
+        self._reset_manager = None  # populated by bind_env (provides task_id per env)
 
     def bind_env(self, env) -> None:
         """Called by BCPPORunner post-init so we can track per-env success."""
@@ -78,6 +83,21 @@ class BCPPO(PPO):
             self._progress_term = env.unwrapped.reward_manager.get_term_cfg("progress_context").func
         except Exception:
             self._progress_term = None
+        # Locate the MultiResetManager so we can read per-env task_id at done time.
+        # Try common event term names; fall back to scanning all reset events.
+        self._reset_manager = None
+        try:
+            event_mgr = env.unwrapped.event_manager
+            for name in ("reset_from_states", "reset_from_reset_states"):
+                try:
+                    term = event_mgr.get_term_cfg(name).func
+                    if hasattr(term, "task_id"):
+                        self._reset_manager = term
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape) -> None:
         super().init_storage(training_type, num_envs, num_transitions_per_env, obs, actions_shape)
@@ -139,6 +159,7 @@ class BCPPO(PPO):
             return
         done_ids = dones.view(-1).nonzero(as_tuple=False).view(-1)
         if done_ids.numel() == 0:
+            self._publish_metrics(extras)
             return
         try:
             succ = self._progress_term.success[done_ids].float().detach().cpu()
@@ -154,6 +175,45 @@ class BCPPO(PPO):
             self._buf_student_eval.extend(succ[stud_eval_m].tolist())
         if teach_m.any():
             self._buf_teacher_eval.extend(succ[teach_m].tolist())
+        # Per-task split: requires reset_manager.task_id per env.
+        if self._reset_manager is not None and hasattr(self._reset_manager, "task_id"):
+            task_id_done = self._reset_manager.task_id[done_ids].detach().cpu()
+            for t in torch.unique(task_id_done).tolist():
+                t_mask = task_id_done == t
+                if (train_m & t_mask).any():
+                    self._buf_train_task.setdefault(int(t), deque(maxlen=1024)).extend(
+                        succ[train_m & t_mask].tolist()
+                    )
+                if (stud_eval_m & t_mask).any():
+                    self._buf_student_eval_task.setdefault(int(t), deque(maxlen=1024)).extend(
+                        succ[stud_eval_m & t_mask].tolist()
+                    )
+                if (teach_m & t_mask).any():
+                    self._buf_teacher_eval_task.setdefault(int(t), deque(maxlen=1024)).extend(
+                        succ[teach_m & t_mask].tolist()
+                    )
+        self._publish_metrics(extras)
+
+    def _publish_metrics(self, extras: dict) -> None:
+        """Push per-pool / per-task success rates to env extras['log'] under
+        the ``Metrics/`` namespace so they show up in wandb as Metrics/* not
+        Loss/*. Idempotent: safe to call every step."""
+        log = extras.setdefault("log", {})
+        if len(self._buf_train) > 0:
+            log["Metrics/success_student_train"] = sum(self._buf_train) / len(self._buf_train)
+        if len(self._buf_student_eval) > 0:
+            log["Metrics/success_student_eval"] = sum(self._buf_student_eval) / len(self._buf_student_eval)
+        if len(self._buf_teacher_eval) > 0:
+            log["Metrics/success_teacher_eval"] = sum(self._buf_teacher_eval) / len(self._buf_teacher_eval)
+        for t, buf in self._buf_train_task.items():
+            if len(buf) > 0:
+                log[f"Metrics/success_student_train_task_{t}"] = sum(buf) / len(buf)
+        for t, buf in self._buf_student_eval_task.items():
+            if len(buf) > 0:
+                log[f"Metrics/success_student_eval_task_{t}"] = sum(buf) / len(buf)
+        for t, buf in self._buf_teacher_eval_task.items():
+            if len(buf) > 0:
+                log[f"Metrics/success_teacher_eval_task_{t}"] = sum(buf) / len(buf)
 
     def compute_returns(self, obs) -> None:
         super().compute_returns(obs)
@@ -287,12 +347,7 @@ class BCPPO(PPO):
             "bc_loss": mean_bc_loss,
             "bc_coeff": self._cur_cloning_loss_coeff,
         }
-        # Per-pool success metrics (if eval_fraction > 0). Logged as
-        # Loss/success_train, Loss/success_teacher_eval, Loss/success_student_eval.
-        if len(self._buf_train) > 0:
-            out["success_train"] = sum(self._buf_train) / len(self._buf_train)
-        if len(self._buf_teacher_eval) > 0:
-            out["success_teacher_eval"] = sum(self._buf_teacher_eval) / len(self._buf_teacher_eval)
-        if len(self._buf_student_eval) > 0:
-            out["success_student_eval"] = sum(self._buf_student_eval) / len(self._buf_student_eval)
+        # Per-pool / per-task success metrics are pushed to env extras['log']
+        # under Metrics/* in process_env_step (see _publish_metrics) — they no
+        # longer appear in this loss_dict to avoid the misleading Loss/* prefix.
         return out
