@@ -345,6 +345,7 @@ class FinetuneEvalEventCfg(BaseEventCfg):
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "group_size": 1,
         },
     )
 

@@ -410,6 +410,19 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_GRPOGroupedRunnerCfg",
     },
 )
+# GRPO using the *DAgger native env* (FinetuneEvalEventCfg). Mean ep len ~40,
+# DAgger ckpt has ~50% success here. The right env for GRPO finetune from
+# DAgger because BCPPOSysid env's PA reset states satisfy success in 1 step
+# (mean ep len ~1) which yields no useful rollout data.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-GRPO-Grouped-DAggerNative-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthGRPOGroupedDAggerNativeCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_GRPOGroupedRunnerCfg",
+    },
+)
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-4Canonical-Lean-Drawer-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

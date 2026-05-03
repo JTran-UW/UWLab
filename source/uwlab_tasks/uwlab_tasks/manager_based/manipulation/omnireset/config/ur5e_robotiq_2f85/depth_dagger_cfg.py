@@ -798,6 +798,24 @@ class Ur5eRobotiq2f85BCPPOSysidCfg(_ZeroGStateSysidTrainCfg):
 
 
 @configclass
+class Ur5eRobotiq2f85DepthGRPOGroupedDAggerNativeCfg(Ur5eRobotiq2f85DepthDAggerWristSideCfg):
+    """GRPO env using the DAgger native env (FinetuneEvalEventCfg).
+
+    Built from `Ur5eRobotiq2f85DepthDAggerWristSideCfg` because BCPPOSysidCfg
+    has degenerate dynamics for GRPO: PA reset states satisfy the success
+    criterion in step 0 (mean ep len = 1.0), so the rollout collects no real
+    trajectory data — task_0 (Anywhere) lands stuck at 0 even at iter 0 with
+    DAgger weights freshly loaded. The DAgger native env uses
+    "ObjectAnywhereEEAnywhere" reset only, mean ep len ~40, success ~50% with
+    DAgger ckpt — the regime where grouped GRPO can actually compute baselines.
+
+    Reset event is named ``reset_from_reset_states`` (different from
+    BCPPOSysid's ``reset_from_states``); set group_size via Hydra at:
+       env.events.reset_from_reset_states.params.group_size=K
+    """
+
+
+@configclass
 class Ur5eRobotiq2f85BCPPOSysidCurriculumCfg(Ur5eRobotiq2f85BCPPOSysidCfg):
     """Same as BCPPOSysidCfg but with GPS curriculum re-enabled (target=0.5).
 
