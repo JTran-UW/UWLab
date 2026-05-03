@@ -433,11 +433,11 @@ class _GRPOAlgorithmCfg:
     group_size: int = 1
     normalize_grouped_advantages: bool = False
     # Optional std overwrite at GRPO start (only when loading from DAgger).
-    # DAgger ckpts often collapse std to ~0.10, leaving no exploration on tasks
-    # where the deterministic action fails (e.g. ZeroGAnywhere with 0% DAgger
-    # success). Setting boost_init_std to e.g. 0.5 restores exploration so
-    # GRPO can find advantage signal on those resets.
-    boost_init_std: float | None = None
+    # 0.0 = disable. DAgger ckpts often collapse std to ~0.10, leaving no
+    # exploration on tasks where the deterministic action fails (e.g.
+    # ZeroGAnywhere with 0% DAgger success). Setting boost_init_std to 0.5
+    # restores exploration so GRPO can find advantage signal on those resets.
+    boost_init_std: float = 0.0
 
 
 @configclass

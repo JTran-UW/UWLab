@@ -101,7 +101,7 @@ class GRPO(PPO):
         clamp_advantage_quantile: float | None = None,
         group_size: int = 1,
         normalize_grouped_advantages: bool = False,
-        boost_init_std: float | None = None,
+        boost_init_std: float = 0.0,
         **kwargs,
     ) -> None:
         # Force value_loss_coef=0 so critic doesn't train (we don't use V).
@@ -118,7 +118,7 @@ class GRPO(PPO):
         # GRPO's per-group baseline is identically 0 and no gradient signal
         # exists. Boosting std restores exploration so some envs randomly
         # succeed and a baseline-relative advantage is computable.
-        if boost_init_std is not None and init_from_dagger_path:
+        if boost_init_std > 0 and init_from_dagger_path:
             with torch.no_grad():
                 if hasattr(self.policy, "std"):
                     self.policy.std.data.fill_(float(boost_init_std))
