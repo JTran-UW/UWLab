@@ -170,10 +170,19 @@ class GRPO(PPO):
         elif depth_encoder is not None:
             print("[GRPO] depth_encoder NOT locked (BN remains in train mode, batch-stats).")
         # Snapshot reference policy (frozen) AFTER potentially loading DAgger.
+        # Disable gradient on reference params, but DO NOT call .eval() —
+        # leaving reference in train mode keeps its BN layers in batch-stats
+        # mode, matching self.policy (also in train mode). For the same input
+        # obs_batch both encoders normalize using the same minibatch stats →
+        # identical features → small KL between current and reference.
+        # If we .eval() the reference, BN switches to running stats (frozen at
+        # deepcopy time) while self.policy uses live batch stats → different
+        # features → KL explodes (we observed ref_kl=7000+ in 35001682 with
+        # this setup).
         self.reference_policy = copy.deepcopy(self.policy)
         for p in self.reference_policy.parameters():
             p.requires_grad = False
-        self.reference_policy.eval()
+        # NOTE: not calling .eval() — see comment above.
         self.kl_coeff = float(kl_coeff)
         self.kl_target = kl_target  # if set, adapt kl_coeff toward this
         self.kl_coeff_min = float(kl_coeff_min)
