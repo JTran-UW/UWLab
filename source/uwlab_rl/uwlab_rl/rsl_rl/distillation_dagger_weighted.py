@@ -49,7 +49,31 @@ def _l2(model: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 class DistillationDAggerWeighted(DistillationDAgger):
-    """DAgger with inverse-variance-weighted L2 on mean + L2 on std."""
+    """DAgger with inverse-variance-weighted L2 on mean + L2 on std.
+
+    Optional separate loss treatment for the binary gripper dim (last action
+    dim) — addresses the failure mode where MSE'd binary gripper command
+    smooths out into indecisive sub-threshold values that mistime the grasp.
+    """
+
+    def __init__(
+        self,
+        *args,
+        gripper_loss_type: str = "shared",
+        gripper_loss_weight: float = 1.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        # gripper_loss_type:
+        #   "shared" — treat gripper dim like arm dims in weighted_l2 (original)
+        #   "mse"    — split arm vs gripper; add λ·MSE(student_grip, teacher_grip)
+        #   "bce"    — split arm vs gripper; add λ·BCE_with_logits(student_grip,
+        #              (teacher_grip > 0).float()) — treats binary action as
+        #              classification, more faithful to BinaryJointPositionAction
+        if gripper_loss_type not in ("shared", "mse", "bce"):
+            raise ValueError(f"Unknown gripper_loss_type: {gripper_loss_type}")
+        self.gripper_loss_type = gripper_loss_type
+        self.gripper_loss_weight = float(gripper_loss_weight)
 
     # Uses parent's ``act`` unchanged — teacher mean is stored as ``privileged_actions``.
     # Teacher std is re-computed on demand in ``update`` via a fresh ``evaluate_with_std``
@@ -109,13 +133,35 @@ class DistillationDAggerWeighted(DistillationDAgger):
 
                 # weights = (1/σ_t)² per dim, detached.
                 weights = (1.0 / t_sig.detach().clamp_min(1e-6)) ** 2
-                mu_loss = _weighted_l2(s_mu, t_mu, weights).mean()
+                if self.gripper_loss_type == "shared":
+                    mu_loss = _weighted_l2(s_mu, t_mu, weights).mean()
+                    arm_loss_val = mu_loss.item()
+                    gripper_loss_val = 0.0
+                else:
+                    # Split arm dims (0:6) from gripper dim (6).
+                    arm_loss = _weighted_l2(s_mu[:, :6], t_mu[:, :6], weights[:, :6]).mean()
+                    if self.gripper_loss_type == "mse":
+                        gripper_loss = (s_mu[:, 6] - t_mu[:, 6]).pow(2).mean()
+                    else:  # bce
+                        # Teacher's binary intent: gripper output > 0 means CLOSE.
+                        binary_target = (t_mu[:, 6] > 0).float()
+                        gripper_loss = nn.functional.binary_cross_entropy_with_logits(
+                            s_mu[:, 6], binary_target
+                        )
+                    mu_loss = arm_loss + self.gripper_loss_weight * gripper_loss
+                    arm_loss_val = arm_loss.item()
+                    gripper_loss_val = gripper_loss.item()
                 sigma_loss = _l2(s_sig, t_sig).mean()
                 step_loss = mu_loss + sigma_loss
 
                 loss = loss + step_loss
                 mean_mu_loss += mu_loss.item()
                 mean_sigma_loss += sigma_loss.item()
+                if not hasattr(self, "_mean_arm_loss"):
+                    self._mean_arm_loss = 0.0
+                    self._mean_gripper_loss = 0.0
+                self._mean_arm_loss += arm_loss_val
+                self._mean_gripper_loss += gripper_loss_val
                 cnt += 1
 
                 if cnt % self.gradient_length == 0:
@@ -134,6 +180,11 @@ class DistillationDAggerWeighted(DistillationDAgger):
 
         mean_mu_loss /= cnt
         mean_sigma_loss /= cnt
+        mean_arm_loss = self._mean_arm_loss / cnt if hasattr(self, "_mean_arm_loss") else 0.0
+        mean_gripper_loss = self._mean_gripper_loss / cnt if hasattr(self, "_mean_gripper_loss") else 0.0
+        if hasattr(self, "_mean_arm_loss"):
+            self._mean_arm_loss = 0.0
+            self._mean_gripper_loss = 0.0
         self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
@@ -143,6 +194,8 @@ class DistillationDAggerWeighted(DistillationDAgger):
             "behavior": mean_mu_loss + mean_sigma_loss,
             "behavior_mu": mean_mu_loss,
             "behavior_sigma": mean_sigma_loss,
+            "behavior_arm": mean_arm_loss,
+            "behavior_gripper": mean_gripper_loss,
         }
         if self.student_mask is None:
             loss_dict["beta"] = self.beta

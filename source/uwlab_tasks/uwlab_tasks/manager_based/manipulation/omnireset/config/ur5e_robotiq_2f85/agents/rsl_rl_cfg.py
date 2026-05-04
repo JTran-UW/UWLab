@@ -75,6 +75,13 @@ class DistillationDAggerAlgorithmCfg:
     loss_type: str = "mse"
     beta_anneal_iters: int = 0
     aux_coeff: float = 1.0
+    # Gripper-specific loss handling for DistillationDAggerWeighted only.
+    # "shared": gripper dim treated like arm dims in weighted_l2 (default).
+    # "mse":    arm uses weighted_l2 on dims 0-5; gripper uses MSE * weight.
+    # "bce":    arm uses weighted_l2 on dims 0-5; gripper uses BCE_with_logits
+    #           against (teacher > 0).float() — matches binary action semantics.
+    gripper_loss_type: str = "shared"
+    gripper_loss_weight: float = 1.0
 
 
 @configclass
