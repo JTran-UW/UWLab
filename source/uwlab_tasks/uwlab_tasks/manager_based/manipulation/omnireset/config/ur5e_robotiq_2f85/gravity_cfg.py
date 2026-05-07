@@ -493,6 +493,54 @@ class ZeroGStateGPSTrainCfg(ZeroGBaseCfg):
 
 
 # ===========================================================================
+# ScenePC + uniform routing — winning gravity recipe with PC obs
+# Mirrors ZeroGStateTrainCfg's reset-event overrides but feeds the actor/critic
+# the 512-pt scene point cloud instead of object pose terms. Used to retrain
+# the peg RL teacher with PC obs + the existing multi-canonical sparse reward,
+# so the teacher can't lock onto a specific yaw via explicit pose input
+# (cylindrical peg PC has approximate SO(2) symmetry → policy is forced
+# toward a yaw-invariant action under the 4-canonical reward).
+# ===========================================================================
+@configclass
+class ZeroGScenePCUniformTrainCfg(ZeroGGPSScenePCTrainCfg):
+    """ScenePC obs + uniform reset-type sampling (no GPS).
+
+    Pair with Hydra overrides for the winning gravity recipe::
+
+        env.curriculum.gravity_curriculum.params.reduction=monitor_mean
+        env.curriculum.gravity_curriculum.params.floor=0.1
+
+    Multi-canonical reward is inherited from ``ZeroGRewardsCfg`` via the
+    ``assembled_offsets`` migration (commit ``4b06dc5``); for cylindrical peg
+    success fires for any of the 4 yaw-equivalent poses.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Disable GPS routing → uniform multinomial over reset types
+        # (matches ZeroGStateTrainCfg, the winning recipe from `34722401`).
+        self.events.reset_from_states.params["curriculum_target"] = None
+        self.events.reset_from_states.params["use_classifier"] = False
+        self.events.reset_from_states.params["use_success_critic"] = False
+
+
+@configclass
+class ZeroGScenePCUniformNoPrevActTrainCfg(ZeroGScenePCUniformTrainCfg):
+    """Ablation: ``ZeroGScenePCUniformTrainCfg`` minus ``prev_actions`` from proprio.
+
+    Tests whether last-action carryover is providing a yaw "anchor" that lets
+    the teacher implicitly pick a canonical (and so produces multimodal teacher
+    actions across rollouts). Without prev_actions the proprio still has
+    ``joint_pos`` and ``end_effector_pose`` (both yaw-revealing), so this is
+    not a strict yaw-invariance test — it isolates the prev_action contribution.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.proprio.prev_actions = None
+
+
+# ===========================================================================
 # State-only + DR for sim-to-real teacher distillation
 # Retains pat/gravity's ZeroG resets + gravity curriculum + IMPLICIT actuator.
 # Adds: arm sysid DR (armature/delays U(0.8,1.2), friction widened to U(0,1.5))

@@ -136,6 +136,29 @@ gym.register(
     },
 )
 
+# ScenePC + uniform routing — peg RL retrain to break yaw multimodality
+# via PC obs (cylindrical peg PC ~ SO(2)-symmetric) + 4-canonical reward.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-Uniform-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCUniformTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+# Ablation: same as above but drops `prev_actions` from proprio.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-Uniform-NoPrevAct-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCUniformNoPrevActTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
 # Same as ZeroG-State-v0 but adds arm sysid + OSC gain DR (widened friction)
 # for sim-to-real-robust state teachers we'll DAgger from.
 gym.register(
