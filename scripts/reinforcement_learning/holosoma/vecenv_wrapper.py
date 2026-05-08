@@ -236,6 +236,11 @@ class HolosomaVecEnvWrapper(VecEnv):
         # clip actions
         if self.clip_actions is not None:
             actions = torch.clamp(actions, -self.clip_actions, self.clip_actions)
+        # Grab the current log dict reference before stepping. During _reset_idx, IsaacLab
+        # calls event_manager.apply() which mutates this dict in-place (e.g. MultiResetManager
+        # writes task success metrics), then replaces extras["log"] with a new empty dict.
+        # Holding this reference lets us capture those metrics after the step returns.
+        pre_step_log = self.unwrapped.extras.get("log", {})
         # record step information
         obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
         # compute dones for compatibility with RSL-RL
@@ -247,11 +252,17 @@ class HolosomaVecEnvWrapper(VecEnv):
         if basetask_mode:
             # BaseTask interface: plain dicts, info_dict with expected keys
             plain_obs = dict(obs_dict) if isinstance(obs_dict, TensorDict) else obs_dict
+            # Merge pre-step log (has event-term metrics like task success rates) with the
+            # post-reset log (has reward totals, command metrics, etc.) so all metrics are visible.
+            if dones.any():
+                episode_log = {**pre_step_log, **extras.get("log", {})}
+            else:
+                episode_log = {}
             info_dict = {
                 "time_outs": extras.get(
                     "time_outs", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
                 ),
-                "episode": extras.get("log", {}) if dones.any() else {},
+                "episode": episode_log,
                 "episode_all": {},
                 "to_log": {},
             }

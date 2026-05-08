@@ -44,8 +44,14 @@ parser.add_argument(
     default=None,
     help=(
         "Path to a .pt file of recorded transitions (from play.py --record_transitions). "
-        "If set, FastSACAgent mixes 50%% of each training batch from this expert buffer."
+        "If set, FastSACAgent mixes expert transitions into each training batch."
     ),
+)
+parser.add_argument(
+    "--expert_ratio",
+    type=float,
+    default=0.5,
+    help="Fraction of each training batch sampled from the expert replay buffer (default: 0.5).",
 )
 parser.add_argument(
     "--expert_checkpoint",
@@ -275,6 +281,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "max_iterations": agent_cfg.max_iterations,
                 "device": agent_cfg.device,
                 "expert_transitions": args_cli.expert_transitions,
+                "expert_ratio": args_cli.expert_ratio,
                 "expert_checkpoint": args_cli.expert_checkpoint,
             },
             dir=log_dir,
@@ -290,6 +297,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             lambda_bc_critic=1.0,
         )
         runner.setup()
+        runner.expert_ratio = args_cli.expert_ratio
         runner.attach_checkpoint_metadata(ExperimentConfig(), log_dir)
         if args_cli.expert_transitions is not None:
             runner.load_expert_replay_buffer(args_cli.expert_transitions)
