@@ -337,6 +337,13 @@ class MeshPointCloud(ManagerTermBase):
         object_cfg: SceneEntityCfg = cfg.params["object_cfg"]
         ref_cfg: SceneEntityCfg = cfg.params.get("ref_cfg", cfg.params.get("robot_cfg"))
         self.num_points: int = cfg.params.get("num_points", 128)
+        # Re-sample mesh points per env at episode reset. Breaks the "PC point
+        # arrangement → absolute yaw" memorization channel that lets the policy
+        # use a fixed-init point pattern as a yaw oracle for symmetric objects.
+        # Does nothing geometrically if the mesh has no rotational symmetry, but
+        # is necessary to make the symmetric-reward + cylindrical-PC argument
+        # actually hold (otherwise the network can leak yaw via point identity).
+        self.resample_on_reset: bool = cfg.params.get("resample_on_reset", False)
 
         self.object_asset: RigidObject = env.scene[object_cfg.name]
         self.ref_asset = env.scene[ref_cfg.name]
@@ -346,11 +353,11 @@ class MeshPointCloud(ManagerTermBase):
             ref_cfg.resolve(env.scene)
             self.ref_body_idx = ref_cfg.body_ids[0]  # type: ignore
 
-        prim_path_pattern = self.object_asset.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        self._prim_path_pattern = self.object_asset.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
         self.canonical_points = utils.sample_object_point_cloud(
             num_envs=env.num_envs,
             num_points=self.num_points,
-            prim_path_pattern=prim_path_pattern,
+            prim_path_pattern=self._prim_path_pattern,
             device=str(env.device),
         )  # [num_envs, num_points, 3] in object local frame
 
@@ -398,10 +405,24 @@ class MeshPointCloud(ManagerTermBase):
         ref_cfg: SceneEntityCfg | None = None,
         robot_cfg: SceneEntityCfg | None = None,
         num_points: int = 128,
+        resample_on_reset: bool = False,
         visualize: bool = False,
         visualize_env_ids: list[int] | None = None,
         marker_color: tuple[float, float, float] = (1.0, 0.0, 0.0),
     ) -> torch.Tensor:
+        # Re-sample mesh points for envs that have just reset (episode_length_buf == 0).
+        # This breaks the "fixed init points" memorization channel for symmetric objects.
+        if self.resample_on_reset and hasattr(env, "episode_length_buf"):
+            reset_mask = env.episode_length_buf == 0
+            if reset_mask.any():
+                fresh = utils.sample_object_point_cloud(
+                    num_envs=env.num_envs,
+                    num_points=self.num_points,
+                    prim_path_pattern=self._prim_path_pattern,
+                    device=str(env.device),
+                )  # [num_envs, num_points, 3]
+                self.canonical_points[reset_mask] = fresh[reset_mask]
+
         obj_pos_w = self.object_asset.data.root_pos_w
         obj_quat_w = self.object_asset.data.root_quat_w
 
@@ -451,6 +472,10 @@ class ScenePointCloud(ManagerTermBase):
 
         self.num_points: int = cfg.params.get("num_points", 512)
         oversample: int = cfg.params.get("oversample", 2)
+        # See MeshPointCloud.resample_on_reset — same idea but for the ins/rec
+        # subsets of the scene PC. Robot points stay fixed (robot has no
+        # rotational symmetry the network could exploit).
+        self.resample_on_reset: bool = cfg.params.get("resample_on_reset", False)
 
         robot_cfg: SceneEntityCfg = cfg.params["robot_cfg"]
         ins_cfg: SceneEntityCfg = cfg.params["insertive_cfg"]
@@ -501,6 +526,11 @@ class ScenePointCloud(ManagerTermBase):
             num_envs=env.num_envs, num_points=oversample * 128,
             prim_path_pattern=rec_prim_pattern, device=str(device),
         )
+        # Keep the oversampled pools around so per-reset resampling can re-pick
+        # ins/rec subsets without re-sampling from the USD mesh every time.
+        if self.resample_on_reset:
+            self._ins_canonical_pool = ins_canonical_all  # [N, oversample*128, 3]
+            self._rec_canonical_pool = rec_canonical_all
 
         # -- Build (num_task_types, num_points, ...) canonical selections via per-task FPS --
         # For each task type, gather its representative env's object points, concat with robot,
@@ -557,6 +587,30 @@ class ScenePointCloud(ManagerTermBase):
         self.robot_mask = self.selected_source_type == self._SRC_ROBOT
         self.ins_mask = self.selected_source_type == self._SRC_INSERTIVE
         self.rec_mask = self.selected_source_type == self._SRC_RECEPTIVE
+
+        # Per-env selected_local override for per-reset resampling. When this is
+        # populated, ``__call__`` routes through the multi-task style per-env
+        # transform path so each env can have its own ins/rec point pattern.
+        self.selected_local_per_env: torch.Tensor | None = None
+        if self.resample_on_reset:
+            # Initialize per-env table from the per-task canonical (broadcast).
+            tt_ids = self.task_type_ids if self.is_multitask else torch.zeros(
+                env.num_envs, dtype=torch.long, device=device
+            )
+            self.selected_local_per_env = self.selected_local_task[tt_ids].clone().contiguous()
+            # Cache slot indices for each task type (which positions in the
+            # selected_local hold ins / rec points). In single-task all envs
+            # share the same source pattern.
+            self._ins_slots_task = [
+                (self.selected_source_type_task[t] == self._SRC_INSERTIVE).nonzero(as_tuple=True)[0]
+                for t in range(self.num_task_types)
+            ]
+            self._rec_slots_task = [
+                (self.selected_source_type_task[t] == self._SRC_RECEPTIVE).nonzero(as_tuple=True)[0]
+                for t in range(self.num_task_types)
+            ]
+            self._ins_pool_size = ins_canonical_all.shape[1] if ins_canonical_all is not None else 0
+            self._rec_pool_size = rec_canonical_all.shape[1] if rec_canonical_all is not None else 0
 
         for t in range(self.num_task_types):
             src = self.selected_source_type_task[t]
@@ -689,6 +743,7 @@ class ScenePointCloud(ManagerTermBase):
         receptive_cfg: SceneEntityCfg,
         num_points: int = 512,
         oversample: int = 2,
+        resample_on_reset: bool = False,
         visualize: bool = False,
         visualize_env_ids: list[int] | None = None,
     ) -> torch.Tensor:
@@ -696,14 +751,62 @@ class ScenePointCloud(ManagerTermBase):
         P = self.num_points
         device = env.device
 
-        if self.is_multitask:
-            # Per-env canonical selections (gathered from per-task tables via task_type_ids).
-            # env_local:       (N, P, 3)
+        # Per-reset resampling: replace ins/rec slots in selected_local_per_env
+        # for envs that just reset (episode_length_buf == 0). Uses the
+        # oversampled pools captured at init.
+        if self.resample_on_reset and self.selected_local_per_env is not None and hasattr(env, "episode_length_buf"):
+            reset_mask = env.episode_length_buf == 0
+            if reset_mask.any():
+                reset_ids = reset_mask.nonzero(as_tuple=True)[0]
+                n_reset = reset_ids.shape[0]
+                # Per-env slot indices (single-task: same for all envs; multi-task: per task type).
+                if self.is_multitask:
+                    rid_tt = self.task_type_ids[reset_ids]
+                else:
+                    rid_tt = torch.zeros(n_reset, dtype=torch.long, device=device)
+                # Process each task type's reset envs in a single tensor op.
+                for t in range(self.num_task_types):
+                    in_t = (rid_tt == t).nonzero(as_tuple=True)[0]
+                    if in_t.numel() == 0:
+                        continue
+                    rids_t = reset_ids[in_t]  # env_ids in task t
+                    n_t = rids_t.shape[0]
+                    ins_slots = self._ins_slots_task[t]  # [n_ins_t]
+                    rec_slots = self._rec_slots_task[t]
+                    if ins_slots.numel() > 0 and self._ins_pool_size > 0:
+                        # Random subset: pick ins_slots.numel() indices from pool per env.
+                        ins_perm = torch.argsort(
+                            torch.rand(n_t, self._ins_pool_size, device=device), dim=1
+                        )[:, : ins_slots.numel()]  # [n_t, n_ins_t]
+                        ins_pool_t = self._ins_canonical_pool[rids_t]  # [n_t, pool, 3]
+                        gathered = torch.gather(
+                            ins_pool_t, 1, ins_perm.unsqueeze(-1).expand(-1, -1, 3)
+                        )  # [n_t, n_ins_t, 3]
+                        self.selected_local_per_env[rids_t.unsqueeze(1), ins_slots.unsqueeze(0)] = gathered
+                    if rec_slots.numel() > 0 and self._rec_pool_size > 0:
+                        rec_perm = torch.argsort(
+                            torch.rand(n_t, self._rec_pool_size, device=device), dim=1
+                        )[:, : rec_slots.numel()]
+                        rec_pool_t = self._rec_canonical_pool[rids_t]
+                        gathered = torch.gather(
+                            rec_pool_t, 1, rec_perm.unsqueeze(-1).expand(-1, -1, 3)
+                        )
+                        self.selected_local_per_env[rids_t.unsqueeze(1), rec_slots.unsqueeze(0)] = gathered
+
+        # Route through the multi-task per-env path when per-env data is present
+        # (either is_multitask, or resample_on_reset built selected_local_per_env).
+        if self.is_multitask or self.selected_local_per_env is not None:
+            # Per-env canonical selections.
+            # env_local:       (N, P, 3) — uses per-env override if resample_on_reset is on
             # env_source_type: (N, P)
             # env_body_idx:    (N, P)
-            env_local = self.selected_local_task[self.task_type_ids]
-            env_source_type = self.selected_source_type_task[self.task_type_ids]
-            env_body_idx = self.selected_body_idx_task[self.task_type_ids]
+            if self.selected_local_per_env is not None:
+                env_local = self.selected_local_per_env
+            else:
+                env_local = self.selected_local_task[self.task_type_ids]
+            tt_ids = self.task_type_ids if self.is_multitask else torch.zeros(N, dtype=torch.long, device=device)
+            env_source_type = self.selected_source_type_task[tt_ids]
+            env_body_idx = self.selected_body_idx_task[tt_ids]
 
             robot_mask_np = env_source_type == self._SRC_ROBOT  # (N, P)
             ins_mask_np = env_source_type == self._SRC_INSERTIVE

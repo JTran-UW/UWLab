@@ -145,6 +145,10 @@ class ScenePCObsCfg:
                 "receptive_cfg": SceneEntityCfg("receptive_object"),
                 "visualize": False,
                 "num_points": 512,
+                # Re-sample mesh points for ins/rec subsets at episode reset.
+                # Kills the "fixed-init point arrangement → absolute yaw"
+                # memorization channel. Hydra-overridable.
+                "resample_on_reset": False,
             },
         )
 
