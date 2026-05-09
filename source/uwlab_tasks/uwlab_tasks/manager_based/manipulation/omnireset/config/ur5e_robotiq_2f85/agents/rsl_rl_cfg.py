@@ -157,6 +157,10 @@ class Depth_DAggerSplitRunnerCfg(Depth_DAggerRunnerCfg):
     max_iterations: int = 200000
     student_fraction: float = 1.0
     eval_fraction: float = 0.1
+    # Of the eval pool, fraction running teacher actions (no-grad teacher rate).
+    # Default 0 = backward-compatible (eval is all student). Set to 0.5 to log
+    # Metrics/success_teacher_eval alongside Metrics/success_student_eval.
+    teacher_eval_fraction: float = 0.0
     algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(
         beta_anneal_iters=0,
         num_learning_epochs=1,
