@@ -824,3 +824,176 @@ class Ur5eRobotiq2f85BCPPOSysidCurriculumCfg(Ur5eRobotiq2f85BCPPOSysidCfg):
         self.events.reset_from_states.params["curriculum_target"] = 0.5
         self.events.reset_from_states.params["curriculum_kappa"] = 2.0
         self.events.reset_from_states.params["curriculum_temperature"] = 2.0
+
+
+# ---------------------------------------------------------------------------
+# ScenePC peg teacher DAgger (pat/dagger-symmetry)
+#
+# Replaces the 215d state teacher (pose-based MLP) with the new ScenePC teacher
+# (proprio + 512-pt scene point cloud through a shared MLP encoder, then actor
+# MLP). The hypothesis: cylindrical peg PC ~ SO(2)-symmetric → teacher action
+# becomes yaw-invariant → DAgger MSE no longer collapses to averaged-across-
+# canonicals actions, lifting peg DAgger above the ~50% ceiling.
+#
+# Teacher checkpoints from Tillicum 107905 (with prev_actions) and 107906
+# (NoPrevAct) — both converged ~99% on task_0/task_1 at full gravity. Synthetic
+# yaw probe showed scene_std/yaw_std ratio of 126x (107905) / 197x (107906),
+# consistent with yaw-invariant action map.
+#
+# Two env variants below:
+#   * Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanCfg          (prev_act)
+#   * Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanNoPrevActCfg (no prev_act)
+# In the NoPrevAct variant the *student* proprio also drops prev_actions, so
+# what the student sees mirrors what the teacher saw at training time.
+# ---------------------------------------------------------------------------
+
+from .gravity_cfg import (  # noqa: E402
+    ZeroGGPSEventCfg as _ZeroGGPSEventCfg,
+    ScenePCObsCfg as _ScenePCObsCfg,
+)
+
+
+@configclass
+class _ZeroGNoSysidWristSideEventCfg(_ZeroGGPSEventCfg):
+    """Plain ZeroG GPS events (no sysid) + reset_wrist_camera_pose.
+
+    Matches the ScenePC teacher's training events (it trained on
+    ``ZeroGGPSEventCfg`` via ``ZeroGScenePCUniformTrainCfg`` → ``ZeroGBaseCfg``,
+    which never layered in sysid DR).
+    """
+
+    reset_wrist_camera_pose = EventTerm(
+        func=task_mdp.randomize_tiled_cameras,
+        mode="reset",
+        params={
+            "camera_path_template": "/World/envs/env_{}/Robot/robotiq_base_link/rgb_wrist_camera",
+            "base_position": (0.0182505, -0.00408447, -0.0689107),
+            "base_rotation": (0.34254336, -0.61819255, -0.6160212, 0.347879),
+            "position_deltas": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+            "euler_deltas": {"pitch": (0.0, 0.0), "yaw": (0.0, 0.0), "roll": (0.0, 0.0)},
+        },
+    )
+
+
+# Term order is structural — the JIT teacher splits its input as
+# ``[proprio_first | pointcloud_second]``. proprio terms must come first and in
+# the same order as ``ScenePCObsCfg.GroupCfg`` (prev_actions, joint_pos, ee_pose).
+# Then scene_pc.
+@configclass
+class TeacherProprioWithPCCfg(ObsGroup):
+    """ScenePC teacher input: proprio (25d) + scene_pc (1536d) = 1561d, single-frame.
+
+    Mirrors ``ScenePCObsCfg.GroupCfg`` (proprio) + ``ScenePCObsCfg.PointcloudCfg``
+    (pointcloud) concatenated into one obs group. The JIT teacher splits this
+    1561d tensor into proprio (first 25) and pc (last 1536) internally.
+    """
+
+    prev_actions = ObsTerm(func=task_mdp.last_action)
+    joint_pos = ObsTerm(func=task_mdp.joint_pos)
+    end_effector_pose = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "root_asset_cfg": SceneEntityCfg("robot"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+    scene_pc = ObsTerm(
+        func=task_mdp.ScenePointCloud,
+        params={
+            "robot_cfg": SceneEntityCfg("robot"),
+            "insertive_cfg": SceneEntityCfg("insertive_object"),
+            "receptive_cfg": SceneEntityCfg("receptive_object"),
+            "visualize": False,
+            "num_points": 512,
+            # Match teacher's training: resample_on_reset=False (default).
+            "resample_on_reset": False,
+        },
+    )
+
+    def __post_init__(self):
+        # Match training-time corruption flag from ScenePCObsCfg.GroupCfg
+        # (PointcloudCfg also had enable_corruption=True; both were True).
+        self.enable_corruption = True
+        self.concatenate_terms = True
+        self.history_length = 1
+
+
+@configclass
+class TeacherProprioWithPCNoPrevActCfg(TeacherProprioWithPCCfg):
+    """Same as TeacherProprioWithPCCfg minus prev_actions (18d proprio + 1536d pc = 1554d).
+
+    Pair with the NoPrevAct teacher checkpoint (Tillicum 107906).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.prev_actions = None
+
+
+@configclass
+class _DepthProprioNoPrevActCfg(DepthDAggerObservationsCfg.ProprioCfg):
+    """Student proprio with prev_actions removed (paired with NoPrevAct teacher)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.prev_actions = None
+
+
+@configclass
+class DepthDAggerWristSidePCTeacherObsCfg(DepthDAggerWristSideObservationsCfg):
+    """WristSide depth obs with the ScenePC teacher group (proprio+pc=1561d)."""
+
+    teacher: TeacherProprioWithPCCfg = TeacherProprioWithPCCfg()
+
+
+@configclass
+class DepthDAggerWristSidePCTeacherNoPrevActObsCfg(DepthDAggerWristSidePCTeacherObsCfg):
+    """NoPrevAct variant: drops prev_actions from BOTH student proprio and teacher proprio."""
+
+    proprio: _DepthProprioNoPrevActCfg = _DepthProprioNoPrevActCfg()
+    teacher: TeacherProprioWithPCNoPrevActCfg = TeacherProprioWithPCNoPrevActCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanCfg(
+    Ur5eRobotiq2f85DepthDAggerWristSideCfg
+):
+    """Lean DAgger paired with ScenePC peg teacher (with prev_actions).
+
+    Mirrors ``Ur5eRobotiq2f85DepthDAggerWristSide4CanonicalLeanCfg`` but:
+      * teacher obs group = proprio + scene_pc (1561d) instead of 215d state
+      * events are no-sysid (matches ScenePC teacher's training) + wrist cam reset
+      * IMPLICIT actuator + training-scale OSC action (same as the 4-canonical Lean)
+
+    Teacher JIT: ``teachers/peg_pc_prevact_jit.pt``.
+    """
+
+    observations: DepthDAggerWristSidePCTeacherObsCfg = DepthDAggerWristSidePCTeacherObsCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    events: _ZeroGNoSysidWristSideEventCfg = _ZeroGNoSysidWristSideEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # IMPLICIT actuator (same as ScenePC teacher's training env, ZeroGSceneCfg).
+        self.scene.robot = IMPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # Match ScenePC teacher's training reset distribution (50/50 Anywhere/PA, uniform).
+        self.events.reset_from_states.params["reset_types"] = ["ZeroGAnywhere", "ZeroGPartialAssembly"]
+        self.events.reset_from_states.params["probs"] = [0.5, 0.5]
+        self.events.reset_from_states.params["curriculum_target"] = None
+        self.events.reset_from_states.params["use_classifier"] = False
+        self.events.reset_from_states.params["use_success_critic"] = False
+
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanNoPrevActCfg(
+    Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanCfg
+):
+    """NoPrevAct variant — student proprio AND teacher proprio drop prev_actions.
+
+    Pair with ``teachers/peg_pc_noprevact_jit.pt``.
+    """
+
+    observations: DepthDAggerWristSidePCTeacherNoPrevActObsCfg = (
+        DepthDAggerWristSidePCTeacherNoPrevActObsCfg()
+    )

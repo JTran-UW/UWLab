@@ -371,6 +371,31 @@ gym.register(
     },
 )
 
+# Lean DAgger paired with the new ScenePC peg teacher (pat/dagger-symmetry).
+# Tests whether yaw-symmetric teacher (trained on cylindrical-peg PC obs +
+# 8-canonical reward) lifts peg DAgger past the ~50% ceiling.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-PCTeacher-Lean-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
+# Same as above but student + teacher proprio both drop prev_actions
+# (paired with Tillicum 107906, the NoPrevAct teacher).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-PCTeacher-Lean-NoPrevAct-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanNoPrevActCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
 # BCPPO peg env: same Lean scene/teacher/cameras, but runs PPO+BC instead of
 # DAgger. Reward-bearing PPO loop with BC auxiliary toward JIT teacher
 # pulls the depth student past the DAgger-only ceiling (~50% on peg).
