@@ -149,6 +149,12 @@ class ScenePCObsCfg:
                 # Kills the "fixed-init point arrangement → absolute yaw"
                 # memorization channel. Hydra-overridable.
                 "resample_on_reset": False,
+                # Same idea but for robot points: per-env random subset of each
+                # body's oversampled mesh pool, re-rolled each reset. Forces the
+                # encoder to be agnostic to specific robot point selections so
+                # the trained teacher generalizes across env init RNG state at
+                # deploy time. Hydra-overridable.
+                "resample_on_reset_robot": False,
             },
         )
 

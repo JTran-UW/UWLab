@@ -476,6 +476,12 @@ class ScenePointCloud(ManagerTermBase):
         # subsets of the scene PC. Robot points stay fixed (robot has no
         # rotational symmetry the network could exploit).
         self.resample_on_reset: bool = cfg.params.get("resample_on_reset", False)
+        # When True, ALSO randomize per-env which subset of each robot body's
+        # oversampled-mesh pool gets used as the robot points each reset. Without
+        # this, robot points are sampled once at init via global RNG state — and
+        # because that state depends on num_envs / sim init order, the policy can
+        # overfit to a specific point selection that doesn't reproduce at deploy.
+        self.resample_on_reset_robot: bool = cfg.params.get("resample_on_reset_robot", False)
 
         robot_cfg: SceneEntityCfg = cfg.params["robot_cfg"]
         ins_cfg: SceneEntityCfg = cfg.params["insertive_cfg"]
@@ -501,15 +507,21 @@ class ScenePointCloud(ManagerTermBase):
 
         robot_local_parts: list[torch.Tensor] = []
         robot_body_idx_parts: list[int] = []
+        # Keep the pre-FPS oversampled pool per body when resample_on_reset_robot
+        # is enabled. The pool is indexed by body_idx_int.
+        self._robot_pool_per_body: dict[int, torch.Tensor] = {}
         for body_idx_int, body_name in enumerate(body_names):
             body_prim_path = f"{robot_prim_path_env0}/{body_name}"
             try:
-                body_points = self._sample_body_points(
-                    body_prim_path, oversample * 64, 64, device
+                body_points, body_pool = self._sample_body_points(
+                    body_prim_path, oversample * 64, 64, device,
+                    return_pool=self.resample_on_reset_robot,
                 )
                 if body_points is not None and body_points.shape[0] > 0:
                     robot_local_parts.append(body_points)
                     robot_body_idx_parts.extend([body_idx_int] * body_points.shape[0])
+                    if body_pool is not None:
+                        self._robot_pool_per_body[body_idx_int] = body_pool
             except Exception:
                 continue
         robot_local = torch.cat(robot_local_parts, dim=0).to(device)  # (n_robot, 3)
@@ -592,7 +604,7 @@ class ScenePointCloud(ManagerTermBase):
         # populated, ``__call__`` routes through the multi-task style per-env
         # transform path so each env can have its own ins/rec point pattern.
         self.selected_local_per_env: torch.Tensor | None = None
-        if self.resample_on_reset:
+        if self.resample_on_reset or self.resample_on_reset_robot:
             # Initialize per-env table from the per-task canonical (broadcast).
             tt_ids = self.task_type_ids if self.is_multitask else torch.zeros(
                 env.num_envs, dtype=torch.long, device=device
@@ -611,6 +623,22 @@ class ScenePointCloud(ManagerTermBase):
             ]
             self._ins_pool_size = ins_canonical_all.shape[1] if ins_canonical_all is not None else 0
             self._rec_pool_size = rec_canonical_all.shape[1] if rec_canonical_all is not None else 0
+            # For robot resampling: per-task, group robot slots by body_idx so we
+            # can vectorize the per-reset gather per body.
+            self._robot_slots_by_body_task: list[dict[int, torch.Tensor]] = []
+            for t in range(self.num_task_types):
+                src_t = self.selected_source_type_task[t]
+                body_t = self.selected_body_idx_task[t]
+                robot_slots = (src_t == self._SRC_ROBOT).nonzero(as_tuple=True)[0]
+                slots_by_body: dict[int, torch.Tensor] = {}
+                for slot in robot_slots:
+                    bi = int(body_t[slot].item())
+                    slots_by_body.setdefault(bi, []).append(int(slot.item()))
+                slots_by_body_tensor = {
+                    bi: torch.tensor(slots, dtype=torch.long, device=device)
+                    for bi, slots in slots_by_body.items()
+                }
+                self._robot_slots_by_body_task.append(slots_by_body_tensor)
 
         for t in range(self.num_task_types):
             src = self.selected_source_type_task[t]
@@ -650,9 +678,17 @@ class ScenePointCloud(ManagerTermBase):
                 self._pc_markers[src_type] = VisualizationMarkers(marker_cfg)
 
     def _sample_body_points(
-        self, body_prim_path: str, n_oversample: int, n_points: int, device
-    ) -> torch.Tensor | None:
-        """Sample FPS points from all collision meshes under a robot body prim."""
+        self, body_prim_path: str, n_oversample: int, n_points: int, device,
+        return_pool: bool = False,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Sample FPS points from all collision meshes under a robot body prim.
+
+        Returns ``(selected, pool)``. ``selected`` is the FPS-down-sampled
+        ``n_points`` set used for the active selection. ``pool`` is the full
+        merged-and-FPS-thinned set of size ``min(n_oversample, ...)``-after-merge
+        used as a per-reset random-subset source when
+        ``resample_on_reset_robot=True``; ``None`` when ``return_pool=False``.
+        """
         from isaaclab.sim import get_all_matching_child_prims
         from pytorch3d.ops import sample_farthest_points, sample_points_from_meshes
         from pytorch3d.structures import Meshes
@@ -664,7 +700,7 @@ class ScenePointCloud(ManagerTermBase):
             ),
         )
         if not collider_prims:
-            return None
+            return None, None
 
         verts_list, faces_list = [], []
         for cp in collider_prims:
@@ -686,9 +722,18 @@ class ScenePointCloud(ManagerTermBase):
 
         meshes = Meshes(verts=verts_list, faces=faces_list)
         samp = sample_points_from_meshes(meshes, n_oversample)  # (n_meshes, n_oversample, 3)
-        merged = samp.reshape(1, -1, 3)
+        merged = samp.reshape(1, -1, 3)  # (1, n_meshes*n_oversample, 3)
+        # Pool: FPS-thin to a stable, well-spread subset (size = n_oversample)
+        # and use as the resample source. This gives more diverse subsets than
+        # uniform-random over raw mesh samples while remaining cheap to sample
+        # at reset time.
+        pool = None
+        if return_pool:
+            pool_size = min(n_oversample, merged.shape[1])
+            pool, _ = sample_farthest_points(merged, K=pool_size)  # (1, pool_size, 3)
+            pool = pool[0]  # (pool_size, 3)
         selected, _ = sample_farthest_points(merged, K=min(n_points, merged.shape[1]))
-        return selected[0]  # (n_points, 3) in body-local frame
+        return selected[0], pool  # (n_points, 3) in body-local frame
 
     def _transform_to_world_env(
         self, pts_local: torch.Tensor, source_type: torch.Tensor,
@@ -744,6 +789,7 @@ class ScenePointCloud(ManagerTermBase):
         num_points: int = 512,
         oversample: int = 2,
         resample_on_reset: bool = False,
+        resample_on_reset_robot: bool = False,
         visualize: bool = False,
         visualize_env_ids: list[int] | None = None,
     ) -> torch.Tensor:
@@ -754,7 +800,8 @@ class ScenePointCloud(ManagerTermBase):
         # Per-reset resampling: replace ins/rec slots in selected_local_per_env
         # for envs that just reset (episode_length_buf == 0). Uses the
         # oversampled pools captured at init.
-        if self.resample_on_reset and self.selected_local_per_env is not None and hasattr(env, "episode_length_buf"):
+        do_resample = (self.resample_on_reset or self.resample_on_reset_robot)
+        if do_resample and self.selected_local_per_env is not None and hasattr(env, "episode_length_buf"):
             reset_mask = env.episode_length_buf == 0
             if reset_mask.any():
                 reset_ids = reset_mask.nonzero(as_tuple=True)[0]
@@ -771,27 +818,43 @@ class ScenePointCloud(ManagerTermBase):
                         continue
                     rids_t = reset_ids[in_t]  # env_ids in task t
                     n_t = rids_t.shape[0]
-                    ins_slots = self._ins_slots_task[t]  # [n_ins_t]
-                    rec_slots = self._rec_slots_task[t]
-                    if ins_slots.numel() > 0 and self._ins_pool_size > 0:
-                        # Random subset: pick ins_slots.numel() indices from pool per env.
-                        ins_perm = torch.argsort(
-                            torch.rand(n_t, self._ins_pool_size, device=device), dim=1
-                        )[:, : ins_slots.numel()]  # [n_t, n_ins_t]
-                        ins_pool_t = self._ins_canonical_pool[rids_t]  # [n_t, pool, 3]
-                        gathered = torch.gather(
-                            ins_pool_t, 1, ins_perm.unsqueeze(-1).expand(-1, -1, 3)
-                        )  # [n_t, n_ins_t, 3]
-                        self.selected_local_per_env[rids_t.unsqueeze(1), ins_slots.unsqueeze(0)] = gathered
-                    if rec_slots.numel() > 0 and self._rec_pool_size > 0:
-                        rec_perm = torch.argsort(
-                            torch.rand(n_t, self._rec_pool_size, device=device), dim=1
-                        )[:, : rec_slots.numel()]
-                        rec_pool_t = self._rec_canonical_pool[rids_t]
-                        gathered = torch.gather(
-                            rec_pool_t, 1, rec_perm.unsqueeze(-1).expand(-1, -1, 3)
-                        )
-                        self.selected_local_per_env[rids_t.unsqueeze(1), rec_slots.unsqueeze(0)] = gathered
+                    if self.resample_on_reset:
+                        ins_slots = self._ins_slots_task[t]  # [n_ins_t]
+                        rec_slots = self._rec_slots_task[t]
+                        if ins_slots.numel() > 0 and self._ins_pool_size > 0:
+                            # Random subset: pick ins_slots.numel() indices from pool per env.
+                            ins_perm = torch.argsort(
+                                torch.rand(n_t, self._ins_pool_size, device=device), dim=1
+                            )[:, : ins_slots.numel()]  # [n_t, n_ins_t]
+                            ins_pool_t = self._ins_canonical_pool[rids_t]  # [n_t, pool, 3]
+                            gathered = torch.gather(
+                                ins_pool_t, 1, ins_perm.unsqueeze(-1).expand(-1, -1, 3)
+                            )  # [n_t, n_ins_t, 3]
+                            self.selected_local_per_env[rids_t.unsqueeze(1), ins_slots.unsqueeze(0)] = gathered
+                        if rec_slots.numel() > 0 and self._rec_pool_size > 0:
+                            rec_perm = torch.argsort(
+                                torch.rand(n_t, self._rec_pool_size, device=device), dim=1
+                            )[:, : rec_slots.numel()]
+                            rec_pool_t = self._rec_canonical_pool[rids_t]
+                            gathered = torch.gather(
+                                rec_pool_t, 1, rec_perm.unsqueeze(-1).expand(-1, -1, 3)
+                            )
+                            self.selected_local_per_env[rids_t.unsqueeze(1), rec_slots.unsqueeze(0)] = gathered
+                    if self.resample_on_reset_robot:
+                        # Per-body random subset of robot points. For each body
+                        # appearing in this task's robot slots, gather n_slots
+                        # random points from that body's pool per reset env.
+                        slots_by_body = self._robot_slots_by_body_task[t]
+                        for bi, bi_slots in slots_by_body.items():
+                            if bi not in self._robot_pool_per_body:
+                                continue
+                            pool = self._robot_pool_per_body[bi]  # [pool_size, 3]
+                            pool_size = pool.shape[0]
+                            n_slots = int(bi_slots.numel())
+                            # (n_t, n_slots) random indices into the pool.
+                            rand_idx = torch.randint(0, pool_size, (n_t, n_slots), device=device)
+                            gathered = pool[rand_idx]  # [n_t, n_slots, 3]
+                            self.selected_local_per_env[rids_t.unsqueeze(1), bi_slots.unsqueeze(0)] = gathered
 
         # Route through the multi-task per-env path when per-env data is present
         # (either is_multitask, or resample_on_reset built selected_local_per_env).
