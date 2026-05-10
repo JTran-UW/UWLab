@@ -74,10 +74,12 @@ The peg task with 4096 envs uses ~22 GB per GPU — requires 40+ GB cards.
 
 ## Partitions
 
-| Partition | Account suffix | Notes |
+| Partition | Account | Notes |
 |---|---|---|
 | `ckpt` | `weirdlab-ckpt` | Preemptible, auto-requeues, free |
-| `gpu-l40s` | `weirdlab` | Dedicated, faster queue, costs allocation |
+| `gpu-l40s` | `weirdlab` or `cse` | Dedicated, faster queue, costs allocation |
+| `gpu-l40` | `weirdlab` or `cse` | L40 GPUs (48 GB), dedicated |
+| `gpu-a100` | `cse` | A100 GPUs (40–80 GB), dedicated |
 | `gpu-a40` | `weirdlab` | 24 GB GPUs — avoid for large jobs |
 
 ---
