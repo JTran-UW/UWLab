@@ -210,7 +210,7 @@ singularity exec \
     --env REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt \
     --env CURL_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt \
     --nv --containall "$JOB_TMPDIR/$PROFILE_ARG.sif" \
-    bash -c 'export PYTHONUSERBASE=/workspace/holosoma-deps && if [ -d /workspace/rsl_rl ]; then echo "[INFO] Using rsl_rl from local fork (PYTHONPATH override)" && export PYTHONPATH=/workspace/rsl_rl:${PYTHONPATH}; fi && echo "[INFO] Installing holosoma deps (cached after first run)..." && /isaac-sim/python.sh -m pip install --user -q -e /workspace/holosoma/src/holosoma && export VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_optimus && export UWLAB_PATH=/workspace/uwlab && cd /workspace/uwlab && /isaac-sim/python.sh -m torch.distributed.run --rdzv_backend=c10d "$@"' _ ${DIST_ARGS[@]} ${CLUSTER_PYTHON_EXECUTABLE} ${CLI_ARGS[@]} --distributed
+    bash -c 'export PYTHONUSERBASE=/workspace/holosoma-deps && if [ -d /workspace/rsl_rl ]; then echo "[INFO] Using rsl_rl from local fork (PYTHONPATH override)" && export PYTHONPATH=/workspace/rsl_rl:${PYTHONPATH}; fi && echo "[INFO] Installing holosoma deps (cached after first run)..." && /isaac-sim/python.sh -m pip install --user -q -e /workspace/holosoma/src/holosoma && export PYTHONPATH=/workspace/holosoma-deps/lib/python3.11/site-packages:${PYTHONPATH} && export VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_optimus && export UWLAB_PATH=/workspace/uwlab && cd /workspace/uwlab && /isaac-sim/python.sh -m torch.distributed.run --rdzv_backend=c10d "$@"' _ ${DIST_ARGS[@]} ${CLUSTER_PYTHON_EXECUTABLE} ${CLI_ARGS[@]} --distributed
 
 # copy resulting cache files back to the persistent storage
 rsync -azPv "${RSYNC_EXCLUDES[@]}" "$JOB_TMPDIR/docker-isaac-sim/" $CLUSTER_ISAAC_SIM_CACHE_DIR

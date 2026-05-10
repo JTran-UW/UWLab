@@ -54,6 +54,12 @@ parser.add_argument(
     help="Fraction of each training batch sampled from the expert replay buffer (default: 0.5).",
 )
 parser.add_argument(
+    "--expert_ratio_anneal_steps",
+    type=int,
+    default=0,
+    help="Linearly anneal expert_ratio to 0 over this many global steps. 0 = no annealing (default).",
+)
+parser.add_argument(
     "--expert_checkpoint",
     type=str,
     default=None,
@@ -298,6 +304,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
         runner.setup()
         runner.expert_ratio = args_cli.expert_ratio
+        runner.expert_ratio_anneal_steps = args_cli.expert_ratio_anneal_steps
         runner.attach_checkpoint_metadata(ExperimentConfig(), log_dir)
         if args_cli.expert_transitions is not None:
             runner.load_expert_replay_buffer(args_cli.expert_transitions)
