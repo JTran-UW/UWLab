@@ -513,9 +513,13 @@ class ScenePointCloud(ManagerTermBase):
         for body_idx_int, body_name in enumerate(body_names):
             body_prim_path = f"{robot_prim_path_env0}/{body_name}"
             try:
+                # Per-body deterministic seed so the selection is reproducible
+                # across env-init contexts (training, eval, distributed ranks)
+                # regardless of upstream RNG consumption.
                 body_points, body_pool = self._sample_body_points(
                     body_prim_path, oversample * 64, 64, device,
                     return_pool=self.resample_on_reset_robot,
+                    seed=42 + body_idx_int,
                 )
                 if body_points is not None and body_points.shape[0] > 0:
                     robot_local_parts.append(body_points)
@@ -578,10 +582,42 @@ class ScenePointCloud(ManagerTermBase):
             task_source = torch.cat(parts_source, dim=0)
             task_body = torch.cat(parts_body, dim=0)
 
-            # Transform to world using this task's representative env poses for FPS selection.
-            task_world = self._transform_to_world_env(task_local, task_source, task_body, rep_env)
-            _, fps_indices = sample_farthest_points(task_world.unsqueeze(0), K=self.num_points)
-            sel = fps_indices[0]  # (num_points,)
+            # Deterministic per-source selection. The legacy approach was a single
+            # FPS over (robot ∪ ins ∪ rec) in world frame, which depends on
+            # body_pos_w / root_pos_w and hence on physics-warmup state — so the
+            # selected indices vary with num_envs / sim batching even after seed-
+            # locking all the random calls. Trained teachers overfit to whatever
+            # selection their training run happened to make.
+            #
+            # Instead: fix a target count per source, then take the FIRST N points
+            # from each source's pool. The pools are themselves seed-locked
+            # (robot via per-body temporary_seed in _sample_body_points; ins/rec
+            # via temporary_seed inside sample_object_point_cloud), so the
+            # selection is fully deterministic across runs and env counts.
+            #
+            # The split (target ~285 robot / 87 ins / 140 rec = 512) was chosen
+            # to match what global-FPS gave on this scene historically; the
+            # encoder will learn whatever distribution we hand it.
+            n_robot_avail = (task_source == self._SRC_ROBOT).sum().item()
+            n_ins_avail = (task_source == self._SRC_INSERTIVE).sum().item()
+            n_rec_avail = (task_source == self._SRC_RECEPTIVE).sum().item()
+            n_robot_target = min(285, n_robot_avail)
+            n_ins_target = min(87, n_ins_avail)
+            n_rec_target = self.num_points - n_robot_target - n_ins_target
+            n_rec_target = min(n_rec_target, n_rec_avail)
+            # If rec is short, pad robot.
+            shortfall = self.num_points - n_robot_target - n_ins_target - n_rec_target
+            if shortfall > 0:
+                n_robot_target = min(n_robot_target + shortfall, n_robot_avail)
+
+            robot_idx = (task_source == self._SRC_ROBOT).nonzero(as_tuple=True)[0][:n_robot_target]
+            ins_idx = (task_source == self._SRC_INSERTIVE).nonzero(as_tuple=True)[0][:n_ins_target]
+            rec_idx = (task_source == self._SRC_RECEPTIVE).nonzero(as_tuple=True)[0][:n_rec_target]
+            sel = torch.cat([robot_idx, ins_idx, rec_idx], dim=0)
+            # Pad to num_points if still short (defensive).
+            if sel.numel() < self.num_points:
+                pad = self.num_points - sel.numel()
+                sel = torch.cat([sel, torch.zeros(pad, dtype=torch.long, device=device)], dim=0)
 
             selected_local_list.append(task_local[sel])
             selected_source_list.append(task_source[sel])
@@ -646,9 +682,15 @@ class ScenePointCloud(ManagerTermBase):
             n_i = (src == self._SRC_INSERTIVE).sum().item()
             n_re = (src == self._SRC_RECEPTIVE).sum().item()
             label = f"task {t}" if self.is_multitask else "single-task"
+            # Determinism diagnostic: hash of selected_local tells us if the
+            # SPECIFIC points are the same across runs (counts can match while
+            # points differ if our selection algorithm is num_envs-dependent).
+            points_hash = hex(int(
+                (self.selected_local_task[t].double().sum() * 1e9).long() & 0xFFFFFFFF
+            ))
             print(
                 f"[ScenePointCloud] {label}: {self.num_points} points: "
-                f"robot={n_r}, insertive={n_i}, receptive={n_re}"
+                f"robot={n_r}, insertive={n_i}, receptive={n_re}, points_hash={points_hash}"
             )
 
         # -- Visualization --
@@ -679,14 +721,23 @@ class ScenePointCloud(ManagerTermBase):
 
     def _sample_body_points(
         self, body_prim_path: str, n_oversample: int, n_points: int, device,
-        return_pool: bool = False,
+        return_pool: bool = False, seed: int = 42,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Sample FPS points from all collision meshes under a robot body prim.
 
+        ``pytorch3d.sample_points_from_meshes`` and ``sample_farthest_points``
+        consume from the global ``torch.random`` state, so without seed-locking
+        the specific points selected at __init__ depend on RNG state at the call
+        site (which varies with num_envs, sim init order, distributed rank, etc).
+        That made trained teachers overfit to their training-time selection and
+        fail at deploy. We wrap the sampling block in ``temporary_seed(seed)`` so
+        the result is reproducible across env-init contexts: training and eval
+        get identical points iff they call this function with the same seed AND
+        identical mesh geometry.
+
         Returns ``(selected, pool)``. ``selected`` is the FPS-down-sampled
         ``n_points`` set used for the active selection. ``pool`` is the full
-        merged-and-FPS-thinned set of size ``min(n_oversample, ...)``-after-merge
-        used as a per-reset random-subset source when
+        merged-and-FPS-thinned set used as a per-reset random-subset source when
         ``resample_on_reset_robot=True``; ``None`` when ``return_pool=False``.
         """
         from isaaclab.sim import get_all_matching_child_prims
@@ -721,18 +772,19 @@ class ScenePointCloud(ManagerTermBase):
             faces_list.append(f)
 
         meshes = Meshes(verts=verts_list, faces=faces_list)
-        samp = sample_points_from_meshes(meshes, n_oversample)  # (n_meshes, n_oversample, 3)
-        merged = samp.reshape(1, -1, 3)  # (1, n_meshes*n_oversample, 3)
-        # Pool: FPS-thin to a stable, well-spread subset (size = n_oversample)
-        # and use as the resample source. This gives more diverse subsets than
-        # uniform-random over raw mesh samples while remaining cheap to sample
-        # at reset time.
-        pool = None
-        if return_pool:
-            pool_size = min(n_oversample, merged.shape[1])
-            pool, _ = sample_farthest_points(merged, K=pool_size)  # (1, pool_size, 3)
-            pool = pool[0]  # (pool_size, 3)
-        selected, _ = sample_farthest_points(merged, K=min(n_points, merged.shape[1]))
+        with utils.temporary_seed(seed):
+            samp = sample_points_from_meshes(meshes, n_oversample)  # (n_meshes, n_oversample, 3)
+            merged = samp.reshape(1, -1, 3)  # (1, n_meshes*n_oversample, 3)
+            # Pool: FPS-thin to a stable, well-spread subset (size = n_oversample)
+            # and use as the resample source. This gives more diverse subsets than
+            # uniform-random over raw mesh samples while remaining cheap to sample
+            # at reset time.
+            pool = None
+            if return_pool:
+                pool_size = min(n_oversample, merged.shape[1])
+                pool, _ = sample_farthest_points(merged, K=pool_size)  # (1, pool_size, 3)
+                pool = pool[0]  # (pool_size, 3)
+            selected, _ = sample_farthest_points(merged, K=min(n_points, merged.shape[1]))
         return selected[0], pool  # (n_points, 3) in body-local frame
 
     def _transform_to_world_env(
