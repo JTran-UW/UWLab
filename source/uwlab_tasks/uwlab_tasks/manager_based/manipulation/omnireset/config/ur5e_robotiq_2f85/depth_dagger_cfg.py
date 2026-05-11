@@ -977,9 +977,15 @@ class Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanCfg(
         super().__post_init__()
         # IMPLICIT actuator (same as ScenePC teacher's training env, ZeroGSceneCfg).
         self.scene.robot = IMPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        # Match ScenePC teacher's training reset distribution (50/50 Anywhere/PA, uniform).
-        self.events.reset_from_states.params["reset_types"] = ["ZeroGAnywhere", "ZeroGPartialAssembly"]
-        self.events.reset_from_states.params["probs"] = [0.5, 0.5]
+        # Match the OLD 4-canonical Lean DAgger reset distribution: ZeroGAnywhere
+        # only. The teacher was trained on 50/50 (Anywhere/PA) but at convergence
+        # solves both task types >99%, so deploying on Anywhere alone is fine and
+        # gives apples-to-apples comparison with the historical 4-canonical Lean
+        # run. Without this, half the reset states are PA which fire
+        # success_termination immediately, inflating early student_eval to ~98%
+        # even at random init.
+        self.events.reset_from_states.params["reset_types"] = ["ZeroGAnywhere"]
+        self.events.reset_from_states.params["probs"] = [1.0]
         self.events.reset_from_states.params["curriculum_target"] = None
         self.events.reset_from_states.params["use_classifier"] = False
         self.events.reset_from_states.params["use_success_critic"] = False
