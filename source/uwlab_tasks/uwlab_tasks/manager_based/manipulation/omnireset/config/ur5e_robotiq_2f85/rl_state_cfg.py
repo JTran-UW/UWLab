@@ -572,15 +572,15 @@ class TerminationsCfg:
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
     # Conservative failure: world Z only (cf. grasp_sampling check_grasp_success pos_above_ground on root_pos_w[:, 2])
-    insertive_fell_too_low = DoneTerm(
-        func=task_mdp.object_root_w_z_below_threshold,
-        params={
-            "object_cfg": SceneEntityCfg("insertive_object"),
-            "min_world_z": -0.2,
-        },
-    )
+    # insertive_fell_too_low = DoneTerm(
+    #     func=task_mdp.object_root_w_z_below_threshold,
+    #     params={
+    #         "object_cfg": SceneEntityCfg("insertive_object"),
+    #         "min_world_z": -0.2,
+    #     },
+    # )
 
-    success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 10})
+    # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 10})
 
 
 @configclass
@@ -660,6 +660,24 @@ def make_receptive_object(usd_path: str):
     )
 
 
+def make_non_rigid_receptive_object(usd_path: str):
+    return RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/ReceptiveObject",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=usd_path,
+            scale=(1, 1, 1),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+                disable_gravity=True,
+                kinematic_enabled=True,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
 variants = {
     "scene.insertive_object": {
         "fbleg": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
@@ -678,6 +696,7 @@ variants = {
         "fbdrawerbox": make_receptive_object(
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd"
         ),
+        "peg_goal": make_non_rigid_receptive_object("PegInsertive/peg.usd"),
         "peghole": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"),
         "plate": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Plate/plate.usd"),
         "cube": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/ReceptiveCube/receptive_cube.usd"),
