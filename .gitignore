@@ -43,6 +43,7 @@ docker/.container.cfg
 **/.neptune/*
 docker/artifacts/
 *.tmp
+depth_render_smoke/*
 
 # Doc Outputs
 **/docs/_build/*
