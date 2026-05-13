@@ -33,7 +33,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
-from uwlab_assets.robots.ur5e_robotiq_gripper import IMPLICIT_UR5E_ROBOTIQ_2F85
+from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85, IMPLICIT_UR5E_ROBOTIQ_2F85
 
 from ... import mdp as task_mdp
 
@@ -863,6 +863,214 @@ class ZeroGStateSysidFullDRTrainCfg(ZeroGStateTrainCfg):
     """
 
     events: ZeroGGPSSysidFullDREventCfg = ZeroGGPSSysidFullDREventCfg()
+
+
+# ===========================================================================
+# Sim2Real DR: UWLab-ICL-style unified arm+OSC+action-scale DR + narrow contact
+# DR. Mirrors ``Ur5eRobotiq2f85RelCartesianOSCPrivilegedTrainCfg`` from
+# UWLab-ICL on the dynamics axis: a single ``randomize_env_cfg_unified`` event
+# with one coupled progress scalar drives arm sysid + OSC gain interpolation +
+# motor delay together (so we never sample "high friction + low OSC Kp", which
+# is unsolvable). Action scale gets an independent progress (decoupled because
+# scale doesn't gate task feasibility). On top of that we add narrow-range
+# material / mass / gripper-actuator DR for sim2real contact robustness.
+# Pairs with the ScenePC ZeroG training task for 0-shot transfer experiments.
+# ===========================================================================
+@configclass
+class ZeroGGPSSysidSim2RealEventCfg(ZeroGGPSEventCfg):
+    """Unified arm+OSC+scale DR (UWLab-ICL parity) + narrow contact DR + ZeroG resets.
+
+    Inherits the two reset events from ``ZeroGGPSEventCfg``. Adds:
+
+    * ``randomize_env_cfg_unified`` -- ported from UWLab-ICL's
+      ``Ur5eRobotiq2f85RelCartesianOSCPrivilegedTrainCfg``. Single coupled
+      progress ~ U(0, 1.5) drives armature/friction (0 to 1.5x sysid),
+      motor delay (0 to ceil(1.5*delay_hi) steps), and OSC Kp/Kd interpolation
+      from ``_kp_default`` to ``terminal_kp * U(0.8, 1.2)``. Action scale uses
+      an independent progress ~ U(0, 1.5) to slide between ``initial_scales``
+      (= training Z=0.02) and ``target_scales`` (= eval Z=0.002).
+    * 4 narrow material-friction startup events (robot / insertive / receptive / table).
+    * 4 narrow mass-randomization startup events (~halved-width vs FullDR ranges).
+    * 1 narrow gripper-actuator log-uniform reset event.
+    """
+
+    # ---- Unified arm + OSC + action-scale DR (reset) ---------------------
+    randomize_env_cfg_unified = EventTerm(
+        func=task_mdp.randomize_env_cfg_unified,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "joint_names": [
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ],
+            "actuator_name": "arm",
+            "action_name": "arm",
+            "arm_scale_range": (0.8, 1.2),
+            "delay_range": (0, 1),
+            "kp_scale_range": (0.8, 1.2),
+            "terminal_kp": (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0),
+            "terminal_damping_ratio": (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+            "initial_scales": (0.02, 0.02, 0.02, 0.02, 0.02, 0.2),
+            "target_scales": (0.01, 0.01, 0.002, 0.02, 0.02, 0.2),
+            "coupled_progress_range": (0.0, 1.5),
+            "action_scale_progress_range": (0.0, 1.5),
+        },
+    )
+
+    # ---- Material DR (startup) -- narrow ---------------------------------
+    robot_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.6, 0.9),
+            "dynamic_friction_range": (0.5, 0.8),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("robot"),
+            "make_consistent": True,
+        },
+    )
+    insertive_object_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (1.2, 1.8),
+            "dynamic_friction_range": (1.1, 1.7),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            "make_consistent": True,
+        },
+    )
+    receptive_object_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.3, 0.5),
+            "dynamic_friction_range": (0.25, 0.45),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("receptive_object"),
+            "make_consistent": True,
+        },
+    )
+    table_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.4, 0.55),
+            "dynamic_friction_range": (0.3, 0.45),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("table"),
+            "make_consistent": True,
+        },
+    )
+
+    # ---- Mass DR (startup) -- narrow -------------------------------------
+    randomize_robot_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "mass_distribution_params": (0.85, 1.15),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+    randomize_insertive_object_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            # 50-120g: narrowed around a realistic ~80g insertive part
+            # (vs FullDR's 20-200g sweep).
+            "mass_distribution_params": (0.05, 0.12),
+            "operation": "abs",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+    randomize_receptive_object_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("receptive_object"),
+            "mass_distribution_params": (0.85, 1.15),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+    randomize_table_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("table"),
+            "mass_distribution_params": (0.85, 1.15),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+
+    # ---- Gripper actuator DR (reset) -- narrow ---------------------------
+    randomize_gripper_actuator_parameters = EventTerm(
+        func=task_mdp.randomize_actuator_gains,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_joint"]),
+            "stiffness_distribution_params": (0.7, 1.4),
+            "damping_distribution_params": (0.7, 1.4),
+            "operation": "scale",
+            "distribution": "log_uniform",
+        },
+    )
+
+
+@configclass
+class ZeroGScenePCUniformSim2RealDRTrainCfg(ZeroGScenePCUniformTrainCfg):
+    """ScenePC uniform-routing + wide arm DR (0-1.5x sysid) + narrow contact DR.
+
+    Designed to mirror UWLab-ICL's ``Ur5eRobotiq2f85RelCartesianOSCPrivilegedTrainCfg``
+    (unified-DR privileged training) on the dynamics axis while keeping this
+    branch's ZeroG scene/obs/curriculum. Two deltas vs the parent
+    ``ZeroGScenePCUniformTrainCfg``:
+
+    * ``events``    -- swapped to ``ZeroGGPSSysidSim2RealEventCfg`` (wide arm
+      sysid friction U(0, 1.5) inherited from ``ZeroGGPSSysidEventCfg`` plus
+      narrow-range material/mass/gripper-actuator DR).
+    * ``scene.robot`` -- swapped (in ``__post_init__``) to
+      ``EXPLICIT_UR5E_ROBOTIQ_2F85`` (DelayedPDActuator). Required for the
+      ``delay_range=(0, 1)`` term in ``randomize_arm_sysid`` to actually
+      fire -- IMPLICIT actuators have no ``positions_delay_buffer`` and the
+      delay DR is silently a no-op on them.
+
+    The ``actions`` field stays at the parent's ``Ur5eRobotiq2f85RelativeOSCAction``
+    (training scales, Z=0.02). The OSC terminal Kp is handled entirely by
+    ``randomize_osc_gains`` (``_fixed`` variant, scale_progress=1) -- it
+    interpolates from the action's ``_kp_default`` to ``terminal_kp * U(0.8, 1.2)``
+    and lands at the terminal point regardless of the action cfg's initial Kp.
+    Training scales (Z=0.02) also match UWLab-ICL's ``initial_scales`` in the
+    unified-DR privileged cfg.
+
+    The parent's ``__post_init__`` (called via ``super().__post_init__()``)
+    still nulls GPS classifier/critic on the inherited ``reset_from_states``,
+    preserving the uniform-routing behavior of the base task.
+    """
+
+    events: ZeroGGPSSysidSim2RealEventCfg = ZeroGGPSSysidSim2RealEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 
 # ===========================================================================

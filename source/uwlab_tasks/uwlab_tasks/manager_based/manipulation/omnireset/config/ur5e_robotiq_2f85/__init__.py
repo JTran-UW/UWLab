@@ -148,6 +148,20 @@ gym.register(
     },
 )
 
+# Sim2Real DR variant of ScenePC-Uniform-v0: wide arm DR (0-1.5x sysid, friction
+# included) + narrow contact DR (material/mass/gripper-actuator) on top of the
+# same scene/obs/curriculum. Used to train teachers that transfer 0-shot to the
+# real robot regardless of where its true sysid lands inside the wide DR window.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-Uniform-Sim2RealDR-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCUniformSim2RealDRTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
 # Ablation: same as above but drops `prev_actions` from proprio.
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-Uniform-NoPrevAct-v0",
