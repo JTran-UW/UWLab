@@ -90,7 +90,13 @@ class DepthDAggerSceneCfg(RlStateSceneCfg):
         ),
     )
 
-def _depth_obs_term(sensor_name: str) -> ObsTerm:
+def _depth_obs_term(
+    sensor_name: str,
+    depth_noise_range: float = 0.0,
+    depth_global_bias_range: float = 0.0,
+    depth_global_scale_range: float = 0.0,
+    depth_dropout_prob: float = 0.0,
+) -> ObsTerm:
     return ObsTerm(
         func=task_mdp.process_image,
         params={
@@ -99,6 +105,10 @@ def _depth_obs_term(sensor_name: str) -> ObsTerm:
             "process_image": True,
             "output_size": (IMG_H, IMG_W),
             "depth_clip": DEPTH_CLIP,
+            "depth_noise_range": depth_noise_range,
+            "depth_global_bias_range": depth_global_bias_range,
+            "depth_global_scale_range": depth_global_scale_range,
+            "depth_dropout_prob": depth_dropout_prob,
         },
     )
 

@@ -211,6 +211,10 @@ def process_image(
     process_image: bool = True,
     output_size: tuple = (224, 224),
     depth_clip: tuple[float, float] = (0.01, 2.0),
+    depth_noise_range: float = 0.0,
+    depth_global_bias_range: float = 0.0,
+    depth_global_scale_range: float = 0.0,
+    depth_dropout_prob: float = 0.0,
 ) -> torch.Tensor:
     """Images of a specific datatype from the camera sensor.
 
@@ -221,12 +225,32 @@ def process_image(
     - "depth" or "distance_to_camera" or "distance_to_image_plane": replaces inf/nan with ``depth_clip[1]``,
       clips to ``depth_clip``, and normalizes to [0, 1].
 
+    For depth images, three optional uniform-noise sources can be enabled (all expressed
+    in normalized [0, 1] depth units, applied after clip+normalize and before any resize).
+    Each parameter is a half-range ``r``; samples are drawn from ``U(-r, +r)``:
+
+    - ``depth_noise_range``: per-pixel additive jitter (mimics sensor shot noise).
+    - ``depth_global_bias_range``: per-frame additive offset, drawn once per env then
+      broadcast across the image (mimics calibration drift / temperature bias).
+    - ``depth_global_scale_range``: per-frame multiplicative gain ``1 + U(-r, +r)``,
+      drawn once per env (mimics scale-factor miscalibration).
+
+    A fourth optional pixel-dropout source independently zeros or saturates pixels
+    to mimic dead pixels / no-return surfaces:
+
+    - ``depth_dropout_prob``: Bernoulli probability that a pixel is dropped; dropped
+      pixels are independently set to 0.0 or 1.0 with equal probability.
+
     Args:
         env: The environment the cameras are placed within.
         sensor_cfg: The desired sensor to read from. Defaults to SceneEntityCfg("tiled_camera").
         data_type: The data type to pull from the desired camera. Defaults to "rgb".
         process_image: Whether to normalize the image. Defaults to True.
         depth_clip: (min, max) meters for depth clipping/normalization. Ignored for rgb.
+        depth_noise_range: Per-pixel uniform half-range in normalized depth units. 0 disables.
+        depth_global_bias_range: Per-frame global additive bias half-range (normalized units). 0 disables.
+        depth_global_scale_range: Per-frame global multiplicative gain half-range. 0 disables.
+        depth_dropout_prob: Per-pixel probability of being saturated to 0.0 or 1.0 (50/50). 0 disables.
 
     Returns:
         The images produced at the last time-step
@@ -256,6 +280,28 @@ def process_image(
     else:
         images.div_(255.0).clamp_(0.0, 1.0)
     images = images.permute(start_dims + [s + 3, s + 1, s + 2])
+
+    if is_depth and (depth_noise_range > 0.0 or depth_global_bias_range > 0.0 or depth_global_scale_range > 0.0):
+        # Uniform samples on U(-r, +r) via (2*rand - 1) * r.
+        # Global params: one draw per env, broadcast over (C, H, W).
+        global_shape = images.shape[:-3] + (1, 1, 1)
+        if depth_global_scale_range > 0.0:
+            u = torch.rand(global_shape, device=images.device, dtype=images.dtype).mul_(2.0).sub_(1.0)
+            images = images * (1.0 + depth_global_scale_range * u)
+        if depth_global_bias_range > 0.0:
+            u = torch.rand(global_shape, device=images.device, dtype=images.dtype).mul_(2.0).sub_(1.0)
+            images = images + depth_global_bias_range * u
+        if depth_noise_range > 0.0:
+            u = torch.rand_like(images).mul_(2.0).sub_(1.0)
+            images = images + depth_noise_range * u
+        images = images.clamp(0.0, 1.0)
+
+    if is_depth and depth_dropout_prob > 0.0:
+        # Per-pixel dropout: with prob p, replace with 0 or 1 (50/50). Applied
+        # last so additive/scale noise doesn't perturb the saturated pixels.
+        drop_mask = torch.rand_like(images) < depth_dropout_prob
+        high_mask = torch.rand_like(images) < 0.5
+        images = torch.where(drop_mask, high_mask.to(images.dtype), images)
 
     if current_size != output_size:
         # Perform resize operation
