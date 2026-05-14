@@ -799,12 +799,13 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
     """Eval after Stage 2: explicit actuator, stiff gains, training (0.02) action scales, fixed sysid + OSC gains."""
 
     events: FinetuneEvalEventCfg = FinetuneEvalEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
 
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
+        self.terminations.success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 10})
 
 @configclass
 class PointCloudTrainEventCfg:

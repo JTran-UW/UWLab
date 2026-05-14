@@ -162,6 +162,38 @@ gym.register(
     },
 )
 
+
+# Do not need to randomize over full dynamics space, since low gravity already provides "easy" dynamics for learning signal
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-Train-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCSysidSim2RealTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-Eval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCSysidSim2RealEValCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-Real-Eval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ScenePCRealEvalTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
 # Ablation: same as above but drops `prev_actions` from proprio.
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-Uniform-NoPrevAct-v0",
@@ -394,6 +426,17 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
+# Same as above but with full sysid DR
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-DAgger-WristSide-Pretrained-Weighted-PCTeacher-Lean-FullSysidDR-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.depth_dagger_cfg:Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherSysidTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Depth_DAggerWristSidePretrainedWeightedRunnerCfg",
     },
 )

@@ -28,6 +28,8 @@ from isaaclab.utils import configclass
 
 from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85
 
+from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.gravity_cfg import ZeroGGPSSysidFullDREventCfg
+
 from ... import mdp as task_mdp
 from .actions import Ur5eRobotiq2f85RelativeOSCEvalAction
 from .rl_state_cfg import FinetuneEvalEventCfg, RlStateSceneCfg, Ur5eRobotiq2f85RlStateCfg
@@ -139,7 +141,7 @@ class DepthDAggerObservationsCfg:
 
     @configclass
     class SideDepthCfg(ObsGroup):
-        image = _depth_obs_term("side_camera")
+        image = _depth_obs_term("side_camera", depth_noise_range=0.01, depth_global_bias_range=0.05, depth_global_scale_range=0.05, depth_dropout_prob=0.05)
 
         def __post_init__(self):
             # Single-term group: concatenate_terms=True so the image tensor is hoisted to
@@ -414,7 +416,7 @@ class DepthDAggerWristSideObservationsCfg:
 
     @configclass
     class WristDepthCfg(ObsGroup):
-        image = _depth_obs_term("wrist_camera")
+        image = _depth_obs_term("wrist_camera", depth_noise_range=0.01, depth_global_bias_range=0.05, depth_global_scale_range=0.05, depth_dropout_prob=0.05)
 
         def __post_init__(self):
             self.concatenate_terms = True
@@ -884,6 +886,19 @@ class _ZeroGNoSysidWristSideEventCfg(_ZeroGGPSEventCfg):
         },
     )
 
+@configclass
+class FullSysidDRWristSideEventCfg(ZeroGGPSSysidFullDREventCfg):
+    reset_wrist_camera_pose = EventTerm(
+        func=task_mdp.randomize_tiled_cameras,
+        mode="reset",
+        params={
+            "camera_path_template": "/World/envs/env_{}/Robot/robotiq_base_link/rgb_wrist_camera",
+            "base_position": (0.0182505, -0.00408447, -0.0689107),
+            "base_rotation": (0.34254336, -0.61819255, -0.6160212, 0.347879),
+            "position_deltas": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+            "euler_deltas": {"pitch": (0.0, 0.0), "yaw": (0.0, 0.0), "roll": (0.0, 0.0)},
+        },
+    )
 
 # Term order is structural — the JIT teacher splits its input as
 # ``[proprio_first | pointcloud_second]``. proprio terms must come first and in
@@ -999,6 +1014,19 @@ class Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanCfg(
         self.events.reset_from_states.params["curriculum_target"] = None
         self.events.reset_from_states.params["use_classifier"] = False
         self.events.reset_from_states.params["use_success_critic"] = False
+
+@configclass
+class Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherSysidTrainCfg(
+    Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherLeanCfg
+):
+    events: FullSysidDRWristSideEventCfg = FullSysidDRWristSideEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+        self.curriculum = None
 
 
 @configclass

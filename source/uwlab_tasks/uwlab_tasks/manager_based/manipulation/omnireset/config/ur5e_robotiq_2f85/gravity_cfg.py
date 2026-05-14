@@ -35,6 +35,8 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85, IMPLICIT_UR5E_ROBOTIQ_2F85
 
+from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.rl_state_cfg import Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg, Ur5eRobotiq2f85RelativeOSCEvalAction
+
 from ... import mdp as task_mdp
 
 
@@ -864,6 +866,25 @@ class ZeroGStateSysidFullDRTrainCfg(ZeroGStateTrainCfg):
 
     events: ZeroGGPSSysidFullDREventCfg = ZeroGGPSSysidFullDREventCfg()
 
+@configclass
+class ZeroGScenePCSysidSim2RealTrainCfg(ZeroGScenePCUniformTrainCfg):
+    events: ZeroGGPSSysidFullDREventCfg = ZeroGGPSSysidFullDREventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+@configclass
+class ZeroGScenePCSysidSim2RealEValCfg(ZeroGScenePCSysidSim2RealTrainCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.terminations.success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 10})
+        self.events.reset_from_states.params["reset_types"] = ["ZeroGAnywhere"]
+        self.events.reset_from_states.params["probs"] = [1.0]
+
+        self.curriculum = None
 
 # ===========================================================================
 # Sim2Real DR: UWLab-ICL-style unified arm+OSC+action-scale DR + narrow contact
@@ -1071,6 +1092,15 @@ class ZeroGScenePCUniformSim2RealDRTrainCfg(ZeroGScenePCUniformTrainCfg):
         super().__post_init__()
 
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+@configclass
+class ScenePCRealEvalTrainCfg(Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg):
+
+    scene: ZeroGSceneCfg = ZeroGSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+    
+    def __post_init__(self):
+        super().__post_init__()
 
 
 # ===========================================================================

@@ -33,6 +33,15 @@ parser.add_argument(
     action="store_true",
     help="Use the pre-trained checkpoint from Nucleus.",
 )
+parser.add_argument("--num_steps", type=int, default=None, help="Maximum number of policy steps (safety cap; prefer --num_episodes for unbiased eval).")
+parser.add_argument(
+    "--num_episodes",
+    type=int,
+    default=None,
+    help="Stop after this many episodes have terminated. Unbiased — every counted episode runs to "
+    "its natural success/time_out, so longer (failing) episodes are not under-sampled the way "
+    "they are when truncating on --num_steps.",
+)
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -222,6 +231,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = env.get_observations()
     timestep = 0
+    # Episode-success tracking (matches UWLab-ICL play.py). A done with positive
+    # reward indicates a success-triggered termination; pure time-outs and
+    # abnormal-state terminations land at ~0 reward and are counted as failures.
+    num_episodes = 0
+    num_successes = 0
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -230,18 +244,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, _, dones, _ = env.step(actions)
+            obs, rewards, dones, _ = env.step(actions)
+            if dones.any():
+                num_episodes += dones.sum().item()
+                num_successes += torch.logical_and(rewards > 0.1, dones).sum().item()
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
 
         timestep += 1
         if args_cli.video and timestep >= args_cli.video_length:
             break
+        # Episode-count termination is unbiased: every counted episode ran to
+        # its natural end (success-trigger or time_out). Truncating on steps
+        # instead would systematically over-sample fast episodes (which are
+        # mostly successes) and bias the reported success rate upward.
+        if args_cli.num_episodes is not None and num_episodes >= args_cli.num_episodes:
+            break
+        # --num_steps stays as a safety cap (e.g. you want "stop at 100 episodes
+        # OR 10000 steps, whichever first") so a stuck rollout can't hang the eval.
+        if args_cli.num_steps is not None and timestep >= args_cli.num_steps:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    print(f"Number of episodes: {num_episodes}")
+    print(f"Number of successes: {num_successes}")
+    if num_episodes:
+        print(f"Success rate: {num_successes / num_episodes:.2%}")
 
     # close the simulator
     env.close()
