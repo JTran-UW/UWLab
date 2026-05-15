@@ -540,13 +540,37 @@ def load_asset_paths_from_config(
     return valid_paths
 
 
-def _download_cloud_assets(cloud_urls: list[str], cache_subdir: str = "", num_workers: int = 8) -> list[str]:
+def _download_one_with_retry(url: str, resolve_cloud_path, max_retries: int = 15) -> str:
+    """Download a single cloud URL with exponential backoff on 429 / transient errors."""
+    import random
+    import time
+
+    for attempt in range(max_retries):
+        try:
+            return resolve_cloud_path(url)
+        except Exception as e:
+            is_rate_limit = "429" in str(e) or "Too Many Requests" in str(e)
+            is_transient = is_rate_limit or "LocalEntryNotFoundError" in type(e).__name__
+            if is_transient and attempt < max_retries - 1:
+                # Capped exponential backoff with full random jitter to spread concurrent retries.
+                base_wait = min(2 ** attempt, 60)
+                wait = base_wait + random.uniform(0, base_wait)
+                print(f"\n[WARN] Download failed ({type(e).__name__}), retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries}): {url}", flush=True)
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f"unreachable: {url}")
+
+
+def _download_cloud_assets(cloud_urls: list[str], cache_subdir: str = "", num_workers: int = 3) -> list[str]:
     """Download cloud URLs to local cache, return local paths.
 
     Delegates to :func:`resolve_cloud_path` for each URL so all cloud
     assets share the same persistent cache and atomic-download logic.
     Downloads are parallelized with *num_workers* threads and a live
-    progress line with elapsed time is printed.
+    progress line with elapsed time is printed.  Each URL is retried
+    up to 15 times with capped exponential back-off + full jitter to handle
+    HuggingFace 429 rate-limit errors when multiple processes download simultaneously.
     """
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -561,14 +585,14 @@ def _download_cloud_assets(cloud_urls: list[str], cache_subdir: str = "", num_wo
         return [resolve_cloud_path(url) for url in cloud_urls]
 
     tag = cache_subdir or "cloud"
-    print(f"[INFO] Downloading {needs_download}/{n} {tag} assets ({num_workers} workers) ...")
+    print(f"[INFO] Downloading {needs_download}/{n} {tag} assets ({num_workers} workers, up to 15 retries) ...")
     t0 = time.monotonic()
 
     downloaded = 0
     futures = {}
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
         for url in to_download:
-            futures[pool.submit(resolve_cloud_path, url)] = url
+            futures[pool.submit(_download_one_with_retry, url, resolve_cloud_path)] = url
         for future in as_completed(futures):
             future.result()
             downloaded += 1
@@ -588,10 +612,31 @@ def _download_cloud_assets(cloud_urls: list[str], cache_subdir: str = "", num_wo
 
 
 def _cached_local_path(url: str) -> str:
-    """Return the expected local cache path for a cloud URL without downloading."""
-    from uwlab_assets import _extract_relative_path
+    """Return the expected local cache path for a cloud URL without downloading.
 
-    rel = _extract_relative_path(url)
+    The uwlab_assets package rebased onto HuggingFace Hub and no longer exposes
+    ``_extract_relative_path``. For HF URLs we ask the Hub cache directly via
+    ``try_to_load_from_cache`` (returns the local path if present, ``None`` if
+    not — we return a sentinel that ``os.path.isfile`` treats as missing so the
+    loop falls through to ``resolve_cloud_path``).
+    """
+    from uwlab_assets import _parse_hf_url
+
+    hf_parts = _parse_hf_url(url)
+    if hf_parts is not None:
+        from huggingface_hub import try_to_load_from_cache
+
+        repo_id, repo_type, revision, filename = hf_parts
+        cached = try_to_load_from_cache(
+            repo_id=repo_id, repo_type=repo_type, revision=revision, filename=filename
+        )
+        return cached if isinstance(cached, str) else "/__not_cached__"
+
+    # Non-HF HTTP fallback: predict the urllib download cache path used by
+    # ``_urlretrieve_quiet`` (~/.cache/uwlab/assets/<url-path>).
+    from urllib.parse import urlparse
+
+    rel = urlparse(url).path.lstrip("/")
     return os.path.join(os.path.expanduser("~"), ".cache", "uwlab", "assets", rel)
 
 
