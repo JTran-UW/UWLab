@@ -22,11 +22,10 @@ base_link frame (180 deg Z rotation from base_link_inertia).
 
 import functools
 import os
-import tempfile
 import torch
 import yaml
 
-from isaaclab.utils.assets import retrieve_file_path
+from uwlab_assets import resolve_cloud_path
 
 # ============================================================================
 # Constants
@@ -59,11 +58,7 @@ def _load_calibration() -> dict[str, torch.Tensor]:
 
     usd_dir = os.path.dirname(UR5E_ARTICULATION.spawn.usd_path)
     meta_path = os.path.join(usd_dir, "metadata.yaml")
-    # Use per-GPU temp dir to avoid race condition in distributed training
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    dl_dir = os.path.join(tempfile.gettempdir(), "uwlab", str(os.getuid()), f"gpu_{local_rank}")
-    os.makedirs(dl_dir, mode=0o700, exist_ok=True)
-    local = retrieve_file_path(meta_path, download_dir=dl_dir)
+    local = resolve_cloud_path(meta_path)
     with open(local) as f:
         metadata = yaml.safe_load(f)
     if metadata is None:

@@ -463,6 +463,17 @@ gym.register(
     },
 )
 
+# RGB variant of the sysid PC-teacher DAgger env above (wrist + side, full visual DR).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-Weighted-PCTeacher-FullSysidDR-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rgb_dagger_cfg:Ur5eRobotiq2f85RGBDAggerWristSidePCTeacherSysidTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:RGB_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
 # Same as above but student + teacher proprio both drop prev_actions
 # (paired with Tillicum 107906, the NoPrevAct teacher).
 gym.register(

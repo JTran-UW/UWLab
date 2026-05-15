@@ -192,6 +192,29 @@ class Depth_DAggerWristSidePretrainedWeightedRunnerCfg(Depth_DAggerSplitRunnerCf
 
 
 @configclass
+class RGB_DAggerWristSidePretrainedWeightedRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """2cam RGB (side+wrist) + ImageNet ResNet18 + DEXTRAH-style weighted-L2 loss."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_rgb_dagger_wristside_pretrained_weighted"
+    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(
+        beta_anneal_iters=0,
+        num_learning_epochs=1,
+        gradient_length=1,
+    )
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_rgb", "wrist_rgb"],
+        student_hidden_dims=[512, 256],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+        predict_std=True,
+        teacher_returns_std=True,
+    )
+
+    def __post_init__(self) -> None:
+        self.algorithm.class_name = "DistillationDAggerWeighted"
+
+
+@configclass
 class StudentTeacherMLPPolicyCfg:
     """Policy cfg for an MLP student + JIT teacher (state→state DAgger)."""
 
