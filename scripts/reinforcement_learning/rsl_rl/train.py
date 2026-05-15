@@ -141,6 +141,14 @@ _runner_module.ActorCriticDepth = ActorCriticDepth
 _runner_module.BCPPO = BCPPO
 _runner_module.GRPO = GRPO
 _runner_module.PPOPBRS = PPOPBRS
+from uwlab_rl.rsl_rl.actor_critic_rma import ActorCriticRMA
+from uwlab_rl.rsl_rl.ppo_rma import PPO_RMA
+_runner_module.ActorCriticRMA = ActorCriticRMA
+_runner_module.PPO_RMA = PPO_RMA
+# Also expose PPO_RMA via rsl_rl.algorithms so cli_args.sanitize_rsl_rl_cfg can
+# look it up and strip kwargs the upstream PPO base doesn't accept.
+import rsl_rl.algorithms as _rsl_rl_algorithms
+_rsl_rl_algorithms.PPO_RMA = PPO_RMA
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config
@@ -278,6 +286,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     elif agent_cfg.class_name == "GRPOGroupedRunner":
         from uwlab_rl.rsl_rl.grpo_grouped_runner import GRPOGroupedRunner
         runner = GRPOGroupedRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name == "OnPolicyRunnerRMA":
+        from uwlab_rl.rsl_rl.on_policy_runner_rma import OnPolicyRunnerRMA
+        runner = OnPolicyRunnerRMA(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs

@@ -184,6 +184,28 @@ gym.register(
     },
 )
 
+# RMA: same Sysid Sim2Real dynamics, with an added privileged_rma obs group and
+# a runner that trains a history-encoder transformer to match phi(privileged_rma).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-RMA-Train-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rma_cfg:ZeroGScenePCSysidRMATrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCRMARunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-RMA-Eval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rma_cfg:ZeroGScenePCSysidRMAEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCRMARunnerCfg",
+    },
+)
+
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-Real-Eval-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

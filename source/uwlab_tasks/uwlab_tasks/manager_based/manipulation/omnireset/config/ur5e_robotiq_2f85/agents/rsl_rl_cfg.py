@@ -349,6 +349,88 @@ class ScenePCPPORunnerCfg(Base_PPORunnerCfg):
 
 
 # ===========================================================================
+# RMA (Rapid Motor Adaptation) on ScenePC + Sysid Sim2Real.
+# Actor conditions on phi(privileged_rma) -> z (16d). A small bidirectional
+# transformer psi is trained in parallel to predict z from a 32-step history
+# of proprio + last_action via MSE (stop-grad on z).
+# ===========================================================================
+@configclass
+class RslRlActorCriticRMACfg(RslRlActorCriticWithEncoderCfg):
+    class_name: str = "ActorCriticRMA"
+    privileged_group: str = "privileged_rma"
+    latent_dim: int = 16
+    history_length: int = 32
+    history_obs_keys: tuple = ("proprio",)
+    history_include_actions: bool = True
+    transformer_d_model: int = 64
+    transformer_num_layers: int = 2
+    transformer_num_heads: int = 4
+    transformer_ff: int = 128
+
+
+@configclass
+class RslRlPpoRMAAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    class_name: str = "PPO_RMA"
+    aux_coeff: float = 1.0
+    history_learning_rate: float = 1.0e-4
+    history_num_learning_epochs: int = 5
+    history_num_mini_batches: int = 4
+    # Cap per-minibatch size for the transformer aux pass. Without this,
+    # 16k envs/GPU × 16 rollout steps = 262144 transitions, and divided by
+    # ``history_num_mini_batches=4`` gives a 65k-batch SDPA forward that
+    # trips CUDA's invalid-configuration limit. 4096 is safe; tune up if
+    # you have memory headroom and want lower variance per update.
+    history_minibatch_size: int = 4096
+    # Optional: only train psi on a random subset of transitions per epoch.
+    # ``None`` uses all transitions. Set if you want psi training cost
+    # decoupled from policy num_envs.
+    history_max_samples_per_epoch: int | None = None
+    history_max_grad_norm: float = 1.0
+
+
+@configclass
+class ScenePCRMARunnerCfg(ScenePCPPORunnerCfg):
+    """RMA: ScenePC PPO + privileged latent + history-encoder MSE auxiliary loss."""
+
+    class_name: str = "OnPolicyRunnerRMA"
+
+    obs_groups = {
+        "policy": ["proprio", "pointcloud", "privileged_rma"],
+        "critic": ["proprio", "pointcloud", "privileged_rma", "time_left"],
+    }
+    policy: RslRlActorCriticRMACfg = RslRlActorCriticRMACfg(
+        init_noise_std=1.0,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[512, 256, 128, 64],
+        critic_hidden_dims=[512, 256, 128, 64],
+        activation="elu",
+        noise_std_type="gsde",
+        state_dependent_std=False,
+        encoder_groups={
+            "pointcloud": {"hidden_dims": [256, 128], "output_dim": 32},
+            # privileged_rma encoder (phi) is auto-injected by ActorCriticRMA
+            # with output_dim=latent_dim; override hidden_dims here if desired.
+        },
+    )
+    algorithm: RslRlPpoRMAAlgorithmCfg = RslRlPpoRMAAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        normalize_advantage_per_mini_batch=False,
+        clip_param=0.2,
+        entropy_coef=0.006,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )
+
+
+# ===========================================================================
 # BCPPO (PPO + BC auxiliary loss) for depth student.
 # Asymmetric AC: depth-CNN actor on `proprio` + `wrist_depth` + `side_depth`
 # (sees only what a real robot sees), state-only critic on `teacher` group

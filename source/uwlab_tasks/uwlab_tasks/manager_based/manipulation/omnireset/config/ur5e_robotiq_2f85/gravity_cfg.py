@@ -866,6 +866,8 @@ class ZeroGStateSysidFullDRTrainCfg(ZeroGStateTrainCfg):
 
     events: ZeroGGPSSysidFullDREventCfg = ZeroGGPSSysidFullDREventCfg()
 
+## ^^^ this is bugged because wrong action and robot
+
 @configclass
 class ZeroGScenePCSysidSim2RealTrainCfg(ZeroGScenePCUniformTrainCfg):
     events: ZeroGGPSSysidFullDREventCfg = ZeroGGPSSysidFullDREventCfg()

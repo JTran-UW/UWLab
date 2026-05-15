@@ -8,7 +8,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import copy
 import os
+from typing import List
+
 import torch
 from torch import nn
 
@@ -26,6 +29,85 @@ def export_policy_as_jit(policy: object, normalizer: object | None, path: str, f
     """
     policy_exporter = _TorchPolicyExporterExtended(policy, normalizer)
     policy_exporter.export(path, filename)
+
+
+def export_vision_student_as_jit(
+    policy,
+    path: str,
+    filename: str = "depth_policy.pt",
+    vision_groups: List[str] | None = None,
+) -> str:
+    """Export a ``StudentTeacherVision`` policy as a self-contained JIT module.
+
+    Bundles the proprio normalizer + shared depth encoder + student MLP into one
+    module so the real-robot eval (``robodiff_real`` env, no rsl_rl deps) can load
+    it with just ``torch.jit.load`` and call ``forward(proprio, images)``.
+
+    Forward signature (as scripted):
+        forward(proprio: (B, num_proprio) float32,
+                images: List[(B, 1, H, W) float32 in [0,1]]) -> (B, num_actions)
+
+    Image list order MUST match the order in ``policy.vision_groups`` at training
+    time (e.g. ``["side_depth", "wrist_depth"]``); the eval script reads
+    ``vision_groups`` from the saved metadata file alongside the JIT.
+    """
+    os.makedirs(path, exist_ok=True)
+    groups = list(vision_groups) if vision_groups is not None else list(policy.vision_groups)
+    embed_dim = _depth_encoder_embed_dim(policy.depth_encoder)
+    student_in = _mlp_in_features(policy.student)
+    num_proprio = int(student_in - len(groups) * embed_dim)
+    num_actions = int(policy.num_actions)
+    first_conv = _first_conv2d(policy.depth_encoder)
+    image_channels = int(first_conv.in_channels)
+    # Encoder is fully convolutional → spatial dim isn't fixed by weights, but
+    # sim always feeds 224x224 (DepthDAggerObservationsCfg.IMG_H/W). Hard-code.
+    image_h, image_w = 224, 224
+
+    wrapper = _VisionStudentJITExporter(policy)
+    wrapper.eval()
+    out_path = os.path.join(path, filename)
+    scripted = torch.jit.script(wrapper)
+    scripted.save(out_path)
+
+    # Sidecar metadata: lets eval pick up obs layout without re-loading the runner.
+    meta_path = os.path.join(path, os.path.splitext(filename)[0] + "_meta.txt")
+    with open(meta_path, "w") as f:
+        f.write(f"num_proprio={num_proprio}\n")
+        f.write(f"num_actions={num_actions}\n")
+        f.write(f"image_h={image_h}\n")
+        f.write(f"image_w={image_w}\n")
+        f.write(f"image_channels={image_channels}\n")
+        f.write("vision_groups=" + ",".join(groups) + "\n")
+    print(f"[export_vision_student_as_jit] wrote {out_path} "
+          f"(proprio={num_proprio}, actions={num_actions}, "
+          f"image={image_channels}x{image_h}x{image_w}, groups={groups})")
+    print(f"[export_vision_student_as_jit] wrote sidecar {meta_path}")
+    return out_path
+
+
+def _first_conv2d(module: nn.Module) -> nn.Conv2d:
+    for m in module.modules():
+        if isinstance(m, nn.Conv2d):
+            return m
+    raise ValueError("Expected a Conv2d in the depth encoder, found none")
+
+
+def _depth_encoder_embed_dim(encoder: nn.Module) -> int:
+    # DepthCNN.head = Sequential(Linear(flat, embed), ReLU); ResNet18Encoder.proj = Linear(512, embed).
+    if hasattr(encoder, "proj") and isinstance(encoder.proj, nn.Linear):
+        return int(encoder.proj.out_features)
+    if hasattr(encoder, "head"):
+        for m in encoder.head:
+            if isinstance(m, nn.Linear):
+                return int(m.out_features)
+    raise ValueError("Could not determine embed_dim from encoder")
+
+
+def _mlp_in_features(student: nn.Module) -> int:
+    for m in student.modules():
+        if isinstance(m, nn.Linear):
+            return int(m.in_features)
+    raise ValueError("Could not find a Linear layer in the student MLP")
 
 
 def export_policy_as_onnx(
@@ -165,6 +247,38 @@ class _TorchPolicyExporterExtended(_TorchPolicyExporter, _StateDependentPolicyMi
     def compute_distribution(self, x):
         observations = self.normalizer(x)
         return self._compute_distribution(observations)
+
+
+class _VisionStudentJITExporter(nn.Module):
+    """Self-contained JIT wrapper around ``StudentTeacherVision``.
+
+    Inputs at inference time:
+        proprio: (B, num_proprio) — concatenation of policy obs groups in the order
+            given by ``policy.obs_groups['policy']``, already including history flatten.
+        images:  list of (B, C, H, W) tensors in [0, 1], one per entry of
+            ``policy.vision_groups`` and in the SAME order.
+
+    Output: action mean (B, num_actions). No exploration noise — eval is deterministic.
+
+    Holds deep-copied module references (normalizer, depth_encoder, student MLP)
+    so the eval env doesn't need to import rsl_rl / uwlab_rl.
+    """
+
+    def __init__(self, policy):
+        super().__init__()
+        # Deep-copy submodules: source-policy mutation can't affect the export,
+        # and the scripted graph owns its own parameters.
+        self.normalizer = copy.deepcopy(policy.student_obs_normalizer)
+        self.depth_encoder = copy.deepcopy(policy.depth_encoder)
+        self.student = copy.deepcopy(policy.student)
+
+    def forward(self, proprio: torch.Tensor, images: List[torch.Tensor]) -> torch.Tensor:
+        # Mirror StudentTeacherVision._encode_student + .act_inference.
+        proprio_norm = self.normalizer(proprio)
+        feats: List[torch.Tensor] = [proprio_norm]
+        for img in images:
+            feats.append(self.depth_encoder(img))
+        return self.student(torch.cat(feats, dim=-1))
 
 
 class _OnnxPolicyExporterExtended(_OnnxPolicyExporter, _StateDependentPolicyMixin):

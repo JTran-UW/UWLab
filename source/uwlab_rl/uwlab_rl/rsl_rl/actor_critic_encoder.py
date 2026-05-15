@@ -40,7 +40,13 @@ class ActorCriticWithEncoder(ActorCritic):
         self.critic_encoders = nn.ModuleDict()
         self._group_normalizers = nn.ModuleDict()
 
-        all_groups = set(obs_groups.get("policy", [])) | set(obs_groups.get("critic", []))
+        # NOTE: `set` iteration order depends on PYTHONHASHSEED which is randomized
+        # per process. In distributed training this would build the encoder
+        # ModuleDicts in different orders on different ranks, so
+        # ``self.policy.parameters()`` would yield parameters in different orders
+        # per rank and ``broadcast_parameters`` would deadlock on size-mismatched
+        # collectives. Sort the groups to keep the construction order deterministic.
+        all_groups = sorted(set(obs_groups.get("policy", [])) | set(obs_groups.get("critic", [])))
         for name in all_groups:
             raw_dim = obs[name].shape[-1]
             if self._do_normalize:

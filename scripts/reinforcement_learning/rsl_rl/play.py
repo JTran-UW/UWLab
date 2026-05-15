@@ -82,7 +82,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
+from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx, export_vision_student_as_jit
 
 # Inject UWLab distillation classes into rsl_rl's distillation_runner module so
 # the runner's eval(class_name) lookup resolves them at checkpoint load time.
@@ -116,6 +116,12 @@ _runner_module.ActorCriticDepth = ActorCriticDepth
 _runner_module.BCPPO = BCPPO
 _runner_module.GRPO = GRPO
 _runner_module.PPOPBRS = PPOPBRS
+from uwlab_rl.rsl_rl.actor_critic_rma import ActorCriticRMA
+from uwlab_rl.rsl_rl.ppo_rma import PPO_RMA
+_runner_module.ActorCriticRMA = ActorCriticRMA
+_runner_module.PPO_RMA = PPO_RMA
+import rsl_rl.algorithms as _rsl_rl_algorithms
+_rsl_rl_algorithms.PPO_RMA = PPO_RMA
 
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config
@@ -197,6 +203,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     elif agent_cfg.class_name == "GRPOGroupedRunner":
         from uwlab_rl.rsl_rl.grpo_grouped_runner import GRPOGroupedRunner
         runner = GRPOGroupedRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    elif agent_cfg.class_name == "OnPolicyRunnerRMA":
+        from uwlab_rl.rsl_rl.on_policy_runner_rma import OnPolicyRunnerRMA
+        runner = OnPolicyRunnerRMA(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     runner.load(resume_path)
@@ -223,8 +232,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    # StudentTeacherVision needs a custom multi-input exporter (proprio + depth images);
+    # the default actor-MLP exporter would silently drop the encoder. Detect by attr.
+    if isinstance(policy_nn, StudentTeacherVision):
+        export_vision_student_as_jit(policy_nn, path=export_model_dir, filename="depth_policy.pt")
+    else:
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 

@@ -153,7 +153,7 @@ def get_material_properties(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.root_physx_view.get_material_properties().view(env.num_envs, -1)
+    return asset.root_physx_view.get_material_properties().view(env.num_envs, -1).to(env.device)
 
 
 def get_mass(
@@ -161,7 +161,7 @@ def get_mass(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.root_physx_view.get_masses().view(env.num_envs, -1)
+    return asset.root_physx_view.get_masses().view(env.num_envs, -1).to(env.device)
 
 
 def get_joint_friction(
@@ -169,7 +169,7 @@ def get_joint_friction(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.data.joint_friction_coeff.view(env.num_envs, -1)
+    return asset.data.joint_friction_coeff.view(env.num_envs, -1).to(env.device)
 
 
 def get_joint_armature(
@@ -177,7 +177,7 @@ def get_joint_armature(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.data.joint_armature.view(env.num_envs, -1)
+    return asset.data.joint_armature.view(env.num_envs, -1).to(env.device)
 
 
 def get_joint_stiffness(
@@ -185,7 +185,7 @@ def get_joint_stiffness(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.data.joint_stiffness.view(env.num_envs, -1)
+    return asset.data.joint_stiffness.view(env.num_envs, -1).to(env.device)
 
 
 def get_joint_damping(
@@ -193,7 +193,36 @@ def get_joint_damping(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.data.joint_damping.view(env.num_envs, -1)
+    return asset.data.joint_damping.view(env.num_envs, -1).to(env.device)
+
+
+def get_osc_gains(env: ManagerBasedRLEnv, action_name: str) -> torch.Tensor:
+    """Per-env OSC Kp and Kd from a RelCartesianOSCAction term.
+
+    Returned shape: (num_envs, 12)  ->  [Kp_xyz(3), Kp_rpy(3), Kd_xyz(3), Kd_rpy(3)].
+    Reads ``_kp`` / ``_kd`` written by ``randomize_rel_cartesian_osc_gains``.
+    """
+    term = env.action_manager._terms[action_name]
+    kp = term._kp.view(env.num_envs, -1).to(env.device)
+    kd = term._kd.view(env.num_envs, -1).to(env.device)
+    return torch.cat([kp, kd], dim=-1)
+
+
+def get_actuator_delay(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    actuator_name: str,
+) -> torch.Tensor:
+    """Per-env motor delay (positions buffer lag) for a delayed actuator.
+
+    Returns (num_envs, 1) float. Zero if the actuator has no delay buffer.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    actuator = asset.actuators[actuator_name]
+    if not hasattr(actuator, "positions_delay_buffer"):
+        return torch.zeros(env.num_envs, 1, device=env.device)
+    lag = actuator.positions_delay_buffer.time_lags
+    return lag.view(env.num_envs, 1).to(dtype=torch.float32, device=env.device)
 
 
 def time_left(env) -> torch.Tensor:
