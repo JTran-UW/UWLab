@@ -73,3 +73,5 @@ tests/
 
 # Docker history
 .uw-lab-docker-history
+
+tmp/

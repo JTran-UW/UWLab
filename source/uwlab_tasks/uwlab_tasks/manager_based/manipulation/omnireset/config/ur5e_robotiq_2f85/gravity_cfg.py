@@ -878,8 +878,19 @@ class ZeroGScenePCSysidSim2RealTrainCfg(ZeroGScenePCUniformTrainCfg):
         
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
+# Eval cfg's observations cfg: same as ScenePCObsCfg (proprio, pointcloud,
+# time_left, success_classifier) plus a diagnostic ``heuristics`` group used
+# by the policy-comparison tooling. The runner only reads the policy obs group,
+# so adding ``heuristics`` is invisible to inference.
 @configclass
-class ZeroGScenePCSysidSim2RealEValCfg(ZeroGScenePCSysidSim2RealTrainCfg):
+class _ScenePCEvalObsCfgWithHeuristics(ScenePCObsCfg):
+    heuristics: task_mdp.HeuristicsCfg = task_mdp.HeuristicsCfg()
+
+
+@configclass
+class ZeroGScenePCSysidSim2RealEvalCfg(ZeroGScenePCSysidSim2RealTrainCfg):
+    observations: _ScenePCEvalObsCfgWithHeuristics = _ScenePCEvalObsCfgWithHeuristics()
+
     def __post_init__(self):
         super().__post_init__()
         self.terminations.success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 10})
