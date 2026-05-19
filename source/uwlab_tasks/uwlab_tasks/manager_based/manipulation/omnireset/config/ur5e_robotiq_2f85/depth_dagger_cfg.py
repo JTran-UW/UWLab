@@ -36,7 +36,7 @@ from .rl_state_cfg import FinetuneEvalEventCfg, RlStateSceneCfg, Ur5eRobotiq2f85
 
 DEPTH_CLIP = (0.01, 2.0)
 IMG_H, IMG_W = 224, 224
-RENDER_H, RENDER_W = 224, 224
+RENDER_H, RENDER_W = 240, 320
 
 
 @configclass

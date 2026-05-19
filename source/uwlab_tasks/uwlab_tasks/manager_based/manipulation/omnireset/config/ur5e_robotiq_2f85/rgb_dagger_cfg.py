@@ -30,8 +30,9 @@ from .depth_dagger_cfg import (
     Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherSysidTrainCfg,
 )
 
-IMG_H, IMG_W = 224, 224
-# IMG_H, IMG_W = 168, 168
+# IMG_H, IMG_W = 224, 224  # 1:1 (old, matched 224x224 render)
+# IMG_H, IMG_W = 168, 168  # 1:1 (intermediate)
+IMG_H, IMG_W = 168, 224  # 4:3 — matches RENDER_H=240, RENDER_W=320 and real 640x480 obs
 
 # ---------------------------------------------------------------------------
 # Helpers
