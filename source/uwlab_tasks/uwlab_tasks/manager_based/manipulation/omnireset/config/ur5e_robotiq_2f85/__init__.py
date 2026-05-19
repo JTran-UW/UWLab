@@ -474,6 +474,20 @@ gym.register(
     },
 )
 
+# Eval cfg for students trained on the RGB PC-teacher sysid DAgger env above.
+# Inherits Stage-2 finetune-eval semantics (fixed sysid + OSC gains, 10-consecutive
+# success, EXPLICIT actuator) and layers on the wrist + side RGB cameras + matching
+# obs groups so the vision student can run at inference.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-Weighted-PCTeacher-FullSysidDR-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rgb_dagger_cfg:Ur5eRobotiq2f85RGBDAggerWristSidePCTeacherSysidEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:RGB_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
 # Same as above but student + teacher proprio both drop prev_actions
 # (paired with Tillicum 107906, the NoPrevAct teacher).
 gym.register(

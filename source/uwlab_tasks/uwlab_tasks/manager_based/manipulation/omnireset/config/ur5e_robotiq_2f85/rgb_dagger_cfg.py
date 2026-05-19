@@ -24,11 +24,14 @@ from isaaclab.utils import configclass
 
 from ... import mdp as task_mdp
 from .depth_dagger_cfg import (
+    DAggerWristSideSceneCfg,
     DepthDAggerObservationsCfg,
     FullSysidDRWristSideEventCfg,
     TeacherProprioWithPCCfg,
     Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherSysidTrainCfg,
+    WristSideEventCfg,
 )
+from .rl_state_cfg import Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg
 
 # IMG_H, IMG_W = 224, 224  # 1:1 (old, matched 224x224 render)
 # IMG_H, IMG_W = 168, 168  # 1:1 (intermediate)
@@ -340,6 +343,56 @@ class Ur5eRobotiq2f85RGBDAggerWristSidePCTeacherSysidTrainCfg(
         # Parent DAgger scene uses True; override here.
         self.scene.replicate_physics = False
         # Enable quality render settings needed for visual fidelity.
+        self.sim.render.enable_ambient_occlusion = True
+        self.sim.render.enable_reflections = True
+        self.sim.render.enable_dl_denoiser = True
+        self.sim.render.antialiasing_mode = "DLAA"
+        self.num_rerenders_on_reset = 1
+
+
+# ---------------------------------------------------------------------------
+# Eval env config
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class Ur5eRobotiq2f85RGBDAggerWristSidePCTeacherSysidEvalCfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg
+):
+    """Eval cfg for the student trained on
+    ``Ur5eRobotiq2f85RGBDAggerWristSidePCTeacherSysidTrainCfg``.
+
+    Inherits the Stage-2 finetune-eval env (EXPLICIT actuator, ``RelativeOSCEvalAction``,
+    ``FinetuneEvalEventCfg`` fixed sysid + OSC gains, 10-consecutive success termination)
+    and layers on the visual machinery the student needs at inference:
+
+      * scene swapped to ``DAggerWristSideSceneCfg`` (= ``RlStateSceneCfg`` + 3 curtains
+        + wrist & side RGB ``TiledCameraCfg``s, defaults to ``rgb`` data type),
+      * events swapped to ``WristSideEventCfg`` (= ``FinetuneEvalEventCfg`` + a
+        zero-delta ``reset_wrist_camera_pose`` so the wrist cam's local XformOps are
+        rewritten after ``reset_scene_to_default`` instead of being zeroed → camera
+        pointing at the sky),
+      * observations swapped to ``RGBDAggerWristSidePCTeacherObsCfg`` (proprio +
+        side_rgb + wrist_rgb + teacher + aux_target — identical group layout to the
+        train cfg, so the student receives its training-time input dict).
+
+    Visual / camera-pose / focal / HDRI DR are intentionally OFF (this is the eval
+    counterpart of the train cfg's ``RGBDAggerSysidEventCfg``). ``replicate_physics``
+    stays at the scene default (``True``) since we're not running
+    ``randomize_visual_appearance_multiple_meshes``.
+    """
+
+    scene: DAggerWristSideSceneCfg = DAggerWristSideSceneCfg(
+        num_envs=256, env_spacing=1.5, replicate_physics=True
+    )
+    observations: RGBDAggerWristSidePCTeacherObsCfg = RGBDAggerWristSidePCTeacherObsCfg()
+    events: WristSideEventCfg = WristSideEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Cameras default to rgb in DAggerWristSideSceneCfg — no flip needed.
+        # Match the train cfg's render settings so the vision encoder sees inputs
+        # with the same lighting / AO / reflections it was trained on.
         self.sim.render.enable_ambient_occlusion = True
         self.sim.render.enable_reflections = True
         self.sim.render.enable_dl_denoiser = True

@@ -14,4 +14,5 @@ from .recorders import *
 from .rewards import *
 from .terminations import *
 from .gravity_curriculum import *
+from .heuristics import *
 from .utils import *
