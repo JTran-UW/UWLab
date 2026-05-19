@@ -834,7 +834,7 @@ class PointCloudTrainEventCfg:
 class SharedEncoder128PCObservationsCfg:
     """128-pt wrist-frame PCs with 2 obs groups: proprio (pass-through) + pointcloud (shared encoder).
 
-    Groups: proprio (~21d), pointcloud (768d = 128×3×2 objects).
+    Groups: proprio (~21d), pointcloud (768d = 128x3x2 objects).
     Shared encoder compresses concatenated PCs to 32d; main MLP sees 21+32=53d.
     """
 
