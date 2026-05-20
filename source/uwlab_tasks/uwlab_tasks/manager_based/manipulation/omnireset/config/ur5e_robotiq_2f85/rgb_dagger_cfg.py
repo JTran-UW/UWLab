@@ -33,9 +33,9 @@ from .depth_dagger_cfg import (
 )
 from .rl_state_cfg import Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg
 
-# IMG_H, IMG_W = 224, 224  # 1:1 (old, matched 224x224 render)
+# IMG_H, IMG_W = 168, 224  # 4:3 finetune / eval of finetuned policies
 # IMG_H, IMG_W = 168, 168  # 1:1 (intermediate)
-IMG_H, IMG_W = 168, 224  # 4:3 — matches RENDER_H=240, RENDER_W=320 and real 640x480 obs
+IMG_H, IMG_W = 224, 224  # 1:1 — pre-training from scratch; matches RENDER_H=RENDER_W=224
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -356,6 +356,163 @@ class Ur5eRobotiq2f85RGBDAggerWristSidePCTeacherSysidTrainCfg(
 
 
 @configclass
+class RGBDAggerEvalEventCfg(WristSideEventCfg):
+    """Color-only visual DR for eval: no textures, mild colors on all surfaces.
+
+    No texture randomization (texture_prob=0). Objects, table, and curtains get
+    mild near-neutral color variation. Curtains/back wall use near-white colors to
+    match a typical lab background. HDRI varies for lighting diversity.
+    ``replicate_physics`` must be ``False`` in the scene when this cfg is used.
+    """
+
+    randomize_insertive_object_appearance = EventTerm(
+        func=task_mdp.randomize_visual_appearance_multiple_meshes,
+        mode="interval",
+        interval_range_s=(4.0, 4.0),
+        params={
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            "event_name": "eval_insertive_object_event",
+            "mesh_names": [],
+            "texture_prob": 0.0,
+            "texture_config_path": str(Path(__file__).parent / "resources" / "texture_paths.yaml"),
+            "diffuse_tint_range": ((0.3, 0.3, 0.3), (0.9, 0.9, 0.9)),
+            "colors": {"r": (0.3, 0.9), "g": (0.3, 0.9), "b": (0.3, 0.9)},
+            "texture_scale_range": (1.0, 1.0),
+            "roughness_range": (0.3, 0.8),
+            "metallic_range": (0.0, 0.3),
+            "specular_range": (0.0, 0.5),
+        },
+    )
+
+    randomize_receptive_object_appearance = EventTerm(
+        func=task_mdp.randomize_visual_appearance_multiple_meshes,
+        mode="interval",
+        interval_range_s=(4.0, 4.0),
+        params={
+            "asset_cfg": SceneEntityCfg("receptive_object"),
+            "event_name": "eval_receptive_object_event",
+            "mesh_names": [],
+            "texture_prob": 0.0,
+            "texture_config_path": str(Path(__file__).parent / "resources" / "texture_paths.yaml"),
+            "diffuse_tint_range": ((0.3, 0.3, 0.3), (0.9, 0.9, 0.9)),
+            "colors": {"r": (0.3, 0.9), "g": (0.3, 0.9), "b": (0.3, 0.9)},
+            "texture_scale_range": (1.0, 1.0),
+            "roughness_range": (0.3, 0.8),
+            "metallic_range": (0.0, 0.3),
+            "specular_range": (0.0, 0.5),
+        },
+    )
+
+    randomize_table_appearance = EventTerm(
+        func=task_mdp.randomize_visual_appearance_multiple_meshes,
+        mode="interval",
+        interval_range_s=(4.0, 4.0),
+        params={
+            "asset_cfg": SceneEntityCfg("table"),
+            "event_name": "eval_table_event",
+            "mesh_names": ["visuals/vention_mat"],
+            "texture_prob": 0.0,
+            "texture_config_path": str(Path(__file__).parent / "resources" / "texture_paths.yaml"),
+            "diffuse_tint_range": ((0.3, 0.3, 0.3), (0.9, 0.9, 0.9)),
+            "colors": {"r": (0.3, 0.9), "g": (0.3, 0.9), "b": (0.3, 0.9)},
+            "texture_scale_range": (1.0, 1.0),
+            "roughness_range": (0.3, 0.7),
+            "metallic_range": (0.0, 0.1),
+            "specular_range": (0.0, 0.4),
+        },
+    )
+
+    randomize_curtain_left_appearance = EventTerm(
+        func=task_mdp.randomize_visual_appearance_multiple_meshes,
+        mode="interval",
+        interval_range_s=(4.0, 4.0),
+        params={
+            "asset_cfg": SceneEntityCfg("curtain_left"),
+            "event_name": "eval_curtain_left_event",
+            "mesh_names": [],
+            "texture_prob": 0.0,
+            "texture_config_path": str(Path(__file__).parent / "resources" / "texture_paths.yaml"),
+            "diffuse_tint_range": ((0.7, 0.7, 0.7), (1.0, 1.0, 1.0)),
+            "colors": {"r": (0.7, 1.0), "g": (0.7, 1.0), "b": (0.7, 1.0)},
+            "texture_scale_range": (1.0, 1.0),
+            "roughness_range": (0.5, 1.0),
+            "metallic_range": (0.0, 0.0),
+            "specular_range": (0.0, 0.2),
+        },
+    )
+
+    randomize_curtain_back_appearance = EventTerm(
+        func=task_mdp.randomize_visual_appearance_multiple_meshes,
+        mode="interval",
+        interval_range_s=(4.0, 4.0),
+        params={
+            "asset_cfg": SceneEntityCfg("curtain_back"),
+            "event_name": "eval_curtain_back_event",
+            "mesh_names": [],
+            "texture_prob": 0.0,
+            "texture_config_path": str(Path(__file__).parent / "resources" / "texture_paths.yaml"),
+            "diffuse_tint_range": ((0.7, 0.7, 0.7), (1.0, 1.0, 1.0)),
+            "colors": {"r": (0.7, 1.0), "g": (0.7, 1.0), "b": (0.7, 1.0)},
+            "texture_scale_range": (1.0, 1.0),
+            "roughness_range": (0.5, 1.0),
+            "metallic_range": (0.0, 0.0),
+            "specular_range": (0.0, 0.2),
+        },
+    )
+
+    randomize_curtain_right_appearance = EventTerm(
+        func=task_mdp.randomize_visual_appearance_multiple_meshes,
+        mode="interval",
+        interval_range_s=(4.0, 4.0),
+        params={
+            "asset_cfg": SceneEntityCfg("curtain_right"),
+            "event_name": "eval_curtain_right_event",
+            "mesh_names": [],
+            "texture_prob": 0.0,
+            "texture_config_path": str(Path(__file__).parent / "resources" / "texture_paths.yaml"),
+            "diffuse_tint_range": ((0.7, 0.7, 0.7), (1.0, 1.0, 1.0)),
+            "colors": {"r": (0.7, 1.0), "g": (0.7, 1.0), "b": (0.7, 1.0)},
+            "texture_scale_range": (1.0, 1.0),
+            "roughness_range": (0.5, 1.0),
+            "metallic_range": (0.0, 0.0),
+            "specular_range": (0.0, 0.2),
+        },
+    )
+
+    randomize_sky_light = EventTerm(
+        func=task_mdp.randomize_hdri,
+        mode="interval",
+        interval_range_s=(4.0, 4.0),
+        params={
+            "light_path": "/World/skyLight",
+            "hdri_config_path": str(Path(__file__).parent / "resources" / "hdri_paths.yaml"),
+            "intensity_range": (1500.0, 3500.0),
+            "rotation_range": (0.0, 360.0),
+        },
+    )
+
+
+@configclass
+class _PCTeacherOnlyObsCfg:
+    """Single obs group for direct JIT teacher evaluation: 25d proprio + 1536d PC = 1561d."""
+
+    policy: TeacherProprioWithPCCfg = TeacherProprioWithPCCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85PCTeacherFinetuneEvalCfg(Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg):
+    """FinetuneEval env for direct JIT ScenePC-teacher evaluation (no cameras).
+
+    Identical dynamics to the RGB DAgger eval env (FinetuneEvalEventCfg: fixed sysid +
+    OSC gains, ObjectAnywhereEEAnywhere resets, EXPLICIT actuator) but swaps out
+    cameras and visual DR for a plain ScenePC obs group. Allows measuring teacher
+    performance against the exact dynamics the student is evaluated on.
+    """
+
+    observations: _PCTeacherOnlyObsCfg = _PCTeacherOnlyObsCfg()
+
+
+@configclass
 class Ur5eRobotiq2f85RGBDAggerWristSidePCTeacherSysidEvalCfg(
     Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg
 ):
@@ -368,25 +525,20 @@ class Ur5eRobotiq2f85RGBDAggerWristSidePCTeacherSysidEvalCfg(
 
       * scene swapped to ``DAggerWristSideSceneCfg`` (= ``RlStateSceneCfg`` + 3 curtains
         + wrist & side RGB ``TiledCameraCfg``s, defaults to ``rgb`` data type),
-      * events swapped to ``WristSideEventCfg`` (= ``FinetuneEvalEventCfg`` + a
-        zero-delta ``reset_wrist_camera_pose`` so the wrist cam's local XformOps are
-        rewritten after ``reset_scene_to_default`` instead of being zeroed → camera
-        pointing at the sky),
+      * events swapped to ``RGBDAggerEvalEventCfg`` (FinetuneEval sysid gains + zero-delta
+        wrist camera pose restore + tame visual DR),
       * observations swapped to ``RGBDAggerWristSidePCTeacherObsCfg`` (proprio +
         side_rgb + wrist_rgb + teacher + aux_target — identical group layout to the
         train cfg, so the student receives its training-time input dict).
 
-    Visual / camera-pose / focal / HDRI DR are intentionally OFF (this is the eval
-    counterpart of the train cfg's ``RGBDAggerSysidEventCfg``). ``replicate_physics``
-    stays at the scene default (``True``) since we're not running
-    ``randomize_visual_appearance_multiple_meshes``.
+    ``replicate_physics=False`` required by ``randomize_visual_appearance_multiple_meshes``.
     """
 
     scene: DAggerWristSideSceneCfg = DAggerWristSideSceneCfg(
-        num_envs=256, env_spacing=1.5, replicate_physics=True
+        num_envs=256, env_spacing=1.5, replicate_physics=False
     )
     observations: RGBDAggerWristSidePCTeacherObsCfg = RGBDAggerWristSidePCTeacherObsCfg()
-    events: WristSideEventCfg = WristSideEventCfg()
+    events: RGBDAggerEvalEventCfg = RGBDAggerEvalEventCfg()
 
     def __post_init__(self):
         super().__post_init__()
