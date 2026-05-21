@@ -675,3 +675,29 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_DAggerRunnerCfg",
     },
 )
+
+# ===========================================================================
+# BAMDP-over-expert-failure-rates (uses the seeds 20/21 ScenePC experts +
+# their discriminator from UWLab-ICL/EXPERT_DISCRIMINATOR.md). Wire the
+# action-side injector at rollout time via uwlab_rl.wrappers.bamdp_failures.
+# See BAMDP_FAILURES.md for the launch template.
+# ===========================================================================
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-BAMDPFailures-Train-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.bamdp_failures_cfg:Ur5eRobotiq2f85BAMDPFailuresTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-BAMDPFailures-StudentEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.bamdp_failures_cfg:Ur5eRobotiq2f85BAMDPFailuresStudentEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)

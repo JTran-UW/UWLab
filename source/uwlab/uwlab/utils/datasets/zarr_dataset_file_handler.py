@@ -234,6 +234,10 @@ class ZarrDatasetFileHandler(DatasetFileHandlerBase):
             "obs": processed_obs,
             "rewards": episode_dict.get("rewards", torch.zeros(num_frames)).cpu().numpy(),
             "dones": episode_dict.get("dones", torch.cat([torch.zeros(num_frames - 1), torch.ones(1)])).cpu().numpy(),
+            # expert_mask is BAMDP / ASTEROID metadata indicating which steps were
+            # expert-driven (vs learner). The diffusion-policy dataset loader keys
+            # off this; default to all-expert if the recorder didn't emit one.
+            "expert_mask": episode_dict.get("expert_mask", torch.ones((num_frames, 1))).cpu().numpy(),
         }
 
         # Save episode data to Zarr

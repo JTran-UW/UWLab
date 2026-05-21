@@ -84,3 +84,50 @@ class PreStepDataCollectionObservationsRecorder(RecorderTerm):
     def record_pre_step(self):
         """Record data collection observations from the data_collection observation group."""
         return "obs", self._env.obs_buf["data_collection"]
+
+
+class PreStepBAMDPRescueActionRecorder(RecorderTerm):
+    """Replaces the default ``PreStepActionsRecorder`` for BAMDP demo collection.
+
+    The diffusion-policy dataset reads its training-action target from
+    ``data/actions`` in the zarr. For BAMDP we want the supervision target
+    to be the *rescue expert's* counterfactual action (what it would have
+    done at every step), regardless of whether the learner or the rescue
+    actually drove physics that step. So we read from
+    ``env.bamdp.last_rescue_action`` (populated by the env-side BAMDP
+    layer) instead of ``env.action_manager.action``.
+
+    Falls back to ``action_manager.action`` if ``env.bamdp`` is not present
+    (e.g., on a non-BAMDP env), so the recorder is safe to wire into any
+    env cfg.
+    """
+
+    def record_pre_step(self):
+        bamdp = getattr(self._env, "bamdp", None)
+        if bamdp is not None and getattr(bamdp, "last_rescue_action", None) is not None:
+            return "actions", bamdp.last_rescue_action.clone()
+        return "actions", self._env.action_manager.action
+
+
+class PreStepExpertMaskRecorder(RecorderTerm):
+    """Per-step mask of which envs were driven by the expert (rescue) vs the learner.
+
+    Ported from UWLab-ICL. The demo-collection script sets the mask each step
+    via ``set_mask``; recorder writes it into the episode at pre-step time.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._expert_mask = torch.ones((env.num_envs, 1), dtype=torch.bool, device=env.device)
+        self._exploration_horizon = None
+
+    def set_mask(self, expert_mask: torch.Tensor):
+        """Set the expert mask externally each environment step."""
+        self._expert_mask = expert_mask
+
+    def set_exploration_horizon(self, exploration_horizon: torch.Tensor):
+        """Parity setter retained from OctiLab; currently not used by recorder output."""
+        self._exploration_horizon = exploration_horizon
+
+    def record_pre_step(self):
+        return "expert_mask", self._expert_mask.clone()

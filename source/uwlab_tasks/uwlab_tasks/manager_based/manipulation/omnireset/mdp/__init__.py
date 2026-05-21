@@ -16,3 +16,14 @@ from .terminations import *
 from .gravity_curriculum import *
 from .heuristics import *
 from .utils import *
+from .bamdp_failures import (
+    BAMDPLatentSampler,
+    bamdp_executed_action,
+    bamdp_failure_count,
+    bamdp_rescue_action,
+    bamdp_rescue_bit,
+    bamdp_stall_bit,
+    bamdp_steps_since_failure,
+    compute_rescue_action,
+    load_expert_specs_json,
+)
