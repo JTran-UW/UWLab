@@ -40,12 +40,37 @@ scripts/
 
 ## Environment
 
-- **Conda env**: `env_uwlab`
+- **Conda env**: `patlab` (Python 3.11) + Isaac Sim setup (see below)
 - **Python**: 3.11
-- **IsaacSim**: 5.1.0
+- **IsaacSim**: 5.1.0 — installed at `/home/yandabao/isaacsim/`
 - **Branch**: `pat/multitask`
 - **RL library**: `patrickhaoy/rsl_rl` fork (has `ActorCriticWithEncoder` natively)
 - **Reference codebase**: `/home/patrickhaoy/research/OctiLab` branch `feature/locomotion-clean`
+
+### Local Launch Setup (yandabao machine)
+
+`patlab` is a minimal Python 3.11 env — it does **not** have Isaac Sim packages installed directly. Isaac Sim packages (isaacsim, torch, omni.\*) are injected via `setup_conda_env.sh`. The correct launch sequence is:
+
+```bash
+conda activate patlab
+source /home/yandabao/isaacsim/setup_conda_env.sh
+cd /home/yandabao/UWLab-patrick-private
+python scripts/reinforcement_learning/rsl_rl/train.py ...
+```
+
+For `nohup` / non-interactive background jobs, both steps must be explicit since shell init files are not sourced:
+
+```bash
+nohup bash -c "
+  source /home/yandabao/miniforge3/etc/profile.d/conda.sh
+  conda activate patlab
+  source /home/yandabao/isaacsim/setup_conda_env.sh
+  cd /home/yandabao/UWLab-patrick-private
+  CUDA_VISIBLE_DEVICES=<id> python scripts/reinforcement_learning/rsl_rl/train.py ...
+" > /tmp/run.log 2>&1 &
+```
+
+**Do not use `env_uwlab`** — it points at the UWLab-ICL IsaacLab install which has a broken `isaacsim` reference on this machine.
 
 ## Registered Multi-Task Environments
 
