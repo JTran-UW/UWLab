@@ -3,6 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import hashlib
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -12,9 +15,15 @@ from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 from isaaclab.managers import ManagerTermBase, ObservationTermCfg, SceneEntityCfg
 from isaaclab.sensors import Camera, RayCasterCamera, TiledCamera
 from pxr import UsdGeom, UsdPhysics
+from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR, resolve_cloud_path
 
 from uwlab_tasks.manager_based.manipulation.omnireset.assembly_keypoints import Offset
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
+
+# Per-machine cache fallback when HF doesn't have the canonical points yet.
+SCENE_PC_LOCAL_CACHE_DIR = os.path.join(
+    os.path.expanduser("~"), ".cache", "uwlab", "scene_pc_cache"
+)
 
 
 def target_asset_pose_in_root_asset_frame(
@@ -576,134 +585,33 @@ class ScenePointCloud(ManagerTermBase):
         if self.is_multitask:
             self.task_type_ids = torch.arange(env.num_envs, device=device) % self.num_task_types
 
-        # -- Sample canonical points per robot body (same across tasks; robot is homogeneous) --
-        robot_prim_path_env0 = self.robot.cfg.prim_path.replace("env_.*", "env_0")
-        body_names = self.robot.body_names
+        # -- Canonical-points cache (hardware-invariant point selection) --
+        # pytorch3d's sampling kernels produce different selections across CPU
+        # vs GPU (and potentially across NVIDIA archs). To guarantee identical
+        # ScenePC observations on every machine, we cache the (T, num_points, ...)
+        # canonical-point tensors keyed by the (robot, ins paths, rec paths,
+        # num_points, oversample, budget) tuple. Cache lives on HF Hub for shared
+        # distribution and falls back to a local ~/.cache/uwlab dir when missing.
+        # Caching is skipped when resample_on_reset[/_robot] is enabled because
+        # those modes also need the oversampled pools (more state to cache).
+        self._cache_key = self._compute_cache_key(ins_usd_paths, rec_usd_paths, oversample)
+        cache_usable = not (self.resample_on_reset or self.resample_on_reset_robot)
+        generate_mode = os.environ.get("UWLAB_GENERATE_SCENE_PC_CACHE") == "1"
 
-        robot_local_parts: list[torch.Tensor] = []
-        robot_body_idx_parts: list[int] = []
-        # Keep the pre-FPS oversampled pool per body when resample_on_reset_robot
-        # is enabled. The pool is indexed by body_idx_int.
-        self._robot_pool_per_body: dict[int, torch.Tensor] = {}
-        for body_idx_int, body_name in enumerate(body_names):
-            body_prim_path = f"{robot_prim_path_env0}/{body_name}"
-            try:
-                # Per-body deterministic seed so the selection is reproducible
-                # across env-init contexts (training, eval, distributed ranks)
-                # regardless of upstream RNG consumption.
-                body_points, body_pool = self._sample_body_points(
-                    body_prim_path, oversample * 64, 64, device,
-                    return_pool=self.resample_on_reset_robot,
-                    seed=42 + body_idx_int,
-                )
-                if body_points is not None and body_points.shape[0] > 0:
-                    robot_local_parts.append(body_points)
-                    robot_body_idx_parts.extend([body_idx_int] * body_points.shape[0])
-                    if body_pool is not None:
-                        self._robot_pool_per_body[body_idx_int] = body_pool
-            except Exception:
-                continue
-        robot_local = torch.cat(robot_local_parts, dim=0).to(device)  # (n_robot, 3)
-        robot_body_idx = torch.tensor(robot_body_idx_parts, dtype=torch.long, device=device)
+        if cache_usable and not generate_mode:
+            # STRICT path (default for training/eval): HF only. Raises on miss
+            # to prevent silent per-machine drift from lazy local generation.
+            self._load_canonical_cache_strict(device)
+        else:
+            # GENERATE path: explicit cache-generation script sets the env var;
+            # or resample mode (which can't use a static cache anyway).
+            self._sample_and_select_canonical(
+                oversample, ins_usd_paths, rec_usd_paths, env.num_envs, device,
+            )
+            if cache_usable and generate_mode:
+                self._save_canonical_cache_local()
 
-        # -- Sample canonical object points (per-env, heterogeneous-aware) --
-        ins_prim_pattern = self.insertive.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
-        ins_canonical_all = utils.sample_object_point_cloud(
-            num_envs=env.num_envs, num_points=oversample * 128,
-            prim_path_pattern=ins_prim_pattern, device=str(device),
-        )
-        rec_prim_pattern = self.receptive.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
-        rec_canonical_all = utils.sample_object_point_cloud(
-            num_envs=env.num_envs, num_points=oversample * 128,
-            prim_path_pattern=rec_prim_pattern, device=str(device),
-        )
-        # Keep the oversampled pools around so per-reset resampling can re-pick
-        # ins/rec subsets without re-sampling from the USD mesh every time.
-        if self.resample_on_reset:
-            self._ins_canonical_pool = ins_canonical_all  # [N, oversample*128, 3]
-            self._rec_canonical_pool = rec_canonical_all
-
-        # -- Build (num_task_types, num_points, ...) canonical selections via per-task FPS --
-        # For each task type, gather its representative env's object points, concat with robot,
-        # transform to world using that env's poses, run FPS, and store the selection.
-        selected_local_list: list[torch.Tensor] = []
-        selected_source_list: list[torch.Tensor] = []
-        selected_body_idx_list: list[torch.Tensor] = []
-
-        n_robot_pts = robot_local.shape[0]
-        for t in range(self.num_task_types):
-            # Representative env for this task type (first env whose task_type_id == t).
-            if self.is_multitask:
-                rep_env = int((self.task_type_ids == t).nonzero(as_tuple=True)[0][0].item())
-            else:
-                rep_env = 0
-
-            parts_local = [robot_local]
-            parts_source = [torch.full((n_robot_pts,), self._SRC_ROBOT, dtype=torch.long, device=device)]
-            parts_body = [robot_body_idx]
-
-            if ins_canonical_all is not None:
-                ins_pts = ins_canonical_all[rep_env]  # (n_ins, 3) in this env's object-local frame
-                parts_local.append(ins_pts)
-                parts_source.append(torch.full((ins_pts.shape[0],), self._SRC_INSERTIVE, dtype=torch.long, device=device))
-                parts_body.append(torch.full((ins_pts.shape[0],), -1, dtype=torch.long, device=device))
-            if rec_canonical_all is not None:
-                rec_pts = rec_canonical_all[rep_env]
-                parts_local.append(rec_pts)
-                parts_source.append(torch.full((rec_pts.shape[0],), self._SRC_RECEPTIVE, dtype=torch.long, device=device))
-                parts_body.append(torch.full((rec_pts.shape[0],), -1, dtype=torch.long, device=device))
-
-            task_local = torch.cat(parts_local, dim=0)
-            task_source = torch.cat(parts_source, dim=0)
-            task_body = torch.cat(parts_body, dim=0)
-
-            # Deterministic per-source selection. The legacy approach was a single
-            # FPS over (robot ∪ ins ∪ rec) in world frame, which depends on
-            # body_pos_w / root_pos_w and hence on physics-warmup state — so the
-            # selected indices vary with num_envs / sim batching even after seed-
-            # locking all the random calls. Trained teachers overfit to whatever
-            # selection their training run happened to make.
-            #
-            # Instead: fix a target count per source, then take the FIRST N points
-            # from each source's pool. The pools are themselves seed-locked
-            # (robot via per-body temporary_seed in _sample_body_points; ins/rec
-            # via temporary_seed inside sample_object_point_cloud), so the
-            # selection is fully deterministic across runs and env counts.
-            #
-            # The split (target ~285 robot / 87 ins / 140 rec = 512) was chosen
-            # to match what global-FPS gave on this scene historically; the
-            # encoder will learn whatever distribution we hand it.
-            n_robot_avail = (task_source == self._SRC_ROBOT).sum().item()
-            n_ins_avail = (task_source == self._SRC_INSERTIVE).sum().item()
-            n_rec_avail = (task_source == self._SRC_RECEPTIVE).sum().item()
-            n_robot_target = min(285, n_robot_avail)
-            n_ins_target = min(87, n_ins_avail)
-            n_rec_target = self.num_points - n_robot_target - n_ins_target
-            n_rec_target = min(n_rec_target, n_rec_avail)
-            # If rec is short, pad robot.
-            shortfall = self.num_points - n_robot_target - n_ins_target - n_rec_target
-            if shortfall > 0:
-                n_robot_target = min(n_robot_target + shortfall, n_robot_avail)
-
-            robot_idx = (task_source == self._SRC_ROBOT).nonzero(as_tuple=True)[0][:n_robot_target]
-            ins_idx = (task_source == self._SRC_INSERTIVE).nonzero(as_tuple=True)[0][:n_ins_target]
-            rec_idx = (task_source == self._SRC_RECEPTIVE).nonzero(as_tuple=True)[0][:n_rec_target]
-            sel = torch.cat([robot_idx, ins_idx, rec_idx], dim=0)
-            # Pad to num_points if still short (defensive).
-            if sel.numel() < self.num_points:
-                pad = self.num_points - sel.numel()
-                sel = torch.cat([sel, torch.zeros(pad, dtype=torch.long, device=device)], dim=0)
-
-            selected_local_list.append(task_local[sel])
-            selected_source_list.append(task_source[sel])
-            selected_body_idx_list.append(task_body[sel])
-
-        # Per-task canonical tables: (T, num_points, 3), (T, num_points), (T, num_points)
-        self.selected_local_task = torch.stack(selected_local_list, dim=0)
-        self.selected_source_type_task = torch.stack(selected_source_list, dim=0)
-        self.selected_body_idx_task = torch.stack(selected_body_idx_list, dim=0)
-
-        # Back-compat aliases for single-task runtime path.
+        # -- Back-compat aliases for single-task runtime path --
         self.selected_local = self.selected_local_task[0]
         self.selected_source_type = self.selected_source_type_task[0]
         self.selected_body_idx = self.selected_body_idx_task[0]
@@ -732,8 +640,10 @@ class ScenePointCloud(ManagerTermBase):
                 (self.selected_source_type_task[t] == self._SRC_RECEPTIVE).nonzero(as_tuple=True)[0]
                 for t in range(self.num_task_types)
             ]
-            self._ins_pool_size = ins_canonical_all.shape[1] if ins_canonical_all is not None else 0
-            self._rec_pool_size = rec_canonical_all.shape[1] if rec_canonical_all is not None else 0
+            # ``_ins_canonical_pool`` / ``_rec_canonical_pool`` are populated by
+            # ``_sample_and_select_canonical`` whenever ``resample_on_reset`` is True.
+            self._ins_pool_size = self._ins_canonical_pool.shape[1] if getattr(self, "_ins_canonical_pool", None) is not None else 0
+            self._rec_pool_size = self._rec_canonical_pool.shape[1] if getattr(self, "_rec_canonical_pool", None) is not None else 0
             # For robot resampling: per-task, group robot slots by body_idx so we
             # can vectorize the per-reset gather per body.
             self._robot_slots_by_body_task: list[dict[int, torch.Tensor]] = []
@@ -793,6 +703,221 @@ class ScenePointCloud(ManagerTermBase):
                     },
                 )
                 self._pc_markers[src_type] = VisualizationMarkers(marker_cfg)
+
+    # ------------------------------------------------------------------------
+    # Canonical-points cache
+    # ------------------------------------------------------------------------
+    _BUDGET_SPLIT = (285, 87, 140)  # (robot, ins, rec) — see selection comment
+
+    def _compute_cache_key(
+        self,
+        ins_usd_paths: list[str],
+        rec_usd_paths: list[str],
+        oversample: int,
+    ) -> str:
+        """SHA256-keyed cache identifier from canonical inputs."""
+        robot_id = ",".join(self.robot.body_names)
+        parts = "|".join([
+            f"robot:{robot_id}",
+            "ins:" + ",".join(sorted(ins_usd_paths)),
+            "rec:" + ",".join(sorted(rec_usd_paths)),
+            f"num_points:{self.num_points}",
+            f"oversample:{oversample}",
+            f"budget:{self._BUDGET_SPLIT[0]},{self._BUDGET_SPLIT[1]},{self._BUDGET_SPLIT[2]}",
+        ])
+        return hashlib.sha256(parts.encode()).hexdigest()[:16]
+
+    def _cache_url(self, key: str) -> str:
+        return f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset/scene_pc_cache/{key}.pt"
+
+    def _cache_local_fallback(self, key: str) -> str:
+        return os.path.join(SCENE_PC_LOCAL_CACHE_DIR, f"{key}.pt")
+
+    def _load_canonical_cache_strict(self, device) -> None:
+        """Load canonical points from HF Hub. Raise if missing (no silent drift).
+
+        For generation, set ``UWLAB_GENERATE_SCENE_PC_CACHE=1`` to bypass this
+        path entirely and sample fresh — see ``scripts/generate_scene_pc_cache.py``.
+        """
+        key = self._cache_key
+        cache_url = self._cache_url(key)
+        try:
+            local_path = resolve_cloud_path(cache_url)
+        except Exception as e:
+            raise RuntimeError(
+                f"\n[ScenePointCloud] No canonical points cached on HF for key {key}.\n"
+                f"  This usually means a new asset combination (robot+ins+rec or num_points)\n"
+                f"  was introduced. To generate the cache locally, run:\n"
+                f"      UWLAB_GENERATE_SCENE_PC_CACHE=1 python scripts/generate_scene_pc_cache.py \\\n"
+                f"          --task <task_id> [hydra overrides]\n"
+                f"  Then publish to HF Hub (every machine will load identical points):\n"
+                f"      huggingface-cli upload patrickhaoy/uwlab-assets \\\n"
+                f"          {self._cache_local_fallback(key)} \\\n"
+                f"          Datasets/OmniReset/scene_pc_cache/{key}.pt \\\n"
+                f"          --repo-type=dataset\n"
+                f"  Underlying error: {e}"
+            ) from e
+        try:
+            blob = torch.load(local_path, map_location=device)
+            self.selected_local_task = blob["selected_local_task"].to(device)
+            self.selected_source_type_task = blob["selected_source_type_task"].to(device)
+            self.selected_body_idx_task = blob["selected_body_idx_task"].to(device)
+        except Exception as e:
+            raise RuntimeError(
+                f"[ScenePointCloud] cache file at {local_path} is corrupt or missing "
+                f"expected keys: {e}"
+            ) from e
+        print(f"[ScenePointCloud] cache HIT (HF) for key {key} from {local_path}")
+
+    def _save_canonical_cache_local(self) -> None:
+        """Save freshly-sampled points to local cache dir (generate mode only).
+
+        After this saves, the user MUST upload to HF Hub for other machines to
+        see identical points — the upload command is printed for convenience.
+        """
+        key = self._cache_key
+        local_path = self._cache_local_fallback(key)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        torch.save(
+            {
+                "selected_local_task": self.selected_local_task.cpu(),
+                "selected_source_type_task": self.selected_source_type_task.cpu(),
+                "selected_body_idx_task": self.selected_body_idx_task.cpu(),
+                "num_points": self.num_points,
+                "num_task_types": self.num_task_types,
+            },
+            local_path,
+        )
+        print(f"[ScenePointCloud] cache SAVED to {local_path}")
+        print(
+            f"[ScenePointCloud] *** UPLOAD REQUIRED ***  Run:\n"
+            f"    huggingface-cli upload patrickhaoy/uwlab-assets \\\n"
+            f"        {local_path} \\\n"
+            f"        Datasets/OmniReset/scene_pc_cache/{key}.pt \\\n"
+            f"        --repo-type=dataset"
+        )
+
+    # ------------------------------------------------------------------------
+    # Canonical sampling (extracted from __init__ so the cache can skip it)
+    # ------------------------------------------------------------------------
+    def _sample_and_select_canonical(
+        self,
+        oversample: int,
+        ins_usd_paths: list[str],
+        rec_usd_paths: list[str],
+        env_num_envs: int,
+        device,
+    ) -> None:
+        """Sample per-body and per-object point pools, run deterministic per-source
+        selection, and populate ``selected_local_task`` / ``_source_type_task`` /
+        ``_body_idx_task``.
+
+        Note: ``ins_usd_paths`` / ``rec_usd_paths`` are accepted for symmetry with
+        the cache key signature even though the sampling itself reads USD prims
+        from the live scene rather than the path strings.
+        """
+        robot_prim_path_env0 = self.robot.cfg.prim_path.replace("env_.*", "env_0")
+        body_names = self.robot.body_names
+
+        robot_local_parts: list[torch.Tensor] = []
+        robot_body_idx_parts: list[int] = []
+        # Keep the pre-FPS oversampled pool per body when resample_on_reset_robot
+        # is enabled. The pool is indexed by body_idx_int.
+        self._robot_pool_per_body: dict[int, torch.Tensor] = {}
+        for body_idx_int, body_name in enumerate(body_names):
+            body_prim_path = f"{robot_prim_path_env0}/{body_name}"
+            try:
+                # Per-body deterministic seed so the selection is reproducible
+                # across env-init contexts (training, eval, distributed ranks)
+                # regardless of upstream RNG consumption.
+                body_points, body_pool = self._sample_body_points(
+                    body_prim_path, oversample * 64, 64, device,
+                    return_pool=self.resample_on_reset_robot,
+                    seed=42 + body_idx_int,
+                )
+                if body_points is not None and body_points.shape[0] > 0:
+                    robot_local_parts.append(body_points)
+                    robot_body_idx_parts.extend([body_idx_int] * body_points.shape[0])
+                    if body_pool is not None:
+                        self._robot_pool_per_body[body_idx_int] = body_pool
+            except Exception:
+                continue
+        robot_local = torch.cat(robot_local_parts, dim=0).to(device)
+        robot_body_idx = torch.tensor(robot_body_idx_parts, dtype=torch.long, device=device)
+
+        # -- Sample canonical object points (per-env, heterogeneous-aware) --
+        ins_prim_pattern = self.insertive.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        ins_canonical_all = utils.sample_object_point_cloud(
+            num_envs=env_num_envs, num_points=oversample * 128,
+            prim_path_pattern=ins_prim_pattern, device=str(device),
+        )
+        rec_prim_pattern = self.receptive.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+        rec_canonical_all = utils.sample_object_point_cloud(
+            num_envs=env_num_envs, num_points=oversample * 128,
+            prim_path_pattern=rec_prim_pattern, device=str(device),
+        )
+        if self.resample_on_reset:
+            self._ins_canonical_pool = ins_canonical_all
+            self._rec_canonical_pool = rec_canonical_all
+
+        # -- Build (num_task_types, num_points, ...) canonical selections --
+        selected_local_list: list[torch.Tensor] = []
+        selected_source_list: list[torch.Tensor] = []
+        selected_body_idx_list: list[torch.Tensor] = []
+        n_robot_pts = robot_local.shape[0]
+        for t in range(self.num_task_types):
+            if self.is_multitask:
+                rep_env = int((self.task_type_ids == t).nonzero(as_tuple=True)[0][0].item())
+            else:
+                rep_env = 0
+
+            parts_local = [robot_local]
+            parts_source = [torch.full((n_robot_pts,), self._SRC_ROBOT, dtype=torch.long, device=device)]
+            parts_body = [robot_body_idx]
+
+            if ins_canonical_all is not None:
+                ins_pts = ins_canonical_all[rep_env]
+                parts_local.append(ins_pts)
+                parts_source.append(torch.full((ins_pts.shape[0],), self._SRC_INSERTIVE, dtype=torch.long, device=device))
+                parts_body.append(torch.full((ins_pts.shape[0],), -1, dtype=torch.long, device=device))
+            if rec_canonical_all is not None:
+                rec_pts = rec_canonical_all[rep_env]
+                parts_local.append(rec_pts)
+                parts_source.append(torch.full((rec_pts.shape[0],), self._SRC_RECEPTIVE, dtype=torch.long, device=device))
+                parts_body.append(torch.full((rec_pts.shape[0],), -1, dtype=torch.long, device=device))
+
+            task_local = torch.cat(parts_local, dim=0)
+            task_source = torch.cat(parts_source, dim=0)
+            task_body = torch.cat(parts_body, dim=0)
+
+            # Deterministic per-source first-N selection (avoids global-FPS's
+            # num_envs / physics-warmup dependence).
+            robot_target, ins_target, rec_target = self._BUDGET_SPLIT
+            n_robot_avail = int((task_source == self._SRC_ROBOT).sum().item())
+            n_ins_avail = int((task_source == self._SRC_INSERTIVE).sum().item())
+            n_rec_avail = int((task_source == self._SRC_RECEPTIVE).sum().item())
+            n_robot_target = min(robot_target, n_robot_avail)
+            n_ins_target = min(ins_target, n_ins_avail)
+            n_rec_target = min(self.num_points - n_robot_target - n_ins_target, n_rec_avail)
+            shortfall = self.num_points - n_robot_target - n_ins_target - n_rec_target
+            if shortfall > 0:
+                n_robot_target = min(n_robot_target + shortfall, n_robot_avail)
+
+            robot_idx = (task_source == self._SRC_ROBOT).nonzero(as_tuple=True)[0][:n_robot_target]
+            ins_idx = (task_source == self._SRC_INSERTIVE).nonzero(as_tuple=True)[0][:n_ins_target]
+            rec_idx = (task_source == self._SRC_RECEPTIVE).nonzero(as_tuple=True)[0][:n_rec_target]
+            sel = torch.cat([robot_idx, ins_idx, rec_idx], dim=0)
+            if sel.numel() < self.num_points:
+                pad = self.num_points - sel.numel()
+                sel = torch.cat([sel, torch.zeros(pad, dtype=torch.long, device=device)], dim=0)
+
+            selected_local_list.append(task_local[sel])
+            selected_source_list.append(task_source[sel])
+            selected_body_idx_list.append(task_body[sel])
+
+        self.selected_local_task = torch.stack(selected_local_list, dim=0)
+        self.selected_source_type_task = torch.stack(selected_source_list, dim=0)
+        self.selected_body_idx_task = torch.stack(selected_body_idx_list, dim=0)
 
     def _sample_body_points(
         self, body_prim_path: str, n_oversample: int, n_points: int, device,
