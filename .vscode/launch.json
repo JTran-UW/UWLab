@@ -13,7 +13,9 @@
             "type": "python",
             "request": "launch",
             "program": "${file}",
-            "console": "integratedTerminal"
+            "console": "integratedTerminal",
+            "python": "/home/yandabao/miniforge3/envs/patlab/bin/python",
+            "args" : ["--teacher", "/home/yandabao/UWLab-patrick-private/teachers/seed23_sysidenv.pt", "--num_envs", "128", "--num_episodes", "1024", "--headless"]
         },
         {
             "name": "Python: Attach (windows-x86_64/linux-x86_64)",

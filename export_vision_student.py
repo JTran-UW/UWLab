@@ -204,6 +204,7 @@ def main():
     )
 
     print("Instantiating StudentTeacherVision...")
+    print(f"encoder_imagenet_norm: {policy_cfg.get('encoder_imagenet_norm', False)}")
     policy = StudentTeacherVision(
         obs=dummy_obs,
         obs_groups=obs_groups,
@@ -217,6 +218,7 @@ def main():
         noise_std_type=policy_cfg.get("noise_std_type", "scalar"),
         student_obs_normalization=bool(policy_cfg.get("student_obs_normalization", True)),
         encoder_type=encoder_type,
+        encoder_imagenet_norm=bool(policy_cfg.get("encoder_imagenet_norm", False)),
         encoder_pretrained_path="",   # weights come from checkpoint; skip ImageNet load
         encoder_freeze_iters=0,
         aux_enabled=False,

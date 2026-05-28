@@ -71,17 +71,69 @@ class DepthCNN(nn.Module):
         return self.head(self.conv(x).flatten(1))
 
 
+class _RGBAugmentation(nn.Module):
+    """Stochastic RGB augmentation for training, no-op at inference.
+
+    GaussianBlur is applied to the full batch (shared sigma per forward call).
+    ColorJitter and RandomGrayscale are applied per-image via a loop for
+    independent random params. GaussianNoise is per-pixel by construction.
+
+    Expects input in [0, 1] float32 (B, 3, H, W). Output is clamped to [0, 1].
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        import torchvision.transforms.v2 as T
+        self._jitter = T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05)
+        self._blur = T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
+        self._grayscale = T.RandomGrayscale(p=0.05)
+
+    def _aug_one(self, img: torch.Tensor) -> torch.Tensor:
+        img = self._jitter(img)
+        img = self._grayscale(img)
+        return img
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return x
+        x = self._blur(x)  # shared sigma per step — applied to full batch
+        x = torch.stack([self._aug_one(x[i]) for i in range(x.shape[0])])  # per-image
+        x = (x + torch.randn_like(x) * 0.01).clamp_(0.0, 1.0)
+        return x
+
+
+def _replace_bn_with_gn(module: nn.Module, num_groups: int = 32) -> None:
+    """Recursively replace all BatchNorm2d layers with GroupNorm in-place."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            gn = nn.GroupNorm(min(num_groups, child.num_features), child.num_features)
+            setattr(module, name, gn)
+        else:
+            _replace_bn_with_gn(child, num_groups)
+
+
 class ResNet18Encoder(nn.Module):
     """Torchvision ResNet18 backbone + linear projection to ``embed_dim``.
 
     If ``pretrained_path`` is set, loads ImageNet weights from that file before
     replacing conv1 (so all other layers keep the pretrained values). Scratch
     init otherwise.
+
+    If ``imagenet_norm`` is True, applies ImageNet mean/std normalization to the
+    input before the backbone (expects input in [0, 1]). Only valid for 3-channel
+    inputs; raises if enabled with in_channels != 3.
     """
 
-    def __init__(self, in_channels: int, embed_dim: int = 128, pretrained_path: str = ""):
+    def __init__(self, in_channels: int, embed_dim: int = 128, pretrained_path: str = "", imagenet_norm: bool = False):
         super().__init__()
         import torchvision.models as tvm
+
+        if imagenet_norm and in_channels != 3:
+            raise ValueError(f"imagenet_norm=True requires in_channels=3, got {in_channels}")
+        self.imagenet_norm = imagenet_norm
+        if imagenet_norm:
+            self.register_buffer("_img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer("_img_std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         backbone = tvm.resnet18(weights=None)
         if pretrained_path:
@@ -101,10 +153,16 @@ class ResNet18Encoder(nn.Module):
                     else:
                         new_conv1.weight.copy_(avg_w.expand(-1, in_channels, -1, -1))
             backbone.conv1 = new_conv1
+        # Replace all BatchNorm2d with GroupNorm (32 groups). ResNet18 channels are
+        # 64/128/256/512, all divisible by 32. Done after weight loading so the conv
+        # weights are preserved; BN running stats are discarded (GN has none).
+        _replace_bn_with_gn(backbone)
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
         self.proj = nn.Linear(512, embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.imagenet_norm:
+            x = (x - self._img_mean) / self._img_std
         f = self.backbone(x).flatten(1)
         return torch.relu(self.proj(f))
 
@@ -129,6 +187,7 @@ class StudentTeacherVision(StudentTeacher):
         student_obs_normalization: bool = True,
         encoder_type: str = "depth_cnn",
         encoder_pretrained_path: str = "",
+        encoder_imagenet_norm: bool = False,
         encoder_freeze_iters: int = 0,
         aux_enabled: bool = False,
         aux_target_group: str = "aux_target",
@@ -161,11 +220,14 @@ class StudentTeacherVision(StudentTeacher):
                 f"all vision groups must share shape; {g} has {obs[g].shape} vs {first_img.shape}"
             )
 
+        # RGB augmentation — only for 3-channel inputs (depth groups are 1-channel).
+        self._rgb_aug: _RGBAugmentation | None = _RGBAugmentation() if in_channels == 3 else None
+
         # Shared image encoder across cameras.
         if encoder_type == "depth_cnn":
             self.depth_encoder = DepthCNN(in_channels, H, W, embed_dim=embed_dim)
         elif encoder_type == "resnet18":
-            self.depth_encoder = ResNet18Encoder(in_channels, embed_dim=embed_dim, pretrained_path=encoder_pretrained_path)
+            self.depth_encoder = ResNet18Encoder(in_channels, embed_dim=embed_dim, pretrained_path=encoder_pretrained_path, imagenet_norm=encoder_imagenet_norm)
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
         vision_feat_dim = len(self.vision_groups) * embed_dim
@@ -173,7 +235,7 @@ class StudentTeacherVision(StudentTeacher):
         # DEXTRAH-style frozen-backbone warmup. If > 0, backbone starts with
         # ``requires_grad=False`` and is unfrozen once the algorithm hits
         # ``encoder_freeze_iters`` updates (see ``maybe_unfreeze_backbone``).
-        # proj/std_head/aux_head/student MLP always stay trainable.
+        # proj/log_std_head/aux_head/student MLP always stay trainable.
         self.encoder_freeze_iters = int(encoder_freeze_iters)
         self._backbone_frozen = self.encoder_freeze_iters > 0 and encoder_type == "resnet18"
         if self._backbone_frozen:
@@ -234,13 +296,11 @@ class StudentTeacherVision(StudentTeacher):
         self.predict_std = bool(predict_std)
         std_head_in_dim = num_proprio + vision_feat_dim
         if self.predict_std:
-            self.std_head = nn.Linear(std_head_in_dim, num_actions)
-            # Initialize so exp(log_std) ≈ init_noise_std at init (stable start).
-            nn.init.zeros_(self.std_head.weight)
-            nn.init.constant_(self.std_head.bias, float(torch.log(torch.tensor(init_noise_std)).item()))
+            self.log_std_head = nn.Linear(std_head_in_dim, num_actions)
+            self.log_std_limits = (-5.0, 2.0)
             print(f"Std head ({std_head_in_dim} -> {num_actions}) enabled; log-std output")
         else:
-            self.std_head = None
+            self.log_std_head = None
 
         # Teacher contract: if JIT returns (mean, std) tuple, callers can fetch both
         # via ``evaluate_with_std``; ``evaluate`` still returns mean-only for
@@ -274,10 +334,16 @@ class StudentTeacherVision(StudentTeacher):
             self._backbone_frozen = False
             print(f"[StudentTeacherVision] unfroze ResNet18 backbone at iter {num_updates}")
 
+    def _aug_imgs(self, obs: TensorDict) -> list[torch.Tensor]:
+        imgs = [obs[g] for g in self.vision_groups]
+        if self._rgb_aug is not None:
+            imgs = [self._rgb_aug(img) for img in imgs]
+        return imgs
+
     def _encode_student(self, obs: TensorDict) -> torch.Tensor:
         proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)
         proprio = self.student_obs_normalizer(proprio)
-        img_feats = [self.depth_encoder(obs[g]) for g in self.vision_groups]
+        img_feats = [self.depth_encoder(img) for img in self._aug_imgs(obs)]
         return torch.cat([proprio] + img_feats, dim=-1)
 
     def forward_with_aux(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -288,10 +354,29 @@ class StudentTeacherVision(StudentTeacher):
         """
         proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)
         proprio = self.student_obs_normalizer(proprio)
-        img_feats = torch.cat([self.depth_encoder(obs[g]) for g in self.vision_groups], dim=-1)
+        img_feats = torch.cat([self.depth_encoder(img) for img in self._aug_imgs(obs)], dim=-1)
         action = self.student(torch.cat([proprio, img_feats], dim=-1))
         aux_pred = self.aux_head(img_feats) if self.aux_enabled else None
         return action, aux_pred
+
+    def forward_with_aux_and_std(
+        self, obs: TensorDict
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Single encoder pass returning (mean, std, aux_pred) for the weighted DAgger update.
+
+        Avoids running the encoder three times when both std supervision and the
+        aux pose-regression loss are active simultaneously.
+        """
+        if not self.predict_std:
+            raise RuntimeError("forward_with_aux_and_std requires predict_std=True")
+        proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)
+        proprio = self.student_obs_normalizer(proprio)
+        img_feats = torch.cat([self.depth_encoder(img) for img in self._aug_imgs(obs)], dim=-1)
+        feat = torch.cat([proprio, img_feats], dim=-1)
+        mean = self.student(feat)
+        std = torch.exp(self.log_std_head(feat).clamp(*self.log_std_limits))
+        aux_pred = self.aux_head(img_feats) if self.aux_enabled else None
+        return mean, std, aux_pred
 
     def get_aux_target(self, obs: TensorDict) -> torch.Tensor:
         if not self.aux_enabled:
@@ -347,7 +432,7 @@ class StudentTeacherVision(StudentTeacher):
             raise RuntimeError("act_inference_with_std called but predict_std=False")
         feat = self._encode_student(obs)
         mean = self.student(feat)
-        log_std = self.std_head(feat)
+        log_std = self.log_std_head(feat).clamp(*self.log_std_limits)
         std = torch.exp(log_std)
         return mean, std
 

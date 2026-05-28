@@ -3402,7 +3402,7 @@ class randomize_gripper_from_sysid(ManagerTermBase):
     When used with ADR, ``scale_progress`` (0→1):
     - Armature/friction: interpolate from 0 to sysid × U(scale_range).
     - Stiffness/damping: interpolate from ``initial_stiffness``/``initial_damping``
-      (sim defaults) to sysid × U(scale_range).
+      (sim defaults) to sysid x U(scale_range).
     """
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):

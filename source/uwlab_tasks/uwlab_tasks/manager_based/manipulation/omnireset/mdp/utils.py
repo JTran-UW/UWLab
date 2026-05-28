@@ -335,7 +335,11 @@ def get_temp_dir(rank: int | None = None) -> str:
     uid = os.getuid()
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
 
-    download_dir = os.path.join("/tmp", "uwlab", str(uid), f"gpu_{local_rank}")
+    base = "/tmp/uwlab"
+    if not os.access(base, os.W_OK) and not os.path.isdir(os.path.join(base, str(uid))):
+        # /tmp/uwlab not writable by this user (e.g. owned by another user); fall back to home cache
+        base = os.path.join(os.path.expanduser("~"), ".cache", "uwlab", "tmp")
+    download_dir = os.path.join(base, str(uid), f"gpu_{local_rank}")
     os.makedirs(download_dir, mode=0o700, exist_ok=True)
 
     return download_dir

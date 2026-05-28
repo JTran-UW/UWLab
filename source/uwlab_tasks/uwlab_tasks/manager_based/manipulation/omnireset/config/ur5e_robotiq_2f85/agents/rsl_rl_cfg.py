@@ -100,6 +100,7 @@ class StudentTeacherVisionPolicyCfg:
     student_obs_normalization: bool = True
     encoder_type: str = "depth_cnn"  # "depth_cnn" (slim 4-conv) or "resnet18"
     encoder_pretrained_path: str = ""  # path to ImageNet weights (.pth) for resnet18
+    encoder_imagenet_norm: bool = False  # apply ImageNet mean/std normalization inside the encoder (RGB only)
     encoder_freeze_iters: int = 0  # DEXTRAH-style warmup: freeze ResNet18 backbone for first N algorithm updates
     aux_enabled: bool = False  # train an aux pose-regression head on vision features
     aux_target_group: str = "aux_target"
@@ -196,6 +197,7 @@ class RGB_DAggerWristSidePretrainedWeightedRunnerCfg(Depth_DAggerSplitRunnerCfg)
     """2cam RGB (side+wrist) + ImageNet ResNet18 + DEXTRAH-style weighted-L2 loss."""
 
     experiment_name: str = "ur5e_robotiq_2f85_rgb_dagger_wristside_pretrained_weighted"
+    student_fraction: float = 0.5
     algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(
         beta_anneal_iters=0,
         num_learning_epochs=1,
@@ -203,9 +205,10 @@ class RGB_DAggerWristSidePretrainedWeightedRunnerCfg(Depth_DAggerSplitRunnerCfg)
     )
     policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
         vision_groups=["side_rgb", "wrist_rgb"],
-        student_hidden_dims=[512, 256],
+        student_hidden_dims=[512, 512, 512, 512],
         encoder_type="resnet18",
         encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+        encoder_imagenet_norm=True,
         predict_std=True,
         teacher_returns_std=True,
     )

@@ -26,7 +26,7 @@ Requires:
 * Policy built with ``teacher_returns_std=True`` + teacher JIT that returns
   ``(mean, std)`` (see :func:`scripts_v2/tools/convert_state_expert_to_jit.py`
   with ``--std``).
-* Policy built with ``predict_std=True`` — adds a student ``std_head`` head.
+* Policy built with ``predict_std=True`` — adds a student ``log_std_head`` head.
 """
 
 from __future__ import annotations
@@ -106,15 +106,13 @@ class DistillationDAggerWeighted(DistillationDAgger):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
             for obs, _, privileged_mu, dones in self.storage.generator():
-                # Student (μ, σ).
+                # Student (μ, σ) — single encoder pass, optionally with aux.
                 if aux_enabled:
-                    # forward_with_aux returns (mean, aux_pred); need std separately,
-                    # which requires a second encoder call. For now: no aux here.
-                    raise NotImplementedError(
-                        "DistillationDAggerWeighted + aux head not implemented; "
-                        "share the encoder between action-head/std-head/aux-head forward."
-                    )
-                student_mu, student_sigma = self.policy.act_inference_with_std(obs)
+                    student_mu, student_sigma, aux_pred = self.policy.forward_with_aux_and_std(obs)
+                    aux_target = self.policy.get_aux_target(obs)
+                else:
+                    student_mu, student_sigma = self.policy.act_inference_with_std(obs)
+                    aux_pred, aux_target = None, None
 
                 # Re-run teacher to get σ (teacher μ is already in privileged_actions).
                 # Frozen JIT forward — cheap (215d → 7d MLP + gSDE head).
@@ -127,6 +125,9 @@ class DistillationDAggerWeighted(DistillationDAgger):
                     s_sig = student_sigma[train_mask]
                     t_mu = teacher_mu[train_mask]
                     t_sig = teacher_sigma[train_mask]
+                    if aux_enabled:
+                        aux_pred = aux_pred[train_mask]
+                        aux_target = aux_target[train_mask]
                 else:
                     s_mu, s_sig = student_mu, student_sigma
                     t_mu, t_sig = teacher_mu, teacher_sigma
@@ -153,6 +154,10 @@ class DistillationDAggerWeighted(DistillationDAgger):
                     gripper_loss_val = gripper_loss.item()
                 sigma_loss = _l2(s_sig, t_sig).mean()
                 step_loss = mu_loss + sigma_loss
+                if aux_enabled:
+                    aux_loss = self.loss_fn(aux_pred, aux_target)
+                    step_loss = step_loss + self.aux_coeff * aux_loss
+                    mean_aux_loss += aux_loss.item()
 
                 loss = loss + step_loss
                 mean_mu_loss += mu_loss.item()
@@ -197,6 +202,8 @@ class DistillationDAggerWeighted(DistillationDAgger):
             "behavior_arm": mean_arm_loss,
             "behavior_gripper": mean_gripper_loss,
         }
+        if aux_enabled:
+            loss_dict["aux"] = mean_aux_loss / cnt
         if self.student_mask is None:
             loss_dict["beta"] = self.beta
         else:

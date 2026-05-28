@@ -35,6 +35,7 @@ simulation_app = app_launcher.app
 
 import os
 import sys as _sys
+import numpy as np
 # Force unbuffered stdout so debug prints survive a C++ crash
 _sys.stdout.reconfigure(line_buffering=True)
 
@@ -48,6 +49,7 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.rgb_dagger_cfg import (
     Ur5eRobotiq2f85PCTeacherFinetuneEvalCfg,
+    DebugEvalCfg
 )
 
 
@@ -80,19 +82,40 @@ def main():
     num_episodes = 0
     num_successes = 0
 
+    # per-env accumulators for debug joint_pos (12-dim)
+    num_envs = env.unwrapped.num_envs
+    current_eps = [[] for _ in range(num_envs)]
+    all_episodes = []   # list of (T, 12) arrays
+
+    out_path = os.path.join(os.path.dirname(os.path.abspath(args_cli.teacher)),
+                            "debug_joint_pos_episodes.npy")
+
     while simulation_app.is_running():
         with torch.inference_mode():
             out = teacher(obs)
             actions = out[0] if isinstance(out, (tuple, list)) else out
             obs_td, rewards, dones, _ = env.step(actions)
             obs = obs_td["policy"]
+
+            # debug: (num_envs, 12) joint_pos
+            joint_pos = obs_td["debug"].cpu().numpy()  # (num_envs, 12)
+            print(joint_pos)
+            for i in range(num_envs):
+                current_eps[i].append(joint_pos[i].copy())
+
             if dones.any():
+                for i in range(num_envs):
+                    if dones[i]:
+                        all_episodes.append(np.array(current_eps[i]))  # (T, 12)
+                        current_eps[i] = []
                 num_episodes += int(dones.sum().item())
                 num_successes += int(torch.logical_and(rewards > 0.1, dones).sum().item())
 
         if num_episodes >= args_cli.num_episodes:
             break
 
+    np.save(out_path, np.array(all_episodes, dtype=object))
+    print(f"Saved {len(all_episodes)} episodes of debug joint_pos to: {out_path}")
     print(f"Episodes : {num_episodes}")
     print(f"Successes: {num_successes}")
     if num_episodes:

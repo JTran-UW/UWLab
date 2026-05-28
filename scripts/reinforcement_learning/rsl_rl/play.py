@@ -129,6 +129,15 @@ from uwlab_tasks.utils.hydra import hydra_task_config
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
+def _is_jit_checkpoint(path: str) -> bool:
+    """Return True if *path* is a TorchScript (JIT) file, False if it is a runner checkpoint."""
+    try:
+        torch.jit.load(path, map_location="cpu")
+        return True
+    except RuntimeError:
+        return False
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -190,55 +199,84 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # load previously trained model
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunnerSplit":
-        runner = DistillationRunnerSplit(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "BCPPORunner":
-        from uwlab_rl.rsl_rl.bc_ppo_runner import BCPPORunner
-        runner = BCPPORunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "GRPOGroupedRunner":
-        from uwlab_rl.rsl_rl.grpo_grouped_runner import GRPOGroupedRunner
-        runner = GRPOGroupedRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "OnPolicyRunnerRMA":
-        from uwlab_rl.rsl_rl.on_policy_runner_rma import OnPolicyRunnerRMA
-        runner = OnPolicyRunnerRMA(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    # Auto-detect whether the checkpoint is a TorchScript (JIT) file or a runner checkpoint.
+    is_jit = _is_jit_checkpoint(resume_path)
+
+    if is_jit:
+        print("[INFO]: Detected TorchScript checkpoint — loading with torch.jit.load (skipping runner).")
+        policy_nn = torch.jit.load(resume_path, map_location=agent_cfg.device)
+        policy_nn.eval()
+        # JIT policy forward takes a flat obs tensor; policy() alias used in the loop below.
+        policy = policy_nn
     else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+        # load previously trained model
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunnerSplit":
+            runner = DistillationRunnerSplit(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "BCPPORunner":
+            from uwlab_rl.rsl_rl.bc_ppo_runner import BCPPORunner
+            runner = BCPPORunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "GRPOGroupedRunner":
+            from uwlab_rl.rsl_rl.grpo_grouped_runner import GRPOGroupedRunner
+            runner = GRPOGroupedRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "OnPolicyRunnerRMA":
+            from uwlab_rl.rsl_rl.on_policy_runner_rma import OnPolicyRunnerRMA
+            runner = OnPolicyRunnerRMA(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        try:
+            runner.load(resume_path)
+        except ValueError as _e:
+            if "optimizer" not in str(_e).lower():
+                raise
+            # Optimizer param-group mismatch: checkpoint was saved with a different
+            # policy architecture (e.g. std-head added/removed between train and play).
+            # For inference we only need model weights, so skip the optimizer.
+            print(f"[WARN] Optimizer state mismatch — loading model weights only: {_e}")
+            _ckpt = torch.load(resume_path, map_location=agent_cfg.device)
+            runner.alg.policy.load_state_dict(_ckpt["model_state_dict"])
+        except RuntimeError as _e:
+            if "size mismatch" not in str(_e):
+                raise
+            # Critic obs size mismatch (e.g. checkpoint trained with different critic obs dim).
+            # strict=False still errors on size mismatches, so drop critic keys entirely.
+            print(f"[WARN] State dict size mismatch — dropping critic keys and loading actor only: {_e}")
+            _ckpt = torch.load(resume_path, map_location=agent_cfg.device)
+            _sd = {k: v for k, v in _ckpt["model_state_dict"].items() if not k.startswith("critic")}
+            runner.alg.policy.load_state_dict(_sd, strict=False)
 
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
+        # obtain the trained policy for inference
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
-        policy_nn = runner.alg.actor_critic
+        # extract the neural network module
+        # we do this in a try-except to maintain backwards compatibility.
+        try:
+            # version 2.3 onwards
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            # version 2.2 and below
+            policy_nn = runner.alg.actor_critic
 
-    # extract the normalizer
-    if hasattr(policy_nn, "actor_obs_normalizer"):
-        normalizer = policy_nn.actor_obs_normalizer
-    elif hasattr(policy_nn, "student_obs_normalizer"):
-        normalizer = policy_nn.student_obs_normalizer
-    else:
-        normalizer = None
+        # extract the normalizer
+        if hasattr(policy_nn, "actor_obs_normalizer"):
+            normalizer = policy_nn.actor_obs_normalizer
+        elif hasattr(policy_nn, "student_obs_normalizer"):
+            normalizer = policy_nn.student_obs_normalizer
+        else:
+            normalizer = None
 
-    # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    # StudentTeacherVision needs a custom multi-input exporter (proprio + depth images);
-    # the default actor-MLP exporter would silently drop the encoder. Detect by attr.
-    if isinstance(policy_nn, StudentTeacherVision):
-        export_vision_student_as_jit(policy_nn, path=export_model_dir, filename="depth_policy.pt")
-    else:
-        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+        # export policy to onnx/jit
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        # StudentTeacherVision needs a custom multi-input exporter (proprio + depth images);
+        # the default actor-MLP exporter would silently drop the encoder. Detect by attr.
+        if isinstance(policy_nn, StudentTeacherVision):
+            export_vision_student_as_jit(policy_nn, path=export_model_dir, filename="depth_policy.pt")
+        else:
+            export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+            export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 
@@ -250,20 +288,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # abnormal-state terminations land at ~0 reward and are counted as failures.
     num_episodes = 0
     num_successes = 0
+    finger_pose_history: list = []
+    # DEBUG: collect actions for env 0
+    action_history: list = []
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            actions = policy(obs)
+            # JIT policy takes a flat tensor directly; runner inference policy takes the obs dict.
+            if is_jit:
+                mean, std = policy(obs)
+                actions = mean
+            else:
+                actions = policy(obs)
+            # DEBUG: save actions for env 0
+            action_history.append(actions[0].cpu().numpy())
             # env stepping
             obs, rewards, dones, _ = env.step(actions)
             if dones.any():
                 num_episodes += dones.sum().item()
                 num_successes += torch.logical_and(rewards > 0.1, dones).sum().item()
-            # reset recurrent states for episodes that have terminated
-            policy_nn.reset(dones)
+                print(f"Success rate: {num_successes / num_episodes:.2%}")
+                print(f"Number of episodes: {num_episodes}")
+                print(f"Number of successes: {num_successes}")
+            # reset recurrent states for episodes that have terminated.
+            # JIT reset() takes no arguments and resets all hidden states.
+            if not is_jit:
+                policy_nn.reset(dones)
 
         timestep += 1
         if args_cli.video and timestep >= args_cli.video_length:
@@ -284,10 +337,39 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
+    print("=" * 50)
     print(f"Number of episodes: {num_episodes}")
     print(f"Number of successes: {num_successes}")
     if num_episodes:
         print(f"Success rate: {num_successes / num_episodes:.2%}")
+
+    if finger_pose_history:
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        data = np.array(finger_pose_history)  # (T, num_finger_joints)
+        fig, ax = plt.subplots(figsize=(10, 4))
+        for j in range(data.shape[1]):
+            ax.plot(data[:, j], label=f"finger_{j}")
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Joint position (rad)")
+        ax.set_title("Finger joint positions over time (sim)")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+        plot_path = os.path.join(log_dir, "finger_joint_positions.png")
+        npy_path  = os.path.join(log_dir, "finger_joint_positions.npy")
+        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        np.save(npy_path, data)
+        print(f"[INFO] Finger joint position plot saved to: {plot_path}")
+        print(f"[INFO] Finger joint position data saved to: {npy_path}")
+
+    # DEBUG: save action history for env 0
+    if action_history:
+        import numpy as np
+        action_npy_path = os.path.join(log_dir, "debug_actions_env0.npy")
+        np.save(action_npy_path, np.array(action_history))
+        print(f"[DEBUG] Actions for env 0 saved to: {action_npy_path}  shape={np.array(action_history).shape}")
 
     # close the simulator
     env.close()

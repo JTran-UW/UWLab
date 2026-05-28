@@ -486,6 +486,17 @@ gym.register(
     },
 )
 
+# Evaling the PC Expert, debug eng
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PCTeacher-DebugEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rgb_dagger_cfg:DebugEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:RGB_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
 # Eval cfg for students trained on the RGB PC-teacher sysid DAgger env above.
 # Inherits Stage-2 finetune-eval semantics (fixed sysid + OSC gains, 10-consecutive
 # success, EXPLICIT actuator) and layers on the wrist + side RGB cameras + matching
@@ -631,6 +642,32 @@ gym.register(
     },
 )
 
+
+# RGB DAgger from data-collection scene + state teacher (seed42 finetuned expert).
+# Env: DataCollection scene (224x224, 4-reset-type sampling, FinetuneEval sysid).
+# Runner: RGB_DAggerWristSidePretrainedWeightedRunnerCfg (unchanged).
+# NOTE: teacher must be exported with --std (teacher_returns_std=True in runner).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-DataCollection-StateTeacher-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rgb_dagger_cfg:Ur5eRobotiq2f85RGBDAggerDataCollectionStateCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:RGB_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
+
+# DataCollection scene + PC teacher (seed23_sysidenv.pt): broader reset distribution
+# with the same ScenePC teacher used in the sysid DAgger runs.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-DataCollection-PCTeacher-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rgb_dagger_cfg:Ur5eRobotiq2f85RGBDAggerDataCollectionPCTeacherCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:RGB_DAggerWristSidePretrainedWeightedRunnerCfg",
+    },
+)
 
 # RGB environments for data collection and evaluation
 gym.register(

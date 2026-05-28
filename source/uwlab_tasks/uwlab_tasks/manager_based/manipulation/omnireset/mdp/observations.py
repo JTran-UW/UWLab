@@ -599,9 +599,20 @@ class ScenePointCloud(ManagerTermBase):
         generate_mode = os.environ.get("UWLAB_GENERATE_SCENE_PC_CACHE") == "1"
 
         if cache_usable and not generate_mode:
-            # STRICT path (default for training/eval): HF only. Raises on miss
-            # to prevent silent per-machine drift from lazy local generation.
-            self._load_canonical_cache_strict(device)
+            # Preferred path: load from HF Hub for deterministic points across machines.
+            # If HF is unavailable (rate-limit, 404, network down), fall back to local
+            # procedural sampling so training is not blocked by asset availability.
+            try:
+                self._load_canonical_cache_strict(device)
+            except Exception as e:
+                print(
+                    f"[ScenePointCloud] WARNING: HF cache unavailable for key {self._cache_key} "
+                    f"({type(e).__name__}: {e}). Falling back to procedural sampling — "
+                    f"points may differ across machines."
+                )
+                self._sample_and_select_canonical(
+                    oversample, ins_usd_paths, rec_usd_paths, env.num_envs, device,
+                )
         else:
             # GENERATE path: explicit cache-generation script sets the env var;
             # or resample mode (which can't use a static cache anyway).

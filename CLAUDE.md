@@ -116,6 +116,14 @@ python scripts/reinforcement_learning/rsl_rl/train.py \
     --num_envs 1 \
     env.scene.insertive_object=peg env.scene.receptive_object=peghole
 
+# DAgger / any env with cameras (local) — must pass --enable_cameras or Isaac Sim will crash
+# on "A camera was spawned without the --enable_cameras flag". --video implicitly sets this,
+# but plain training runs do not.
+python scripts/reinforcement_learning/rsl_rl/train.py \
+    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DAgger-WristSide-Pretrained-Weighted-PCTeacher-FullSysidDR-v0 \
+    --num_envs 32 --logger wandb --headless --enable_cameras \
+    agent.policy.teacher_jit_path=teachers/seed22_sysidenv.pt
+
 # Multi-task (cluster, Hyak)
 ./docker/cluster/cluster_interface.sh --cluster hyak job base \
     --gpus 4 --partition gpu-l40s --account weirdlab \

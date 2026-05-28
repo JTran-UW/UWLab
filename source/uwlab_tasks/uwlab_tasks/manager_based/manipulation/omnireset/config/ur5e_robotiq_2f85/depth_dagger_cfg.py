@@ -36,7 +36,7 @@ from .rl_state_cfg import FinetuneEvalEventCfg, RlStateSceneCfg, Ur5eRobotiq2f85
 
 DEPTH_CLIP = (0.01, 2.0)
 IMG_H, IMG_W = 224, 224
-RENDER_H, RENDER_W = 224, 224  # square render for pre-training from scratch
+RENDER_H, RENDER_W = 240, 320  # pre-train from scratch on 4:3 render. It has to be 4:3 to match realsense camera's aspect ratio
 
 
 @configclass
@@ -114,6 +114,42 @@ def _depth_obs_term(
         },
     )
 
+import torch
+from isaaclab.envs import ManagerBasedEnv
+
+
+_ROBOTIQ_2F85_JOINT_NAMES = [
+    "finger_joint",
+    "right_outer_knuckle_joint",
+    "left_inner_knuckle_joint",
+    "right_inner_knuckle_joint",
+    "left_inner_finger_knuckle_joint",
+    "right_inner_finger_knuckle_joint",
+]
+
+
+_GRIPPER_IDS_CACHE: dict[int, list[int]] = {}
+
+
+def joint_pos_zero_gripper(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """All joint positions with gripper joints zeroed — arm joints only contribute signal.
+
+    Preserves output shape (no joints dropped) so num_proprio stays constant.
+    Gripper joint indices are resolved from joint_names on first call and cached.
+    """
+    asset = env.scene[asset_cfg.name]
+    key = id(asset)
+    if key not in _GRIPPER_IDS_CACHE:
+        _GRIPPER_IDS_CACHE[key] = [
+            i for i, name in enumerate(asset.joint_names)
+            if name in _ROBOTIQ_2F85_JOINT_NAMES
+        ]
+    pos = asset.data.joint_pos.clone()
+    pos[:, _GRIPPER_IDS_CACHE[key]] = 0.0
+    return pos[:, asset_cfg.joint_ids]
 
 @configclass
 class DepthDAggerObservationsCfg:
@@ -268,6 +304,10 @@ class DepthDAggerTerminationsCfg:
         params={"num_consecutive_successes": 5, "min_episode_length": 10},
     )
     success = DoneTerm(func=task_mdp.success_termination, time_out=False)
+    corrupted_camera = DoneTerm(
+        func=task_mdp.corrupted_camera_detected,
+        params={"camera_names": ["side_camera", "wrist_camera"], "std_threshold": 10.0},
+    )
 
 
 @configclass
@@ -276,7 +316,7 @@ class Ur5eRobotiq2f85DepthDAggerRelCartesianOSCCfg(Ur5eRobotiq2f85RlStateCfg):
 
     Uses the **eval** action scales/gains (``Ur5eRobotiq2f85RelativeOSCEvalAction``)
     because the downloaded state expert was exported from the Stage-2 finetune *eval*
-    config (``Finetune-Play-v0``); training scales are 10× larger on Z and would make
+    config (``Finetune-Play-v0``); training scales are 10x larger on Z and would make
     teacher-driven rollouts overshoot.
     """
 
@@ -1024,7 +1064,7 @@ class Ur5eRobotiq2f85DepthDAggerWristSidePCTeacherSysidTrainCfg(
 
     def __post_init__(self):
         super().__post_init__()
-        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
         self.curriculum = None
 
