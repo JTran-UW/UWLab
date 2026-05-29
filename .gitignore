@@ -75,3 +75,8 @@ tests/
 .uw-lab-docker-history
 
 tmp/
+
+# Local agent sessions + large analysis/checkpoint artifacts (not for VCS)
+/.claude/
+/analysis/
+/teachers/
