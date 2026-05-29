@@ -43,6 +43,14 @@ parser.add_argument(
     help="Direct path to a checkpoint file to resume from (bypasses log directory search).",
 )
 parser.add_argument(
+    "--init_weights", type=str, default=None,
+    help="Path to a fixed initial policy/critic weights file. If it exists, the policy is "
+    "initialized from it on every run (byte-identical params across seeds/machines/GPUs); "
+    "if it does not exist, the freshly-initialized weights are saved there once to mint the "
+    "canonical init. Ignored when resuming. Used for diversity ablations that need to hold "
+    "network initialization fixed.",
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
 # append RSL-RL cli arguments
@@ -162,6 +170,37 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def apply_fixed_init_weights(runner, path: str, device: str, is_distributed: bool) -> None:
+    """Deterministic, hardware-independent policy/critic initialization.
+
+    Loads a fixed set of network weights from ``path`` so every run starts from
+    byte-identical parameters regardless of seed, machine, GPU, or PyTorch RNG.
+    If ``path`` does not yet exist, the freshly-constructed (randomly initialized)
+    weights are saved there once to mint the canonical init, which can then be
+    committed and reused. This is the robust alternative to seeding alone, which
+    is not reproducible across hardware or library versions.
+    """
+    policy = runner.alg.policy
+    if os.path.exists(path):
+        loaded = torch.load(path, map_location=device)
+        state_dict = loaded["model_state_dict"] if isinstance(loaded, dict) and "model_state_dict" in loaded else loaded
+        policy.load_state_dict(state_dict)
+        print(f"[INFO] Loaded fixed initial policy weights from: {path}")
+    else:
+        # Minting per-rank would give each rank different weights — require a prior
+        # single-process run to create the canonical file before distributed launch.
+        if is_distributed:
+            raise FileNotFoundError(
+                f"--init_weights file not found: {path}. In distributed runs the file must be minted "
+                f"first by a single-process run (each rank would otherwise mint different weights). "
+                f"Run once without --distributed to create it, then re-launch."
+            )
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        cpu_state = {k: v.detach().cpu() for k, v in policy.state_dict().items()}
+        torch.save({"model_state_dict": cpu_state}, path)
+        print(f"[INFO] Minted canonical initial policy weights to: {path}")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -298,6 +337,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+    elif args_cli.init_weights:
+        # Fixed initial weights: hold the network init constant across runs (resume takes priority).
+        apply_fixed_init_weights(runner, args_cli.init_weights, agent_cfg.device, args_cli.distributed)
 
     # dump the configuration into log-directory (only on main process to avoid duplicates)
     if is_main_process:

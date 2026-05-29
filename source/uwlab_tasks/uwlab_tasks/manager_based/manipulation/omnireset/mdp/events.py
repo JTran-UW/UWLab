@@ -2543,6 +2543,35 @@ class MultiResetManager(ManagerTermBase):
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
         self.state_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        # Sequential sampling (diversity ablation): deterministic round-robin over an
+        # interleaved flat list of all reset states. We pretend the reset types are
+        # interleaved into one list (0, 1, 2, 3, 0, 1, 2, 3, ...) and keep a running
+        # index; each reset grabs the next ``len(env_ids)`` entries and advances the
+        # index, wrapping at the end. Never materialized — computed by the math:
+        #   flat index g -> reset_type = g % R, cycle = g // R, state = cycle % n[tt][rt].
+        # One independent counter per task type so multi-task envs stay in their own
+        # dataset; the wrap length L is R * (max states across reset types).
+        self.sampling_mode: str = cfg.params.get("sampling_mode", "random")
+        if self.sampling_mode not in ("random", "sequential"):
+            raise ValueError(f"Unknown sampling_mode '{self.sampling_mode}' (expected 'random' or 'sequential')")
+        self.pair_num_states_t = [
+            torch.tensor(self.pair_num_states[tt], dtype=torch.long, device=self.device)
+            for tt in range(self.num_task_types)
+        ]
+        max_states_per_type = [max(self.pair_num_states[tt]) for tt in range(self.num_task_types)]
+        self.seq_cycle_len = torch.tensor(
+            [self.num_reset_types * m for m in max_states_per_type], dtype=torch.long, device=self.device
+        )
+        self.seq_index = torch.zeros(self.num_task_types, dtype=torch.long, device=self.device)
+        # Cumulative reset-type offsets into the concatenated flat dataset (matches flat_rt_labels order).
+        self.rt_state_offsets = [
+            torch.tensor(
+                [sum(self.pair_num_states[tt][:rt]) for rt in range(self.num_reset_types)],
+                dtype=torch.long, device=self.device,
+            )
+            for tt in range(self.num_task_types)
+        ]
+
         # One-shot reset-write sanity check: after the first reset, compare the realized
         # insertive/receptive poses against the dataset we sampled from. Catches silent
         # failures in MultiAsset heterogeneous writes (e.g. peg states landing in leg envs).
@@ -2639,6 +2668,7 @@ class MultiResetManager(ManagerTermBase):
         curriculum_monitor_history_len: int = 100,
         success_monitor_history_len: int = 100,
         group_size: int = 1,
+        sampling_mode: str = "random",
     ) -> None:
         self._lazy_init()
 
@@ -2731,7 +2761,50 @@ class MultiResetManager(ManagerTermBase):
             ep_lengths = self._env.episode_length_buf[env_ids].float()
             self._env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
 
-        if self.curriculum_target is not None and hasattr(self, "curriculum_monitor"):
+        if self.sampling_mode == "sequential":
+            # Deterministic round-robin over the interleaved flat list of reset states.
+            # Grab the next `len(env_ids)` entries (per task type) and advance the counter,
+            # wrapping at the end. group_size replication is intentionally not applied here.
+            R = self.num_reset_types
+            env_task_types = (
+                self.task_type_ids[env_ids]
+                if self.is_multitask
+                else torch.zeros(len(env_ids), dtype=torch.long, device=self._env.device)
+            )
+            reset_type_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+            state_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+            flat_state_ids = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+
+            for tt_idx in range(self.num_task_types):
+                tt_mask = env_task_types == tt_idx
+                n = int(tt_mask.sum())
+                if n == 0:
+                    continue
+                start = int(self.seq_index[tt_idx].item())
+                L = int(self.seq_cycle_len[tt_idx].item())
+                g = (start + torch.arange(n, device=self.device)) % L
+                self.seq_index[tt_idx] = (start + n) % L
+                rt = g % R
+                cycle = g // R
+                s = cycle % self.pair_num_states_t[tt_idx][rt]
+                reset_type_indices[tt_mask] = rt
+                state_indices[tt_mask] = s
+                flat_state_ids[tt_mask] = self.rt_state_offsets[tt_idx][rt] + s
+
+            self.task_id[env_ids] = reset_type_indices
+            self.state_id[env_ids] = flat_state_ids
+
+            for tt_idx in range(self.num_task_types):
+                for rt_idx in range(R):
+                    mask = (env_task_types == tt_idx) & (reset_type_indices == rt_idx)
+                    if not mask.any():
+                        continue
+                    current_env_ids = env_ids[mask]
+                    current_state_indices = state_indices[mask]
+                    states = sample_from_nested_dict(self.pair_datasets[tt_idx][rt_idx], current_state_indices)
+                    self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
+
+        elif self.curriculum_target is not None and hasattr(self, "curriculum_monitor"):
             state_indices = torch.empty(len(env_ids), dtype=torch.int64, device=self.device)
             env_task_types = self.task_type_ids[env_ids]
 

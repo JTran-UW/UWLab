@@ -110,6 +110,20 @@ gym.register(
     },
 )
 
+# Diversity ablation: same as State-v0 but reset states are drawn by a deterministic
+# interleaved round-robin over all reset types (MultiResetManager sampling_mode=
+# "sequential") instead of i.i.d. random sampling. Holds the reset stream fixed so any
+# behavioral diversity across seeds is attributable to random network init, not resets.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Sequential-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCTrainSequentialCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
 # ===========================================================================
 # ZeroG (self-contained in gravity_cfg.py, GPS + truncated success)
 # ===========================================================================

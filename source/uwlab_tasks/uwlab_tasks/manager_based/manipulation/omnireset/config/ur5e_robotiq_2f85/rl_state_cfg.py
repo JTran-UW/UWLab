@@ -769,6 +769,23 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 
+# Diversity ablation: identical to the RelCartesianOSC State train cfg above, but reset
+# states are drawn by a deterministic interleaved round-robin over all reset types
+# (``MultiResetManager`` ``sampling_mode='sequential'``) instead of i.i.d. random sampling.
+# Fixing the reset stream to uniform, deterministic coverage isolates the source of
+# behavioral diversity: with the reset states identical across seeds, any remaining
+# multi-modality is attributable to random network initialization rather than reset variety.
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainSequentialCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.events.reset_from_reset_states.params
+        p["sampling_mode"] = "sequential"
+        # Pure uniform coverage — ensure no GPS curriculum / classifier sampling is active.
+        p["curriculum_target"] = None
+        p["use_classifier"] = False
+
+
 # Finetune configuration (Stage 2: explicit actuator, curriculum ramps sysid + gains + scales)
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCFinetuneCfg(Ur5eRobotiq2f85RlStateCfg):
