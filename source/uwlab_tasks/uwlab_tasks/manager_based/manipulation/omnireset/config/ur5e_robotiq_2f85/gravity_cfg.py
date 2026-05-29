@@ -357,8 +357,15 @@ class ZeroGGPSEventCfg:
         mode="reset",
         params={
             "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
-            "probs": [0.5, 0.5],
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            # "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            # "probs": [0.5, 0.5],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
             "curriculum_target": 0.5,
             "curriculum_kappa": 2.0,
