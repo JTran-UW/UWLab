@@ -203,6 +203,50 @@ def apply_fixed_init_weights(runner, path: str, device: str, is_distributed: boo
         print(f"[INFO] Minted canonical initial policy weights to: {path}")
 
 
+def find_reset_manager(env):
+    """Return the MultiResetManager event-term instance for this env, or None.
+
+    Walks the event manager's class-term configs (the term's ``func`` is the live
+    instance). The instance exists from env creation even though its sequential
+    state is only built on the first reset (lazy init)."""
+    base_env = getattr(env, "unwrapped", env)
+    event_mgr = getattr(base_env, "event_manager", None)
+    if event_mgr is None:
+        return None
+    from uwlab_tasks.manager_based.manipulation.omnireset.mdp.events import MultiResetManager
+    for mode_cfgs in getattr(event_mgr, "_mode_class_term_cfgs", {}).values():
+        for term_cfg in mode_cfgs:
+            if isinstance(term_cfg.func, MultiResetManager):
+                return term_cfg.func
+    return None
+
+
+def install_reset_state_checkpointing(runner, env):
+    """Embed the sequential-reset counter inside each checkpoint so requeued runs
+    continue the deterministic reset stream instead of restarting from index 0.
+
+    Adds a ``reset_manager_state`` key to the saved ``.pt`` (re-read with original tensor
+    devices preserved, so the model/optimizer placement is unchanged). A separate sidecar
+    file is avoided on purpose: ``get_checkpoint_path`` matches every filename in the run
+    dir and would mis-select it as the checkpoint. No-op unless a MultiResetManager in
+    sequential mode is present (random sampling is stateless). Only rank 0 writes
+    checkpoints, so only its counter is stored; on resume every rank restores from it —
+    exact for single-GPU, a small approximation under --distributed where each rank
+    advances its own counter."""
+    orig_save = runner.save
+
+    def save_with_reset_state(path, infos=None):
+        orig_save(path, infos)
+        mgr = find_reset_manager(env)
+        state = mgr.get_sequential_state() if mgr is not None else None
+        if state is not None:
+            ckpt = torch.load(path, weights_only=False)  # default map_location keeps tensor devices
+            ckpt["reset_manager_state"] = state
+            torch.save(ckpt, path)
+
+    runner.save = save_with_reset_state
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
@@ -332,11 +376,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
+    # Persist the sequential-reset counter into each checkpoint (no-op for non-sequential envs).
+    install_reset_state_checkpointing(runner, env)
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        # Resume the deterministic reset stream from where the checkpoint left off.
+        reset_mgr = find_reset_manager(env)
+        if reset_mgr is not None:
+            loaded = torch.load(resume_path, weights_only=False, map_location="cpu")
+            if isinstance(loaded, dict) and "reset_manager_state" in loaded:
+                reset_mgr.load_sequential_state(loaded["reset_manager_state"])
+                print("[INFO]: Restored sequential reset counter from checkpoint.")
     elif args_cli.init_weights:
         # Fixed initial weights: hold the network init constant across runs (resume takes priority).
         apply_fixed_init_weights(runner, args_cli.init_weights, agent_cfg.device, args_cli.distributed)

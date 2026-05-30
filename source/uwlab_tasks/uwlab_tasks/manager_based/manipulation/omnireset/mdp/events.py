@@ -2378,6 +2378,10 @@ class MultiResetManager(ManagerTermBase):
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         self._lazy_initialized = False
+        # Sequential-sampling counter staged from a resumed checkpoint before _lazy_init
+        # has created ``self.seq_index`` (the instance exists at env creation, but its
+        # sequential state is only built on the first reset). Applied in _lazy_init.
+        self._pending_seq_index = None
 
     def _lazy_init(self):
         """Deferred init — called on first __call__ since IsaacLab's EventManager
@@ -2563,6 +2567,10 @@ class MultiResetManager(ManagerTermBase):
             [self.num_reset_types * m for m in max_states_per_type], dtype=torch.long, device=self.device
         )
         self.seq_index = torch.zeros(self.num_task_types, dtype=torch.long, device=self.device)
+        # Restore a sequential counter staged from a resumed checkpoint (see load_sequential_state).
+        if self._pending_seq_index is not None:
+            self.seq_index.copy_(self._pending_seq_index.to(self.device))
+            self._pending_seq_index = None
         # Cumulative reset-type offsets into the concatenated flat dataset (matches flat_rt_labels order).
         self.rt_state_offsets = [
             torch.tensor(
@@ -2576,6 +2584,33 @@ class MultiResetManager(ManagerTermBase):
         # insertive/receptive poses against the dataset we sampled from. Catches silent
         # failures in MultiAsset heterogeneous writes (e.g. peg states landing in leg envs).
         self._reset_sanity_done = False
+
+    def get_sequential_state(self) -> dict | None:
+        """Checkpoint payload for sequential reset sampling, or ``None`` if not applicable.
+
+        Only sequential mode carries cross-reset state worth persisting (the round-robin
+        counter); random sampling is stateless. Returns a CPU snapshot of ``seq_index``.
+        Safe to call before the first reset (returns any value staged by load).
+        """
+        if getattr(self, "sampling_mode", "random") != "sequential":
+            return None
+        if not self._lazy_initialized:
+            return None if self._pending_seq_index is None else {"seq_index": self._pending_seq_index.clone()}
+        return {"seq_index": self.seq_index.detach().cpu().clone()}
+
+    def load_sequential_state(self, state: dict | None) -> None:
+        """Restore the sequential counter from a checkpoint payload.
+
+        Safe to call before or after lazy init: if the sequential state hasn't been
+        built yet (no reset has run), the value is staged and applied in ``_lazy_init``.
+        """
+        if not state or "seq_index" not in state:
+            return
+        seq_index = state["seq_index"]
+        if self._lazy_initialized and hasattr(self, "seq_index"):
+            self.seq_index.copy_(seq_index.to(self.device))
+        else:
+            self._pending_seq_index = seq_index.detach().cpu().clone()
 
     def _get_monitor_id(self, task_type_idx: int, reset_type_idx: torch.Tensor) -> torch.Tensor:
         """Composite index for the success monitor: task_type * num_reset_types + reset_type."""
