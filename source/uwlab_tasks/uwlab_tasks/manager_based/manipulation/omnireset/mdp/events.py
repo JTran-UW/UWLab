@@ -992,6 +992,167 @@ class assembly_sampling_event(ManagerTermBase):
         )
 
 
+class SingleResetManager(ManagerTermBase):
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        dataset_dir: str = cfg.params.get("dataset_dir", "")
+        probabilities: list[float] = cfg.params.get("probs", [])
+
+        # Generate dataset paths from pair directory and reset types
+        dataset_files = [dataset_dir]
+
+        # Load all datasets
+        self.datasets = []
+        num_states = []
+        for dataset_file in dataset_files:
+            local_file_path = utils.safe_retrieve_file_path(dataset_file)
+
+            # Check if local file exists (after potential download)
+            if not os.path.exists(local_file_path):
+                raise FileNotFoundError(f"Dataset file {dataset_file} could not be accessed or downloaded.")
+
+            dataset = torch.load(local_file_path)
+            num_states.append(len(dataset["initial_state"]["articulation"]["robot"]["joint_position"]))
+            init_indices = torch.arange(num_states[-1], device=env.device)
+            self.datasets.append(sample_state_data_set(dataset, init_indices, env.device))
+
+        # Normalize probabilities and store dataset lengths
+        self.probs = torch.tensor(probabilities, device=env.device) / sum(probabilities)
+        self.num_states = torch.tensor(num_states, device=env.device)
+        self.num_tasks = len(self.datasets)
+
+        # Initialize success monitor
+        if cfg.params.get("success") is not None:
+            success_monitor_cfg = SuccessMonitorCfg(
+                monitored_history_len=100, num_monitored_data=self.num_tasks, device=env.device
+            )
+            self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
+
+        self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        dataset_dir: str,
+        probs: list[float],
+        success: str | None = None,
+    ) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self._env.device)
+
+        # Log current data
+        if success is not None:
+            success_mask = torch.where(eval(success)[env_ids], 1.0, 0.0)
+            self.success_monitor.success_update(self.task_id[env_ids], success_mask)
+
+            # Log metrics for each task
+            success_rates = self.success_monitor.get_success_rate()
+            if "log" not in self._env.extras:
+                self._env.extras["log"] = {}
+            for task_idx in range(self.num_tasks):
+                self._env.extras["log"].update({
+                    f"Metrics/task_{task_idx}_success_rate": success_rates[task_idx].item(),
+                    f"Metrics/task_{task_idx}_prob": self.probs[task_idx].item(),
+                    f"Metrics/task_{task_idx}_normalized_prob": self.probs[task_idx].item(),
+                })
+
+            # Log episode length at reset
+            ep_lengths = self._env.episode_length_buf[env_ids].float()
+            self._env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
+
+        # Sample which dataset to use for each environment
+        dataset_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+        self.task_id[env_ids] = dataset_indices
+
+        # Process each dataset's environments
+        for dataset_idx in range(self.num_tasks):
+            mask = dataset_indices == dataset_idx
+            if not mask.any():
+                continue
+
+            current_env_ids = env_ids[mask]
+            state_indices = torch.randint(
+                0, self.num_states[dataset_idx], (len(current_env_ids),), device=self._env.device
+            )
+            states_to_reset_from = sample_from_nested_dict(self.datasets[dataset_idx], state_indices)
+            self._reset_to(states_to_reset_from["initial_state"], env_ids=current_env_ids, is_relative=True)
+
+        # Reset velocities
+        robot: Articulation = self._env.scene["robot"]
+        robot.set_joint_velocity_target(torch.zeros_like(robot.data.joint_vel[env_ids]), env_ids=env_ids)
+
+    def _reset_to(
+        self,
+        state: dict[str, dict[str, dict[str, torch.Tensor]]],
+        env_ids: Sequence[int] | None = None,
+        is_relative: bool = False,
+    ):
+        """Resets the entities in the scene to the provided state.
+
+        Args:
+            state: The state to reset the scene entities to. Please refer to :meth:`get_state` for the format.
+            env_ids: The indices of the environments to reset. Defaults to None, in which case
+                all environment instances are reset.
+            is_relative: If set to True, the state is considered relative to the environment origins.
+                Defaults to False.
+        """
+        # resolve env_ids
+        if env_ids is None:
+            env_ids = self._env.scene._ALL_INDICES
+        # articulations
+        for asset_name, articulation in self._env.scene._articulations.items():
+            if asset_name not in state["articulation"]:
+                continue
+            asset_state = state["articulation"][asset_name]
+            # root state
+            root_pose = asset_state["root_pose"].clone()
+            if is_relative:
+                root_pose[:, :3] += self._env.scene.env_origins[env_ids]
+            root_velocity = asset_state["root_velocity"].clone()
+            articulation.write_root_pose_to_sim(root_pose, env_ids=env_ids)
+            articulation.write_root_velocity_to_sim(root_velocity, env_ids=env_ids)
+            # joint state
+            joint_position = asset_state["joint_position"].clone()
+            joint_velocity = asset_state["joint_velocity"].clone()
+            articulation.write_joint_state_to_sim(joint_position, joint_velocity, env_ids=env_ids)
+            # FIXME: This is not generic as it assumes PD control over the joints.
+            #   This assumption does not hold for effort controlled joints.
+            articulation.set_joint_position_target(joint_position, env_ids=env_ids)
+            articulation.set_joint_velocity_target(joint_velocity, env_ids=env_ids)
+        # deformable objects
+        for asset_name, deformable_object in self._env.scene._deformable_objects.items():
+            if asset_name not in state["deformable_object"]:
+                continue
+            asset_state = state["deformable_object"][asset_name]
+            nodal_position = asset_state["nodal_position"].clone()
+            if is_relative:
+                nodal_position[:, :3] += self._env.scene.env_origins[env_ids]
+            nodal_velocity = asset_state["nodal_velocity"].clone()
+            deformable_object.write_nodal_pos_to_sim(nodal_position, env_ids=env_ids)
+            deformable_object.write_nodal_velocity_to_sim(nodal_velocity, env_ids=env_ids)
+        # rigid objects
+        for asset_name, rigid_object in self._env.scene._rigid_objects.items():
+            if asset_name not in state["rigid_object"]:
+                continue
+            asset_state = state["rigid_object"][asset_name]
+            root_pose = asset_state["root_pose"].clone()
+            if is_relative:
+                root_pose[:, :3] += self._env.scene.env_origins[env_ids]
+            root_velocity = asset_state["root_velocity"].clone()
+            rigid_object.write_root_pose_to_sim(root_pose, env_ids=env_ids)
+            rigid_object.write_root_velocity_to_sim(root_velocity, env_ids=env_ids)
+        # surface grippers
+        for asset_name, surface_gripper in self._env.scene._surface_grippers.items():
+            asset_state = state["gripper"][asset_name]
+            surface_gripper.set_grippers_command(asset_state)
+
+        # write data to simulation to make sure initial state is set
+        # this propagates the joint targets to the simulation
+        self._env.scene.write_data_to_sim()
+
+
 class MultiResetManager(ManagerTermBase):
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)

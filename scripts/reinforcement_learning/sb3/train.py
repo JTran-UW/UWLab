@@ -24,10 +24,19 @@ parser.add_argument("--video_interval", type=int, default=2000, help="Interval b
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
-    "--agent", type=str, default="sb3_cfg_entry_point", help="Name of the RL agent configuration entry point."
+    "--agent", type=str, default=None, help="Name of the RL agent configuration entry point."
 )
+parser.add_argument(
+    "--algo", type=str, default="ppo", choices=["ppo", "sac"], help="SB3 algorithm to train with."
+)
+parser.add_argument(
+    "--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"],
+    help="Logger to use. 'wandb' mirrors the SB3 tensorboard stream via sync_tensorboard=True.",
+)
+parser.add_argument("--run_name", type=str, default=None, help="Optional W&B run name.")
+parser.add_argument("--wandb_project", type=str, default="uwlab_sb3", help="W&B project name.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument("--log_interval", type=int, default=100_000, help="Log data every n timesteps.")
+parser.add_argument("--log_interval", type=int, default=1000, help="Log data every n timesteps.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Continue the training from checkpoint.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -44,6 +53,9 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
+# default --agent entry point based on --algo if not explicitly set
+if args_cli.agent is None:
+    args_cli.agent = "sb3_sac_cfg_entry_point" if args_cli.algo == "sac" else "sb3_cfg_entry_point"
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -82,9 +94,11 @@ import os
 import random
 from datetime import datetime
 
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
 from stable_baselines3.common.vec_env import VecNormalize
+
+ALGO_CLS = {"ppo": PPO, "sac": SAC}
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -119,7 +133,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg["seed"] = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
     # max iterations for training
     if args_cli.max_iterations is not None:
-        agent_cfg["n_timesteps"] = args_cli.max_iterations * agent_cfg["n_steps"] * env_cfg.scene.num_envs
+        if args_cli.algo == "ppo":
+            agent_cfg["n_timesteps"] = args_cli.max_iterations * agent_cfg["n_steps"] * env_cfg.scene.num_envs
+        else:
+            # SAC: one "iteration" == one env step per env
+            agent_cfg["n_timesteps"] = args_cli.max_iterations * env_cfg.scene.num_envs
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -199,13 +217,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
     # create agent from stable baselines
-    agent = PPO(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
+    agent_cls = ALGO_CLS[args_cli.algo]
+    agent = agent_cls(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
     if args_cli.checkpoint is not None:
         agent = agent.load(args_cli.checkpoint, env, print_system_info=True)
 
     # callbacks for agent
     checkpoint_callback = CheckpointCallback(save_freq=1000, save_path=log_dir, name_prefix="model", verbose=2)
     callbacks = [checkpoint_callback, LogEveryNTimesteps(n_steps=args_cli.log_interval)]
+
+    if args_cli.logger == "wandb":
+        import wandb
+        from wandb.integration.sb3 import WandbCallback
+        wandb.init(
+            project=args_cli.wandb_project,
+            name=args_cli.run_name or run_info,
+            config={"env_cfg": env_cfg.to_dict() if hasattr(env_cfg, "to_dict") else None, "agent_cfg": agent_cfg, "algo": args_cli.algo},
+            sync_tensorboard=True,
+            dir=log_dir,
+        )
+        callbacks.append(WandbCallback(verbose=2))
 
     # train the agent
     with contextlib.suppress(KeyboardInterrupt):

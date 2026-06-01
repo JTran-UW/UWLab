@@ -425,6 +425,109 @@ class check_reset_state_success(ManagerTermBase):
         return reset_success
 
 
+class check_reaching_reset_state_success(ManagerTermBase):
+    """Check if grasp is successful based on object stability, gripper closure, and collision detection."""
+
+    def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        self._env = env
+
+        self.robot_cfg = cfg.params.get("robot_cfg")
+        self.ee_body_name = cfg.params.get("ee_body_name")
+        self.pos_z_threshold = cfg.params.get("pos_z_threshold")
+        self.consecutive_stability_steps = cfg.params.get("consecutive_stability_steps", 5)
+
+        # Load gripper_approach_direction from metadata
+        robot_asset = env.scene[self.robot_cfg.name]
+        usd_path = robot_asset.cfg.spawn.usd_path
+        metadata = utils.read_metadata_from_usd_directory(usd_path)
+        self.gripper_approach_direction = tuple(metadata.get("gripper_approach_direction"))
+
+        # Initialize stability counter for consecutive stability checking
+        self.stability_counter = torch.zeros(env.num_envs, device=env.device, dtype=torch.int32)
+
+        self.robot_asset = env.scene[self.robot_cfg.name]
+        self.assets_to_check = [self.robot_asset]
+        self.ee_body_idx = self.robot_asset.data.body_names.index(self.ee_body_name)
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        super().reset(env_ids)
+
+        for asset in self.assets_to_check:
+            if asset is self.robot_asset:
+                asset_pos = asset.data.body_link_pos_w[:, self.ee_body_idx].clone()
+            else:
+                asset_pos = asset.data.root_pos_w.clone()
+            if not hasattr(asset, "initial_pos") or env_ids is None:
+                asset.initial_pos = asset_pos
+            else:
+                asset.initial_pos[env_ids] = asset_pos[env_ids].clone()
+
+        if env_ids is None:
+            self.stability_counter.zero_()
+        else:
+            self.stability_counter[env_ids] = 0
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        robot_cfg: SceneEntityCfg,
+        ee_body_name: str,
+        pos_z_threshold: float = -0.01,
+        consecutive_stability_steps: int = 5,
+        assembly_success_prob: float | None = None,
+        assembly_threshold_scale: float = 1.0,
+    ) -> torch.Tensor:
+
+        # Check time out
+        time_out = env.episode_length_buf >= env.max_episode_length
+
+        # Check for abnormal gripper state (excessive joint velocities)
+        abnormal_gripper_state = (
+            self.robot_asset.data.joint_vel.abs() > (self.robot_asset.data.joint_vel_limits * 2)
+        ).any(dim=1)
+
+        # Check if asset velocities are small
+        current_step_stable = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+        for asset in self.assets_to_check:
+            if isinstance(asset, Articulation):
+                current_step_stable &= asset.data.joint_vel.abs().sum(dim=1) < 5.0
+            elif isinstance(asset, RigidObject):
+                current_step_stable &= asset.data.body_lin_vel_w.abs().sum(dim=2).sum(dim=1) < 0.1
+                current_step_stable &= asset.data.body_ang_vel_w.abs().sum(dim=2).sum(dim=1) < 1.0
+            elif isinstance(asset, RigidObjectCollection):
+                current_step_stable &= asset.data.object_lin_vel_w.abs().sum(dim=2).sum(dim=1) < 0.1
+                current_step_stable &= asset.data.object_ang_vel_w.abs().sum(dim=2).sum(dim=1) < 1.0
+
+        self.stability_counter = torch.where(
+            current_step_stable,
+            self.stability_counter + 1,  # Increment counter if stable
+            torch.zeros_like(self.stability_counter),  # Reset counter if not stable
+        )
+
+        stability_reached = self.stability_counter >= self.consecutive_stability_steps
+
+        # Reset initial positions on first check or after env reset
+        pos_below_threshold = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        for asset in self.assets_to_check:
+            if asset is self.robot_asset:
+                asset_pos = asset.data.body_link_pos_w[:, self.ee_body_idx].clone()
+            else:
+                asset_pos = asset.data.root_pos_w.clone()
+
+            # Asset is above ground if position is greater than z threshold
+            pos_below_threshold |= asset_pos[:, 2] < self.pos_z_threshold
+
+        reset_success = (
+            (~abnormal_gripper_state)
+            & stability_reached
+            & (~pos_below_threshold)
+            & time_out
+        )
+
+        return reset_success
+
 class check_obb_no_overlap_termination(ManagerTermBase):
     """Termination condition that checks if OBBs of two objects no longer overlap."""
 
@@ -757,6 +860,27 @@ def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes:
     continuous_success_counter = getattr(context_term, "continuous_success_counter")
 
     return continuous_success_counter >= num_consecutive_successes
+
+
+def terminate_first_episode(env: ManagerBasedRLEnv):
+    to_terminate = torch.zeros_like(env.episode_length_buf, dtype=bool)
+    if env.common_step_counter > env.max_episode_length:
+        return to_terminate
+
+    # Get envs on the first episode
+
+    num_envs_to_terminate = env.num_envs / env.max_episode_length
+    first_episode_envs = torch.argwhere(env.episode_length_buf >= env.common_step_counter)
+    if num_envs_to_terminate > 1:
+        indices = first_episode_envs[torch.randint(high=len(first_episode_envs), size=(int(num_envs_to_terminate),))]
+        to_terminate[indices] = True
+    else:
+        if env.common_step_counter % int(1 / num_envs_to_terminate) == 0:
+            indices = first_episode_envs[torch.randint(high=len(first_episode_envs), size=(1,))]
+            to_terminate[indices] = True
+
+
+    return to_terminate
 
 
 def consecutive_success_state_with_min_length(
