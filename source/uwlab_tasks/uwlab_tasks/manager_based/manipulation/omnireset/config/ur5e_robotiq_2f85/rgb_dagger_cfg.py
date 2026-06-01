@@ -299,6 +299,8 @@ class _WristRGBCfg(ObsGroup):
 
     def __post_init__(self):
         self.concatenate_terms = True
+        self.history_length = 1
+        self.flatten_history_dim = False
 
 
 @configclass
@@ -307,17 +309,21 @@ class _SideRGBCfg(ObsGroup):
 
     def __post_init__(self):
         self.concatenate_terms = True
+        self.history_length = 1
+        self.flatten_history_dim = False
 
 
 @configclass
 class RGBDAggerWristSidePCTeacherObsCfg:
-    """4-group obs layout: proprio + side_rgb + wrist_rgb + teacher (ScenePC)."""
+    """7-group obs layout: proprio + side_rgb + wrist_rgb + teacher (ScenePC) + 3 aux pose groups."""
 
     proprio: DepthDAggerObservationsCfg.ProprioCfg = DepthDAggerObservationsCfg.ProprioCfg()
     side_rgb: _SideRGBCfg = _SideRGBCfg()
     wrist_rgb: _WristRGBCfg = _WristRGBCfg()
     teacher: TeacherProprioWithPCCfg = TeacherProprioWithPCCfg()
-    aux_target: DepthDAggerObservationsCfg.AuxTargetCfg = DepthDAggerObservationsCfg.AuxTargetCfg()
+    aux_insertive_in_wrist: DepthDAggerObservationsCfg.AuxInsertiveInWristCfg = DepthDAggerObservationsCfg.AuxInsertiveInWristCfg()
+    aux_receptive_in_wrist: DepthDAggerObservationsCfg.AuxReceptiveInWristCfg = DepthDAggerObservationsCfg.AuxReceptiveInWristCfg()
+    aux_insertive_in_receptive: DepthDAggerObservationsCfg.AuxInsertiveInReceptiveCfg = DepthDAggerObservationsCfg.AuxInsertiveInReceptiveCfg()
 
 
 # ---------------------------------------------------------------------------
@@ -643,17 +649,31 @@ class Ur5eRobotiq2f85RGBDAggerWristSidePCTeacherSysidEvalCfg(
 # ---------------------------------------------------------------------------
 
 
-@configclass
-class _ProprioCfgZeroGripper(DepthDAggerObservationsCfg.ProprioCfg):
-    """ProprioCfg with gripper joint positions zeroed out.
+_UR5E_ARM_JOINT_NAMES = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+]
 
-    Replaces ``joint_pos`` with ``joint_pos_zero_gripper`` so the student
-    receives arm-only proprioception — the gripper joint state is not reliably
-    measurable from RGB and can introduce spurious correlations.
-    Output shape is unchanged (gripper dims are kept but zeroed, not dropped).
+
+@configclass
+class _ProprioCfgArmOnly(DepthDAggerObservationsCfg.ProprioCfg):
+    """ProprioCfg restricted to the 6 UR5e arm joints (gripper dims dropped).
+
+    The real robot only reports the 6 arm joint encoders reliably; gripper
+    joint state is rarely available from RGB and can introduce spurious
+    correlations. Dropping (not zeroing) matches the real-robot obs dimension
+    exactly and avoids a constant-zero input that the normalizer treats as signal.
+    Output shape: (B, 6) instead of (B, 12).
     """
 
-    joint_pos = ObsTerm(func=joint_pos_zero_gripper)
+    joint_pos = ObsTerm(
+        func=task_mdp.joint_pos,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=_UR5E_ARM_JOINT_NAMES)},
+    )
 
 
 @configclass
@@ -666,7 +686,7 @@ class RGBDAggerDataCollectionStateObsCfg:
     cameras ``side_camera`` / ``wrist_camera``, matching these groups.
     """
 
-    proprio: _ProprioCfgZeroGripper = _ProprioCfgZeroGripper()
+    proprio: _ProprioCfgArmOnly = _ProprioCfgArmOnly()
     side_rgb: _SideRGBCfg = _SideRGBCfg()
     wrist_rgb: _WristRGBCfg = _WristRGBCfg()
     teacher: DepthDAggerObservationsCfg.TeacherCfg = DepthDAggerObservationsCfg.TeacherCfg()
@@ -712,17 +732,22 @@ class Ur5eRobotiq2f85RGBDAggerDataCollectionStateCfg(Ur5eRobotiq2f85DataCollecti
 
 @configclass
 class RGBDAggerDataCollectionPCTeacherObsCfg:
-    """4-group obs layout for PC-teacher DAgger from data-collection scene.
+    """7-group obs layout for PC-teacher DAgger from data-collection scene.
 
     Same student groups as the state-teacher variant (proprio + side_rgb + wrist_rgb)
     but swaps in TeacherProprioWithPCCfg (25d proprio + 1536d ScenePC = 1561d) to
-    match seed23_sysidenv.pt teacher input format.
+    match seed23_sysidenv.pt teacher input format. Three standalone aux pose groups
+    (each a separate top-level key) are included for the CNN pose-regression aux loss
+    — no concatenation, each key has its own independently-shaped tensor.
     """
 
-    proprio: _ProprioCfgZeroGripper = _ProprioCfgZeroGripper()
+    proprio: _ProprioCfgArmOnly = _ProprioCfgArmOnly()
     side_rgb: _SideRGBCfg = _SideRGBCfg()
     wrist_rgb: _WristRGBCfg = _WristRGBCfg()
     teacher: TeacherProprioWithPCCfg = TeacherProprioWithPCCfg()
+    aux_insertive_in_wrist: DepthDAggerObservationsCfg.AuxInsertiveInWristCfg = DepthDAggerObservationsCfg.AuxInsertiveInWristCfg()
+    aux_receptive_in_wrist: DepthDAggerObservationsCfg.AuxReceptiveInWristCfg = DepthDAggerObservationsCfg.AuxReceptiveInWristCfg()
+    aux_insertive_in_receptive: DepthDAggerObservationsCfg.AuxInsertiveInReceptiveCfg = DepthDAggerObservationsCfg.AuxInsertiveInReceptiveCfg()
 
 
 @configclass

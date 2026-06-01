@@ -89,8 +89,9 @@ class DistillationDAgger(Distillation):
         Copied from ``Distillation.update`` because we need to mask rows
         (eval-pool envs) out of each minibatch before the MSE (parent uses
         a single-path loss), AND to optionally add an aux-pose loss via
-        ``policy.evaluate_aux`` + ``policy.get_aux_target`` when the student
-        has an aux head.
+        ``policy.forward_with_aux`` when the student has aux heads. Each aux
+        key is a separate top-level obs group; ``aux_pred`` is a dict keyed
+        by those group names.
         """
         aux_enabled = bool(getattr(self.policy, "aux_enabled", False))
         use_custom = (self.eval_mask is not None) or aux_enabled
@@ -117,7 +118,6 @@ class DistillationDAgger(Distillation):
                 for obs, _, privileged_actions, dones in self.storage.generator():
                     if aux_enabled:
                         actions, aux_pred = self.policy.forward_with_aux(obs)
-                        aux_target = self.policy.get_aux_target(obs)
                     else:
                         actions = self.policy.act_inference(obs)
                         aux_pred = None
@@ -132,16 +132,19 @@ class DistillationDAgger(Distillation):
                     step_loss = behavior_loss
                     mean_behavior_loss += behavior_loss.item()
 
-                    if aux_enabled:
-                        if train_mask is not None:
-                            aux_pred_m = aux_pred[train_mask]
-                            aux_target_m = aux_target[train_mask]
-                        else:
-                            aux_pred_m = aux_pred
-                            aux_target_m = aux_target
-                        aux_loss = self.loss_fn(aux_pred_m, aux_target_m)
-                        step_loss = step_loss + self.aux_coeff * aux_loss
-                        mean_aux_loss += aux_loss.item()
+                    if aux_pred is not None:
+                        # aux_pred is a dict keyed by aux target obs group name.
+                        # Sum MSE across all keys (Σ_k MSE_k).
+                        aux_keys = list(getattr(self.policy, "aux_keys", aux_pred.keys()))
+                        aux_loss_total = 0.0
+                        for k in aux_keys:
+                            pred_k = aux_pred[k]
+                            target_k = obs[k]
+                            if train_mask is not None:
+                                pred_k, target_k = pred_k[train_mask], target_k[train_mask]
+                            aux_loss_total = aux_loss_total + self.loss_fn(pred_k, target_k)
+                        step_loss = step_loss + self.aux_coeff * aux_loss_total
+                        mean_aux_loss += aux_loss_total.item()
 
                     loss = loss + step_loss
                     cnt += 1

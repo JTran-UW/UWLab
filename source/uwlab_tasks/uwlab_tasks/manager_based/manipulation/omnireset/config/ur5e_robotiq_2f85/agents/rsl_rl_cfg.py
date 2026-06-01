@@ -100,11 +100,15 @@ class StudentTeacherVisionPolicyCfg:
     student_obs_normalization: bool = True
     encoder_type: str = "depth_cnn"  # "depth_cnn" (slim 4-conv) or "resnet18"
     encoder_pretrained_path: str = ""  # path to ImageNet weights (.pth) for resnet18
-    encoder_imagenet_norm: bool = False  # apply ImageNet mean/std normalization inside the encoder (RGB only)
+    encoder_per_view: bool = True  # resnet18 only: True=independent encoder per camera, False=shared encoder
     encoder_freeze_iters: int = 0  # DEXTRAH-style warmup: freeze ResNet18 backbone for first N algorithm updates
-    aux_enabled: bool = False  # train an aux pose-regression head on vision features
-    aux_target_group: str = "aux_target"
+    aux_enabled: bool = False  # train aux pose-regression heads on vision features
     aux_hidden_dims: list[int] = [256, 128]
+    # Aux target keys: names of top-level obs groups used as regression targets,
+    # one per aux head. Each group must be a flat tensor (separate ObsGroup with
+    # concatenate_terms=True). The policy infers each head's output dim from
+    # obs[k].shape[-1] — no equal-dim assumption, any shape is valid.
+    aux_target_keys: list[str] = []
     # Recurrent student params (only used when class_name="StudentTeacherVisionRecurrent")
     rnn_type: str = "lstm"
     rnn_hidden_dim: int = 128
@@ -208,13 +212,38 @@ class RGB_DAggerWristSidePretrainedWeightedRunnerCfg(Depth_DAggerSplitRunnerCfg)
         student_hidden_dims=[512, 512, 512, 512],
         encoder_type="resnet18",
         encoder_pretrained_path="teachers/resnet18_imagenet.pth",
-        encoder_imagenet_norm=True,
         predict_std=True,
         teacher_returns_std=True,
     )
 
     def __post_init__(self) -> None:
         self.algorithm.class_name = "DistillationDAggerWeighted"
+
+
+@configclass
+class RGB_DAggerDataCollectionPCTeacherRunnerCfg(RGB_DAggerWristSidePretrainedWeightedRunnerCfg):
+    """RGB DAgger from data-collection scene + ScenePC teacher + aux pose-regression loss.
+
+    Same split-pool runner + weighted-L2 loss as the WristSide variant.
+    Adds three DEXTRAH-style aux heads (insertive↔wrist, receptive↔wrist,
+    insertive↔receptive) that force the CNN encoder to learn pose-aware features.
+    Requires the env obs config to include an ``aux_target`` group (18d flat tensor,
+    concatenate_terms=True) — see ``RGBDAggerDataCollectionPCTeacherObsCfg``.
+    """
+
+    experiment_name: str = "ur5e_robotiq_2f85_rgb_dagger_datacollection_pc_teacher"
+    policy: StudentTeacherVisionPolicyCfg = StudentTeacherVisionPolicyCfg(
+        vision_groups=["side_rgb", "wrist_rgb"],
+        student_hidden_dims=[512, 512, 512, 512],
+        encoder_type="resnet18",
+        encoder_pretrained_path="teachers/resnet18_imagenet.pth",
+        predict_std=True,
+        teacher_returns_std=True,
+        aux_enabled=True,
+        # Each key is a separate top-level obs group — no concatenation, each
+        # has its own shape. Defined in RGBDAggerDataCollectionPCTeacherObsCfg.
+        aux_target_keys=["aux_insertive_in_wrist", "aux_receptive_in_wrist", "aux_insertive_in_receptive"],
+    )
 
 
 @configclass

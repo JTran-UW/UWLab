@@ -239,11 +239,13 @@ class DepthDAggerObservationsCfg:
 
     @configclass
     class AuxTargetCfg(ObsGroup):
-        """Ground-truth object poses for CNN aux loss.
+        """Ground-truth object poses for CNN aux loss (concatenated form).
 
-        Three pose terms: peg↔wrist, hole↔wrist, peg↔hole. Single-frame,
-        no history, no corruption — this is the target a CNN aux head
-        regresses to, forcing image features to be pose-aware.
+        Three pose terms: peg↔wrist, hole↔wrist, peg↔hole flattened to a
+        single 18d tensor. Kept for backward compatibility with the depth
+        DAgger WristSide variant. New configs should use the individual
+        ``Aux*Cfg`` groups below so each target has an independently-shaped
+        tensor with no equal-dim assumption.
         """
 
         insertive_in_wrist = ObsTerm(
@@ -263,6 +265,57 @@ class DepthDAggerObservationsCfg:
             },
         )
         insertive_in_receptive = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("receptive_object"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class AuxInsertiveInWristCfg(ObsGroup):
+        """Insertive object pose in wrist frame — standalone aux target group."""
+
+        pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class AuxReceptiveInWristCfg(ObsGroup):
+        """Receptive object pose in wrist frame — standalone aux target group."""
+
+        pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class AuxInsertiveInReceptiveCfg(ObsGroup):
+        """Insertive object pose in receptive frame — standalone aux target group."""
+
+        pose = ObsTerm(
             func=task_mdp.target_asset_pose_in_root_asset_frame,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),

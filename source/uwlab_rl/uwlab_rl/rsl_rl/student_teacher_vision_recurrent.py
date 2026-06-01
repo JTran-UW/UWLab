@@ -125,20 +125,20 @@ class StudentTeacherVisionRecurrent(StudentTeacherVision):
         std = torch.exp(self.std_head(feat))
         return mean, std
 
-    def forward_with_aux(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Shared CNN forward between action head (via LSTM) and aux head (no LSTM).
+    def forward_with_aux(self, obs: TensorDict) -> tuple[torch.Tensor, dict | None]:
+        """Shared CNN forward between action head (via LSTM) and aux heads (no LSTM).
 
-        Aux head always operates on raw image features — temporal context is
+        Aux heads always operate on raw image features — temporal context is
         irrelevant for per-step pose regression. Must not re-run the CNN, so we
         compute image features once and reuse for both paths.
         """
         proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)
         proprio = self.student_obs_normalizer(proprio)
-        img_feats = torch.cat([self.depth_encoder(obs[g]) for g in self.vision_groups], dim=-1)
+        img_feats = self._encode_vision(obs)
         fused = torch.cat([proprio, img_feats], dim=-1)
         out_mem = self.memory_s(fused).squeeze(0)
         action = self.student(out_mem)
-        aux_pred = self.aux_head(img_feats) if self.aux_enabled else None
+        aux_pred = {k: head(img_feats) for k, head in self.aux_heads.items()} if self.aux_enabled else None
         return action, aux_pred
 
     # --------------------------------------------------------- hidden state API

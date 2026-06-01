@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torchvision.transforms.v2 as T
 from tensordict import TensorDict
 from torch.distributions import Normal
 
@@ -29,6 +30,26 @@ from rsl_rl.networks import MLP, EmpiricalNormalization
 
 def _conv_out(hw: tuple[int, int], k: int, s: int) -> tuple[int, int]:
     return ((hw[0] - (k - 1) - 1) // s + 1, (hw[1] - (k - 1) - 1) // s + 1)
+
+
+def _replace_bn_with_gn(module: nn.Module, group_size: int = 16) -> int:
+    """In-place replace every ``BatchNorm2d`` under ``module`` with ``GroupNorm``.
+
+    Groups = max(num_channels // ``group_size``, 1). Drops BN running stats
+    (pretrained ImageNet BN stats are lost); GN affine init'd to (γ=1, β=0).
+    Returns count of replacements. Standard recipe for IL/RL — eliminates BN
+    train/eval mismatch and the small-effective-batch noise problem.
+    """
+    n = 0
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            num_channels = child.num_features
+            num_groups = max(num_channels // group_size, 1)
+            setattr(module, name, nn.GroupNorm(num_groups=num_groups, num_channels=num_channels, affine=True))
+            n += 1
+        else:
+            n += _replace_bn_with_gn(child, group_size=group_size)
+    return n
 
 
 class DepthCNN(nn.Module):
@@ -71,69 +92,27 @@ class DepthCNN(nn.Module):
         return self.head(self.conv(x).flatten(1))
 
 
-class _RGBAugmentation(nn.Module):
-    """Stochastic RGB augmentation for training, no-op at inference.
-
-    GaussianBlur is applied to the full batch (shared sigma per forward call).
-    ColorJitter and RandomGrayscale are applied per-image via a loop for
-    independent random params. GaussianNoise is per-pixel by construction.
-
-    Expects input in [0, 1] float32 (B, 3, H, W). Output is clamped to [0, 1].
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        import torchvision.transforms.v2 as T
-        self._jitter = T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05)
-        self._blur = T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
-        self._grayscale = T.RandomGrayscale(p=0.05)
-
-    def _aug_one(self, img: torch.Tensor) -> torch.Tensor:
-        img = self._jitter(img)
-        img = self._grayscale(img)
-        return img
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training:
-            return x
-        x = self._blur(x)  # shared sigma per step — applied to full batch
-        x = torch.stack([self._aug_one(x[i]) for i in range(x.shape[0])])  # per-image
-        x = (x + torch.randn_like(x) * 0.01).clamp_(0.0, 1.0)
-        return x
-
-
-def _replace_bn_with_gn(module: nn.Module, num_groups: int = 32) -> None:
-    """Recursively replace all BatchNorm2d layers with GroupNorm in-place."""
-    for name, child in module.named_children():
-        if isinstance(child, nn.BatchNorm2d):
-            gn = nn.GroupNorm(min(num_groups, child.num_features), child.num_features)
-            setattr(module, name, gn)
-        else:
-            _replace_bn_with_gn(child, num_groups)
-
-
 class ResNet18Encoder(nn.Module):
     """Torchvision ResNet18 backbone + linear projection to ``embed_dim``.
 
     If ``pretrained_path`` is set, loads ImageNet weights from that file before
     replacing conv1 (so all other layers keep the pretrained values). Scratch
-    init otherwise.
+    init otherwise. All ``BatchNorm2d`` layers are swapped to ``GroupNorm`` to
+    eliminate train/eval mismatch and batch-size sensitivity.
 
-    If ``imagenet_norm`` is True, applies ImageNet mean/std normalization to the
-    input before the backbone (expects input in [0, 1]). Only valid for 3-channel
-    inputs; raises if enabled with in_channels != 3.
+    For 3-channel (RGB) input:
+      * ImageNet mean/std normalization is applied in forward (matches the
+        pretrained-weights' expected input distribution).
+      * Training-only photometric augmentations (ColorJitter, GaussianBlur,
+        RandomGrayscale, GaussianNoise) are applied before normalization,
+        gated on ``self.training``.
+
+    For non-RGB (e.g. depth) input these RGB-specific transforms are skipped.
     """
 
-    def __init__(self, in_channels: int, embed_dim: int = 128, pretrained_path: str = "", imagenet_norm: bool = False):
+    def __init__(self, in_channels: int, embed_dim: int = 128, pretrained_path: str = ""):
         super().__init__()
         import torchvision.models as tvm
-
-        if imagenet_norm and in_channels != 3:
-            raise ValueError(f"imagenet_norm=True requires in_channels=3, got {in_channels}")
-        self.imagenet_norm = imagenet_norm
-        if imagenet_norm:
-            self.register_buffer("_img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-            self.register_buffer("_img_std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         backbone = tvm.resnet18(weights=None)
         if pretrained_path:
@@ -153,16 +132,33 @@ class ResNet18Encoder(nn.Module):
                     else:
                         new_conv1.weight.copy_(avg_w.expand(-1, in_channels, -1, -1))
             backbone.conv1 = new_conv1
-        # Replace all BatchNorm2d with GroupNorm (32 groups). ResNet18 channels are
-        # 64/128/256/512, all divisible by 32. Done after weight loading so the conv
-        # weights are preserved; BN running stats are discarded (GN has none).
-        _replace_bn_with_gn(backbone)
+
+        n_replaced = _replace_bn_with_gn(backbone)
+        print(f"[ResNet18Encoder] BatchNorm2d -> GroupNorm: {n_replaced} layers replaced")
+
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
         self.proj = nn.Linear(512, embed_dim)
 
+        self.is_rgb = in_channels == 3
+        if self.is_rgb:
+            # ImageNet normalization buffers (broadcast over B, H, W via [1,3,1,1])
+            self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+            # Photometric augmentations — applied only when ``self.training``.
+            self.train_augs = T.Compose([
+                T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+                T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
+                T.RandomGrayscale(p=0.05),
+                T.GaussianNoise(mean=0.0, sigma=0.01, clip=True),
+            ])
+        else:
+            self.train_augs = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.imagenet_norm:
-            x = (x - self._img_mean) / self._img_std
+        if self.is_rgb:
+            if self.training and self.train_augs is not None:
+                x = self.train_augs(x)
+            x = (x - self.imagenet_mean) / self.imagenet_std
         f = self.backbone(x).flatten(1)
         return torch.relu(self.proj(f))
 
@@ -187,11 +183,11 @@ class StudentTeacherVision(StudentTeacher):
         student_obs_normalization: bool = True,
         encoder_type: str = "depth_cnn",
         encoder_pretrained_path: str = "",
-        encoder_imagenet_norm: bool = False,
         encoder_freeze_iters: int = 0,
+        encoder_per_view: bool = True,
         aux_enabled: bool = False,
-        aux_target_group: str = "aux_target",
         aux_hidden_dims: tuple[int, ...] | list[int] = (256, 128),
+        aux_target_keys: list[str] | None = None,
         predict_std: bool = False,
         teacher_returns_std: bool = False,
         **kwargs,
@@ -209,33 +205,64 @@ class StudentTeacherVision(StudentTeacher):
         assert proprio.ndim == 2, f"policy groups must be 1D; got shape {proprio.shape}"
         num_proprio = proprio.shape[-1]
 
-        # Image shapes: all cameras must share the same (C, H, W).
+        # Image shapes: all cameras must share the same (C, H, W). Accept both
+        # 4D (B, C, H, W) — single-frame — and 5D (B, T, C, H, W) — frame
+        # history. With ``flatten_history_dim=False`` on RGB obs terms, the
+        # group shape is (B, T, C, H, W) and the encoder processes each frame
+        # independently (DP-style).
         first_img = obs[self.vision_groups[0]]
-        assert first_img.ndim == 4, (
-            f"vision group {self.vision_groups[0]} must be 4D (B,C,H,W); got {first_img.shape}"
-        )
-        _, in_channels, H, W = first_img.shape
+        if first_img.ndim == 4:
+            self.n_obs_steps = 1
+            _, in_channels, H, W = first_img.shape
+        elif first_img.ndim == 5:
+            _, self.n_obs_steps, in_channels, H, W = first_img.shape
+        else:
+            raise AssertionError(
+                f"vision group {self.vision_groups[0]} must be 4D (B,C,H,W) "
+                f"or 5D (B,T,C,H,W); got shape {first_img.shape}"
+            )
         for g in self.vision_groups[1:]:
             assert obs[g].shape == first_img.shape, (
                 f"all vision groups must share shape; {g} has {obs[g].shape} vs {first_img.shape}"
             )
 
-        # RGB augmentation — only for 3-channel inputs (depth groups are 1-channel).
-        self._rgb_aug: _RGBAugmentation | None = _RGBAugmentation() if in_channels == 3 else None
-
-        # Shared image encoder across cameras.
+        # Build per-view or shared encoders.
+        # - depth_cnn: always shared (no pretrained weights to individualize).
+        # - resnet18 + encoder_per_view=True (default): independent encoder per
+        #   camera view, DP/DEXTRAH style — each view gets its own feature space.
+        # - resnet18 + encoder_per_view=False: single shared encoder applied to
+        #   all views; lighter, useful for ablations.
         if encoder_type == "depth_cnn":
-            self.depth_encoder = DepthCNN(in_channels, H, W, embed_dim=embed_dim)
+            shared_encoder = DepthCNN(in_channels, H, W, embed_dim=embed_dim)
+            self.encoders = nn.ModuleDict({g: shared_encoder for g in self.vision_groups})
+            self._per_view_encoders = False
         elif encoder_type == "resnet18":
-            self.depth_encoder = ResNet18Encoder(in_channels, embed_dim=embed_dim, pretrained_path=encoder_pretrained_path, imagenet_norm=encoder_imagenet_norm)
+            if encoder_per_view:
+                self.encoders = nn.ModuleDict({
+                    g: ResNet18Encoder(in_channels, embed_dim=embed_dim, pretrained_path=encoder_pretrained_path)
+                    for g in self.vision_groups
+                })
+                self._per_view_encoders = True
+            else:
+                shared_enc = ResNet18Encoder(in_channels, embed_dim=embed_dim, pretrained_path=encoder_pretrained_path)
+                self.encoders = nn.ModuleDict({g: shared_enc for g in self.vision_groups})
+                self._per_view_encoders = False
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
-        vision_feat_dim = len(self.vision_groups) * embed_dim
+        # Keep legacy attribute name for backward compat (recurrent variant).
+        self.depth_encoder = next(iter(self.encoders.values()))
+        # Vision feature is per-view + per-frame concatenated.
+        vision_feat_dim = len(self.vision_groups) * self.n_obs_steps * embed_dim
+        print(
+            f"Encoders: {len(self.encoders)} views x {self.n_obs_steps} frames "
+            f"x {embed_dim} embed = {vision_feat_dim} vision_feat_dim "
+            f"(per_view={self._per_view_encoders})"
+        )
 
         # DEXTRAH-style frozen-backbone warmup. If > 0, backbone starts with
         # ``requires_grad=False`` and is unfrozen once the algorithm hits
         # ``encoder_freeze_iters`` updates (see ``maybe_unfreeze_backbone``).
-        # proj/log_std_head/aux_head/student MLP always stay trainable.
+        # proj/std_head/aux_head/student MLP always stay trainable.
         self.encoder_freeze_iters = int(encoder_freeze_iters)
         self._backbone_frozen = self.encoder_freeze_iters > 0 and encoder_type == "resnet18"
         if self._backbone_frozen:
@@ -247,23 +274,37 @@ class StudentTeacherVision(StudentTeacher):
         print(f"Student (proprio={num_proprio}, vision_feat={vision_feat_dim}): {self.student}")
         print(f"Encoder[{encoder_type}] (C={in_channels}, H={H}, W={W}, embed={embed_dim})")
 
-        # Optional aux head: regresses object-pose targets from vision features only.
-        # Forces the CNN to learn pose-aware features (per DEXTRAH).
+        # Optional aux heads: one per aux target key, each regressing its own
+        # independently-shaped target from vision features. Forces the CNN to
+        # learn pose-aware features (per DEXTRAH). Each key is a separate
+        # top-level obs group (no concatenation), so rsl_rl storage handles it
+        # as a plain flat tensor and no equal-dim assumption is needed.
         self.aux_enabled = bool(aux_enabled)
-        self.aux_target_group = aux_target_group
         if self.aux_enabled:
-            if aux_target_group not in obs:
+            if not aux_target_keys:
                 raise ValueError(
-                    f"aux_enabled=True but obs has no '{aux_target_group}' group; "
+                    "aux_enabled=True but ``aux_target_keys`` is empty; "
+                    "set it on StudentTeacherVisionPolicyCfg to the list of "
+                    "top-level obs group names for the aux targets (e.g. "
+                    "['aux_insertive_in_wrist', 'aux_receptive_in_wrist', "
+                    "'aux_insertive_in_receptive'])."
+                )
+            missing = [k for k in aux_target_keys if k not in obs]
+            if missing:
+                raise ValueError(
+                    f"aux_enabled=True but obs is missing aux target keys: {missing}; "
                     f"got keys: {list(obs.keys())}"
                 )
-            aux_dim = obs[aux_target_group].shape[-1]
-            self.aux_head = MLP(vision_feat_dim, aux_dim, list(aux_hidden_dims), activation)
-            self.aux_target_dim = aux_dim
-            print(f"Aux head (vision_feat={vision_feat_dim} -> {aux_dim}): {self.aux_head}")
+            self.aux_keys: list[str] = list(aux_target_keys)
+            self.aux_heads = nn.ModuleDict(
+                {k: MLP(vision_feat_dim, obs[k].shape[-1], list(aux_hidden_dims), activation)
+                 for k in self.aux_keys}
+            )
+            dims = {k: obs[k].shape[-1] for k in self.aux_keys}
+            print(f"Aux heads (vision_feat={vision_feat_dim}): {dims}")
         else:
-            self.aux_head = None
-            self.aux_target_dim = 0
+            self.aux_heads = None
+            self.aux_keys = []
 
         # Normalize proprio (images already in [0,1] from process_image).
         self.student_obs_normalization = student_obs_normalization
@@ -296,11 +337,13 @@ class StudentTeacherVision(StudentTeacher):
         self.predict_std = bool(predict_std)
         std_head_in_dim = num_proprio + vision_feat_dim
         if self.predict_std:
-            self.log_std_head = nn.Linear(std_head_in_dim, num_actions)
-            self.log_std_limits = (-5.0, 2.0)
+            self.std_head = nn.Linear(std_head_in_dim, num_actions)
+            # Initialize so exp(log_std) ≈ init_noise_std at init (stable start).
+            nn.init.zeros_(self.std_head.weight)
+            nn.init.constant_(self.std_head.bias, float(torch.log(torch.tensor(init_noise_std)).item()))
             print(f"Std head ({std_head_in_dim} -> {num_actions}) enabled; log-std output")
         else:
-            self.log_std_head = None
+            self.std_head = None
 
         # Teacher contract: if JIT returns (mean, std) tuple, callers can fetch both
         # via ``evaluate_with_std``; ``evaluate`` still returns mean-only for
@@ -317,9 +360,10 @@ class StudentTeacherVision(StudentTeacher):
         adapt to the action space even during the freeze window. No-op for
         ``DepthCNN`` (nothing pretrained to preserve).
         """
-        if isinstance(self.depth_encoder, ResNet18Encoder):
-            for p in self.depth_encoder.backbone.parameters():
-                p.requires_grad = flag
+        for enc in self.encoders.values():
+            if isinstance(enc, ResNet18Encoder):
+                for p in enc.backbone.parameters():
+                    p.requires_grad = flag
 
     def maybe_unfreeze_backbone(self, num_updates: int) -> None:
         """Unfreeze the ResNet18 backbone once ``num_updates >= encoder_freeze_iters``.
@@ -334,54 +378,53 @@ class StudentTeacherVision(StudentTeacher):
             self._backbone_frozen = False
             print(f"[StudentTeacherVision] unfroze ResNet18 backbone at iter {num_updates}")
 
-    def _aug_imgs(self, obs: TensorDict) -> list[torch.Tensor]:
-        imgs = [obs[g] for g in self.vision_groups]
-        if self._rgb_aug is not None:
-            imgs = [self._rgb_aug(img) for img in imgs]
-        return imgs
+    def _encode_vision(self, obs: TensorDict) -> torch.Tensor:
+        """Encode all camera views, frame-stacked. Returns flat (B, vision_feat_dim).
+
+        For each view g: obs[g] shape is (B, T, C, H, W) — reshape to
+        (B*T, C, H, W), encode through the per-view encoder, reshape back to
+        (B, T, embed_dim), flatten to (B, T*embed_dim). Concat across views.
+        Single-frame (4D) inputs are auto-promoted to T=1.
+        """
+        feats = []
+        for g in self.vision_groups:
+            img = obs[g]
+            if img.ndim == 4:
+                # (B, C, H, W) — single frame
+                feat = self.encoders[g](img)  # (B, embed_dim)
+            elif img.ndim == 5:
+                # (B, T, C, H, W) — per-frame encode
+                B, T, C, H, W = img.shape
+                feat = self.encoders[g](img.reshape(B * T, C, H, W))  # (B*T, embed_dim)
+                feat = feat.reshape(B, T * feat.shape[-1])  # (B, T*embed_dim)
+            else:
+                raise AssertionError(f"vision group {g} bad shape: {img.shape}")
+            feats.append(feat)
+        return torch.cat(feats, dim=-1)
 
     def _encode_student(self, obs: TensorDict) -> torch.Tensor:
         proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)
         proprio = self.student_obs_normalizer(proprio)
-        img_feats = [self.depth_encoder(img) for img in self._aug_imgs(obs)]
-        return torch.cat([proprio] + img_feats, dim=-1)
+        img_feats = self._encode_vision(obs)
+        return torch.cat([proprio, img_feats], dim=-1)
 
-    def forward_with_aux(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Single forward pass that shares CNN features between action head and aux head.
+    def forward_with_aux(self, obs: TensorDict) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Single forward pass that shares CNN features between action head and aux heads.
 
         Calling ``act_inference`` + ``evaluate_aux`` separately runs the encoder
         twice, doubling peak VRAM. Use this when the aux loss is active.
+
+        ``aux_pred`` is a dict of per-target tensors when ``aux_enabled``;
+        ``None`` otherwise.
         """
         proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)
         proprio = self.student_obs_normalizer(proprio)
-        img_feats = torch.cat([self.depth_encoder(img) for img in self._aug_imgs(obs)], dim=-1)
+        img_feats = self._encode_vision(obs)
         action = self.student(torch.cat([proprio, img_feats], dim=-1))
-        aux_pred = self.aux_head(img_feats) if self.aux_enabled else None
+        aux_pred: dict[str, torch.Tensor] | None = None
+        if self.aux_enabled:
+            aux_pred = {k: head(img_feats) for k, head in self.aux_heads.items()}
         return action, aux_pred
-
-    def forward_with_aux_and_std(
-        self, obs: TensorDict
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Single encoder pass returning (mean, std, aux_pred) for the weighted DAgger update.
-
-        Avoids running the encoder three times when both std supervision and the
-        aux pose-regression loss are active simultaneously.
-        """
-        if not self.predict_std:
-            raise RuntimeError("forward_with_aux_and_std requires predict_std=True")
-        proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)
-        proprio = self.student_obs_normalizer(proprio)
-        img_feats = torch.cat([self.depth_encoder(img) for img in self._aug_imgs(obs)], dim=-1)
-        feat = torch.cat([proprio, img_feats], dim=-1)
-        mean = self.student(feat)
-        std = torch.exp(self.log_std_head(feat).clamp(*self.log_std_limits))
-        aux_pred = self.aux_head(img_feats) if self.aux_enabled else None
-        return mean, std, aux_pred
-
-    def get_aux_target(self, obs: TensorDict) -> torch.Tensor:
-        if not self.aux_enabled:
-            raise RuntimeError("get_aux_target called but aux head is not enabled")
-        return obs[self.aux_target_group]
 
     def _encode_teacher(self, obs: TensorDict) -> torch.Tensor:
         return torch.cat([obs[g] for g in self.obs_groups["teacher"]], dim=-1)
@@ -426,13 +469,41 @@ class StudentTeacherVision(StudentTeacher):
         )
         return out
 
+    def forward_all_heads(
+        self, obs: TensorDict
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Single encoder pass → (μ, σ, aux_pred). Unifies what was previously
+        two separate methods (``act_inference_with_std`` + ``forward_with_aux``)
+        that each ran the encoder. Use this in the weighted-loss update when
+        ``aux_enabled`` and ``predict_std`` are both True.
+
+        ``aux_pred`` is a per-target dict when ``aux_enabled``; None otherwise.
+        It reads the vision portion of ``feat`` only — proprio is excluded so
+        the encoder bears the full pressure of pose-reconstruction.
+        """
+        if not self.predict_std:
+            raise RuntimeError("forward_all_heads called but predict_std=False")
+        proprio = torch.cat([obs[g] for g in self.obs_groups["policy"]], dim=-1)
+        proprio = self.student_obs_normalizer(proprio)
+        img_feats = self._encode_vision(obs)
+        feat = torch.cat([proprio, img_feats], dim=-1)
+        mean = self.student(feat)
+        log_std = self.std_head(feat).clamp(-5.0, 2.0)
+        std = torch.exp(log_std)
+        aux_pred: dict[str, torch.Tensor] | None = None
+        if self.aux_enabled:
+            aux_pred = {k: head(img_feats) for k, head in self.aux_heads.items()}
+        return mean, std, aux_pred
+
     def act_inference_with_std(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (mean, std) from the student. Requires ``predict_std=True``."""
         if not self.predict_std:
             raise RuntimeError("act_inference_with_std called but predict_std=False")
         feat = self._encode_student(obs)
         mean = self.student(feat)
-        log_std = self.log_std_head(feat).clamp(*self.log_std_limits)
+        # Clamp to prevent pathological drift during long DAgger training.
+        # Init bias = log(init_noise_std) ≈ -2.3 sits well inside this range.
+        log_std = self.std_head(feat).clamp(-5.0, 2.0)
         std = torch.exp(log_std)
         return mean, std
 

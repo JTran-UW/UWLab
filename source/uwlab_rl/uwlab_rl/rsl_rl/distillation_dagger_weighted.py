@@ -26,13 +26,14 @@ Requires:
 * Policy built with ``teacher_returns_std=True`` + teacher JIT that returns
   ``(mean, std)`` (see :func:`scripts_v2/tools/convert_state_expert_to_jit.py`
   with ``--std``).
-* Policy built with ``predict_std=True`` — adds a student ``log_std_head`` head.
+* Policy built with ``predict_std=True`` — adds a student ``std_head`` head.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from .distillation_dagger import DistillationDAgger
@@ -95,24 +96,33 @@ class DistillationDAggerWeighted(DistillationDAgger):
         self.num_updates += 1
         mean_mu_loss = 0.0
         mean_sigma_loss = 0.0
-        mean_aux_loss = 0.0
         loss = 0
         cnt = 0
 
         aux_enabled = bool(getattr(self.policy, "aux_enabled", False))
+        # Per-key aux loss accumulators discovered from the policy (no
+        # hard-coded key list — keys come from AuxTargetCfg via the policy's
+        # ``aux_heads`` ModuleDict).
+        aux_keys: list[str] = list(getattr(self.policy, "aux_keys", []))
+        sum_aux_train: dict[str, float] = {k: 0.0 for k in aux_keys}
+        sum_aux_eval: dict[str, float] = {k: 0.0 for k in aux_keys}
+        cnt_aux_train = 0
+        cnt_aux_eval = 0
         train_mask = (~self.eval_mask).to(self.device) if self.eval_mask is not None else None
+        eval_mask = self.eval_mask.to(self.device) if self.eval_mask is not None else None
+        aux_coeff = float(getattr(self, "aux_coeff", 1.0))
 
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
             for obs, _, privileged_mu, dones in self.storage.generator():
-                # Student (μ, σ) — single encoder pass, optionally with aux.
+                # Student forward. Single encoder pass returns (μ, σ, aux_pred);
+                # aux_pred is None when aux_enabled=False.
                 if aux_enabled:
-                    student_mu, student_sigma, aux_pred = self.policy.forward_with_aux_and_std(obs)
-                    aux_target = self.policy.get_aux_target(obs)
+                    student_mu, student_sigma, student_aux = self.policy.forward_all_heads(obs)
                 else:
                     student_mu, student_sigma = self.policy.act_inference_with_std(obs)
-                    aux_pred, aux_target = None, None
+                    student_aux = None
 
                 # Re-run teacher to get σ (teacher μ is already in privileged_actions).
                 # Frozen JIT forward — cheap (215d → 7d MLP + gSDE head).
@@ -125,9 +135,6 @@ class DistillationDAggerWeighted(DistillationDAgger):
                     s_sig = student_sigma[train_mask]
                     t_mu = teacher_mu[train_mask]
                     t_sig = teacher_sigma[train_mask]
-                    if aux_enabled:
-                        aux_pred = aux_pred[train_mask]
-                        aux_target = aux_target[train_mask]
                 else:
                     s_mu, s_sig = student_mu, student_sigma
                     t_mu, t_sig = teacher_mu, teacher_sigma
@@ -154,10 +161,39 @@ class DistillationDAggerWeighted(DistillationDAgger):
                     gripper_loss_val = gripper_loss.item()
                 sigma_loss = _l2(s_sig, t_sig).mean()
                 step_loss = mu_loss + sigma_loss
-                if aux_enabled:
-                    aux_loss = self.loss_fn(aux_pred, aux_target)
-                    step_loss = step_loss + self.aux_coeff * aux_loss
-                    mean_aux_loss += aux_loss.item()
+
+                # ---- aux pose-reconstruction loss (DEXTRAH/DP-style) ----------
+                # Each aux key is a separate top-level obs group so obs[k] is a
+                # plain flat tensor — no concatenation, no equal-dim slicing.
+                # Train pool: aux_coeff * Σ_k MSE_k contributes to gradient.
+                # Eval pool: per-key MSE logged no-grad as sim2real proxy metric.
+                if student_aux is not None:
+                    train_contributed = False
+                    eval_contributed = False
+                    for k in aux_keys:
+                        pred_k = student_aux[k]
+                        target_k = obs[k]
+                        if train_mask is not None:
+                            s_tr, t_tr = pred_k[train_mask], target_k[train_mask]
+                        else:
+                            s_tr, t_tr = pred_k, target_k
+                        if s_tr.shape[0] > 0:
+                            mse_tr = F.mse_loss(s_tr, t_tr)
+                            # Sum (not mean) over keys — matches DP form
+                            # ``aux_loss = Σ_k MSE_k`` with aux_coeff=1.0.
+                            step_loss = step_loss + aux_coeff * mse_tr
+                            sum_aux_train[k] += mse_tr.detach().item()
+                            train_contributed = True
+                        if eval_mask is not None:
+                            s_ev, t_ev = pred_k[eval_mask], target_k[eval_mask]
+                            if s_ev.shape[0] > 0:
+                                with torch.no_grad():
+                                    sum_aux_eval[k] += F.mse_loss(s_ev, t_ev).item()
+                                eval_contributed = True
+                    if train_contributed:
+                        cnt_aux_train += 1
+                    if eval_contributed:
+                        cnt_aux_eval += 1
 
                 loss = loss + step_loss
                 mean_mu_loss += mu_loss.item()
@@ -202,8 +238,20 @@ class DistillationDAggerWeighted(DistillationDAgger):
             "behavior_arm": mean_arm_loss,
             "behavior_gripper": mean_gripper_loss,
         }
-        if aux_enabled:
-            loss_dict["aux"] = mean_aux_loss / cnt
+        if aux_enabled and cnt_aux_train > 0:
+            train_total = 0.0
+            for k in aux_keys:
+                v = sum_aux_train[k] / cnt_aux_train
+                loss_dict[f"aux_train_{k}"] = v
+                train_total += v
+            loss_dict["aux_train_total"] = train_total
+        if aux_enabled and cnt_aux_eval > 0:
+            eval_total = 0.0
+            for k in aux_keys:
+                v = sum_aux_eval[k] / cnt_aux_eval
+                loss_dict[f"aux_eval_{k}"] = v
+                eval_total += v
+            loss_dict["aux_eval_total"] = eval_total
         if self.student_mask is None:
             loss_dict["beta"] = self.beta
         else:

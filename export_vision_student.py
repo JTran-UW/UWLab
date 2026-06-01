@@ -47,19 +47,42 @@ StudentTeacherVision = _stv_mod.StudentTeacherVision
 # ── Inlined export helpers (from uwlab_rl/rsl_rl/exporter.py, pure torch) ────
 
 class _VisionStudentJITExporter(nn.Module):
-    """Self-contained JIT wrapper — deep-copies normalizer + encoder + student MLP."""
+    """Self-contained JIT wrapper — deep-copies normalizer + per-view encoders + student MLP.
+
+    Holds one encoder per vision group, in ``policy.vision_groups`` order. The
+    forward applies encoder ``i`` to ``images[i]`` — matching
+    ``StudentTeacherVision._encode_vision``, which iterates ``self.encoders[g]``
+    over ``vision_groups``. This is what makes per-view encoders (resnet18 +
+    ``encoder_per_view=True``, e.g. the side/wrist RGB DAgger setup) export
+    correctly instead of reusing the first encoder for every camera.
+
+    With a shared encoder (depth_cnn, or resnet18 + ``encoder_per_view=False``)
+    every group maps to the same module, so the per-view copies are identical
+    and behaviour is unchanged.
+    """
 
     def __init__(self, policy):
         super().__init__()
-        self.normalizer    = copy.deepcopy(policy.student_obs_normalizer)
-        self.depth_encoder = copy.deepcopy(policy.depth_encoder)
-        self.student       = copy.deepcopy(policy.student)
+        self.normalizer = copy.deepcopy(policy.student_obs_normalizer)
+        self.encoders   = nn.ModuleList(
+            [copy.deepcopy(policy.encoders[g]) for g in policy.vision_groups]
+        )
+        self.student    = copy.deepcopy(policy.student)
+        # Photometric ``train_augs`` (a torchvision v2 ``Compose``) is not JIT
+        # scriptable and is only applied when ``self.training`` — strip it from
+        # each eval-only encoder copy so the graph compiles. Dropping it does not
+        # change inference output (the augment branch never fires in eval).
+        for enc in self.encoders:
+            if hasattr(enc, "train_augs"):
+                enc.train_augs = None
 
     def forward(self, proprio: torch.Tensor, images: List[torch.Tensor]) -> torch.Tensor:
         proprio_norm = self.normalizer(proprio)
         feats: List[torch.Tensor] = [proprio_norm]
-        for img in images:
-            feats.append(self.depth_encoder(img))
+        i = 0
+        for enc in self.encoders:
+            feats.append(enc(images[i]))
+            i += 1
         return self.student(torch.cat(feats, dim=-1))
 
 
