@@ -17,8 +17,15 @@ import argparse
 import torch
 from tensordict import TensorDict
 
-# Per-step obs layout for known tasks.
-# UR5e Robotiq 2F-85: joint_pos=12 (6 arm + 6 gripper linkage), confirmed from obs_dim=155=31*5, critic=32=31+1
+# Isaac Lab ObservationManager.compute_group() builds a dict keyed by term name in dict
+# insertion order (NOT the declaration order in ObservationsCfg), then concatenates
+# list(group_obs.values()). For each term, history is flattened oldest→newest, so the
+# newest frame of a term is the LAST (term_dim) entries of that term's block.
+#
+# The dict insertion order observed at runtime for OmniReset PolicyCfg:
+#   insertive_asset_in_receptive_asset_frame (6) | prev_actions (7) | joint_pos (12)
+#   | end_effector_pose (6) | insertive_asset_pose (6) | receptive_asset_pose (6)
+# History=5 → 30 | 35 | 60 | 30 | 30 | 30 = 215 dims.
 _JOINT_LABELS = [
     "shoulder_pan", "shoulder_lift", "elbow",
     "wrist_1", "wrist_2", "wrist_3",
@@ -26,29 +33,45 @@ _JOINT_LABELS = [
 ]
 _EE_LABELS = ["ee_pos_x", "ee_pos_y", "ee_pos_z", "ee_aa_x", "ee_aa_y", "ee_aa_z"]
 
-_TASK_OBS_META = {
-    # Reaching: prev_actions(7) + joint_pos(12) + ee_pose(6) + target_pose(6) = 31 per step, history 5
-    "Reaching": {
-        "per_step": 31, "history": 5,
-        "joint_offset": 7,  "joint_len": 12, "joint_labels": _JOINT_LABELS,
-        "ee_offset":    19, "ee_len":     6, "ee_labels":    _EE_LABELS,
-    },
-    # Insertion: prev_actions(7) + joint_pos(12) + ee_pose(6) + ins(6) + rec(6) + ins_in_rec(6) = 43, history 5
-    "OmniReset": {
-        "per_step": 43, "history": 5,
-        "joint_offset": 7,  "joint_len": 12, "joint_labels": _JOINT_LABELS,
-        "ee_offset":    19, "ee_len":     6, "ee_labels":    _EE_LABELS,
-    },
+# Task → ordered list of (term_name, per_frame_dim) matching Isaac Lab's concat order.
+_TASK_TERM_ORDER: dict[str, list[tuple[str, int]]] = {
+    "OmniReset": [
+        ("insertive_asset_in_receptive_asset_frame", 6),
+        ("prev_actions", 7),
+        ("joint_pos", 12),
+        ("end_effector_pose", 6),
+        ("insertive_asset_pose", 6),
+        ("receptive_asset_pose", 6),
+    ],
 }
 
 
-def _get_obs_meta(task: str | None) -> dict | None:
+def _term_offsets(task: str | None, obs_dim: int) -> tuple[dict[str, tuple[int, int]], int] | None:
+    """Return {term_name: (block_start, block_end)} and history, inferred from task + obs_dim.
+
+    history is computed as obs_dim / sum(per_frame_dims) and asserted to be a positive integer.
+    """
     if task is None:
         return None
-    for key, meta in _TASK_OBS_META.items():
+    terms = None
+    for key, t in _TASK_TERM_ORDER.items():
         if key in task:
-            return meta
-    return None
+            terms = t
+            break
+    if terms is None:
+        return None
+    per_frame_total = sum(d for _, d in terms)
+    if obs_dim % per_frame_total != 0:
+        print(f"[WARN] obs_dim={obs_dim} is not a multiple of per-frame total {per_frame_total} for task '{task}'.")
+        return None
+    history = obs_dim // per_frame_total
+    offsets: dict[str, tuple[int, int]] = {}
+    cursor = 0
+    for name, dim in terms:
+        block_size = dim * history
+        offsets[name] = (cursor, cursor + block_size)
+        cursor += block_size
+    return offsets, history
 
 
 def print_tensor_stats(name: str, t: torch.Tensor, per_dim: bool = True, indent: int = 2) -> None:
@@ -233,9 +256,15 @@ def detect_and_parse(data, limit: int | None) -> dict:
     raise ValueError(f"Unrecognized replay buffer format. Available keys/attrs: {available}")
 
 
-def _plot_obs_slice(obs: torch.Tensor, title: str, offset: int, length: int,
-                    labels: list[str], per_step: int, history: int, nrows: int = 1) -> None:
-    """Extract a named slice from the most-recent history frame and show per-dim histograms."""
+def _plot_newest_frame(obs: torch.Tensor, title: str,
+                       block_start: int, block_end: int, term_dim: int,
+                       labels: list[str], nrows: int = 1,
+                       xlim_per_label: dict[str, tuple[float, float]] | None = None) -> None:
+    """Plot per-dim histograms of the newest frame of a term block.
+
+    The newest frame is the LAST term_dim entries of [block_start:block_end].
+    `xlim_per_label` maps label → (xmin, xmax) to fix the x-axis for specific dims.
+    """
     try:
         import math
         import matplotlib.pyplot as plt
@@ -243,21 +272,19 @@ def _plot_obs_slice(obs: torch.Tensor, title: str, offset: int, length: int,
         print("[WARN] matplotlib not available; skipping histogram.")
         return
 
+    start = block_end - term_dim
+    end   = block_end
+
     obs_dim = obs.shape[-1]
-    expected = per_step * history
-    if obs_dim != expected:
-        print(f"[WARN] {title}: obs_dim={obs_dim} but expected {per_step}*{history}={expected}. Skipping.")
+    if end > obs_dim or start < block_start:
+        print(f"[WARN] {title}: slice [{start}:{end}] out of range for block [{block_start}:{block_end}] / obs_dim={obs_dim}.")
         return
 
-    last_frame_start = (history - 1) * per_step
-    start = last_frame_start + offset
-    end   = start + length
-
     flat   = obs.reshape(-1, obs_dim)
-    values = flat[:, start:end].float().cpu()  # [N, length]
+    values = flat[:, start:end].float().cpu()
 
     nrows = max(1, nrows)
-    ncols = math.ceil(length / nrows)
+    ncols = math.ceil(term_dim / nrows)
     fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows), squeeze=False)
     axes_flat = [axes[r][c] for r in range(nrows) for c in range(ncols)]
     for i, lbl in enumerate(labels):
@@ -266,47 +293,46 @@ def _plot_obs_slice(obs: torch.Tensor, title: str, offset: int, length: int,
         ax.set_title(lbl, fontsize=9)
         ax.set_xlabel("value")
         ax.set_ylabel("count")
-    for ax in axes_flat[length:]:  # hide unused subplots
+        if xlim_per_label is not None and lbl in xlim_per_label:
+            ax.set_xlim(*xlim_per_label[lbl])
+    for ax in axes_flat[term_dim:]:
         ax.set_visible(False)
-    fig.suptitle(f"{title} (most-recent frame)", fontsize=10)
+    fig.suptitle(f"{title} (newest frame, dims {start}:{end} of block {block_start}:{block_end})", fontsize=10)
     plt.tight_layout()
     plt.show()
 
 
 def plot_ee_pose_histograms(obs: torch.Tensor, task: str | None,
-                            per_step: int | None = None, history: int | None = None,
-                            ee_offset: int | None = None, ee_len: int | None = None,
-                            ee_labels: list[str] | None = None) -> None:
-    meta = _get_obs_meta(task)
-    per_step  = per_step  or (meta["per_step"]  if meta else None)
-    history   = history   or (meta["history"]   if meta else None)
-    offset    = ee_offset or (meta["ee_offset"] if meta else None)
-    length    = ee_len    or (meta["ee_len"]     if meta else None)
-    labels    = ee_labels or (meta["ee_labels"]  if meta else None)
-    if any(v is None for v in [per_step, history, offset, length]):
-        print("[WARN] Cannot determine obs layout for EE pose. Pass --per_step/--history/--ee_offset/--ee_len.")
-        return
-    if labels is None:
-        labels = [f"ee_{i}" for i in range(length)]
-    _plot_obs_slice(obs, f"EE Pose Histograms  task={task or 'unknown'}", offset, length, labels, per_step, history)
+                            block_override: tuple[int, int] | None = None) -> None:
+    if block_override is not None:
+        block_start, block_end = block_override
+    else:
+        result = _term_offsets(task, obs.shape[-1])
+        if result is None or "end_effector_pose" not in result[0]:
+            print("[WARN] Cannot determine end_effector_pose offsets. Pass --ee_block_start/--ee_block_end.")
+            return
+        block_start, block_end = result[0]["end_effector_pose"]
+    _plot_newest_frame(
+        obs, f"EE Pose Histograms  task={task or 'unknown'}",
+        block_start, block_end, term_dim=6, labels=_EE_LABELS,
+        xlim_per_label={"ee_pos_x": (-1.0, 1.0), "ee_pos_y": (-1.0, 1.0), "ee_pos_z": (-1.0, 1.0)},
+    )
 
 
 def plot_joint_pos_histograms(obs: torch.Tensor, task: str | None,
-                              per_step: int | None = None, history: int | None = None,
-                              joint_offset: int | None = None, joint_len: int | None = None,
-                              joint_labels: list[str] | None = None) -> None:
-    meta = _get_obs_meta(task)
-    per_step     = per_step     or (meta["per_step"]      if meta else None)
-    history      = history      or (meta["history"]       if meta else None)
-    offset       = joint_offset or (meta["joint_offset"]  if meta else None)
-    length       = joint_len    or (meta["joint_len"]     if meta else None)
-    labels       = joint_labels or (meta["joint_labels"]  if meta else None)
-    if any(v is None for v in [per_step, history, offset, length]):
-        print("[WARN] Cannot determine obs layout for joint pos. Pass --per_step/--history/--joint_offset/--joint_len.")
-        return
-    if labels is None:
-        labels = [f"joint_{i}" for i in range(length)]
-    _plot_obs_slice(obs, f"Joint Pos Histograms  task={task or 'unknown'}", offset, length, labels, per_step, history, nrows=2)
+                              block_override: tuple[int, int] | None = None) -> None:
+    if block_override is not None:
+        block_start, block_end = block_override
+    else:
+        result = _term_offsets(task, obs.shape[-1])
+        if result is None or "joint_pos" not in result[0]:
+            print("[WARN] Cannot determine joint_pos offsets. Pass --joint_block_start/--joint_block_end.")
+            return
+        block_start, block_end = result[0]["joint_pos"]
+    _plot_newest_frame(
+        obs, f"Joint Pos Histograms  task={task or 'unknown'}",
+        block_start, block_end, term_dim=12, labels=_JOINT_LABELS, nrows=2,
+    )
 
 
 def main():
@@ -321,13 +347,11 @@ def main():
                         help="Plot per-dimension histograms of the EE pose from actor obs.")
     parser.add_argument("--plot_joint_pos", action="store_true",
                         help="Plot per-dimension histograms of joint positions from actor obs.")
-    # Manual obs-layout overrides (only needed if task auto-detection fails)
-    parser.add_argument("--per_step", type=int, default=None, help="Obs dims per timestep.")
-    parser.add_argument("--history", type=int, default=None, help="History length.")
-    parser.add_argument("--ee_offset", type=int, default=None, help="EE pose start dim within one frame.")
-    parser.add_argument("--ee_len", type=int, default=None, help="Number of EE pose dims.")
-    parser.add_argument("--joint_offset", type=int, default=None, help="Joint pos start dim within one frame.")
-    parser.add_argument("--joint_len", type=int, default=None, help="Number of joint pos dims.")
+    # Manual block overrides (only needed if task auto-detection fails)
+    parser.add_argument("--ee_block_start", type=int, default=None, help="EE pose block start dim.")
+    parser.add_argument("--ee_block_end", type=int, default=None, help="EE pose block end dim (exclusive).")
+    parser.add_argument("--joint_block_start", type=int, default=None, help="Joint pos block start dim.")
+    parser.add_argument("--joint_block_end", type=int, default=None, help="Joint pos block end dim (exclusive).")
     args = parser.parse_args()
 
     print(f"Loading: {args.buffer}")
@@ -403,23 +427,21 @@ def main():
 
     # EE pose histograms
     if args.plot_ee_pose:
-        plot_ee_pose_histograms(
-            obs, task,
-            per_step=args.per_step,
-            history=args.history,
-            ee_offset=args.ee_offset,
-            ee_len=args.ee_len,
+        ee_override = (
+            (args.ee_block_start, args.ee_block_end)
+            if args.ee_block_start is not None and args.ee_block_end is not None
+            else None
         )
+        plot_ee_pose_histograms(obs, task, block_override=ee_override)
 
     # Joint pos histograms
     if args.plot_joint_pos:
-        plot_joint_pos_histograms(
-            obs, task,
-            per_step=args.per_step,
-            history=args.history,
-            joint_offset=args.joint_offset,
-            joint_len=args.joint_len,
+        joint_override = (
+            (args.joint_block_start, args.joint_block_end)
+            if args.joint_block_start is not None and args.joint_block_end is not None
+            else None
         )
+        plot_joint_pos_histograms(obs, task, block_override=joint_override)
 
 
 if __name__ == "__main__":

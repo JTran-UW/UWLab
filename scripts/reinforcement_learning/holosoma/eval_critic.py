@@ -36,6 +36,7 @@ parser.add_argument(
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--expert_checkpoint", type=str, default=None, help="Path to an RSL-RL (PPO) checkpoint .pt file. If set, loads an OnPolicyRunner from that checkpoint and passes its policy and critic to FastSACAgent as BC regularization targets.")
 parser.add_argument("--fastsac_expert_checkpoint", type=str, default=None, help="Path to a FastSAC checkpoint .pt file to use as expert Q function for critic comparison.")
+parser.add_argument("--plot_rewards", action="store_true", default=False, help="Plot individual reward components over time.")
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -191,33 +192,48 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     expert_critic_values = []
     critic_values = []
+    true_rewards = []
+
+    reward_components: dict[str, list[float]] = {}
+    if args_cli.plot_rewards:
+        rm = env.unwrapped.reward_manager
+        for name in rm._term_names:
+            reward_components[name] = []
+
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=-1)
             if expert_is_fastsac:
-                actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=-1)
                 actions = expert_policy({"actor_obs": actor_obs})
-            else:
+            elif expert_policy is not None:
                 actions = expert_policy(obs)
-            new_obs, rew, dones, extras = env.step(actions)
-
-            # Get expert critic value on current obs/actions
-            expert_critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=-1)
-            if expert_is_fastsac:
-                expert_critic_output = expert_critic(expert_critic_obs, actions)
             else:
-                expert_critic_output = rew + 0.99 * expert_critic(expert_critic_obs)
-            expert_critic_value = expert_critic_output.mean()
+                actions = policy({"actor_obs": actor_obs})
+            new_obs, rew, dones, extras = env.step(actions)
 
             # Get policy critic on current obs/actions
             critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=-1)
             critic_output = critic(critic_obs, actions)
             critic_value = critic_output.mean()
-
-            # Save them to an array
-            expert_critic_values.append(expert_critic_value.cpu().item())
             critic_values.append(critic_value.cpu().item())
+
+            # Get expert critic value on current obs/actions (if available)
+            if expert_critic is not None:
+                expert_critic_obs = torch.cat([new_obs[k] for k in critic_obs_keys], dim=-1)
+                if expert_is_fastsac:
+                    expert_critic_output = expert_critic(expert_critic_obs, actions)
+                else:
+                    expert_critic_output = rew + 0.99 * expert_critic(expert_critic_obs)
+                expert_critic_values.append(expert_critic_output.mean().cpu().item())
+
+            true_rewards.append(rew.mean().cpu().item())
+
+            if args_cli.plot_rewards:
+                step_rew = rm._step_reward * dt
+                for idx, name in enumerate(rm._term_names):
+                    reward_components[name].append(step_rew[:, idx].mean().cpu().item())
 
             obs = new_obs
 
@@ -229,13 +245,39 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         elif dones.any():
             break
 
+    # Monte Carlo discounted return: G_t = sum_{k=0}^{N-t-1} gamma^k * r_{t+k}
+    GAMMA = 0.99
+    mc_returns = [0.0] * len(true_rewards)
+    running = 0.0
+    for i in range(len(true_rewards) - 1, -1, -1):
+        running = true_rewards[i] + GAMMA * running
+        mc_returns[i] = running
+
     import matplotlib.pyplot as plt
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    ax.plot(expert_critic_values, label="Expert Critic")
+    if expert_critic_values:
+        ax.plot(expert_critic_values, label="Expert Critic")
     ax.plot(critic_values, label="Policy Critic")
+    ax.plot(true_rewards, label="True Reward (mean across envs)", linestyle="--")
+    ax.plot(mc_returns, label=f"MC Return (γ={GAMMA})", linestyle=":")
+    ax.set_xlabel("step")
+    ax.set_ylabel("value")
     ax.legend()
     fig.savefig("critic_comparison.png")
+
+    if args_cli.plot_rewards and reward_components:
+        fig2, ax2 = plt.subplots(figsize=(12, 6))
+        for name, values in reward_components.items():
+            ax2.plot(values, label=name)
+        ax2.plot(true_rewards, label="Total Reward", linewidth=2, color="black", linestyle="--")
+        ax2.set_xlabel("step")
+        ax2.set_ylabel("reward")
+        ax2.set_title("Reward Components Over Time")
+        ax2.legend(fontsize="small", loc="best")
+        fig2.tight_layout()
+        fig2.savefig("reward_components.png")
+        print(f"[INFO] Saved reward components plot to: reward_components.png")
 
         # time delay for real-time evaluation
         # sleep_time = dt - (time.time() - start_time)

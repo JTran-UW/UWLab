@@ -23,7 +23,10 @@ parser.add_argument(
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
-    "--agent", type=str, default="sb3_cfg_entry_point", help="Name of the RL agent configuration entry point."
+    "--agent", type=str, default=None, help="Name of the RL agent configuration entry point."
+)
+parser.add_argument(
+    "--algo", type=str, default="ppo", choices=["ppo", "sac"], help="SB3 algorithm of the checkpoint."
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
@@ -48,6 +51,9 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
+# default --agent entry point based on --algo if not explicitly set
+if args_cli.agent is None:
+    args_cli.agent = "sb3_sac_cfg_entry_point" if args_cli.algo == "sac" else "sb3_cfg_entry_point"
 
 # always enable cameras to record video
 if args_cli.video:
@@ -67,8 +73,10 @@ import random
 import time
 import torch
 
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.vec_env import VecNormalize
+
+ALGO_CLS = {"ppo": PPO, "sac": SAC}
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -176,7 +184,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create agent from stable baselines
     print(f"Loading checkpoint from: {checkpoint_path}")
-    agent = PPO.load(checkpoint_path, env, print_system_info=True)
+    agent = ALGO_CLS[args_cli.algo].load(checkpoint_path, env, print_system_info=True)
 
     dt = env.unwrapped.step_dt
 

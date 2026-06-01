@@ -49,6 +49,30 @@ parser.add_argument(
     default=None,
     help="Path to save the recorded replay buffer. Defaults to <log_dir>/play_transitions.pt.",
 )
+parser.add_argument(
+    "--single_env_rb",
+    action="store_true",
+    default=False,
+    help=(
+        "Save in FastSAC online-replay-buffer format with n_env=1, collapsing the env "
+        "dimension into the time dimension. Output has shape (num_envs*num_steps, 1, dim) "
+        "and top-level keys (no `buffer_tensors` wrapper) so it can be loaded directly via "
+        "train.py --replay_buffer_path. Use agent.buffer_size=<num_envs*num_steps> and "
+        "--num_envs 1 in the training command."
+    ),
+)
+parser.add_argument(
+    "--eval",
+    type=int,
+    default=None,
+    help="If set, run evaluation for this many episodes (across all envs) and report success rate, then exit.",
+)
+parser.add_argument(
+    "--plot_ee",
+    type=int,
+    default=None,
+    help="If set, run for this many steps collecting EE pose for env 0 (robot base frame), then plot and exit.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -112,6 +136,7 @@ def record_transitions_to_replay_buffer(
     task_name: str,
     device: str,
     gamma: float = 0.99,
+    single_env_rb: bool = False,
 ) -> None:
     """Run a policy for ``num_steps`` and save transitions in SimpleReplayBuffer format.
 
@@ -189,6 +214,40 @@ def record_transitions_to_replay_buffer(
         pbar.update(1)
     pbar.close()
 
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    if single_env_rb:
+        # Collapse env dim into time dim → shape (1, num_steps * n_env, ...). Save in
+        # FastSAC online-RB format (top-level keys) so train.py --replay_buffer_path can
+        # load it directly via FastSACAgent.load_replay_buffer.
+        # SimpleReplayBuffer stores tensors as (n_env, buffer_size, ...) — confirmed
+        # against the agent-side rb shape at load time.
+        def _collapse(t: torch.Tensor) -> torch.Tensor:
+            if t.dim() <= 1:
+                return t
+            return t.detach().cpu().reshape(1, -1, *t.shape[2:])
+
+        total = num_steps * n_env
+        payload = {
+            "observations": _collapse(rb.observations),
+            "actions": _collapse(rb.actions),
+            "rewards": _collapse(rb.rewards),
+            "dones": _collapse(rb.dones),
+            "truncations": _collapse(rb.truncations),
+            "next_observations": _collapse(rb.next_observations),
+            "critic_observations": _collapse(rb.critic_observations),
+            "next_critic_observations": _collapse(rb.next_critic_observations),
+            "ptr": total,
+            "n_env": 1,
+            "buffer_size": total,
+            "global_step": 0,
+        }
+        torch.save(payload, output_path)
+        print(
+            f"[INFO] Saved {total} transitions (single-env RB, online format) to: {output_path}"
+        )
+        return
+
     payload = {
         "buffer_tensors": {
             "observations": rb.observations.detach().cpu(),
@@ -214,7 +273,6 @@ def record_transitions_to_replay_buffer(
         },
     }
 
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     torch.save(payload, output_path)
     print(f"[INFO] Saved {n_env * num_steps} transitions to: {output_path}")
 
@@ -313,6 +371,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 task_name=args_cli.task,
                 device=agent_cfg.device,
                 gamma=getattr(agent_cfg.algorithm, "gamma", 0.99) if hasattr(agent_cfg, "algorithm") else 0.99,
+                single_env_rb=args_cli.single_env_rb,
             )
             env.close()
             return
@@ -339,6 +398,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 task_name=args_cli.task,
                 device=agent_cfg.device,
                 gamma=float(runner.alg_cfg.get("gamma", 0.99)),
+                single_env_rb=args_cli.single_env_rb,
             )
             env.close()
             return
@@ -353,6 +413,188 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # reset environment
     obs = env.get_observations()
+
+    # --eval: run for a fixed number of episodes, report success rate, then exit.
+    # Success isn't a termination (only timeout / abnormal_robot are), so we replicate
+    # ProgressContext's check from the newest `insertive_asset_in_receptive_asset_frame`
+    # frame: pos_norm < pos_thresh AND |aa_x|+|aa_y| < orient_thresh (approximates the
+    # exact Euler-XY L1 used by the reward; matches it well near success). An episode
+    # counts as success if any of its steps satisfied the check.
+    if args_cli.eval is not None:
+        obs_mgr = env.unwrapped.observation_manager
+        term_names = list(obs_mgr.active_terms["policy"])
+        term_dims = list(obs_mgr.group_obs_term_dim["policy"])
+        offsets = {}
+        cursor = 0
+        for name, shape in zip(term_names, term_dims):
+            dim = shape[0] if isinstance(shape, tuple) else int(shape)
+            offsets[name] = (cursor, cursor + dim)
+            cursor += dim
+        if "insertive_asset_in_receptive_asset_frame" not in offsets:
+            raise RuntimeError(
+                "Task has no `insertive_asset_in_receptive_asset_frame` obs term; "
+                "cannot compute success from obs for this task."
+            )
+        ins_block_start, ins_block_end = offsets["insertive_asset_in_receptive_asset_frame"]
+        ins_newest_start = ins_block_end - 6  # last 6 dims of the block = newest frame
+        POS_THRESH = 0.03
+        ORIENT_THRESH = 0.2
+        print(f"[eval] success check: pos_norm < {POS_THRESH}  AND  |aa_x|+|aa_y| < {ORIENT_THRESH}")
+        print(f"[eval] ins_in_rec newest slice: [{ins_newest_start}:{ins_block_end}]")
+
+        target_episodes = args_cli.eval
+        total_episodes = 0
+        successful_episodes = 0
+        device = env.unwrapped.device
+        ever_success = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+
+        # Per-episode initial peg (insertive_object) xy in env-local frame.
+        # Captured at episode start; refreshed after each done.
+        insertive = env.unwrapped.scene["insertive_object"]
+        env_origins = env.unwrapped.scene.env_origins  # [num_envs, 3]
+        init_peg_xy = (insertive.data.root_pos_w - env_origins)[:, :2].clone()
+        # Collected per completed episode: (x, y, success_bool)
+        episode_init_xys: list[torch.Tensor] = []
+        episode_successes: list[bool] = []
+
+        pbar = tqdm.tqdm(total=target_episodes, desc="Eval episodes", unit="ep")
+        while total_episodes < target_episodes:
+            with torch.inference_mode():
+                if is_fastsac:
+                    actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=1)
+                    actions = policy({"actor_obs": actor_obs})
+                else:
+                    actor_obs = obs["policy"] if isinstance(obs, dict) else obs
+                    actions = policy(obs)
+                # Accumulate success at the pre-step state (obs at iter start).
+                obs, _, dones, _ = env.step(actions)
+
+                context_term = env.env.env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
+                orientation_aligned = getattr(context_term, "orientation_aligned")
+                position_aligned = getattr(context_term, "position_aligned")
+                before_es = ever_success.clone()
+                ever_success |= torch.where(orientation_aligned & position_aligned, True, False)
+                new_success = torch.argwhere(~before_es & ever_success)
+                if len(new_success) > 0:
+                    print(f"new success at: {torch.argwhere(~before_es & ever_success)}")
+                
+            done_mask = dones.bool()
+            successes = ever_success & done_mask
+            n_done = int(done_mask.sum().item())
+            n_success = int(successes.sum().item())
+            total_episodes += n_done
+            successful_episodes += n_success
+            pbar.update(n_done)
+
+            # Record (init_xy, success) for each env that just finished an episode,
+            # then refresh init_peg_xy for those envs from the new post-reset peg pose.
+            if n_done > 0:
+                done_idx = torch.nonzero(done_mask, as_tuple=False).flatten()
+                xy_cpu = init_peg_xy[done_idx].cpu()
+                succ_cpu = successes[done_idx].cpu()
+                for k in range(done_idx.numel()):
+                    episode_init_xys.append(xy_cpu[k])
+                    episode_successes.append(bool(succ_cpu[k]))
+                new_xy = (insertive.data.root_pos_w - env_origins)[:, :2]
+                init_peg_xy[done_mask] = new_xy[done_mask]
+            # Reset success flag for envs that just finished an episode.
+            ever_success[done_mask] = False
+        
+        pbar.close()
+        success_rate = successful_episodes / total_episodes if total_episodes > 0 else 0.0
+        print(f"\n[EVAL] Episodes: {total_episodes}  |  Successes: {successful_episodes}  |  Success rate: {success_rate:.2%}")
+
+        # Plot 2D initial peg positions colored by episode outcome.
+        if len(episode_init_xys) > 0:
+            import matplotlib.pyplot as plt
+            xys = torch.stack(episode_init_xys).numpy()
+            successes_np = torch.tensor(episode_successes).numpy()
+            fig, ax = plt.subplots(figsize=(7, 7))
+            ax.scatter(xys[successes_np, 0], xys[successes_np, 1],
+                       c="green", s=18, alpha=0.7, label=f"success ({int(successes_np.sum())})")
+            ax.scatter(xys[~successes_np, 0], xys[~successes_np, 1],
+                       c="red", s=18, alpha=0.7, label=f"failure ({int((~successes_np).sum())})")
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.set_xlabel("x (m, env-local)")
+            ax.set_ylabel("y (m, env-local)")
+            ax.set_title(f"Initial peg xy by outcome  ({successful_episodes}/{total_episodes} = {success_rate:.1%})")
+            ax.legend(loc="best")
+            ax.grid(True, alpha=0.3)
+            out_path = os.path.join(log_dir, "eval_initial_peg_xy.png")
+            plt.tight_layout()
+            plt.savefig(out_path, dpi=150)
+            print(f"[EVAL] Saved initial-pose scatter plot to: {out_path}")
+            plt.show()
+
+        env.close()
+        return
+
+    # --plot_ee: collect EE pose from actor obs for env 0 over N steps and plot, then exit.
+    # Isaac Lab's ObservationManager builds a dict keyed by term name (insertion order, NOT
+    # the order terms are declared in the config), then concatenates list(dict.values()).
+    # For OmniReset PolicyCfg the dict iteration order observed at runtime is:
+    #   insertive_asset_in_receptive_asset_frame (30) | prev_actions (35) | joint_pos (60)
+    #   | end_effector_pose (30) | insertive_asset_pose (30) | receptive_asset_pose (30)
+    # Within each term, history is flattened oldest→newest, so the newest EE frame is at
+    # the last 6 dims of the end_effector_pose block: [149:155] in the 215-dim policy obs.
+    if args_cli.plot_ee is not None:
+        import matplotlib.pyplot as plt
+
+        obs_mgr = env.unwrapped.observation_manager
+        term_names = list(obs_mgr.active_terms["policy"])
+        term_dims = list(obs_mgr.group_obs_term_dim["policy"])
+        # Build offsets for each term in concatenation order.
+        offsets = {}
+        cursor = 0
+        for name, shape in zip(term_names, term_dims):
+            dim = shape[0] if isinstance(shape, tuple) else int(shape)
+            offsets[name] = (cursor, cursor + dim)
+            cursor += dim
+
+        EE_DIM = 6
+        ee_block_start, ee_block_end = offsets["end_effector_pose"]
+        history = (ee_block_end - ee_block_start) // EE_DIM
+        ee_start = ee_block_end - EE_DIM   # newest frame is the last EE_DIM dims of the block
+        ee_end = ee_block_end
+
+        print(f"[plot_ee] obs['policy'] shape: {obs['policy'].shape}")
+        print(f"[plot_ee] term order: {term_names}")
+        print(f"[plot_ee] term offsets: {offsets}")
+        print(f"[plot_ee] history={history}  EE block=[{ee_block_start}:{ee_block_end}]  newest slice=[{ee_start}:{ee_end}]")
+
+        ee_list = []
+        for _ in range(args_cli.plot_ee):
+            with torch.inference_mode():
+                if is_fastsac:
+                    actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=1)
+                    actions = policy({"actor_obs": actor_obs})
+                else:
+                    actor_obs = obs if isinstance(obs, torch.Tensor) else torch.cat(list(obs.values()), dim=-1)
+                    actions = policy(obs)
+                obs, _, _, _ = env.step(actions)
+
+            ee_list.append(actor_obs[0, ee_start:ee_end].cpu())
+
+        env.close()
+
+        ee = torch.stack(ee_list).numpy()   # [steps, 6]
+        steps = range(args_cli.plot_ee)
+        labels   = ["pos_x", "pos_y", "pos_z", "aa_x", "aa_y", "aa_z"]
+        ylabels  = ["m",     "m",     "m",     "rad",  "rad",  "rad"]
+
+        axes_flat = plt.subplots(2, 3, figsize=(14, 6))[1].flatten()
+        for i, (lbl, ylab) in enumerate(zip(labels, ylabels)):
+            axes_flat[i].plot(steps, ee[:, i])
+            axes_flat[i].set_title(f"EE {lbl} (obs, robot base frame)")
+            axes_flat[i].set_xlabel("step")
+            axes_flat[i].set_ylabel(ylab)
+        plt.tight_layout()
+        out_path = os.path.join(log_dir, "ee_pose_over_time.png")
+        plt.savefig(out_path)
+        print(f"[INFO] Saved EE pose plot to: {out_path}")
+        plt.show()
+        return
+
     timestep = 0
     # simulate environment
     while simulation_app.is_running():

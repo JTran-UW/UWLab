@@ -21,6 +21,15 @@ parser.add_argument("--video", action="store_true", default=False, help="Record 
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument(
+    "--eval_envs", type=int, default=0,
+    help=(
+        "Number of envs (from the END of the env range) reserved for online evaluation only. "
+        "These envs step alongside training but their transitions are NOT added to the replay buffer "
+        "and their data is NOT used for critic/actor updates. Success rate of these eval envs is "
+        "logged to wandb under Eval/. Must satisfy 0 <= eval_envs < num_envs."
+    ),
+)
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
@@ -34,6 +43,14 @@ parser.add_argument("--export_io_descriptors", action="store_true", default=Fals
 parser.add_argument(
     "--resume_path", type=str, default=None,
     help="Direct path to a checkpoint file to resume from (bypasses log directory search).",
+)
+parser.add_argument(
+    "--replay_buffer_path", type=str, default=None,
+    help=(
+        "Optional path to an online replay_buffer_*.pt file (saved by save_replay_buffer_interval). "
+        "If set, the online replay buffer is loaded into FastSACAgent after the model checkpoint. "
+        "agent.buffer_size / num_envs must match the saved buffer's shape."
+    ),
 )
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
@@ -301,6 +318,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             expert_critic=None, # expert_critic,
             lambda_bc_policy=1.0,
             lambda_bc_critic=1.0,
+            eval_envs=args_cli.eval_envs,
         )
         runner.setup()
         runner.expert_ratio = args_cli.expert_ratio
@@ -319,6 +337,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+
+    # Optional: load online replay buffer from a saved snapshot (FastSAC only).
+    if args_cli.replay_buffer_path is not None and hasattr(runner, "load_replay_buffer"):
+        print(f"[INFO]: Loading online replay buffer from: {args_cli.replay_buffer_path}")
+        runner.load_replay_buffer(args_cli.replay_buffer_path)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

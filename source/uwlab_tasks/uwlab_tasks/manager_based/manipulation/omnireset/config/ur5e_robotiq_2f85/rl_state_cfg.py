@@ -160,7 +160,7 @@ class RlStateReachingSceneCfg(InteractiveSceneCfg):
 
 
 @configclass
-class BaseEventWithDRCfg:
+class BaseEventWithDynamicsGapCfg:
     """Shared events: material/mass randomization, gripper gains, scene reset.
 
     Does NOT include arm sysid or OSC gain randomization -- those differ
@@ -173,8 +173,8 @@ class BaseEventWithDRCfg:
         func=task_mdp.randomize_rigid_body_material,  # type: ignore
         mode="startup",
         params={
-            "static_friction_range": (0.3, 1.2),
-            "dynamic_friction_range": (0.2, 1.0),
+            "static_friction_range": (0.3, 0.3), # (0.3, 1.2),
+            "dynamic_friction_range": (0.5, 0.5), # (0.2, 1.0),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 256,
             "asset_cfg": SceneEntityCfg("robot"),
@@ -186,8 +186,8 @@ class BaseEventWithDRCfg:
         func=task_mdp.randomize_rigid_body_material,  # type: ignore
         mode="startup",
         params={
-            "static_friction_range": (1.0, 2.0),
-            "dynamic_friction_range": (0.9, 1.9),
+            "static_friction_range": (1.5, 1.5), # (1.0, 2.0),
+            "dynamic_friction_range": (1.5, 1.5), #  (0.9, 1.9),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 256,
             "asset_cfg": SceneEntityCfg("insertive_object"),
@@ -199,8 +199,8 @@ class BaseEventWithDRCfg:
         func=task_mdp.randomize_rigid_body_material,  # type: ignore
         mode="startup",
         params={
-            "static_friction_range": (0.2, 0.6),
-            "dynamic_friction_range": (0.15, 0.5),
+            "static_friction_range": (0.4, 0.4), # (0.2, 0.6),
+            "dynamic_friction_range": (0.3, 0.3), # (0.15, 0.5),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 256,
             "asset_cfg": SceneEntityCfg("receptive_object"),
@@ -212,8 +212,8 @@ class BaseEventWithDRCfg:
         func=task_mdp.randomize_rigid_body_material,  # type: ignore
         mode="startup",
         params={
-            "static_friction_range": (0.3, 0.6),
-            "dynamic_friction_range": (0.2, 0.5),
+            "static_friction_range": (0.4, 0.4), # (0.3, 0.6),
+            "dynamic_friction_range": (0.3, 0.3), # (0.2, 0.5),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 256,
             "asset_cfg": SceneEntityCfg("table"),
@@ -226,7 +226,7 @@ class BaseEventWithDRCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "mass_distribution_params": (0.7, 1.3),
+            "mass_distribution_params": (0.7, 0.7), # (0.7, 1.3),
             "operation": "scale",
             "distribution": "uniform",
             "recompute_inertia": True,
@@ -239,7 +239,7 @@ class BaseEventWithDRCfg:
         params={
             "asset_cfg": SceneEntityCfg("insertive_object"),
             # we assume insertive object is somewhere between 20g and 200g
-            "mass_distribution_params": (0.02, 0.2),
+            "mass_distribution_params": (0.1, 0.1), # (0.02, 0.2),
             "operation": "abs",
             "distribution": "uniform",
             "recompute_inertia": True,
@@ -251,7 +251,7 @@ class BaseEventWithDRCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("receptive_object"),
-            "mass_distribution_params": (0.5, 1.5),
+            "mass_distribution_params": (0.5, 0.5), # (0.5, 1.5),
             "operation": "scale",
             "distribution": "uniform",
             "recompute_inertia": True,
@@ -263,7 +263,7 @@ class BaseEventWithDRCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("table"),
-            "mass_distribution_params": (0.5, 1.5),
+            "mass_distribution_params": (1.0, 1.0), # (0.5, 1.5),
             "operation": "scale",
             "distribution": "uniform",
             "recompute_inertia": True,
@@ -275,10 +275,20 @@ class BaseEventWithDRCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_joint"]),
-            "stiffness_distribution_params": (0.5, 2.0),
-            "damping_distribution_params": (0.5, 2.0),
+            "stiffness_distribution_params": (1.5, 1.5), # (0.5, 2.0),
+            "damping_distribution_params": (1.5, 1.5), # (0.5, 2.0),
             "operation": "scale",
             "distribution": "log_uniform",
+        },
+    )
+
+
+    randomize_osc_gains = EventTerm(
+        func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
+        mode="reset",
+        params={
+            "action_name": "arm",
+            "scale_range": (0.8, 0.8),
         },
     )
 
@@ -445,28 +455,52 @@ class TrainEventCfg(BaseEventCfg):
         },
     )
 
+@configclass
+class TrainEventWithDynamicsGapCfg(BaseEventWithDynamicsGapCfg):
+    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere"
+            ],
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+        },
+    )
+
+@configclass
+class TrainEventWithSuboptimalCfg(BaseEventCfg):
+    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere"
+            ],
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+        },
+    )
+
 import numpy as np
 @configclass
 class TrainReachingEventCfg(BaseReachingEventCfg):
     """Reaching training events: scene reset to default only (fixed target, fixed arm init)."""
 
     reset_from_reset_states = EventTerm(
-        func=task_mdp.reset_end_effector_round_fixed_asset,
+        func=task_mdp.SingleResetManager,
         mode="reset",
         params={
-            "fixed_asset_cfg": SceneEntityCfg("robot"),
-            "fixed_asset_offset": None,
-            "pose_range_b": {
-                "x": (0.3, 0.7),
-                "y": (-0.4, 0.4),
-                "z": (0.0, 0.5),
-                "roll": (0.0, 0.0),
-                "pitch": (np.pi / 4, 3 * np.pi / 4),
-                "yaw": (np.pi / 2, 3 * np.pi / 2),
-            },
-            "robot_ik_cfg": SceneEntityCfg(
-                "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
-            ),
+            "dataset_dir": "Datasets/OmniReset/Resets/resets_reaching.pt",
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
         },
     )
     
@@ -490,6 +524,21 @@ class TrainEasyEventCfg(BaseEventCfg):
 
 @configclass
 class TrainEvalEventCfg(BaseEventCfg):
+    """Eval after Stage 1: no sysid/OSC gain randomization, 1-path resets."""
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": ["ObjectAnywhereEEAnywhere"],
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+        },
+    )
+
+@configclass
+class TrainEvalEventWithDynamicsGapCfg(BaseEventWithDynamicsGapCfg):
     """Eval after Stage 1: no sysid/OSC gain randomization, 1-path resets."""
 
     reset_from_reset_states = EventTerm(
@@ -936,6 +985,8 @@ class TerminationsCfg:
     #     },
     # )
 
+    # first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode)
+
     # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1})
 
 
@@ -946,6 +997,8 @@ class TerminationsReachingCfg:
     time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
+
+    # first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode)
 
     # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1})
 
@@ -1106,7 +1159,7 @@ class Ur5eRobotiq2f85RlStateReachingCfg(ManagerBasedRLEnvCfg):
 
     def __post_init__(self):
         self.decimation = 12
-        self.episode_length_s = 16.0
+        self.episode_length_s = 4.0
         # simulation settings
         self.sim.dt = 1 / 120.0
 
@@ -1136,6 +1189,18 @@ class Ur5eRobotiq2f85RlStateReachingCfg(ManagerBasedRLEnvCfg):
 class Ur5eRobotiq2f85RelCartesianOSCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
 
     events: TrainEventCfg = TrainEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainFinetuneDynamicsCfg(Ur5eRobotiq2f85RlStateCfg):
+
+    events: TrainEventWithDynamicsGapCfg = TrainEventWithDynamicsGapCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainFinetuneSuboptimalCfg(Ur5eRobotiq2f85RlStateCfg):
+
+    events: TrainEventWithSuboptimalCfg = TrainEventWithSuboptimalCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 @configclass
@@ -1170,6 +1235,15 @@ class Ur5eRobotiq2f85RelCartesianOSCEvalCfg(Ur5eRobotiq2f85RlStateCfg):
     """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
 
     events: TrainEvalEventCfg = TrainEvalEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+
+# Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCEvalFinetuneDynamicsCfg(Ur5eRobotiq2f85RlStateCfg):
+    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
+
+    events: TrainEvalEventWithDynamicsGapCfg = TrainEvalEventWithDynamicsGapCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 

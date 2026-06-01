@@ -34,6 +34,13 @@ gym.register(
 )
 
 gym.register(
+    id="OmniReset-UR5eRobotiq2f85-Reaching-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.reset_states_cfg:ReachingResetStatesCfg"},
+)
+
+gym.register(
     id="OmniReset-UR5eRobotiq2f85-ObjectRestingEEGrasped-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -106,6 +113,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCTrainReachingCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+        "sb3_sac_cfg_entry_point": f"{agents.__name__}:sb3_sac_cfg.yaml",
     },
 )
 
@@ -120,6 +128,25 @@ gym.register(
     },
 )
 
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Suboptimal-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCTrainFinetuneSuboptimalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Dynamics-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCTrainFinetuneDynamicsCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
 
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Easy-v0",
@@ -158,6 +185,28 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCEvalCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Dynamics-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCEvalFinetuneDynamicsCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
     },
 )
 

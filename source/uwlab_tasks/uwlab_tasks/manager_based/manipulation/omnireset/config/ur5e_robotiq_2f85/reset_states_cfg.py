@@ -104,6 +104,61 @@ class ResetStatesSceneCfg(InteractiveSceneCfg):
 
 
 @configclass
+class ReachingResetStatesSceneCfg(InteractiveSceneCfg):
+    """Scene configuration for reset states environment."""
+
+    robot = IMPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+    target_marker = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/TargetMarker",
+        spawn=sim_utils.SphereCfg(
+            radius=0.02,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+        ),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.0),
+    ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.3, 0.0, 0.3), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+    # Environment
+    table = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Table",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, 0.0, -0.881), rot=(0.707, 0.0, 0.0, -0.707)),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Mounts/UWPatVention/pat_vention.usd",
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+        ),
+    )
+
+    ur5_metal_support = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/UR5MetalSupport",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0, -0.013), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Mounts/UWPatVention2/Ur5MetalSupport/ur5plate.usd",
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+        ),
+    )
+
+    ground = AssetBaseCfg(
+        prim_path="/World/GroundPlane",
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.868)),
+        spawn=sim_utils.GroundPlaneCfg(),
+    )
+
+    sky_light = AssetBaseCfg(
+        prim_path="/World/skyLight",
+        spawn=sim_utils.DomeLightCfg(
+            intensity=1000.0,
+            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+        ),
+    )
+
+
+@configclass
 class ResetStatesBaseEventCfg:
     """Configuration for randomization."""
 
@@ -189,6 +244,47 @@ class ResetStatesBaseEventCfg:
 
 
 @configclass
+class ReachingResetStatesBaseEventCfg:
+    """Configuration for randomization."""
+
+    # startup: low friction to avoid slip
+    reset_robot_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.3, 0.3),
+            "dynamic_friction_range": (0.2, 0.2),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 1,
+            "asset_cfg": SceneEntityCfg("robot"),
+            "make_consistent": True,
+        },
+    )
+
+    # reset
+
+    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
+
+    reset_robot_pose = EventTerm(
+        func=task_mdp.reset_root_states_uniform,
+        mode="reset",
+        params={
+            "pose_range": {
+                "x": (-0.01, 0.01),
+                "y": (-0.059, -0.019),
+                "z": (-0.01, 0.01),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+            "velocity_range": {},
+            "asset_cfgs": {"robot": SceneEntityCfg("robot"), "ur5_metal_support": SceneEntityCfg("ur5_metal_support")},
+        },
+    )
+
+
+
+@configclass
 class ObjectAnywhereEEAnywhereEventCfg(ResetStatesBaseEventCfg):
     reset_insertive_object_pose = EventTerm(
         func=task_mdp.reset_root_states_uniform,
@@ -229,6 +325,29 @@ class ObjectAnywhereEEAnywhereEventCfg(ResetStatesBaseEventCfg):
         },
     )
 
+
+
+@configclass
+class ReachingEventCfg(ReachingResetStatesBaseEventCfg):
+    reset_end_effector_pose = EventTerm(
+        func=task_mdp.reset_end_effector_round_fixed_asset,
+        mode="reset",
+        params={
+            "fixed_asset_cfg": SceneEntityCfg("robot"),
+            "fixed_asset_offset": None,
+            "pose_range_b": {
+                "x": (0.3, 0.7),
+                "y": (-0.4, 0.4),
+                "z": (0.0, 0.5),
+                "roll": (0.0, 0.0),
+                "pitch": (np.pi / 4, 3 * np.pi / 4),
+                "yaw": (np.pi / 2, 3 * np.pi / 2),
+            },
+            "robot_ik_cfg": SceneEntityCfg(
+                "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
+            ),
+        },
+    )
 
 @configclass
 class ObjectRestingEEGraspedEventCfg(ResetStatesBaseEventCfg):
@@ -437,6 +556,26 @@ class ResetStatesTerminationCfg:
 
 
 @configclass
+class ReachingResetStatesTerminationCfg:
+    """Configuration for reset states termination conditions."""
+
+    time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+
+    abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
+
+    success = DoneTerm(
+        func=task_mdp.check_reaching_reset_state_success,
+        params={
+            "robot_cfg": SceneEntityCfg("robot"),
+            "ee_body_name": "robotiq_base_link",
+            "pos_z_threshold": -0.02,
+            "consecutive_stability_steps": 5,
+        },
+        time_out=True,
+    )
+
+
+@configclass
 class ResetStatesObservationsCfg:
     """Configuration for reset states observations."""
 
@@ -550,6 +689,46 @@ class UR5eRobotiq2f85ResetStatesCfg(ManagerBasedRLEnvCfg):
         self.sim.render.enable_ambient_occlusion = True
         self.sim.render.enable_reflections = True
         self.sim.render.enable_dl_denoiser = True
+    
+
+
+@configclass
+class UR5eRobotiq2f85ReachingResetStatesCfg(ManagerBasedRLEnvCfg):
+    """Configuration for reset states environment with UR5e Robotiq 2F85 gripper."""
+
+    scene: ReachingResetStatesSceneCfg = ReachingResetStatesSceneCfg(num_envs=1, env_spacing=1.5)
+    events: ResetStatesBaseEventCfg = MISSING
+    terminations: ReachingResetStatesTerminationCfg = ReachingResetStatesTerminationCfg()
+    observations: ResetStatesObservationsCfg = ResetStatesObservationsCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    rewards: ResetStatesRewardsCfg = ResetStatesRewardsCfg()
+    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
+
+    def __post_init__(self):
+        self.decimation = 12
+        self.episode_length_s = 2.0
+        # simulation settings
+        self.sim.dt = 1 / 120.0
+
+        # Contact and solver settings
+        self.sim.physx.solver_type = 1
+        self.sim.physx.max_position_iteration_count = 192
+        self.sim.physx.max_velocity_iteration_count = 1
+        self.sim.physx.bounce_threshold_velocity = 0.02
+        self.sim.physx.friction_offset_threshold = 0.01
+        self.sim.physx.friction_correlation_distance = 0.0005
+
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
+        self.sim.physx.gpu_max_rigid_contact_count = 2**23
+        self.sim.physx.gpu_max_rigid_patch_count = 2**23
+        self.sim.physx.gpu_collision_stack_size = 2**31
+
+        # Render settings
+        self.sim.render.enable_dlssg = True
+        self.sim.render.enable_ambient_occlusion = True
+        self.sim.render.enable_reflections = True
+        self.sim.render.enable_dl_denoiser = True
 
 
 @configclass
@@ -559,6 +738,13 @@ class ObjectAnywhereEEAnywhereResetStatesCfg(UR5eRobotiq2f85ResetStatesCfg):
     def __post_init__(self):
         super().__post_init__()
         self.terminations.success.params["max_object_pos_deviation"] = np.inf
+
+@configclass
+class ReachingResetStatesCfg(UR5eRobotiq2f85ReachingResetStatesCfg):
+    events: ReachingEventCfg = ReachingEventCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
 
 
 @configclass
