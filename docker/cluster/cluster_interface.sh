@@ -89,9 +89,15 @@ submit_job() {
     esac
 
     # We copy the cluster-specific env file to .env.cluster on the remote side
-    # so that run_singularity.sh works without modification.
+    # so that run_singularity.sh works without modification. Then patch the
+    # CLUSTER_*_DIR lines so the in-container mounts point at the suffixed
+    # paths chosen for this submission (latest vs timestamped).
     ssh $CLUSTER_LOGIN "cd $CLUSTER_UWLAB_DIR && \
-        cp docker/cluster/.env.${CLUSTER_NAME} docker/cluster/.env.cluster && \
+        cp -f docker/cluster/.env.${CLUSTER_NAME} docker/cluster/.env.cluster && \
+        sed -i 's|^CLUSTER_UWLAB_DIR=.*|CLUSTER_UWLAB_DIR=${CLUSTER_UWLAB_DIR}|' docker/cluster/.env.cluster && \
+        sed -i 's|^CLUSTER_RSL_RL_DIR=.*|CLUSTER_RSL_RL_DIR=${CLUSTER_RSL_RL_DIR}|' docker/cluster/.env.cluster && \
+        sed -i 's|^CLUSTER_HOLOSOMA_DIR=.*|CLUSTER_HOLOSOMA_DIR=${CLUSTER_HOLOSOMA_DIR}|' docker/cluster/.env.cluster && \
+        sed -i 's|^REMOVE_CODE_COPY_AFTER_JOB=.*|REMOVE_CODE_COPY_AFTER_JOB=${REMOVE_CODE_COPY_AFTER_JOB}|' docker/cluster/.env.cluster && \
         NODES=${NODES} GPUS_PER_NODE=${GPUS_PER_NODE} \
         PARTITION=${PARTITION} ACCOUNT=${ACCOUNT} TIME=${TIME} \
         CPUS_PER_TASK=${CPUS_PER_TASK} MEM_PER_GPU=${MEM_PER_GPU} CONST=${CONSTRAINT} \
@@ -215,20 +221,38 @@ case $command in
             exit 1
         fi
 
-        # Get current date and time
-        current_datetime=$(date +"%Y%m%d_%H%M%S")
-        # Append current date and time to CLUSTER_UWLAB_DIR
-        CLUSTER_UWLAB_DIR="${CLUSTER_UWLAB_DIR}_${current_datetime}"
+        # Snapshot suffix selects whether all three trees go to shared "_latest"
+        # directories (default — fast, shared fate with other live jobs) or to
+        # per-submission "_<timestamp>" directories (no shared fate).
+        # Triggered from the caller by setting UWLAB_TIMESTAMP_SNAPSHOT=1.
+        if [ "${UWLAB_TIMESTAMP_SNAPSHOT:-0}" = "1" ]; then
+            SNAPSHOT_SUFFIX=$(date +"%Y%m%d_%H%M%S")
+            echo "[INFO] Snapshot mode: timestamp ($SNAPSHOT_SUFFIX) — no shared fate"
+        else
+            SNAPSHOT_SUFFIX="latest"
+            REMOVE_CODE_COPY_AFTER_JOB=false
+            echo "[INFO] Snapshot mode: latest — shared fate with other live jobs"
+        fi
+        # Apply the suffix to all three tree paths (UWLab, rsl_rl, holosoma).
+        # These modified paths are used for rsync targets here and re-injected
+        # into .env.cluster inside submit_job so the in-container mounts agree.
+        CLUSTER_UWLAB_DIR="${CLUSTER_UWLAB_DIR}_${SNAPSHOT_SUFFIX}"
+        if [ -n "$CLUSTER_RSL_RL_DIR" ]; then
+            CLUSTER_RSL_RL_DIR="${CLUSTER_RSL_RL_DIR}_${SNAPSHOT_SUFFIX}"
+        fi
+        if [ -n "$CLUSTER_HOLOSOMA_DIR" ]; then
+            CLUSTER_HOLOSOMA_DIR="${CLUSTER_HOLOSOMA_DIR}_${SNAPSHOT_SUFFIX}"
+        fi
         # Check if singularity image exists on the remote host
         check_singularity_image_exists uw-lab-$profile
         # make sure target directory exists
         ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_UWLAB_DIR"
         # Sync UW Lab code
-        echo "[INFO] Syncing UW Lab code..."
+        echo "[INFO] Syncing UW Lab code to $CLUSTER_UWLAB_DIR ..."
         rsync -rh --exclude="*.git*" --filter=':- .dockerignore' /$SCRIPT_DIR/../.. $CLUSTER_LOGIN:$CLUSTER_UWLAB_DIR
         # Sync rsl_rl if configured
         if [ -n "$LOCAL_RSL_RL_DIR" ] && [ -n "$CLUSTER_RSL_RL_DIR" ]; then
-            echo "[INFO] Syncing rsl_rl code..."
+            echo "[INFO] Syncing rsl_rl code to $CLUSTER_RSL_RL_DIR ..."
             ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_RSL_RL_DIR"
             rsync -rh --exclude="*.git*" --exclude="__pycache__" --exclude="*.pyc" \
                 --exclude="logs/" \
@@ -236,10 +260,12 @@ case $command in
         fi
         # Sync holosoma if configured
         if [ -n "$LOCAL_HOLOSOMA_DIR" ] && [ -n "$CLUSTER_HOLOSOMA_DIR" ]; then
-            echo "[INFO] Syncing holosoma code..."
+            echo "[INFO] Syncing holosoma code to $CLUSTER_HOLOSOMA_DIR ..."
             ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_HOLOSOMA_DIR"
             rsync -rh --exclude="*.git*" --exclude="__pycache__" --exclude="*.pyc" \
                 --exclude=".wandb" --exclude="logs/" \
+                --exclude="src/holosoma_retargeting/" \
+                --exclude="src/holosoma/holosoma/data/" \
                 "$LOCAL_HOLOSOMA_DIR/" "$CLUSTER_LOGIN:$CLUSTER_HOLOSOMA_DIR/"
         fi
         # execute job script
