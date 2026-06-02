@@ -34,3 +34,21 @@ docker/.uw-lab-docker-history
 
 # Expert replay buffer datasets
 expert_rb/
+
+# Local training artifacts — uploaded explicitly to /mmfs1/.../<dir>/<file>
+# when actually needed by a job, not bulk-synced with the source tree.
+rbs/
+checkpoints/
+Datasets/
+data_archive/
+PegInsertive/
+# Plot artifacts and stray .pt files dropped at the repo root
+/critic_comparison.png
+/ee_pose_over_time.png
+/eval_initial_peg_xy.png
+/peg_state_rl_expert_seed42.pt
+/peg_state_rl_expert_seed42.pt.*
+# Stray installers / large blobs that occasionally land at the repo root
+/Miniconda3-latest-Linux-x86_64.sh
+/*.sif
+/*.tar
