@@ -310,6 +310,132 @@ class BaseEventCfg:
         func=task_mdp.randomize_rigid_body_material,  # type: ignore
         mode="startup",
         params={
+            "static_friction_range": (0.3, 1.2),
+            "dynamic_friction_range": (0.2, 1.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("robot"),
+            "make_consistent": True,
+        },
+    )
+
+    insertive_object_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (1.0, 2.0),
+            "dynamic_friction_range": (0.9, 1.9),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            "make_consistent": True,
+        },
+    )
+
+    receptive_object_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.2, 0.6),
+            "dynamic_friction_range": (0.15, 0.5),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("receptive_object"),
+            "make_consistent": True,
+        },
+    )
+
+    table_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
+            "static_friction_range": (0.3, 0.6),
+            "dynamic_friction_range": (0.2, 0.5),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 256,
+            "asset_cfg": SceneEntityCfg("table"),
+            "make_consistent": True,
+        },
+    )
+
+    randomize_robot_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "mass_distribution_params": (0.7, 1.3),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+
+    randomize_insertive_object_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("insertive_object"),
+            # we assume insertive object is somewhere between 20g and 200g
+            "mass_distribution_params": (0.02, 0.2),
+            "operation": "abs",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+
+    randomize_receptive_object_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("receptive_object"),
+            "mass_distribution_params": (0.5, 1.5),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+
+    randomize_table_mass = EventTerm(
+        func=task_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("table"),
+            "mass_distribution_params": (0.5, 1.5),
+            "operation": "scale",
+            "distribution": "uniform",
+            "recompute_inertia": True,
+        },
+    )
+
+    randomize_gripper_actuator_parameters = EventTerm(
+        func=task_mdp.randomize_actuator_gains,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_joint"]),
+            "stiffness_distribution_params": (0.5, 2.0),
+            "damping_distribution_params": (0.5, 2.0),
+            "operation": "scale",
+            "distribution": "log_uniform",
+        },
+    )
+
+    # mode: reset
+    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
+
+@configclass
+class BaseEventNoDRCfg:
+    """Shared events: material/mass randomization, gripper gains, scene reset.
+
+    Does NOT include arm sysid or OSC gain randomization -- those differ
+    between finetune (curriculum-ramped) and eval (fixed) stages.  See
+    ``FinetuneEventCfg`` and ``FinetuneEvalEventCfg``.
+    """
+
+    # mode: startup (randomize dynamics)
+    robot_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material,  # type: ignore
+        mode="startup",
+        params={
             "static_friction_range": (0.3, 0.3), # (0.3, 1.2),
             "dynamic_friction_range": (0.5, 0.5), # (0.2, 1.0),
             "restitution_range": (0.0, 0.0),
@@ -473,18 +599,22 @@ class TrainEventWithDynamicsGapCfg(BaseEventWithDynamicsGapCfg):
     )
 
 @configclass
-class TrainEventWithSuboptimalCfg(BaseEventCfg):
+class TrainEventWithSuboptimalCfg(BaseEventNoDRCfg):
     """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
 
+    # TEMPORARILY SETTING THIS TO FULL RESET DISTRIBUTION
     reset_from_reset_states = EventTerm(
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
             "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
             "reset_types": [
-                "ObjectAnywhereEEAnywhere"
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
             ],
-            "probs": [1.0],
+            "probs": [0.25, 0.25, 0.25, 0.25],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
         },
     )
@@ -985,7 +1115,7 @@ class TerminationsCfg:
     #     },
     # )
 
-    # first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode)
+    first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode)
 
     # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1})
 

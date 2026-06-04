@@ -21,15 +21,6 @@ parser.add_argument("--video", action="store_true", default=False, help="Record 
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
-parser.add_argument(
-    "--eval_envs", type=int, default=0,
-    help=(
-        "Number of envs (from the END of the env range) reserved for online evaluation only. "
-        "These envs step alongside training but their transitions are NOT added to the replay buffer "
-        "and their data is NOT used for critic/actor updates. Success rate of these eval envs is "
-        "logged to wandb under Eval/. Must satisfy 0 <= eval_envs < num_envs."
-    ),
-)
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
@@ -306,6 +297,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "expert_transitions": args_cli.expert_transitions,
                 "expert_ratio": args_cli.expert_ratio,
                 "expert_checkpoint": args_cli.expert_checkpoint,
+                "replay_buffer_path": args_cli.replay_buffer_path,
+                "resume_path": args_cli.resume_path,
             },
             dir=log_dir,
             sync_tensorboard=False,
@@ -318,7 +311,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             expert_critic=None, # expert_critic,
             lambda_bc_policy=1.0,
             lambda_bc_critic=1.0,
-            eval_envs=args_cli.eval_envs,
         )
         runner.setup()
         runner.expert_ratio = args_cli.expert_ratio

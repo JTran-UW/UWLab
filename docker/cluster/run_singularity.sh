@@ -113,8 +113,12 @@ echo "[INFO] Verified critical cache directories exist on node."
 mkdir -p "$CLUSTER_UWLAB_DIR/logs"
 touch "$CLUSTER_UWLAB_DIR/logs/.keep"
 
-# copy the temporary uwlab directory with the latest changes to the compute node
-cp -r "$UWLAB_DIR_ARG" "$JOB_TMPDIR"
+# copy the temporary uwlab directory with the latest changes to the compute node.
+# Exclude bulky persistent dirs (logs/, rbs/) — under `_latest` snapshot mode these
+# accumulate across jobs and can balloon to hundreds of GB. logs/ is provided to the
+# container via the persistent bind-mount below regardless, so excluding it here only
+# affects the per-job /tmp copy, not what the container sees.
+rsync -a --exclude="logs/" --exclude="rbs/" "$UWLAB_DIR_ARG" "$JOB_TMPDIR/"
 # Get the directory name
 dir_name=$(basename "$UWLAB_DIR_ARG")
 
@@ -209,6 +213,8 @@ singularity exec \
     --env SSL_CERT_DIR=/etc/pki/tls/certs \
     --env REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt \
     --env CURL_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt \
+    --env SLURM_RESTART_COUNT=${SLURM_RESTART_COUNT:-0} \
+    --env SLURM_JOB_ID=${SLURM_JOB_ID:-} \
     --nv --containall "$JOB_TMPDIR/$PROFILE_ARG.sif" \
     bash -c 'export PYTHONUSERBASE=/workspace/holosoma-deps && if [ -d /workspace/rsl_rl ]; then echo "[INFO] Using rsl_rl from local fork (PYTHONPATH override)" && export PYTHONPATH=/workspace/rsl_rl:${PYTHONPATH}; fi && echo "[INFO] Installing holosoma deps (cached after first run)..." && /isaac-sim/python.sh -m pip install --user -q -e /workspace/holosoma/src/holosoma && export PYTHONPATH=/workspace/holosoma-deps/lib/python3.11/site-packages:${PYTHONPATH} && export VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_optimus && export UWLAB_PATH=/workspace/uwlab && cd /workspace/uwlab && /isaac-sim/python.sh -m torch.distributed.run --rdzv_backend=c10d "$@"' _ ${DIST_ARGS[@]} ${CLUSTER_PYTHON_EXECUTABLE} ${CLI_ARGS[@]} --distributed
 
