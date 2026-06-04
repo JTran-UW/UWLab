@@ -1115,7 +1115,10 @@ class TerminationsCfg:
     #     },
     # )
 
-    first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode)
+    # Nullable so submissions can disable it from the CLI via Hydra:
+    #   env.terminations.first_episode_termination=null
+    # IsaacLab's TerminationManager skips None-valued term fields.
+    first_episode_termination: DoneTerm | None = DoneTerm(func=task_mdp.terminate_first_episode)
 
     # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1})
 
