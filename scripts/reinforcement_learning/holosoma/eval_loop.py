@@ -167,6 +167,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"Loading latest checkpoint: {latest_ckpt_path}")
 
         env.reset()
+        
 
 
 
