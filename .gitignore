@@ -78,5 +78,8 @@ tmp/
 
 # Local agent sessions + large analysis/checkpoint artifacts (not for VCS)
 /.claude/
-/analysis/
+# Ignore analysis/ contents (data dumps, npz, figures) but allow-list specific
+# "timeless" analysis scripts worth versioning. Add a `!` line per script to keep.
+/analysis/*
+!/analysis/action_multimodality.py
 /teachers/
