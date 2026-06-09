@@ -124,6 +124,64 @@ gym.register(
     },
 )
 
+# Video-eval variants for the seed-diversity study: subclass the env each policy was
+# trained on, but reset ONLY from ObjectAnywhereEEAnywhere (probs=[1.0]) and terminate
+# on success. With a fixed --seed every seed of a configuration sees identical reset
+# states. See video_eval_cfg.py and analysis/record_seed_videos.py.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:StateVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Sequential-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:StateSequentialVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-Uniform-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:ZeroGScenePCUniformVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-Train-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:ZeroGScenePCSysidVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+# Point-cloud pre-training WITHOUT gravity curriculum: base Stage-1 train cfg
+# (full DR + EXPLICIT actuator + normal gravity) with state obs replaced by 128-pt
+# wrist-frame PCs (shared encoder). Decouples PC obs from the ZeroG recipe that all
+# registered PC envs in gravity_cfg.py are bound to.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
 # ===========================================================================
 # ZeroG (self-contained in gravity_cfg.py, GPS + truncated success)
 # ===========================================================================
@@ -740,6 +798,9 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.bamdp_failures_cfg:Ur5eRobotiq2f85BAMDPFailuresTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+        # Critic-only V_success fitting for a frozen expert (BAMDP value
+        # feedback); select with --agent rsl_rl_success_critic_cfg_entry_point.
+        "rsl_rl_success_critic_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCSuccessCriticOnlyRunnerCfg",
     },
 )
 

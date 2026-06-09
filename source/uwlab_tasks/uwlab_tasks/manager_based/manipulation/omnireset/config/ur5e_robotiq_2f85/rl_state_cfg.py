@@ -30,6 +30,7 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.a
 )
 
 from ... import mdp as task_mdp
+from .pc_obs_cfg import ScenePCObsCfg
 
 
 @configclass
@@ -849,10 +850,12 @@ class PointCloudTrainEventCfg:
 
 @configclass
 class SharedEncoder128PCObservationsCfg:
-    """128-pt wrist-frame PCs with 2 obs groups: proprio (pass-through) + pointcloud (shared encoder).
+    """128-pt wrist-frame PCs with 3 obs groups: proprio (pass-through) + pointcloud (shared encoder) + time_left.
 
-    Groups: proprio (~21d), pointcloud (768d = 128x3x2 objects).
+    Groups: proprio (~21d), pointcloud (768d = 128x3x2 objects), time_left (1d, critic-only).
     Shared encoder compresses concatenated PCs to 32d; main MLP sees 21+32=53d.
+    ``time_left`` is the privileged critic group required by ``ScenePCPPORunnerCfg`` /
+    ``SharedEncoder128PPORunnerCfg`` (their critic obs_groups list ``time_left``).
     """
 
     @configclass
@@ -895,8 +898,19 @@ class SharedEncoder128PCObservationsCfg:
             self.enable_corruption = True
             self.concatenate_terms = True
 
+    @configclass
+    class TimeLeftCfg(ObsGroup):
+        """Privileged critic-only group (matches ScenePCObsCfg.TimeLeftCfg)."""
+
+        time_left = ObsTerm(func=task_mdp.time_left)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     proprio: ProprioCfg = ProprioCfg()
     pointcloud: PointcloudCfg = PointcloudCfg()
+    time_left: TimeLeftCfg = TimeLeftCfg()
 
 
 @configclass
@@ -905,3 +919,18 @@ class Ur5eRobotiq2f85RelCartesianOSCPC128SharedEncTrainCfg(Ur5eRobotiq2f85RelCar
 
     observations: SharedEncoder128PCObservationsCfg = SharedEncoder128PCObservationsCfg()
     events: PointCloudTrainEventCfg = PointCloudTrainEventCfg()
+
+
+# Point-cloud pre-training WITHOUT the gravity curriculum: the base Stage-1 train cfg
+# (full DR via TrainEventCfg + EXPLICIT actuator + normal gravity, inherited unchanged)
+# with the state observation group swapped for the SAME 512-pt ScenePC obs the gravity
+# envs use. Decouples PC obs from the ZeroG gravity-curriculum recipe that every registered
+# PC env in gravity_cfg.py is bound to, while keeping FULL parity on the PC obs / shared
+# encoder / policy parameterization. Pair with ScenePCPPORunnerCfg (identical to the
+# gravity ScenePC-uniform envs): proprio+pointcloud through the shared encoder, critic
+# also sees time_left.
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    """Base Stage-1 pre-training (full DR, normal gravity, no gravity curriculum) + 512-pt ScenePC obs."""
+
+    observations: ScenePCObsCfg = ScenePCObsCfg()

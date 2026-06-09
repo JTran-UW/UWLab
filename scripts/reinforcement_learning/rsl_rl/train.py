@@ -140,6 +140,7 @@ import rsl_rl.runners.on_policy_runner as _runner_module
 from uwlab_rl.rsl_rl.actor_critic_encoder import ActorCriticWithEncoder
 from uwlab_rl.rsl_rl.on_policy_runner_with_classifier import OnPolicyRunnerWithClassifier
 from uwlab_rl.rsl_rl.on_policy_runner_with_success_critic import OnPolicyRunnerWithSuccessCritic
+from uwlab_rl.rsl_rl.success_critic_only_runner import SuccessCriticOnlyRunner
 _runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
 from uwlab_rl.rsl_rl.actor_critic_depth import ActorCriticDepth
 from uwlab_rl.rsl_rl.bc_ppo import BCPPO
@@ -359,6 +360,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = OnPolicyRunnerWithClassifier(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "OnPolicyRunnerWithSuccessCritic":
         runner = OnPolicyRunnerWithSuccessCritic(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name == "SuccessCriticOnlyRunner":
+        runner = SuccessCriticOnlyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunnerSplit":

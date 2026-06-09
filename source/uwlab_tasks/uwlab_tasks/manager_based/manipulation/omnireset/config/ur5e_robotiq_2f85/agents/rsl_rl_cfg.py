@@ -374,6 +374,38 @@ class ScenePCPPORunnerCfg(Base_PPORunnerCfg):
     )
 
 
+@configclass
+class ScenePCSuccessCriticOnlyRunnerCfg(ScenePCPPORunnerCfg):
+    """Fit V_success for ONE frozen expert — PPO never updates (critic-only).
+
+    Used to build the per-strategy value ensemble for the BAMDP
+    value-feedback layer: run once per expert with
+    ``--resume_path <expert ckpt>``; the saved checkpoints carry the critic
+    under a ``success_critic`` key (see ``SuccessCriticOnlyRunner.save``).
+    ``V(s, z=i)`` at deployment = critic from run i.
+
+    ``gamma=0.95`` on purpose (parent default is 1.0): with terminal-success
+    reward, gamma<1 makes V_success a *progress-graded* signal
+    (~gamma^steps-to-success), the analog of the dm_control prototype's
+    discounted-proximity V(s,z). The BAMDP failure cue is "value stops
+    rising", which needs a value that rises in the first place; at gamma=1
+    a near-optimal expert's V is ~flat (its success prob) and a synthetic
+    plateau would be invisible.
+    """
+
+    class_name: str = "SuccessCriticOnlyRunner"
+    experiment_name = "bamdp_success_critic"
+    max_iterations = 300
+    save_interval = 50
+    obs_groups = {
+        "policy": ["proprio", "pointcloud"],
+        "critic": ["proprio", "pointcloud", "time_left"],
+        "success_classifier": ["success_classifier"],
+    }
+    deterministic_rollout: bool = True
+    success_critic: SuccessCriticCfg = SuccessCriticCfg(gamma=0.95)
+
+
 # ===========================================================================
 # RMA (Rapid Motor Adaptation) on ScenePC + Sysid Sim2Real.
 # Actor conditions on phi(privileged_rma) -> z (16d). A small bidirectional

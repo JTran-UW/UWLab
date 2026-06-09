@@ -83,7 +83,7 @@ class RslRlFancyPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
 class SuccessCriticCfg:
     """Auxiliary V_success head trained from terminal-success reward with TD/GAE."""
 
-    hidden_dims: list[int] = [256, 128, 64]
+    hidden_dims: list[int] = [512, 256, 128]
     activation: str = "elu"
     obs_normalization: bool = True
     lr: float = 3e-4

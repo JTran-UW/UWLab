@@ -37,6 +37,10 @@ from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85,
 
 from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.rl_state_cfg import Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg, Ur5eRobotiq2f85RelativeOSCEvalAction
 
+# ScenePCObsCfg lives in the shared pc_obs_cfg module so rl_state_cfg's normal-gravity
+# PC env can use the identical obs/encoder parameterization (re-exported for back-compat).
+from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.pc_obs_cfg import ScenePCObsCfg
+
 from ... import mdp as task_mdp
 
 
@@ -116,98 +120,7 @@ class ZeroGSceneCfg(InteractiveSceneCfg):
 # ===========================================================================
 # Observations
 # ===========================================================================
-@configclass
-class ScenePCObsCfg:
-    """512-pt scene PC (robot+insertive+receptive) + proprio. Shared encoder compresses PC to 32d."""
-
-    @configclass
-    class GroupCfg(ObsGroup):
-        prev_actions = ObsTerm(func=task_mdp.last_action)
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
-        end_effector_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    @configclass
-    class PointcloudCfg(ObsGroup):
-        scene_pc = ObsTerm(
-            func=task_mdp.ScenePointCloud,
-            params={
-                "robot_cfg": SceneEntityCfg("robot"),
-                "insertive_cfg": SceneEntityCfg("insertive_object"),
-                "receptive_cfg": SceneEntityCfg("receptive_object"),
-                "visualize": False,
-                "num_points": 512,
-                # Re-sample mesh points for ins/rec subsets at episode reset.
-                # Kills the "fixed-init point arrangement → absolute yaw"
-                # memorization channel. Hydra-overridable.
-                "resample_on_reset": False,
-                # Same idea but for robot points: per-env random subset of each
-                # body's oversampled mesh pool, re-rolled each reset. Forces the
-                # encoder to be agnostic to specific robot point selections so
-                # the trained teacher generalizes across env init RNG state at
-                # deploy time. Hydra-overridable.
-                "resample_on_reset_robot": False,
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    @configclass
-    class TimeLeftCfg(ObsGroup):
-        time_left = ObsTerm(func=task_mdp.time_left)
-
-        def __post_init__(self):
-            self.enable_corruption = False
-            self.concatenate_terms = True
-
-    @configclass
-    class SuccessClassifierCfg(ObsGroup):
-        """Obs for the auxiliary V_success head: kinematic state + time_left.
-
-        ee_pose is intentionally omitted — no offline FK utility exists, and
-        joint_pos is a bijection to ee_pose, so V_success can learn it.
-        """
-
-        prev_actions = ObsTerm(func=task_mdp.last_action)
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
-        insertive_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("insertive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "quat",
-            },
-        )
-        receptive_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("receptive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "quat",
-            },
-        )
-        time_left = ObsTerm(func=task_mdp.time_left)
-
-        def __post_init__(self):
-            self.enable_corruption = False
-            self.concatenate_terms = True
-
-    proprio: GroupCfg = GroupCfg()
-    pointcloud: PointcloudCfg = PointcloudCfg()
-    time_left: TimeLeftCfg = TimeLeftCfg()
-    success_classifier: SuccessClassifierCfg = SuccessClassifierCfg()
+# ``ScenePCObsCfg`` is imported from ``pc_obs_cfg`` (see imports above).
 
 
 @configclass
@@ -357,15 +270,15 @@ class ZeroGGPSEventCfg:
         mode="reset",
         params={
             "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectAnywhereEEAnywhere",
-                "ObjectRestingEEGrasped",
-                "ObjectAnywhereEEGrasped",
-                "ObjectPartiallyAssembledEEGrasped",
-            ],
-            # "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
-            "probs": [0.25, 0.25, 0.25, 0.25],
-            # "probs": [0.5, 0.5],
+            # "reset_types": [
+            #     "ObjectAnywhereEEAnywhere",
+            #     "ObjectRestingEEGrasped",
+            #     "ObjectAnywhereEEGrasped",
+            #     "ObjectPartiallyAssembledEEGrasped",
+            # ],
+            "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
+            # "probs": [0.25, 0.25, 0.25, 0.25],
+            "probs": [0.5, 0.5],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
             "curriculum_target": 0.5,
             "curriculum_kappa": 2.0,
