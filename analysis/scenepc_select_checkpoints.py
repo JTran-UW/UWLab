@@ -59,10 +59,18 @@ def run_history(run):
     return sorted(pts)
 
 
-def success_near(pts, it, window=100):
-    """Max success within +-window steps of iteration `it` (None if no points there)."""
-    vals = [v for s, v in pts if abs(s - it) <= window]
-    return max(vals) if vals else None
+def success_near(pts, it, back=10, fwd=30):
+    """MIN success in steps [it-back, it+fwd] (None if no points there).
+
+    The min (not max) matters: several runs collapse off a cliff mid-run (success
+    drops 0.98 -> 0.00 within ~2 iterations, e.g. after an in-place slurm requeue
+    picked up mutated huggingface assets). A checkpoint saved just after the cliff
+    is broken even though a +-window max still sees pre-cliff values. Requiring the
+    window min >= threshold keeps only checkpoints with sustained success around
+    (and shortly after) the save point.
+    """
+    vals = [v for s, v in pts if it - back <= s <= it + fwd]
+    return min(vals) if vals else None
 
 
 def main():
