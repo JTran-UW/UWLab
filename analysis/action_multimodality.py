@@ -57,6 +57,7 @@ CONFIG_LABEL = {
     "seq_resets__State-Sequential": ("E", "state + 4 reset distributions + fixed reset state ordering"),
     "seq_resets__State": ("F", "state + 4 reset distributions + fixed initial init"),
     "base_4resets": ("G", "state + 4 reset distribution"),
+    "pc_4_resets": ("H", "PC + 4 reset distributions (normal gravity, no curriculum)"),
 }
 
 

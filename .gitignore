@@ -82,4 +82,5 @@ tmp/
 # "timeless" analysis scripts worth versioning. Add a `!` line per script to keep.
 /analysis/*
 !/analysis/action_multimodality.py
+!/analysis/scenepc_select_checkpoints.py
 /teachers/

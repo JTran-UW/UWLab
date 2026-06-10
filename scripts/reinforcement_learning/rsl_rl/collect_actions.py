@@ -59,6 +59,11 @@ parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument(
+    "--use_pretrained_checkpoint",
+    action="store_true",
+    help="Use the pre-trained checkpoint from Nucleus.",
+)
 parser.add_argument("--num_steps", type=int, default=None, help="Maximum number of policy steps (collection mode).")
 parser.add_argument(
     "--force_sequential_reset",

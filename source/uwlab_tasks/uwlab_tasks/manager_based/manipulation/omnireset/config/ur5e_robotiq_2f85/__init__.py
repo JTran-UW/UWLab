@@ -168,6 +168,16 @@ gym.register(
     },
 )
 
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:ScenePCVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
 # Point-cloud pre-training WITHOUT gravity curriculum: base Stage-1 train cfg
 # (full DR + EXPLICIT actuator + normal gravity) with state obs replaced by 128-pt
 # wrist-frame PCs (shared encoder). Decouples PC obs from the ZeroG recipe that all

@@ -68,6 +68,24 @@ class StateSequentialVideoEvalCfg(rl_state_cfg.Ur5eRobotiq2f85RelCartesianOSCTra
 
 
 # ---------------------------------------------------------------------------
+# ScenePC pre-training variant (ScenePC-v0: full DR, normal gravity, no gravity
+# curriculum, 512-pt ScenePC obs). Same State train events as State-v0, so the
+# reset term and missing success DoneTerm are handled identically.
+# ---------------------------------------------------------------------------
+@configclass
+class ScenePCVideoEvalCfg(rl_state_cfg.Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg):
+    """ScenePC-v0 policies (pc_4_resets) rolled out for video."""
+
+    terminations: _StateVideoEvalTerminationsCfg = _StateVideoEvalTerminationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.events.reset_from_reset_states.params
+        p["reset_types"] = [_RESET_TYPE]
+        p["probs"] = [1.0]
+
+
+# ---------------------------------------------------------------------------
 # ZeroG ScenePC variants (ZeroG-ScenePC-Uniform-v0 / ZeroG-ScenePC-SysID-Train-v0)
 # ZeroGTerminationsCfg already carries a success DoneTerm, so only the reset
 # distribution needs standardizing.
