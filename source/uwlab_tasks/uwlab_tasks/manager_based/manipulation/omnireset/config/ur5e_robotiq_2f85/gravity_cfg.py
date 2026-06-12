@@ -788,6 +788,59 @@ class ZeroGStateSysidFullDRTrainCfg(ZeroGStateTrainCfg):
 
 ## ^^^ this is bugged because wrong action and robot
 
+
+@configclass
+class ZeroGGPSSysidFinetuneEventCfg(ZeroGGPSSysidFullDREventCfg):
+    """FullDR events but with ADR-curriculum arm sysid ramping OLD->NEW metadata.
+
+    Identical to ``ZeroGGPSSysidFullDREventCfg`` except ``randomize_arm_sysid``
+    uses the curriculum-capable ``randomize_arm_from_sysid`` (not ``_fixed``) so
+    ``scale_progress`` can be driven from 0 (old sysid = what the policy trained on)
+    to 1 (new sysid = target deployment params). The ADR curriculum
+    ``ZeroGSysidFinetuneCurriculumCfg.adr_sysid`` ramps this automatically.
+    """
+
+    randomize_arm_sysid = EventTerm(
+        func=task_mdp.randomize_arm_from_sysid,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "joint_names": [
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ],
+            "actuator_name": "arm",
+            "scale_range": (0.8, 1.2),
+            "friction_scale_range": (0.8, 1.2),
+            "delay_range": (0, 1),
+            "start_metadata_filename": "metadata_old.yaml",
+        },
+    )
+
+
+@configclass
+class ZeroGSysidFinetuneCurriculumCfg(ZeroGCurriculumCfg):
+    """Gravity curriculum + ADR sysid ramp for finetune (OLD->NEW sysid)."""
+
+    adr_sysid = CurrTerm(
+        func=task_mdp.adr_sysid_curriculum,
+        params={
+            "event_term_names": ["randomize_arm_sysid"],
+            "reset_event_name": "reset_from_states",
+            "success_threshold_up": 0.90,
+            "success_threshold_down": 0.80,
+            "delta": 0.01,
+            "update_every_n_steps": 200,
+            "initial_scale_progress": 0.0,
+            "warmup_success_threshold": 0.80,
+        },
+    )
+
+
 @configclass
 class ZeroGScenePCSysidSim2RealTrainCfg(ZeroGScenePCUniformTrainCfg):
     events: ZeroGGPSSysidFullDREventCfg = ZeroGGPSSysidFullDREventCfg()
@@ -795,8 +848,27 @@ class ZeroGScenePCSysidSim2RealTrainCfg(ZeroGScenePCUniformTrainCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        
+
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+@configclass
+class ZeroGScenePCSysidFinetuneCfg(ZeroGScenePCSysidSim2RealTrainCfg):
+    """Finetune: load converged SysID policy, ADR curriculum ramps arm sysid OLD->NEW.
+
+    Identical to ``ZeroGScenePCSysidSim2RealTrainCfg`` except:
+    - events: ``ZeroGGPSSysidFinetuneEventCfg`` — arm sysid uses ADR-capable
+      ``randomize_arm_from_sysid`` with ``start_metadata_filename="metadata_old.yaml"``
+      so scale_progress=0 reproduces training-time dynamics and scale_progress=1
+      hits the new target sysid.
+    - curriculum: adds ``adr_sysid`` term on top of gravity curriculum.
+    Resume from seed-8/12 checkpoint; obs/action dims are unchanged so strict=False
+    is not required but won't hurt.
+    """
+
+    events: ZeroGGPSSysidFinetuneEventCfg = ZeroGGPSSysidFinetuneEventCfg()
+    curriculum: ZeroGSysidFinetuneCurriculumCfg = ZeroGSysidFinetuneCurriculumCfg()
+
 
 # Eval cfg's observations cfg: same as ScenePCObsCfg (proprio, pointcloud,
 # time_left, success_classifier) plus a diagnostic ``heuristics`` group used

@@ -385,7 +385,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path)
+        runner.load(resume_path, strict=False)
         # Resume the deterministic reset stream from where the checkpoint left off.
         reset_mgr = find_reset_manager(env)
         if reset_mgr is not None:
