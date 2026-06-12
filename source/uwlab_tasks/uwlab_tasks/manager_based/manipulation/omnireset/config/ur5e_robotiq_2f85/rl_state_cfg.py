@@ -372,18 +372,26 @@ class FinetuneEventCfg(TrainEventCfg):
             "scale_range": (0.8, 1.2),
             "delay_range": (0, 1),
             "initial_scale_progress": 0.0,
+            # Finetune curriculum start point: at scale_progress=0 reproduce the OLD
+            # (pre-sysid-redo) arm dynamics the checkpoints were trained on, ramping
+            # to the NEW sysid (metadata.yaml) at scale_progress=1.
+            "start_metadata_filename": "metadata_old.yaml",
         },
     )
 
+    # OSC gains are NOT ramped during this finetune: the checkpoints trained at the
+    # terminal (stiff) gains via ``*_fixed`` (scale_progress=1), so we hold them there
+    # (terminal x U(0.8, 1.2)) from iter 0. Only the arm sysid is curriculum-ramped
+    # OLD -> NEW. Ramping gains soft->terminal would start the policy out-of-distribution
+    # and stall the 0.95 warmup gate.
     randomize_osc_gains = EventTerm(
-        func=task_mdp.randomize_rel_cartesian_osc_gains,
+        func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
         mode="reset",
         params={
             "action_name": "arm",
             "scale_range": (0.8, 1.2),
             "terminal_kp": (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0),
             "terminal_damping_ratio": (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
-            "initial_scale_progress": 0.0,
         },
     )
 
@@ -613,34 +621,26 @@ class TerminationsCfg:
 
 @configclass
 class FinetuneCurriculumsCfg:
-    """Finetune curriculum: ADR sysid + action scale ramp. No actuator swap (explicit from start)."""
+    """Finetune curriculum: ADR ramps the arm sysid OLD -> NEW only.
+
+    OSC gains and action scales are held fixed at the trained-on (terminal) values
+    -- see ``FinetuneEventCfg.randomize_osc_gains`` (``*_fixed``) and the native
+    ``Ur5eRobotiq2f85RelativeOSCAction`` scales (0.02..0.2). Only the arm sysid is
+    curriculum-ramped so the policy starts in-distribution (OLD params it trained on)
+    and is adapted onto the redone (NEW) params.
+    """
 
     adr_sysid = CurrTerm(
         func=task_mdp.adr_sysid_curriculum,
         params={
-            "event_term_names": ["randomize_arm_sysid", "randomize_osc_gains"],
+            "event_term_names": ["randomize_arm_sysid"],
             "reset_event_name": "reset_from_reset_states",
-            "success_threshold_up": 0.95,
-            "success_threshold_down": 0.9,
+            "success_threshold_up": 0.90,
+            "success_threshold_down": 0.80,
             "delta": 0.01,
             "update_every_n_steps": 200,
             "initial_scale_progress": 0.0,
-            "warmup_success_threshold": 0.95,
-        },
-    )
-
-    action_scale = CurrTerm(
-        func=task_mdp.action_scale_curriculum,
-        params={
-            "action_name": "arm",
-            "reset_event_name": "reset_from_reset_states",
-            "initial_scales": [0.02, 0.02, 0.02, 0.02, 0.02, 0.2],
-            "target_scales": [0.01, 0.01, 0.002, 0.02, 0.02, 0.2],
-            "success_threshold_up": 0.95,
-            "success_threshold_down": 0.9,
-            "delta": 0.01,
-            "update_every_n_steps": 200,
-            "initial_progress": 0.0,
+            "warmup_success_threshold": 0.80,
         },
     )
 
