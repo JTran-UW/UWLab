@@ -1,0 +1,20 @@
+# Variant of base: Gaussian-NLL head instead of MSE.
+# Question: does modeling per-dim action uncertainty help on this (mildly multimodal)
+# insertion data, or does MSE's point estimate win for BC?
+model:
+  encoder_dims: [64, 128, 256]
+  action_dims: [512, 256, 128, 64]
+  predict_std: true
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 50
+  batch_size: 512
+
+data:
+  num_points: null
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

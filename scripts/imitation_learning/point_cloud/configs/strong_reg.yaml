@@ -1,0 +1,19 @@
+# Variant of base: 10x weight decay (1e-4 -> 1e-3).
+# Question: is base overfitting the 3.16M-step set? Stronger AdamW reg as the control.
+model:
+  encoder_dims: [64, 128, 256]
+  action_dims: [512, 256, 128, 64]
+  predict_std: false
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-3
+  epochs: 50
+  batch_size: 512
+
+data:
+  num_points: null
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

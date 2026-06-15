@@ -280,6 +280,7 @@ gym.register(
     },
 )
 
+# we use these to finetune on the new sysid parameters
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-Finetune-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -855,5 +856,35 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.bamdp_failures_cfg:Ur5eRobotiq2f85BAMDPFailuresStudentEvalCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+# Sim2real point-cloud augmentation sanity-check env (no objects, robot-only PC)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-Sim2RealPC-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85Sim2RealPCCfg"},
+)
+
+# Data-collection env: Train cfg + calibrated/DR'd sim2real point-cloud obs group
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg"},
+)
+
+# BC-PointNet eval env: roll out a trained PointNet (play.py --bc_checkpoint) on the
+# sim2real PC obs. Same scene/action/reset as DataCollectionPC, minus the teacher group.
+# The rsl_rl agent cfg is only used for seed/clip_actions -- the --bc_checkpoint path
+# bypasses the runner entirely.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )

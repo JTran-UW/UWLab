@@ -43,6 +43,21 @@ parser.add_argument(
     "they are when truncating on --num_steps.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--bc_checkpoint",
+    type=str,
+    default=None,
+    help="Path to a PointNet BC Lightning checkpoint (from "
+    "scripts/imitation_learning/point_cloud/train_point_net.py). When set, the BC PointNet is rolled "
+    "out instead of an RSL-RL policy — the runner is skipped and obs come from --bc_obs_group.",
+)
+parser.add_argument(
+    "--bc_obs_group",
+    type=str,
+    default="data_collect",
+    help="Observation group feeding the BC PointNet: a per-term dict with the point cloud (scene_pc) "
+    "and the proprio terms (concatenated in declaration order, matching training).",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -138,6 +153,17 @@ def _is_jit_checkpoint(path: str) -> bool:
         return False
 
 
+def _import_bc_utils():
+    """Lazily import the BC PointNet helpers (live in scripts/imitation_learning/point_cloud)."""
+    pc_bc_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "imitation_learning", "point_cloud"
+    )
+    sys.path.insert(0, pc_bc_dir)
+    from bc_utils import bc_actions, load_bc_pointnet  # noqa: E402
+
+    return load_bc_pointnet, bc_actions
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -161,7 +187,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.use_pretrained_checkpoint:
+    bc_mode = args_cli.bc_checkpoint is not None
+    if bc_mode:
+        # BC PointNet eval: the checkpoint is a Lightning .ckpt, not an RSL-RL run.
+        resume_path = os.path.abspath(args_cli.bc_checkpoint)
+    elif args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
         if not resume_path:
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
@@ -199,10 +229,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+    # BC PointNet eval bypasses the runner / JIT paths entirely.
+    bc = bc_actions = None
+    if bc_mode:
+        load_bc_pointnet, bc_actions = _import_bc_utils()
+        bc = load_bc_pointnet(resume_path, agent_cfg.device)
     # Auto-detect whether the checkpoint is a TorchScript (JIT) file or a runner checkpoint.
-    is_jit = _is_jit_checkpoint(resume_path)
+    is_jit = False if bc_mode else _is_jit_checkpoint(resume_path)
 
-    if is_jit:
+    if bc_mode:
+        print(f"[INFO]: Detected BC PointNet checkpoint — rolling out PointNet on obs group "
+              f"'{args_cli.bc_obs_group}'. hp={bc['hp']}")
+    elif is_jit:
         print("[INFO]: Detected TorchScript checkpoint — loading with torch.jit.load (skipping runner).")
         policy_nn = torch.jit.load(resume_path, map_location=agent_cfg.device)
         policy_nn.eval()
@@ -297,8 +335,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            # JIT policy takes a flat tensor directly; runner inference policy takes the obs dict.
-            if is_jit:
+            # BC PointNet reads its own obs group (PC + proprio); JIT policy takes a flat
+            # tensor directly; runner inference policy takes the obs dict.
+            if bc_mode:
+                actions = bc_actions(bc, obs, args_cli.bc_obs_group)
+            elif is_jit:
                 mean, std = policy(obs)
                 actions = mean
             else:
@@ -314,8 +355,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print(f"Number of episodes: {num_episodes}")
                 print(f"Number of successes: {num_successes}")
             # reset recurrent states for episodes that have terminated.
-            # JIT reset() takes no arguments and resets all hidden states.
-            if not is_jit:
+            # JIT reset() takes no arguments and resets all hidden states. The BC PointNet
+            # is feed-forward (no recurrent state), so nothing to reset.
+            if not is_jit and not bc_mode:
                 policy_nn.reset(dones)
 
         timestep += 1

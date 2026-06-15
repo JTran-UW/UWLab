@@ -841,7 +841,7 @@ class ZeroGSysidFinetuneCurriculumCfg(ZeroGCurriculumCfg):
             "success_threshold_up": 0.90,
             "success_threshold_down": 0.80,
             "delta": 0.01,
-            "update_every_n_steps": 200,
+            "update_every_n_steps": 100,
             "initial_scale_progress": 0.0,
             "warmup_success_threshold": 0.80,
         },

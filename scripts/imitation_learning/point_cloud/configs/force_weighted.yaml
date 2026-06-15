@@ -1,0 +1,26 @@
+# big_model (the proven sweep winner) + force-weighted up-sampling. Isolates the effect
+# of biasing training toward forceful (insertion/contact) timesteps. Requires a dataset
+# collected WITH the `wrist_force` obs term. Compare head-to-head vs big_model.
+model:
+  encoder_dims: [128, 256, 512]
+  action_dims: [1024, 512, 256, 128]
+  predict_std: false
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 75
+  batch_size: 512
+
+data:
+  num_points: null
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0
+  # Draw timesteps ~ 1 + 2*(force/force_p95): a p95-force step is ~3x as likely as a
+  # zero-force step; the very-forceful tail is up-weighted further.
+  force_weighting: true
+  force_weight_coef: 2.0
+  force_weight_alpha: 1.0
+  force_ref_quantile: 0.95
