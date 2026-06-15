@@ -21,7 +21,7 @@ UWLAB_ASSETS_DATA_DIR = os.path.join(UWLAB_ASSETS_EXT_DIR, "data")
 UWLAB_ASSETS_METADATA = toml.load(os.path.join(UWLAB_ASSETS_EXT_DIR, "config", "extension.toml"))
 """Extension metadata dictionary parsed from the extension.toml file."""
 
-UWLAB_CLOUD_ASSETS_DIR = "https://huggingface.co/datasets/patrickhaoy/uwlab-assets/resolve/main"
+UWLAB_CLOUD_ASSETS_DIR = "https://huggingface.co/datasets/yandabao/uwlab-assets/resolve/main"
 
 
 def _parse_hf_url(url: str) -> tuple[str, str, str, str] | None:

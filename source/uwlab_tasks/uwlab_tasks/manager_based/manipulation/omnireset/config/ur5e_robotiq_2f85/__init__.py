@@ -192,6 +192,18 @@ gym.register(
     },
 )
 
+# Same as ScenePC-v0 but the scene pointcloud is expressed in the end-effector
+# (wrist_3_link) frame instead of the robot base frame.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-EECentric-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPCEECentricTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
 # ===========================================================================
 # ZeroG (self-contained in gravity_cfg.py, GPS + truncated success)
 # ===========================================================================
@@ -252,6 +264,18 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCSysidSim2RealTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+# Same as ZeroG-ScenePC-SysID-Train-v0 but the scene pointcloud is expressed in the
+# end-effector (wrist_3_link) frame instead of the robot base frame.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-Train-EECentric-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCSysidSim2RealTrainEECentricCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
     },
 )

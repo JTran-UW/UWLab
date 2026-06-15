@@ -3429,7 +3429,9 @@ class randomize_arm_from_sysid(ManagerTermBase):
         self.joint_ids = self.robot.find_joints(cfg.params["joint_names"])[0]
         self.actuator_name: str = cfg.params["actuator_name"]
 
-        # Load sysid from robot metadata (co-located with USD)
+        # Load target sysid from robot metadata (co-located with USD). This is the
+        # endpoint of the curriculum (``scale_progress = 1``) -- i.e. the *current*
+        # (post-redo) real-robot parameters.
         metadata = utils.read_metadata_from_usd_directory(self.robot.cfg.spawn.usd_path)
         sysid = metadata["sysid"]
         self.armature = sysid["armature"]
@@ -3437,7 +3439,29 @@ class randomize_arm_from_sysid(ManagerTermBase):
         self.dynamic_ratio = sysid["dynamic_ratio"]
         self.viscous_friction = sysid["viscous_friction"]
 
-        # ADR progress: 0 = armature/friction are 0, 1 = full sysid randomization
+        # Optional curriculum START point (``scale_progress = 0``). When a
+        # ``start_metadata_filename`` is given (e.g. ``metadata_old.yaml``), the
+        # curriculum interpolates each sysid nominal OLD -> NEW as scale_progress
+        # ramps 0 -> 1, so a policy trained on the OLD params starts in-distribution
+        # and is finetuned onto the NEW params. When absent, the start point is zero
+        # (legacy behaviour: frictionless -> full sysid).
+        start_filename: str | None = cfg.params.get("start_metadata_filename")
+        self.has_start_metadata: bool = start_filename is not None
+        if self.has_start_metadata:
+            start_sysid = utils.read_metadata_from_usd_directory(
+                self.robot.cfg.spawn.usd_path, filename=start_filename
+            )["sysid"]
+            self.start_armature = start_sysid["armature"]
+            self.start_static_friction = start_sysid["static_friction"]
+            self.start_dynamic_ratio = start_sysid["dynamic_ratio"]
+            self.start_viscous_friction = start_sysid["viscous_friction"]
+        else:
+            self.start_armature = [0.0] * len(self.armature)
+            self.start_static_friction = [0.0] * len(self.static_friction)
+            self.start_dynamic_ratio = [0.0] * len(self.dynamic_ratio)
+            self.start_viscous_friction = [0.0] * len(self.viscous_friction)
+
+        # ADR progress: 0 = start point (zeros, or OLD sysid), 1 = full (NEW) sysid
         self.scale_progress: float = cfg.params.get("initial_scale_progress", 0.0)
 
     def __call__(
@@ -3451,6 +3475,7 @@ class randomize_arm_from_sysid(ManagerTermBase):
         delay_range: tuple[int, int] = (0, 2),
         initial_scale_progress: float = 0.0,
         friction_scale_range: tuple[float, float] | None = None,
+        start_metadata_filename: str | None = None,
     ):
         if env_ids is None:
             env_ids = torch.arange(env.scene.num_envs, device=self.robot.device)
@@ -3461,16 +3486,24 @@ class randomize_arm_from_sysid(ManagerTermBase):
         device = self.robot.device
         p = self.scale_progress
 
-        def _scale(nominal, lo_=lo, hi_=hi):
-            val = torch.as_tensor(nominal, device=device, dtype=torch.float32)
-            return val * (lo_ + torch.rand(N, n_joints, device=device) * (hi_ - lo_))
+        def _interp(start, target):
+            # Per-joint nominal linearly interpolated start -> target by progress p.
+            start_t = torch.as_tensor(start, device=device, dtype=torch.float32)
+            target_t = torch.as_tensor(target, device=device, dtype=torch.float32)
+            return start_t + p * (target_t - start_t)
 
-        # Armature and friction: scaled by ADR progress (0 → sysid)
-        arm_vals = _scale(self.armature) * p
-        sfric_vals = _scale(self.static_friction, flo, fhi) * p
-        dratio_vals = _scale(self.dynamic_ratio, flo, fhi) * p
+        def _scale(nominal, lo_=lo, hi_=hi):
+            # nominal: per-joint (n_joints,) tensor; broadcast U(lo, hi) over envs.
+            return nominal * (lo_ + torch.rand(N, n_joints, device=device) * (hi_ - lo_))
+
+        # Armature and friction: interpolate start -> sysid by ADR progress, then
+        # randomize. With the default zero start this reduces to ``sysid * U * p``
+        # (legacy); with an OLD-sysid start it ramps OLD -> NEW.
+        arm_vals = _scale(_interp(self.start_armature, self.armature))
+        sfric_vals = _scale(_interp(self.start_static_friction, self.static_friction), flo, fhi)
+        dratio_vals = _scale(_interp(self.start_dynamic_ratio, self.dynamic_ratio), flo, fhi)
         dfric_vals = torch.minimum(dratio_vals * sfric_vals, sfric_vals)
-        vfric_vals = _scale(self.viscous_friction, flo, fhi) * p
+        vfric_vals = _scale(_interp(self.start_viscous_friction, self.viscous_friction), flo, fhi)
 
         self.robot.write_joint_armature_to_sim(arm_vals, joint_ids=self.joint_ids, env_ids=env_ids)
         self.robot.write_joint_friction_coefficient_to_sim(
@@ -3481,12 +3514,18 @@ class randomize_arm_from_sysid(ManagerTermBase):
             env_ids=env_ids,
         )
 
-        # Motor delay scaled by ADR progress (if actuator supports it)
+        # Motor delay (if actuator supports it). In the zero-start (legacy) case it
+        # ramps 0 -> delay_range with progress. In OLD -> NEW finetune mode both
+        # endpoints were trained with the full delay range, so apply it from p=0.
         delay_lo, delay_hi = delay_range
         actuator = self.robot.actuators[self.actuator_name]
         if hasattr(actuator, "positions_delay_buffer"):
-            effective_hi = int(round(p * delay_hi))
-            effective_lo = min(delay_lo, effective_hi)
+            if self.has_start_metadata:
+                effective_hi = delay_hi
+                effective_lo = delay_lo
+            else:
+                effective_hi = int(round(p * delay_hi))
+                effective_lo = min(delay_lo, effective_hi)
             delays = torch.randint(effective_lo, effective_hi + 1, (N,), device=device, dtype=torch.int)
             actuator.positions_delay_buffer.set_time_lag(delays, env_ids)
             actuator.velocities_delay_buffer.set_time_lag(delays, env_ids)

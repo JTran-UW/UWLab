@@ -531,7 +531,7 @@ class MeshPointCloud(ManagerTermBase):
 
 
 class ScenePointCloud(ManagerTermBase):
-    """Combined pointcloud from robot + insertive + receptive in robot base frame.
+    """Combined pointcloud from robot + insertive + receptive in a configurable frame.
 
     At init: samples canonical points from all robot body meshes, insertive object,
     and receptive object. Transforms all to world frame using default poses, concatenates,
@@ -539,8 +539,18 @@ class ScenePointCloud(ManagerTermBase):
     (robot body index or object) and its local-frame coordinates.
 
     At runtime: transforms each point from its local frame to world frame using current
-    body/object poses, then transforms all to robot base frame. No runtime FPS — the
-    selected points are fixed for the entire training run.
+    body/object poses, then transforms all to the reference frame given by ``ref_cfg``.
+    No runtime FPS — the selected points are fixed for the entire training run.
+
+    The output frame is set by the ``ref_cfg`` param (a ``SceneEntityCfg``):
+      * Articulation WITH ``body_names`` (e.g. ``wrist_3_link``) -> end-effector frame.
+        Preferred: the task is wrist-centric, so EE-frame points are nearly invariant
+        to arm pose and learn much better than base-frame points.
+      * Articulation WITHOUT ``body_names`` -> robot root (base) frame.
+      * Unset -> defaults to ``robot_cfg`` (base frame) for back-compat.
+
+    The reference-frame transform is applied at runtime only; the canonical-points
+    cache is frame-agnostic, so switching frames does not invalidate cached points.
 
     Returns flattened ``[num_envs, num_points * 3]``.
     """
@@ -574,6 +584,20 @@ class ScenePointCloud(ManagerTermBase):
         self.robot: Articulation = env.scene[robot_cfg.name]
         self.insertive: RigidObject = env.scene[ins_cfg.name]
         self.receptive: RigidObject = env.scene[rec_cfg.name]
+
+        # -- Output reference frame --
+        # The final PC is expressed in this frame. ``ref_cfg`` is a SceneEntityCfg:
+        #   * Articulation WITH body_names (e.g. wrist_3_link) -> end-effector frame.
+        #     Strongly preferred: the task is wrist-centric, so EE-frame points are
+        #     nearly invariant to arm pose and far more effective for learning.
+        #   * Articulation WITHOUT body_names -> robot root (base) frame.
+        # Defaults to ``robot_cfg`` (base frame) for back-compat when unset.
+        ref_cfg: SceneEntityCfg = cfg.params.get("ref_cfg", robot_cfg)
+        self.ref_asset = env.scene[ref_cfg.name]
+        self.ref_body_idx: int | None = None
+        if ref_cfg.body_names and isinstance(self.ref_asset, Articulation):
+            ref_cfg.resolve(env.scene)
+            self.ref_body_idx = ref_cfg.body_ids[0]  # type: ignore
 
         device = env.device
 
@@ -1043,12 +1067,22 @@ class ScenePointCloud(ManagerTermBase):
 
         return pts_world
 
+    def _get_ref_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (pos_w, quat_w) of the output reference frame, shape [N, 3] and [N, 4]."""
+        if self.ref_body_idx is not None:
+            return (
+                self.ref_asset.data.body_pos_w[:, self.ref_body_idx],
+                self.ref_asset.data.body_quat_w[:, self.ref_body_idx],
+            )
+        return self.ref_asset.data.root_pos_w, self.ref_asset.data.root_quat_w
+
     def __call__(
         self,
         env: ManagerBasedEnv,
         robot_cfg: SceneEntityCfg,
         insertive_cfg: SceneEntityCfg,
         receptive_cfg: SceneEntityCfg,
+        ref_cfg: SceneEntityCfg | None = None,
         num_points: int = 512,
         oversample: int = 2,
         resample_on_reset: bool = False,
@@ -1219,14 +1253,15 @@ class ScenePointCloud(ManagerTermBase):
                 if vis_chunks:
                     marker.visualize(translations=torch.cat(vis_chunks, dim=0))
 
-        # -- Transform to robot base frame --
-        base_pos_w = self.robot.data.root_pos_w  # (N, 3)
-        base_quat_w = self.robot.data.root_quat_w  # (N, 4)
-        base_quat_inv = math_utils.quat_inv(base_quat_w)
+        # -- Transform to the output reference frame --
+        # Robot base frame by default; end-effector (e.g. wrist_3_link) frame when
+        # ``ref_cfg`` carries body_names. See ``__init__`` / ``_get_ref_pose_w``.
+        ref_pos_w, ref_quat_w = self._get_ref_pose_w()  # (N, 3), (N, 4)
+        ref_quat_inv = math_utils.quat_inv(ref_quat_w)
 
-        pts_base = math_utils.quat_apply(
-            base_quat_inv.unsqueeze(1).expand(-1, P, -1),
-            pts_world - base_pos_w.unsqueeze(1),
+        pts_ref = math_utils.quat_apply(
+            ref_quat_inv.unsqueeze(1).expand(-1, P, -1),
+            pts_world - ref_pos_w.unsqueeze(1),
         )
 
-        return pts_base.reshape(N, -1)
+        return pts_ref.reshape(N, -1)

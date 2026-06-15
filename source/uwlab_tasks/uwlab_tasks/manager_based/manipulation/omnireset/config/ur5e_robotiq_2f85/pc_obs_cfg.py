@@ -116,3 +116,19 @@ class ScenePCObsCfg:
     pointcloud: PointcloudCfg = PointcloudCfg()
     time_left: TimeLeftCfg = TimeLeftCfg()
     success_classifier: SuccessClassifierCfg = SuccessClassifierCfg()
+
+
+@configclass
+class ScenePCEECentricObsCfg(ScenePCObsCfg):
+    """``ScenePCObsCfg`` with the scene pointcloud expressed in the end-effector frame.
+
+    Identical to ``ScenePCObsCfg`` except the 512-pt scene PC is output in the
+    ``wrist_3_link`` (end-effector) frame rather than the robot base frame. The task
+    is wrist-centric, so EE-frame points are nearly invariant to arm pose and tend to
+    learn more effectively. Obs dimensionality is unchanged (512x3), so the shared
+    encoder / runner config is identical. ``ScenePCObsCfg`` defines no ``__post_init__``
+    of its own, so there is nothing to chain to super.
+    """
+
+    def __post_init__(self):
+        self.pointcloud.scene_pc.params["ref_cfg"] = SceneEntityCfg("robot", body_names="wrist_3_link")

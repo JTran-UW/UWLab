@@ -160,7 +160,7 @@ def main():
         try:
             from huggingface_hub import hf_hub_download
             args.robot_usd = hf_hub_download(
-                "patrickhaoy/uwlab-assets",
+                "yandabao/uwlab-assets",
                 "Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd",
                 repo_type="dataset",
             )

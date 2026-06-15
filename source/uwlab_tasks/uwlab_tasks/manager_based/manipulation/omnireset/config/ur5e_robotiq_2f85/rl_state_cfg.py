@@ -30,7 +30,7 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.a
 )
 
 from ... import mdp as task_mdp
-from .pc_obs_cfg import ScenePCObsCfg
+from .pc_obs_cfg import ScenePCEECentricObsCfg, ScenePCObsCfg
 
 
 @configclass
@@ -242,36 +242,36 @@ class TrainEventCfg(BaseEventCfg):
     armature + delays + OSC gains stay at the calibrated ``U(0.8, 1.2)`` window.
     """
 
-    randomize_arm_sysid = EventTerm(
-        func=task_mdp.randomize_arm_from_sysid_fixed,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "joint_names": [
-                "shoulder_pan_joint",
-                "shoulder_lift_joint",
-                "elbow_joint",
-                "wrist_1_joint",
-                "wrist_2_joint",
-                "wrist_3_joint",
-            ],
-            "actuator_name": "arm",
-            "scale_range": (0.8, 1.2),
-            "friction_scale_range": (0.0, 1.5),
-            "delay_range": (0, 1),
-        },
-    )
+    # randomize_arm_sysid = EventTerm(
+    #     func=task_mdp.randomize_arm_from_sysid_fixed,
+    #     mode="reset",
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot"),
+    #         "joint_names": [
+    #             "shoulder_pan_joint",
+    #             "shoulder_lift_joint",
+    #             "elbow_joint",
+    #             "wrist_1_joint",
+    #             "wrist_2_joint",
+    #             "wrist_3_joint",
+    #         ],
+    #         "actuator_name": "arm",
+    #         "scale_range": (0.8, 1.2),
+    #         "friction_scale_range": (0.0, 1.5),
+    #         "delay_range": (0, 1),
+    #     },
+    # )
 
-    randomize_osc_gains = EventTerm(
-        func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
-        mode="reset",
-        params={
-            "action_name": "arm",
-            "scale_range": (0.8, 1.2),
-            "terminal_kp": (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0),
-            "terminal_damping_ratio": (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
-        },
-    )
+    # randomize_osc_gains = EventTerm(
+    #     func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
+    #     mode="reset",
+    #     params={
+    #         "action_name": "arm",
+    #         "scale_range": (0.8, 1.2),
+    #         "terminal_kp": (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0),
+    #         "terminal_damping_ratio": (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+    #     },
+    # )
 
     reset_from_reset_states = EventTerm(
         func=task_mdp.MultiResetManager,
@@ -934,3 +934,15 @@ class Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTra
     """Base Stage-1 pre-training (full DR, normal gravity, no gravity curriculum) + 512-pt ScenePC obs."""
 
     observations: ScenePCObsCfg = ScenePCObsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPCEECentricTrainCfg(Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg):
+    """``Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg`` with EE-centric scene pointcloud obs.
+
+    Identical to the ScenePC pre-training env (``...-RelCartesianOSC-ScenePC-v0``) except
+    the scene pointcloud is expressed in the end-effector (``wrist_3_link``) frame rather
+    than the robot base frame. Scene, events, rewards, and actions are inherited unchanged.
+    """
+
+    observations: ScenePCEECentricObsCfg = ScenePCEECentricObsCfg()

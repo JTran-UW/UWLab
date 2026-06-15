@@ -375,14 +375,18 @@ def safe_retrieve_file_path(url: str, download_dir: str | None = None) -> str:
 
 
 @functools.cache
-def read_metadata_from_usd_directory(usd_path: str) -> dict:
-    """Read metadata from metadata.yaml in the same directory as the USD file.
+def read_metadata_from_usd_directory(usd_path: str, filename: str = "metadata.yaml") -> dict:
+    """Read metadata from *filename* in the same directory as the USD file.
 
-    Results are memoised per *usd_path* so each asset's metadata is
+    *filename* defaults to ``metadata.yaml`` but may be any co-located YAML
+    (e.g. ``metadata_old.yaml`` holding a pre-change sysid snapshot used as a
+    finetune curriculum start point).
+
+    Results are memoised per *(usd_path, filename)* so each asset's metadata is
     downloaded and parsed at most once per process.
     """
     usd_dir = os.path.dirname(usd_path)
-    metadata_path = os.path.join(usd_dir, "metadata.yaml")
+    metadata_path = os.path.join(usd_dir, filename)
     local_path = safe_retrieve_file_path(metadata_path, download_dir=get_temp_dir())
     with open(local_path) as f:
         metadata_file = yaml.safe_load(f)

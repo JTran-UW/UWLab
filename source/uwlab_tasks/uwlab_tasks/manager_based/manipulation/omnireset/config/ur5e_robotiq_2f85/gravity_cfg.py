@@ -39,7 +39,10 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.r
 
 # ScenePCObsCfg lives in the shared pc_obs_cfg module so rl_state_cfg's normal-gravity
 # PC env can use the identical obs/encoder parameterization (re-exported for back-compat).
-from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.pc_obs_cfg import ScenePCObsCfg
+from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.pc_obs_cfg import (
+    ScenePCEECentricObsCfg,
+    ScenePCObsCfg,
+)
 
 from ... import mdp as task_mdp
 
@@ -270,15 +273,15 @@ class ZeroGGPSEventCfg:
         mode="reset",
         params={
             "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            # "reset_types": [
-            #     "ObjectAnywhereEEAnywhere",
-            #     "ObjectRestingEEGrasped",
-            #     "ObjectAnywhereEEGrasped",
-            #     "ObjectPartiallyAssembledEEGrasped",
-            # ],
-            "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
-            # "probs": [0.25, 0.25, 0.25, 0.25],
-            "probs": [0.5, 0.5],
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            # "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            # "probs": [0.5, 0.5],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
             "curriculum_target": 0.5,
             "curriculum_kappa": 2.0,
@@ -824,7 +827,11 @@ class ZeroGGPSSysidFinetuneEventCfg(ZeroGGPSSysidFullDREventCfg):
 
 @configclass
 class ZeroGSysidFinetuneCurriculumCfg(ZeroGCurriculumCfg):
-    """Gravity curriculum + ADR sysid ramp for finetune (OLD->NEW sysid)."""
+    """Gravity curriculum + ADR sysid ramp for finetune (OLD->NEW sysid).
+
+    Gravity floor is pinned to 1.0 so we start at full gravity — the policy
+    is already trained on full gravity and we just need to ramp sysid.
+    """
 
     adr_sysid = CurrTerm(
         func=task_mdp.adr_sysid_curriculum,
@@ -840,6 +847,9 @@ class ZeroGSysidFinetuneCurriculumCfg(ZeroGCurriculumCfg):
         },
     )
 
+    def __post_init__(self):
+        self.gravity_curriculum.params["floor"] = 1.0
+
 
 @configclass
 class ZeroGScenePCSysidSim2RealTrainCfg(ZeroGScenePCUniformTrainCfg):
@@ -850,6 +860,20 @@ class ZeroGScenePCSysidSim2RealTrainCfg(ZeroGScenePCUniformTrainCfg):
         super().__post_init__()
 
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+@configclass
+class ZeroGScenePCSysidSim2RealTrainEECentricCfg(ZeroGScenePCSysidSim2RealTrainCfg):
+    """``ZeroGScenePCSysidSim2RealTrainCfg`` with EE-centric scene pointcloud obs.
+
+    Identical to the SysID-Train env (``...-ZeroG-ScenePC-SysID-Train-v0``) except
+    the scene pointcloud is expressed in the end-effector (``wrist_3_link``) frame
+    rather than the robot base frame. Scene, events, rewards, actions, and curriculum
+    are all inherited unchanged. ``ScenePCEECentricObsCfg`` lives in ``pc_obs_cfg`` so
+    both the ZeroG and normal-gravity PC envs share the same EE-centric parameterization.
+    """
+
+    observations: ScenePCEECentricObsCfg = ScenePCEECentricObsCfg()
 
 
 @configclass
@@ -868,7 +892,6 @@ class ZeroGScenePCSysidFinetuneCfg(ZeroGScenePCSysidSim2RealTrainCfg):
 
     events: ZeroGGPSSysidFinetuneEventCfg = ZeroGGPSSysidFinetuneEventCfg()
     curriculum: ZeroGSysidFinetuneCurriculumCfg = ZeroGSysidFinetuneCurriculumCfg()
-
 
 # Eval cfg's observations cfg: same as ScenePCObsCfg (proprio, pointcloud,
 # time_left, success_classifier) plus a diagnostic ``heuristics`` group used
