@@ -168,22 +168,53 @@ def surface_bias_batched(
     return torch.where(vmask, pts, points)
 
 
-def resample_batched(
-    points: torch.Tensor, valid: torch.Tensor, num_points: int, generator: torch.Generator | None,
+def resample_gather_idx(
+    valid: torch.Tensor, num_points: int, generator: torch.Generator | None,
 ) -> torch.Tensor:
-    """Resample each env's valid points to exactly ``num_points`` (with replacement
-    when there are fewer). Fully batched: random-index into each env's valid set.
-
-    Returns ``(N, num_points, 3)``. Envs with no valid points return that env's
-    slot-0 point (a rare degenerate case)."""
-    N, M, _ = points.shape
-    device = points.device
+    """``(N, num_points)`` point indices that resample each env's valid set to exactly
+    ``num_points`` (with replacement when there are fewer). Envs with no valid points
+    fall back to slot 0 (a rare degenerate case)."""
+    N, M = valid.shape
+    device = valid.device
     # Valid positions first per row (argsort of the bool, descending).
     order = torch.argsort(valid.to(torch.int8), dim=1, descending=True)  # (N, M)
     counts = valid.sum(1).clamp(min=1)  # (N,)
     r = torch.rand(N, num_points, generator=generator, device=device)
     pick = (r * counts.unsqueeze(1)).long().clamp_(max=M - 1)  # (N, num_points) in [0, counts)
-    gather_idx = torch.gather(order, 1, pick)  # (N, num_points) actual point indices
+    return torch.gather(order, 1, pick)  # (N, num_points) actual point indices
+
+
+def stratified_resample_gather_idx(
+    valid: torch.Tensor, source: torch.Tensor, class_targets, generator: torch.Generator | None,
+) -> torch.Tensor:
+    """``(N, sum(counts))`` indices that resample each class to its own target count,
+    enforcing a fixed per-source split (e.g. robot/ins/rec = 50/25/25) in the output.
+
+    ``source`` is the ``(M,)`` per-point class code (shared across envs); ``class_targets``
+    is a list of ``(code, count)``. Within a class we resample that class's still-valid
+    points (with replacement when fewer survive). If a class has ZERO survivors in an env
+    (e.g. a fully occluded peg), those slots fall back to the env's full visible set so the
+    points stay real and correctly labeled -- the enforced ratio then drifts only for that
+    rare frame rather than duplicating a single arbitrary point."""
+    parts = []
+    for code, cnt in class_targets:
+        if cnt <= 0:
+            continue
+        valid_c = valid & (source == code).unsqueeze(0)  # (N, M)
+        idx_c = resample_gather_idx(valid_c, cnt, generator)  # (N, cnt)
+        has_c = valid_c.any(dim=1)  # (N,)
+        if not bool(has_c.all()):
+            fallback = resample_gather_idx(valid, cnt, generator)
+            idx_c = torch.where(has_c.unsqueeze(1), idx_c, fallback)
+        parts.append(idx_c)
+    return torch.cat(parts, dim=1)  # (N, num_points)
+
+
+def resample_batched(
+    points: torch.Tensor, valid: torch.Tensor, num_points: int, generator: torch.Generator | None,
+) -> torch.Tensor:
+    """Resample each env's valid points to exactly ``num_points``. Returns ``(N, num_points, 3)``."""
+    gather_idx = resample_gather_idx(valid, num_points, generator)
     return torch.gather(points, 1, gather_idx.unsqueeze(-1).expand(-1, -1, 3))
 
 
@@ -213,7 +244,9 @@ def augment_pointcloud_batched(
     num_points: int,
     zbuf_hw: tuple[int, int] = DEFAULT_ZBUF_HW,
     generator: torch.Generator | None = None,
-) -> torch.Tensor:
+    point_source: torch.Tensor | None = None,
+    class_targets=None,
+):
     """Full batched pipeline: frustum -> z-buffer occlusion -> edge bleed ->
     surface bias -> dropout -> resample.
 
@@ -224,9 +257,16 @@ def augment_pointcloud_batched(
         num_points: fixed output size per env.
         zbuf_hw: occlusion grid resolution.
         generator: torch RNG (device-resident) for reproducible noise.
+        point_source: optional ``(M,)`` per-point source/class code aligned with
+            ``points``. When given, the SAME resample indices are used to gather a
+            per-output code, returned alongside the cloud -- this is how the segmented
+            PC carries each point's class label through cull/dropout/resample. Edge-bleed
+            skirt points inherit their parent point's code (skirt ``i`` derives from
+            point ``i``), and fliers don't reindex, so the mapping stays exact.
 
     Returns:
-        ``(N, num_points, 3)`` augmented cloud in the camera optical frame.
+        ``(N, num_points, 3)`` augmented cloud, OR -- when ``point_source`` is given --
+        a tuple ``(cloud, out_source)`` with ``out_source`` of shape ``(N, num_points)``.
     """
     N, M, _ = points.shape
     valid = torch.ones(N, M, dtype=torch.bool, device=points.device)
@@ -237,12 +277,19 @@ def augment_pointcloud_batched(
         valid = valid & zbuffer_visible_mask(points, valid, params, zbuf_hw)
 
     all_pts, all_valid = points, valid
+    # Source code aligned with all_pts' point axis (doubled when edge-bleed cats a skirt).
+    all_source = point_source
     if params.enable_edge_bleed:
         skirt, skirt_valid = edge_bleed_batched(
             points, valid, params, plane_point, plane_normal, zbuf_hw, generator
         )
         all_pts = torch.cat([points, skirt], dim=1)
         all_valid = torch.cat([valid, skirt_valid], dim=1)
+        if point_source is not None:
+            all_source = torch.cat([point_source, point_source])  # skirt inherits parent code
+
+    if class_targets is not None and all_source is None:
+        raise ValueError("class_targets requires point_source (per-point class codes) to stratify by.")
 
     if params.enable_surface_bias:
         all_pts = surface_bias_batched(all_pts, all_valid, params, generator)
@@ -251,7 +298,15 @@ def augment_pointcloud_batched(
         keep = torch.rand(all_valid.shape, generator=generator, device=points.device) < params.dropout_keep
         all_valid = all_valid & keep
 
-    out = resample_batched(all_pts, all_valid, num_points, generator)
+    if class_targets is not None:
+        # Stratified resample: enforce a fixed per-source count split in the output.
+        gather_idx = stratified_resample_gather_idx(all_valid, all_source, class_targets, generator)
+    else:
+        gather_idx = resample_gather_idx(all_valid, num_points, generator)  # (N, num_points)
+    out = torch.gather(all_pts, 1, gather_idx.unsqueeze(-1).expand(-1, -1, 3))
     if params.enable_flier:
-        out = apply_fliers(out, params, generator)
-    return out
+        out = apply_fliers(out, params, generator)  # displaces points in place; no reindex
+    if point_source is None:
+        return out
+    out_source = all_source[gather_idx]  # (N, num_points) — same indices as the cloud
+    return out, out_source

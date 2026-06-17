@@ -1,0 +1,5 @@
+# Max capacity on every axis: wide+deepish encoder (pooled 1024) + a large 4-layer head.
+# The upper-bound "is it just model size?" probe.
+model: {architecture: point_net, encoder_dims: [256, 1024, 1024], action_dims: [2048, 2048, 2048, 1024], predict_std: false}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 512}
+data:  {num_points: null, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0}

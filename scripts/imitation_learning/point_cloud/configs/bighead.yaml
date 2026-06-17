@@ -1,0 +1,22 @@
+# Base-size point encoder [64,128,256] + big_model's large action head [1024,512,256,128].
+# Tests whether the large action head alone (with a cheap encoder) recovers big_model's
+# gains -- i.e. is the head, not the encoder, what mattered. Batch 512 (not subsample1024's
+# 1024). Intended for the contact_seg dataset: native 1024-pt clouds with 4-dim points
+# (xyz + per-point segmentation; point_dim is auto-detected); contact_flags are ignored.
+model:
+  encoder_dims: [64, 128, 256]
+  action_dims: [1024, 512, 256, 128]
+  predict_std: false
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 50
+  batch_size: 512
+
+data:
+  num_points: null   # dataset is natively 1024 points -> no subsampling
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

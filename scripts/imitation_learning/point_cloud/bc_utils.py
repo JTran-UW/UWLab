@@ -18,13 +18,23 @@ import sys
 
 import torch
 
-# PointNet lives next to this file; make it importable regardless of caller cwd.
+# Policy modules live next to this file; make them importable regardless of caller cwd.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from flatten_mlp import FlattenMLP  # noqa: E402
 from point_net import PointNet  # noqa: E402
+from residual_point_net import ResidualPointNet  # noqa: E402
 
-# Obs terms that are point clouds (stored flat as (N, num_points*3)); everything else -> proprio.
+# Must match train_point_net.py's _ARCHITECTURES so a checkpoint loads into the class it trained.
+_ARCHITECTURES = {"point_net": PointNet, "flatten_mlp": FlattenMLP, "residual_point_net": ResidualPointNet}
+
+# Obs terms that are point clouds (stored flat as (N, num_points*point_dim)) -> the PointNet's set input.
 # Mirrors train_point_net.py so eval proprio is built exactly as the model was trained.
 _BC_PC_TERMS = {"scene_pc"}
+# Proprio is an explicit ALLOWLIST mirroring train_point_net._PROPRIO_TERMS: the model sees
+# only these terms (in the obs-group's declaration order) as the 18d proprio it was trained on.
+# Any other term in the live group (privileged poses, contact flags, ... recorded for aux
+# losses) is ignored at deploy, exactly as the trainer ignored it.
+_BC_PROPRIO_TERMS = {"joint_pos", "end_effector_pose"}
 
 
 def load_bc_pointnet(path: str, device: str) -> dict:
@@ -42,13 +52,18 @@ def load_bc_pointnet(path: str, device: str) -> dict:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     hp = ckpt["hyper_parameters"]
     sd = ckpt["state_dict"]
-    model = PointNet(
+    arch = hp.get("architecture", "point_net")  # older ckpts predate the field -> PointNet
+    kwargs = dict(
         encoder_hidden_dims=hp["encoder_dims"],
         action_hidden_dims=hp["action_dims"],
         proprio_dim=hp["proprio_dim"],
         action_dim=hp["action_dim"],
         predict_std=hp["predict_std"],
+        point_dim=hp.get("point_dim", 3),  # 3 = xyz; 4 = xyz + segmentation label
     )
+    if arch == "flatten_mlp":
+        kwargs["num_points"] = hp["num_points"]  # FlattenMLP needs the fixed cloud size
+    model = _ARCHITECTURES[arch](**kwargs)
     model.load_state_dict({k[len("model.") :]: v for k, v in sd.items() if k.startswith("model.")})
     model.to(device).eval()
     norm = {k: sd[k].to(device) for k in ("proprio_mean", "proprio_std", "action_mean", "action_std")}
@@ -59,16 +74,19 @@ def bc_actions(bc: dict, obs, group_name: str) -> torch.Tensor:
     """Run the BC PointNet on the ``group_name`` obs group and return denormalized actions.
 
     The group is a per-term dict (``concatenate_terms=False``): the point cloud term is
-    reshaped to ``(N, num_points, 3)`` and the remaining terms are concatenated -- in
-    declaration order -- into proprio, exactly as ``train_point_net.py`` did. Proprio is
-    z-scored with the saved stats; the predicted (normalized) action is denormalized back
-    to env action units.
+    reshaped to ``(N, num_points, point_dim)`` and the allowlisted proprio terms
+    (``_BC_PROPRIO_TERMS``) are concatenated, in declaration order, into proprio, exactly as
+    ``train_point_net.py`` did. Any other term in the group (privileged poses, contact flags
+    recorded for aux losses) is ignored. Proprio is z-scored with the saved stats; the
+    predicted (normalized) action is denormalized back to env action units.
     """
     g = obs[group_name]
     keys = list(g.keys())
     pc_key = next(k for k in keys if k in _BC_PC_TERMS)
-    pc = g[pc_key].reshape(g[pc_key].shape[0], -1, 3)
-    proprio = torch.cat([g[k] for k in keys if k not in _BC_PC_TERMS], dim=-1)
+    # point_dim (3 or 4) is baked into the model; the live scene_pc must match.
+    pc = g[pc_key].reshape(g[pc_key].shape[0], -1, bc["model"].point_dim)
+    proprio_keys = [k for k in keys if k in _BC_PROPRIO_TERMS]
+    proprio = torch.cat([g[k] for k in proprio_keys], dim=-1)
     proprio = (proprio - bc["proprio_mean"]) / bc["proprio_std"]
     out = bc["model"](pc, proprio)
     mean = out[0] if isinstance(out, tuple) else out  # predict_std -> (mean, log_std)

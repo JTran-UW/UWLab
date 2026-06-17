@@ -531,6 +531,19 @@ class MeshPointCloud(ManagerTermBase):
         return points_ref.reshape(env.num_envs, -1)
 
 
+def ratio_to_counts(ratios, total: int) -> tuple[int, ...]:
+    """Convert per-class ``ratios`` -> integer point counts that sum EXACTLY to
+    ``total`` (largest-remainder rounding). Used to enforce a fixed robot/insertive/
+    receptive split in the scene point clouds (e.g. (0.5, 0.25, 0.25))."""
+    raw = [r * total for r in ratios]
+    counts = [int(x) for x in raw]  # floor (ratios are non-negative)
+    rem = int(total - sum(counts))
+    order = sorted(range(len(ratios)), key=lambda i: raw[i] - counts[i], reverse=True)
+    for k in range(max(rem, 0)):
+        counts[order[k % len(counts)]] += 1
+    return tuple(counts)
+
+
 class ScenePointCloud(ManagerTermBase):
     """Combined pointcloud from robot + insertive + receptive in a configurable frame.
 
@@ -578,6 +591,18 @@ class ScenePointCloud(ManagerTermBase):
         # overfit to a specific point selection that doesn't reproduce at deploy.
         self.resample_on_reset_robot: bool = cfg.params.get("resample_on_reset_robot", False)
 
+        # Enforced per-source split (robot, insertive, receptive). When given, the
+        # canonical selection devotes exactly these fractions of num_points to each
+        # source (e.g. (0.5, 0.25, 0.25)); None keeps the legacy fixed _BUDGET_SPLIT.
+        # NOTE: the teacher/expert ScenePC must stay on the legacy split (the JIT
+        # expert was trained on it), so this is opt-in per obs term, not global.
+        self.class_ratios = cfg.params.get("class_ratios", None)
+        self._budget = (
+            ratio_to_counts(self.class_ratios, self.num_points)
+            if self.class_ratios is not None
+            else self._BUDGET_SPLIT
+        )
+
         robot_cfg: SceneEntityCfg = cfg.params["robot_cfg"]
         ins_cfg: SceneEntityCfg = cfg.params["insertive_cfg"]
         rec_cfg: SceneEntityCfg = cfg.params["receptive_cfg"]
@@ -593,7 +618,10 @@ class ScenePointCloud(ManagerTermBase):
         #     nearly invariant to arm pose and far more effective for learning.
         #   * Articulation WITHOUT body_names -> robot root (base) frame.
         # Defaults to ``robot_cfg`` (base frame) for back-compat when unset.
-        ref_cfg: SceneEntityCfg = cfg.params.get("ref_cfg", robot_cfg)
+        # ``.get`` only substitutes the default for a MISSING key; an explicit
+        # ``ref_cfg=None`` (NotEECentric configs) must also fall back to the robot
+        # base frame -- hence the explicit ``or robot_cfg``.
+        ref_cfg: SceneEntityCfg = cfg.params.get("ref_cfg", robot_cfg) or robot_cfg
         self.ref_asset = env.scene[ref_cfg.name]
         self.ref_body_idx: int | None = None
         if ref_cfg.body_names and isinstance(self.ref_asset, Articulation):
@@ -759,7 +787,7 @@ class ScenePointCloud(ManagerTermBase):
             "rec:" + ",".join(sorted(rec_usd_paths)),
             f"num_points:{self.num_points}",
             f"oversample:{oversample}",
-            f"budget:{self._BUDGET_SPLIT[0]},{self._BUDGET_SPLIT[1]},{self._BUDGET_SPLIT[2]}",
+            f"budget:{self._budget[0]},{self._budget[1]},{self._budget[2]}",
         ])
         return hashlib.sha256(parts.encode()).hexdigest()[:16]
 
@@ -928,7 +956,7 @@ class ScenePointCloud(ManagerTermBase):
 
             # Deterministic per-source first-N selection (avoids global-FPS's
             # num_envs / physics-warmup dependence).
-            robot_target, ins_target, rec_target = self._BUDGET_SPLIT
+            robot_target, ins_target, rec_target = self._budget
             n_robot_avail = int((task_source == self._SRC_ROBOT).sum().item())
             n_ins_avail = int((task_source == self._SRC_INSERTIVE).sum().item())
             n_rec_avail = int((task_source == self._SRC_RECEPTIVE).sum().item())
@@ -1088,6 +1116,7 @@ class ScenePointCloud(ManagerTermBase):
         oversample: int = 2,
         resample_on_reset: bool = False,
         resample_on_reset_robot: bool = False,
+        class_ratios: tuple[float, float, float] | None = None,
         visualize: bool = False,
         visualize_env_ids: list[int] | None = None,
     ) -> torch.Tensor:
@@ -1316,6 +1345,14 @@ class OccludedScenePointCloud(ScenePointCloud):
         self.num_points: int = cfg.params.get("num_points", 2000)
         oversample: int = cfg.params.get("oversample", 3)
 
+        # Enforced (robot, insertive, receptive) split. When set, BOTH stages honor it:
+        #   1. the DENSE pre-occlusion cloud is allocated per-class by this ratio (so
+        #      more DISTINCT object points survive the z-buffer cull -> real signal for
+        #      the maxpool encoder), and
+        #   2. the final resample is STRATIFIED to these exact output counts.
+        # None -> legacy area-weighted dense sample + uniform resample.
+        self.class_ratios = cfg.params.get("class_ratios", None)
+
         robot_cfg: SceneEntityCfg = cfg.params["robot_cfg"]
         self.robot: Articulation = env.scene[robot_cfg.name]
 
@@ -1351,9 +1388,20 @@ class OccludedScenePointCloud(ScenePointCloud):
         )
         n_obj = int((self.dense_obj_idx >= 0).sum())
         print(f"[OccludedScenePointCloud] dense scene cloud: {self.dense_local.shape[0]} points "
-              f"({self.dense_local.shape[0] - n_obj} robot + {n_obj} object, area-weighted over "
+              f"({self.dense_local.shape[0] - n_obj} robot + {n_obj} object, "
+              f"{'ratio ' + str(self.class_ratios) if self.class_ratios else 'area-weighted'} over "
               f"{len(self.robot.body_names)} bodies + {len(self.object_assets)} objects) "
               f"-> {self.num_points} in camera frame")
+
+        # Per-class output targets (src_code, count) for the stratified final resample.
+        # Summed counts == num_points exactly; None -> legacy uniform resample.
+        self._out_targets = None
+        if self.class_ratios is not None:
+            nr, ni, nrec = ratio_to_counts(self.class_ratios, self.num_points)
+            self._out_targets = [
+                (self._SRC_ROBOT, nr), (self._SRC_INSERTIVE, ni), (self._SRC_RECEPTIVE, nrec),
+            ]
+            print(f"[OccludedScenePointCloud] enforced output split robot/ins/rec = {nr}/{ni}/{nrec}")
 
         # -- Fixed front-camera offset (relative to the /Robot root prim) --
         # Defaults match camera_align_cfg.py front_camera (opengl convention).
@@ -1403,6 +1451,19 @@ class OccludedScenePointCloud(ScenePointCloud):
         # fliers) instead of the occluded source-coloured visibility -- lets you
         # see the flier outliers against the real overlay.
         self._visualize_augmented: bool = cfg.params.get("visualize_augmented", False)
+
+        # -- Optional per-point segmentation channel --
+        # When enabled, the obs is (num_points, 4): xyz + a class label per point,
+        # so the policy can tell robot / insertive / receptive apart instead of
+        # inferring it from geometry. Labels are configurable; the default matches
+        # the user's scheme (robot=0, insertive=-1, receptive=+1). The label rides
+        # through the augmentation via point_source (see augment_pointcloud_batched).
+        self.include_segmentation: bool = cfg.params.get("include_segmentation", False)
+        seg = cfg.params.get("segmentation_labels", None) or {"robot": 0.0, "insertive": -1.0, "receptive": 1.0}
+        # LUT indexed by source code: _SRC_ROBOT=0, _SRC_INSERTIVE=1, _SRC_RECEPTIVE=2.
+        self._seg_lut = torch.tensor(
+            [seg["robot"], seg["insertive"], seg["receptive"]], dtype=torch.float32, device=device
+        )
 
         # -- Visualization --
         # -- Optional real point-cloud overlay (sim-vs-real comparison) --
@@ -1558,12 +1619,36 @@ class OccludedScenePointCloud(ScenePointCloud):
 
         total_area = sum(s["area"] for s in sources)
 
+        # Per-source point budget. Legacy: area-weighted over ALL sources (robot wins
+        # by surface area -> ~90%+ robot). With class_ratios: split `total` into per-class
+        # budgets by ratio FIRST, then area-weight WITHIN each class. This raises the
+        # dense object density so more DISTINCT peg/hole points survive occlusion.
+        if self.class_ratios is not None:
+            cls_dense = ratio_to_counts(self.class_ratios, total)  # (robot, ins, rec)
+            cls_budget = {self._SRC_ROBOT: cls_dense[0], self._SRC_INSERTIVE: cls_dense[1],
+                          self._SRC_RECEPTIVE: cls_dense[2]}
+            cls_area: dict[int, float] = {}
+            for s in sources:
+                cls_area[s["src"]] = cls_area.get(s["src"], 0.0) + s["area"]
+
+            def _n_for(s) -> int:
+                ca = cls_area.get(s["src"], 0.0)
+                budget = cls_budget.get(s["src"], 0)
+                if ca <= 0.0 or budget <= 0:
+                    return 0
+                return max(1, int(round(budget * s["area"] / ca)))
+        else:
+            def _n_for(s) -> int:
+                return max(1, int(round(total * s["area"] / total_area)))
+
         local_parts: list[torch.Tensor] = []
         body_idx_parts: list[int] = []
         obj_idx_parts: list[int] = []
         source_parts: list[int] = []
         for s in sources:
-            n_b = max(1, int(round(total * s["area"] / total_area)))
+            n_b = _n_for(s)
+            if n_b <= 0:
+                continue
             with utils.temporary_seed(s["seed"]):
                 pts = sample_points_from_meshes(s["meshes"], n_b)[0]  # (n_b, 3) local
             local_parts.append(pts)
@@ -1861,6 +1946,7 @@ class OccludedScenePointCloud(ScenePointCloud):
         receptive_cfg: SceneEntityCfg | None = None,
         num_points: int = 2000,
         oversample: int = 3,
+        class_ratios: tuple[float, float, float] | None = None,
         camera_offset_pos=None,
         camera_offset_quat=None,
         camera_offset_pos_range=None,
@@ -1876,6 +1962,8 @@ class OccludedScenePointCloud(ScenePointCloud):
         overlay_pc_path: str | None = None,
         overlay_pc_color=None,
         overlay_pc_max_points: int = 6000,
+        include_segmentation: bool = False,
+        segmentation_labels: dict | None = None,
     ) -> torch.Tensor:
         N = env.num_envs
         device = env.device
@@ -1895,10 +1983,22 @@ class OccludedScenePointCloud(ScenePointCloud):
 
         # Fully batched, on-device augmentation (frustum -> z-buffer occlusion ->
         # edge bleed -> surface bias -> dropout -> resample). No host syncs.
-        out_t = self._augt.augment_pointcloud_batched(
-            pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
-            self.num_points, self._zbuf_hw, self._generator,
-        )  # (N, num_points, 3) camera frame
+        # With segmentation on, also gather a per-output source code via the same
+        # resample indices (out_src: (N, num_points), values in {robot,ins,rec} codes).
+        # Source codes are threaded through the pipeline when we need a per-point
+        # label out (segmentation) OR when the final resample is stratified by class.
+        out_src = None
+        if self.include_segmentation or self._out_targets is not None:
+            out_t, out_src = self._augt.augment_pointcloud_batched(
+                pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
+                self.num_points, self._zbuf_hw, self._generator,
+                point_source=self.dense_source, class_targets=self._out_targets,
+            )
+        else:
+            out_t = self._augt.augment_pointcloud_batched(
+                pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
+                self.num_points, self._zbuf_hw, self._generator,
+            )  # (N, num_points, 3) camera frame
 
         # -- Visualize the camera-visible cloud, coloured by source --
         # We re-run only the *visibility* stages (frustum + HPR) on the combined
@@ -1930,5 +2030,12 @@ class OccludedScenePointCloud(ScenePointCloud):
                     cam_quat_w[vid].unsqueeze(0).expand(P, -1), self.overlay_local,
                 ) + cam_pos_w[vid]
                 self._overlay_marker.visualize(translations=ov_world)
+
+        # Append the per-point class label as a 4th channel -> (N, num_points, 4).
+        # Done after visualization (which expects xyz-only) and after fliers, so the
+        # label stays aligned with the final points.
+        if self.include_segmentation:
+            labels = self._seg_lut[out_src]  # (N, num_points) source code -> class label
+            out_t = torch.cat([out_t, labels.unsqueeze(-1)], dim=-1)  # (N, num_points, 4)
 
         return out_t.reshape(N, -1)

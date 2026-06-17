@@ -26,6 +26,7 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
 
 from ... import mdp as task_mdp
@@ -195,6 +196,10 @@ class DataCollectionPCObservationsCfg(ObservationsCfg):
                 "receptive_cfg": SceneEntityCfg("receptive_object"),
                 "num_points": 1024,
                 "oversample": 3,
+                # Enforce a fixed robot/insertive/receptive point split (both the dense
+                # pre-occlusion sample AND the final stratified resample). Area-weighting
+                # alone gives ~93% robot; the small peg/hole were starved (~3%/5%).
+                "class_ratios": (0.5, 0.25, 0.25),
                 # ICP-calibrated D455 extrinsics as the center...
                 "camera_offset_pos": CALIBRATED_CAMERA_OFFSET_POS,
                 "camera_offset_quat": CALIBRATED_CAMERA_OFFSET_QUAT,
@@ -216,16 +221,6 @@ class DataCollectionPCObservationsCfg(ObservationsCfg):
                 "root_asset_cfg": SceneEntityCfg("robot"),
                 "rotation_repr": "axis_angle",
             },
-        )
-
-        # (N,1) magnitude of the wrist_3_link joint reaction force -- a proxy for EE
-        # contact/insertion force. Recorded per step so training can UP-SAMPLE forceful
-        # timesteps (it is NOT a policy input: train_point_net.py excludes it from proprio
-        # and uses it only as a sampling weight). Placed last so proprio = joint_pos +
-        # end_effector_pose (18d) is unchanged.
-        wrist_force = ObsTerm(
-            func=task_mdp.wrist_force_magnitude,
-            params={"robot_cfg": SceneEntityCfg("robot")},
         )
 
         def __post_init__(self):
@@ -263,13 +258,15 @@ class Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg(Ur5eRobotiq2f85RelCartes
     def __post_init__(self):
         super().__post_init__()
 
-        self.events.reset_from_reset_states.params["probs"] = [0.25, 0.25, 0.25, 0.25]
+        # self.events.reset_from_reset_states.params["probs"] = [0.25, 0.25, 0.25, 0.25]
+        self.events.reset_from_reset_states.params["probs"] = [0.34, 0.33, 0.33]
         self.events.reset_from_reset_states.params["reset_types"] = [
             "ObjectAnywhereEEAnywhere",
             "ObjectRestingEEGrasped",
             "ObjectAnywhereEEGrasped",
-            "ObjectPartiallyAssembledEEGrasped",
+            # "ObjectPartiallyAssembledEEGrasped",
         ]
+        self.terminations.success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 2})
 
 
 # ----------------------------------------------------------------------------
@@ -309,7 +306,258 @@ class Ur5eRobotiq2f85BCPointNetEvalCfg(Ur5eRobotiq2f85DataCollectionPCRelCartesi
     def __post_init__(self):
         super().__post_init__()
 
+        # TEMPORARY: 4-path reset distribution (all reset types, equal weight) to match the
+        # distribution the earlier BC sweep was evaluated under, for a fair comparison.
+        # The harder single-path (probs=[1.0], ObjectAnywhereEEAnywhere only) is commented below.
+        # self.events.reset_from_reset_states.params["probs"] = [0.25, 0.25, 0.25, 0.25]
+        # self.events.reset_from_reset_states.params["reset_types"] = [
+        #     "ObjectAnywhereEEAnywhere",
+        #     "ObjectRestingEEGrasped",
+        #     "ObjectAnywhereEEGrasped",
+        #     "ObjectPartiallyAssembledEEGrasped",
+        # ]
         self.events.reset_from_reset_states.params["probs"] = [1.0]
-        self.events.reset_from_reset_states.params["reset_types"] = [
-            "ObjectAnywhereEEAnywhere",
-        ]
+        self.events.reset_from_reset_states.params["reset_types"] = ["ObjectAnywhereEEAnywhere"]
+
+
+@configclass
+class Ur5eRobotiq2f85BCPointNetSegEvalCfg(Ur5eRobotiq2f85BCPointNetEvalCfg):
+    """BC PointNet eval for models trained on SEGMENTED clouds (point_dim=4: xyz + a per-point
+    class label). Identical to :class:`Ur5eRobotiq2f85BCPointNetEvalCfg` (4-path reset, no
+    teacher group) but turns on the ``scene_pc`` segmentation channel so the live cloud is
+    ``(num_points, 4)`` -- matching the contact_seg dataset the model was trained on. The labels
+    MUST match training exactly (robot=0 / insertive=-1 / receptive=+1); ``bc_utils.bc_actions``
+    reshapes the flat cloud with the model's ``point_dim`` so the 4th channel is fed to the encoder.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.data_collect.scene_pc.params["include_segmentation"] = True
+        self.observations.data_collect.scene_pc.params["segmentation_labels"] = {
+            "robot": 0.0,
+            "insertive": -1.0,
+            "receptive": 1.0,
+        }
+
+
+# ----------------------------------------------------------------------------
+# Contact-sensor data-collection env: ground-truth phase flags
+# ----------------------------------------------------------------------------
+# A peg-mounted ContactSensor reports the PhysX solver's pairwise contact force
+# between the insertive object (peg) and, in this fixed column order,
+#   [left_inner_finger, right_inner_finger, receptive_object].
+# mdp.heuristics.object_contact_flags turns that into two binary flags --
+#   gripper_touching_peg (either finger) and peg_touching_hole -- which segment a
+# demo into reach / grasp-transport / insertion phases far more cleanly than the
+# noisy wrist reaction force, so training can sample differently per phase.
+_PEG_CONTACT_SENSOR_NAME = "peg_contacts"
+
+
+def _peg_contact_sensor_cfg() -> ContactSensorCfg:
+    return ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/InsertiveObject",  # peg = sensor body (dynamic)
+        # force_matrix_w columns, in EXACTLY this order (heuristics indexes them):
+        filter_prim_paths_expr=[
+            "{ENV_REGEX_NS}/Robot/left_inner_finger",
+            "{ENV_REGEX_NS}/Robot/right_inner_finger",
+            "{ENV_REGEX_NS}/ReceptiveObject",
+        ],
+        history_length=0,  # current step only
+        update_period=0.0,  # report every sim step
+        track_pose=False,
+        debug_vis=False,
+    )
+
+
+@configclass
+class ContactDataCollectObsCfg(DataCollectionPCObservationsCfg.DataCollectObsCfg):
+    """``data_collect`` student group + the ground-truth contact flags, appended
+    last so proprio = joint_pos + end_effector_pose (18d) is unchanged. Like
+    ``wrist_force``, ``contact_flags`` is recorded metadata, NOT a policy input
+    (train_point_net.py / bc_utils.py exclude it from proprio)."""
+
+    contact_flags = ObsTerm(
+        func=task_mdp.object_contact_flags,
+        params={"sensor_cfg": SceneEntityCfg(_PEG_CONTACT_SENSOR_NAME), "threshold": 0.0},
+    )
+
+
+@configclass
+class DataCollectionPCContactObservationsCfg(DataCollectionPCObservationsCfg):
+    data_collect: ContactDataCollectObsCfg = ContactDataCollectObsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCContactCfg(Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg):
+    """Data-collection env + a peg-mounted ContactSensor recording two
+    ground-truth contact flags/step (gripper<->peg, peg<->hole). Otherwise
+    identical scene / action / sysid / reset distribution to
+    :class:`Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg` -- so demos are
+    drawn from the same distribution, just with the extra phase signal recorded.
+    """
+
+    observations: DataCollectionPCContactObservationsCfg = DataCollectionPCContactObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Contact reporting must be active on every body the sensor pairs with:
+        # the peg (sensor body), both fingers (robot articulation), and the hole.
+        self.scene.robot.spawn.activate_contact_sensors = True
+        self.scene.insertive_object.spawn.activate_contact_sensors = True
+        self.scene.receptive_object.spawn.activate_contact_sensors = True
+        # Register the sensor on the scene (InteractiveScene picks it up at build).
+        setattr(self.scene, _PEG_CONTACT_SENSOR_NAME, _peg_contact_sensor_cfg())
+
+        # Per-point segmentation channel: scene_pc becomes (num_points, 4) = xyz + a
+        # class label (robot=0 / insertive=-1 / receptive=+1). Configurable -- flip to
+        # False (or override segmentation_labels) here. NOTE: with this on, scene_pc is
+        # P*4, so the downstream PointNet must use point_dim=4 (see train_point_net.py).
+        self.observations.data_collect.scene_pc.params["include_segmentation"] = True
+        self.observations.data_collect.scene_pc.params["segmentation_labels"] = {
+            "robot": 0.0, "insertive": -1.0, "receptive": 1.0,
+        }
+
+
+# ----------------------------------------------------------------------------
+# Clean (vanilla) ScenePC data-collection env: NO sim2real occlusion / noise
+# ----------------------------------------------------------------------------
+# Records the ORIGINAL clean ScenePointCloud (full FPS-sampled robot+ins+rec
+# cloud) instead of the OccludedScenePointCloud sim2real augmentation -- i.e. no
+# z-buffer self-occlusion, no edge bleed, no surface bias, no dropout, no fliers,
+# no extrinsics domain randomization. The only sampling stochasticity is
+# resample_on_reset=True, which redraws the FPS subset each episode. 3-channel
+# xyz only (no segmentation label). This is the same term + config the teacher
+# group uses, just at the collection point count (1024) and with resampling on.
+@configclass
+class CleanDataCollectObsCfg(DataCollectionPCObservationsCfg.DataCollectObsCfg):
+    """``data_collect`` student group with the CLEAN ScenePointCloud swapped in for
+    the sim2real-augmented OccludedScenePointCloud. proprio (joint_pos +
+    end_effector_pose = 18d) is unchanged; only the ``scene_pc`` term differs."""
+
+    scene_pc = ObsTerm(
+        func=task_mdp.ScenePointCloud,
+        params={
+            "robot_cfg": SceneEntityCfg("robot"),
+            "insertive_cfg": SceneEntityCfg("insertive_object"),
+            "receptive_cfg": SceneEntityCfg("receptive_object"),
+            # Express the cloud in the END-EFFECTOR (wrist_3_link) frame. The task is
+            # wrist-centric, so EE-frame points are nearly invariant to arm pose and
+            # learn far better than base-frame points (see ScenePointCloud docstring).
+            # NOTE: the teacher/expert clean cloud stays in base frame (unchanged).
+            "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            # Match the teacher group's clean cloud exactly.
+            "num_points": 512,
+            # Enforce a fixed robot/insertive/receptive split (512 -> 256/128/128).
+            # No occlusion here, so these are 256/128/128 DISTINCT points.
+            "class_ratios": (0.5, 0.25, 0.25),
+            # Redraw the FPS subset each episode (the requested stochasticity).
+            "resample_on_reset": True,
+            "visualize": False,
+        },
+    )
+
+    # --- Aux terms recorded ON THE SIDE (metadata, NOT a policy input) ---
+    # The trainer's proprio allowlist ({joint_pos, end_effector_pose}) excludes these,
+    # so they never enter the BC input -- they are stored only for future aux losses
+    # (e.g. predicting object poses / phase from the point cloud). Declared AFTER
+    # joint_pos + end_effector_pose so the 18d proprio order is unchanged.
+    insertive_asset_pose = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+
+    receptive_asset_pose = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("receptive_object"),
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+
+    insertive_in_receptive = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_cfg": SceneEntityCfg("receptive_object"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+
+    contact_flags = ObsTerm(
+        func=task_mdp.object_contact_flags,
+        params={"sensor_cfg": SceneEntityCfg(_PEG_CONTACT_SENSOR_NAME), "threshold": 0.0},
+    )
+
+
+@configclass
+class DataCollectionPCCleanObservationsCfg(DataCollectionPCObservationsCfg):
+    data_collect: CleanDataCollectObsCfg = CleanDataCollectObsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCCleanCfg(Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg):
+    """Data-collection env recording the CLEAN vanilla ScenePC (no sim2real
+    augmentation), with resample_on_reset=True. Otherwise identical scene / action
+    term / sysid + OSC gains / reset distribution to
+    :class:`Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg` -- demos are drawn
+    from the same on-policy distribution; only the recorded cloud's realism differs
+    (clean full cloud vs occluded + noisy). The ``teacher`` group (and thus the JIT
+    expert input) is unchanged, so the same expert generates actions."""
+
+    observations: DataCollectionPCCleanObservationsCfg = DataCollectionPCCleanObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # The ``data_collect`` group records a ground-truth ``contact_flags`` aux term
+        # (gripper<->peg, peg<->hole), which needs the peg-mounted ContactSensor active
+        # on every body it pairs with. Same wiring as the Contact env.
+        self.scene.robot.spawn.activate_contact_sensors = True
+        self.scene.insertive_object.spawn.activate_contact_sensors = True
+        self.scene.receptive_object.spawn.activate_contact_sensors = True
+        setattr(self.scene, _PEG_CONTACT_SENSOR_NAME, _peg_contact_sensor_cfg())
+
+
+# ----------------------------------------------------------------------------
+# BC-PointNet eval env: CLEAN ScenePointCloud (point_dim=3, 512 pts)
+# ----------------------------------------------------------------------------
+@configclass
+class BCPointNetCleanObservationsCfg(ObservationsCfg):
+    """BC eval obs: policy + critic state groups PLUS the CLEAN ScenePointCloud
+    ``data_collect`` group (512-pt, xyz only, no sim2real occlusion/noise) -- matching the
+    ``clean_scenepc`` dataset. No ``teacher`` group (BC rolls out the student itself)."""
+
+    data_collect: CleanDataCollectObsCfg = CleanDataCollectObsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85BCPointNetCleanEvalCfg(Ur5eRobotiq2f85BCPointNetEvalCfg):
+    """BC eval for models trained on the CLEAN ScenePointCloud (point_dim=3, 512 pts).
+    Identical reset / action / success setup to :class:`Ur5eRobotiq2f85BCPointNetEvalCfg`
+    but swaps the occluded sim2real ``scene_pc`` for the clean 512-pt FPS cloud. The live
+    cloud is a fixed 512 points (FlattenMLP requires exactly the trained ``num_points``)."""
+
+    observations: BCPointNetCleanObservationsCfg = BCPointNetCleanObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # The shared clean ``data_collect`` group declares the ``contact_flags`` aux term,
+        # whose obs func reads the peg-mounted ContactSensor every step (the BC policy
+        # ignores it -- allowlist proprio -- but the term still executes). Register the
+        # sensor here too so eval matches the collection env and does not KeyError.
+        self.scene.robot.spawn.activate_contact_sensors = True
+        self.scene.insertive_object.spawn.activate_contact_sensors = True
+        self.scene.receptive_object.spawn.activate_contact_sensors = True
+        setattr(self.scene, _PEG_CONTACT_SENSOR_NAME, _peg_contact_sensor_cfg())
+
+@configclass
+class Ur5eRobotiq2f85BCPointNetCleanNotEECentricEvalCfg(Ur5eRobotiq2f85BCPointNetCleanEvalCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        # we unset it, so it becomes the robot cfg. This is what some older runs were trained on.
+        self.observations.data_collect.scene_pc.params["ref_cfg"] = None

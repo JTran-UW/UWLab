@@ -103,6 +103,19 @@ def main():
     obs_keys = list(group_obs.keys())
     print(f"[collect] recording obs group '{args_cli.obs_group}' terms: {obs_keys}")
 
+    # Point-cloud channel count: 3 (xyz) or 4 (xyz + per-point segmentation label).
+    # Inferred from the live flat dim / num_points so it follows include_segmentation
+    # automatically (no hardcoded 3). Used to reshape scene_pc on save and recorded as
+    # an attr so the trainer rebuilds the right point_dim.
+    pc_point_dim = 3
+    pc_num_points = group_cfg.scene_pc.params.get("num_points") if hasattr(group_cfg, "scene_pc") else None
+    if pc_num_points:
+        for k in obs_keys:
+            if k in _PC_TERMS:
+                pc_point_dim = int(group_obs[k].shape[1] // pc_num_points)
+                break
+    print(f"[collect] point-cloud channels: {pc_point_dim} (num_points={pc_num_points})")
+
     h5 = None
     data_grp = None
     if not args_cli.no_save:
@@ -112,6 +125,7 @@ def main():
         data_grp.attrs["env_name"] = args_cli.task
         data_grp.attrs["obs_group"] = args_cli.obs_group
         data_grp.attrs["obs_keys"] = obs_keys
+        data_grp.attrs["pc_point_dim"] = pc_point_dim
     else:
         print("[collect] --no_save: benchmark mode, HDF5 will NOT be written.", flush=True)
 
@@ -137,7 +151,7 @@ def main():
         for k in obs_keys:
             arr = np.stack(ep_obs[k])  # (T, term_dim)
             if k in _PC_TERMS:
-                arr = arr.reshape(arr.shape[0], -1, 3)  # (T, num_points, 3)
+                arr = arr.reshape(arr.shape[0], -1, pc_point_dim)  # (T, num_points, pc_point_dim)
             og.create_dataset(k, data=arr, compression=comp)
         n_saved += 1
 

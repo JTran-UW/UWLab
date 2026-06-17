@@ -875,6 +875,25 @@ gym.register(
     kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg"},
 )
 
+# Data-collection env + peg-mounted ContactSensor recording two ground-truth contact
+# flags/step (gripper<->peg, peg<->hole). Same distribution as DataCollectionPC-v0.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-Contact-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCContactCfg"},
+)
+
+# Data-collection env recording the CLEAN vanilla ScenePointCloud (no sim2real occlusion /
+# noise), resample_on_reset=True. Same distribution as DataCollectionPC-v0; only the recorded
+# cloud's realism differs (clean full cloud vs occluded + noisy).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-Clean-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCCleanCfg"},
+)
+
 # BC-PointNet eval env: roll out a trained PointNet (play.py --bc_checkpoint) on the
 # sim2real PC obs. Same scene/action/reset as DataCollectionPC, minus the teacher group.
 # The rsl_rl agent cfg is only used for seed/clip_actions -- the --bc_checkpoint path
@@ -885,6 +904,45 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for SEGMENTED-cloud models (point_dim=4: xyz + per-point class label).
+# Same as BCPointNetEval but scene_pc carries the segmentation channel (matches the
+# contact_seg dataset). Use for models trained with point_dim=4.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetSegEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetSegEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for CLEAN-cloud models (point_dim=3, 512 pts, no sim2real occlusion).
+# Same as BCPointNetEval but scene_pc is the clean 512-pt ScenePointCloud (matches the
+# clean_scenepc dataset). Use for models trained on clean_scenepc_100k.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetCleanEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetCleanEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for CLEAN-cloud models trained with the scene_pc NOT EE-centric
+# (ref_cfg unset -> robot frame). Same as BCPointNetCleanEval but the clean ScenePointCloud
+# is expressed in the robot frame rather than the EE frame. Use for models trained that way.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetCleanNotEECentricEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetCleanNotEECentricEvalCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )

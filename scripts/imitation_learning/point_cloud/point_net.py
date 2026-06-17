@@ -4,11 +4,13 @@ import torch.nn.functional as F
 from torchvision.ops import MLP
 
 class PointNet(nn.Module):
-    def __init__(self, encoder_hidden_dims, action_hidden_dims, proprio_dim, action_dim, predict_std):
+    def __init__(self, encoder_hidden_dims, action_hidden_dims, proprio_dim, action_dim, predict_std, point_dim=3):
         super().__init__()
         self.predict_std = predict_std
+        self.point_dim = point_dim  # 3 = xyz; 4 = xyz + per-point segmentation label
+        self.pooled_dim = encoder_hidden_dims[-1]  # width of the pooled global feature (aux-probe input)
         self.set_encoder = MLP(
-            in_channels=3,
+            in_channels=point_dim,
             hidden_channels=encoder_hidden_dims,
             norm_layer=nn.LayerNorm,
         )
@@ -20,18 +22,18 @@ class PointNet(nn.Module):
             hidden_channels=[*action_hidden_dims, out_dim],
         )
 
-    def forward(self, x, proprio):                     # x: (B, N, 3)
-        assert x.ndim == 3 and x.shape[-1] == 3
+    def forward(self, x, proprio, return_pooled=False):  # x: (B, N, point_dim)
+        assert x.ndim == 3 and x.shape[-1] == self.point_dim
         assert proprio.ndim == 2
         feats = self.set_encoder(x)
-        pooled = self.point_norm(feats.amax(dim=1))
+        pooled = self.point_norm(feats.amax(dim=1))      # (B, pooled_dim) global PC feature
         proprio_feats = self.proprio_encoder(proprio)
         feats = torch.cat([pooled, proprio_feats], dim=-1)
         out = self.action_head(feats)
         if self.predict_std:
-            mean, log_std = out.chunk(2, dim=-1)
-            return mean, log_std
-        return out
+            out = out.chunk(2, dim=-1)                    # (mean, log_std)
+        # return_pooled exposes the pooled feature for an auxiliary probe (e.g. object-pose head).
+        return (out, pooled) if return_pooled else out
 
     def calculate_loss(self, points, proprio, targets):
         if self.predict_std:
