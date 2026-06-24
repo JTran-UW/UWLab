@@ -13,6 +13,22 @@ MEM_PER_GPU=${MEM_PER_GPU:-60G}
 CONSTRAINT=${CONSTRAINT:-"h200|l40|l40s|a40"}
 # Time limit (default 24 hours, use shorter for testing requeue, e.g., TIME=00:05:00)
 TIME=${TIME:-24:00:00}
+# QOS (optional; empty = use the partition/account default QOS). Required by some
+# pools, e.g. ckpt GPU jobs typically need QOS=ckpt-gpu.
+QOS=${QOS:-}
+
+# Resolve the SLURM log directory to an absolute path BEFORE it is used in the
+# sbatch --output/--error directives. Fall back to <uwlab>/slurm_logs (derived
+# from the persistent uwlab dir passed as $1) when not provided via the env.
+SLURM_LOGS_DIR=${SLURM_LOGS_DIR:-"$(dirname "$1")/slurm_logs"}
+# Guard: an empty or relative path makes SLURM silently write slurm-<jobid>.out
+# into the submit dir, which on Hyak is the auto-deleted timestamped code copy
+# (REMOVE_CODE_COPY_AFTER_JOB=true) -- i.e. the logs vanish. Fail loudly instead.
+if [[ -z "$SLURM_LOGS_DIR" || "$SLURM_LOGS_DIR" != /* ]]; then
+    echo "[ERROR] SLURM_LOGS_DIR is empty or not absolute ('$SLURM_LOGS_DIR'); refusing to submit." >&2
+    exit 1
+fi
+mkdir -p "$SLURM_LOGS_DIR"
 
 # Calculate total tasks for SLURM
 NTASKS=$((NODES * GPUS_PER_NODE))
@@ -30,6 +46,9 @@ echo "Mem per GPU:   ${MEM_PER_GPU}"
 if [ -n "${CONSTRAINT}" ]; then
     echo "Constraint:    ${CONSTRAINT}"
 fi
+if [ -n "${QOS}" ]; then
+    echo "QOS:           ${QOS}"
+fi
 echo "Time Limit:    ${TIME}"
 echo "SLURM Logs:    ${SLURM_LOGS_DIR}"
 echo "----------------------------------------------------------------"
@@ -44,10 +63,6 @@ if [[ "$PARTITION" == *"ckpt"* ]]; then
         echo "WARNING: Partition is '$PARTITION' but Account is '$ACCOUNT'. Checkpoint jobs usually require an account ending in '-ckpt'."
     fi
 fi
-
-# Derive SLURM log directory from the environment or uwlab directory
-SLURM_LOGS_DIR=${SLURM_LOGS_DIR:-"$(dirname "$1")/slurm_logs"}
-mkdir -p "$SLURM_LOGS_DIR"
 
 # create job script with compute demands
 ### MODIFY HERE FOR YOUR JOB ###
@@ -72,6 +87,9 @@ cat <<'EOFSCRIPT' > job.sh
 
 # Signal handler: send USR1 30 seconds before time limit to trigger requeue
 #SBATCH --signal=B:USR1@30
+
+# Optional QOS
+QOS_PLACEHOLDER
 
 # Optional Constraint
 CONSTRAINT_PLACEHOLDER
@@ -114,6 +132,11 @@ wait $!
 EXIT_CODE=$?
 
 echo "[$(date)] Job finished with exit code: $EXIT_CODE"
+
+# Propagate the real exit code so SLURM reports FAILED (not COMPLETED) when the
+# training process crashes. Requeue on preemption/time-limit is handled by the
+# USR1/TERM traps above, so this only affects the terminal job state.
+exit $EXIT_CODE
 EOFSCRIPT
 
 # Replace placeholders with actual values
@@ -136,6 +159,13 @@ if [ -n "${CONSTRAINT}" ]; then
     sed -i "s%CONSTRAINT_PLACEHOLDER%#SBATCH --constraint=\"${CONSTRAINT}\"%g" job.sh
 else
     sed -i "s%CONSTRAINT_PLACEHOLDER%%g" job.sh
+fi
+
+# Handle optional QOS
+if [ -n "${QOS}" ]; then
+    sed -i "s%QOS_PLACEHOLDER%#SBATCH --qos=${QOS}%g" job.sh
+else
+    sed -i "s%QOS_PLACEHOLDER%%g" job.sh
 fi
 
 # Handle requeue flag

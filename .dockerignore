@@ -26,7 +26,7 @@ recordings/
 env_uwlab/
 # Note: _isaaclab/ is NOT ignored so it gets synced to cluster
 # ignore isaac sim symlink
-_isaac_sim?
+_isaac_sim
 # Docker history
 docker/.uw-lab-docker-history
 # datasets
@@ -34,3 +34,6 @@ docker/.uw-lab-docker-history
 # large local artifacts
 /exported/
 /checkpoints/
+# host-only analysis output + scratch (not needed for cluster training)
+/analysis/
+/tmp/

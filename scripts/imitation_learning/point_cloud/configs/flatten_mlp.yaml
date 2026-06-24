@@ -1,0 +1,23 @@
+# FlattenMLP BC policy: flatten the whole point cloud (num_points*point_dim) and encode with one
+# MLP (no per-point sharing, no permutation invariance). PAIRED with point_net.yaml -- IDENTICAL
+# action head + encoder hidden dims and all optim/data settings; the ONLY difference is
+# `architecture` (the encoder). This isolates the value of the PointNet set-encoder inductive bias.
+# The encoder's input width is num_points*point_dim (1024*4 or 512*3), auto-detected from the data.
+model:
+  architecture: flatten_mlp
+  encoder_dims: [64, 128, 256]
+  action_dims: [1024, 512, 256, 128]
+  predict_std: false
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 50
+  batch_size: 512
+
+data:
+  num_points: null   # use the full stored cloud (no subsampling)
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

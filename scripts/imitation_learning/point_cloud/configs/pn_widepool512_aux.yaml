@@ -1,0 +1,8 @@
+# pn_widepool512 + auxiliary object-pose linear-probe loss (weight 1.0). Identical to
+# pn_widepool512 in every other respect (same arch/optim/data/seed) so it's apples-to-apples vs
+# the running `pnclean_widepool512` (aux off): isolates the effect of the aux representation loss.
+# Aux targets (from clean_scenepc_100k): insertive_asset_pose + receptive_asset_pose +
+# insertive_in_receptive (18d), predicted by a linear probe on the pooled PC feature.
+model: {architecture: point_net, encoder_dims: [128, 256, 512], action_dims: [512, 256, 128], predict_std: false}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 512, aux_weight: 1.0}
+data:  {num_points: null, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0}

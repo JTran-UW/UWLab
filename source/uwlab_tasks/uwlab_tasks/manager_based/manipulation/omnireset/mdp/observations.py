@@ -6,6 +6,7 @@
 import hashlib
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -530,8 +531,21 @@ class MeshPointCloud(ManagerTermBase):
         return points_ref.reshape(env.num_envs, -1)
 
 
+def ratio_to_counts(ratios, total: int) -> tuple[int, ...]:
+    """Convert per-class ``ratios`` -> integer point counts that sum EXACTLY to
+    ``total`` (largest-remainder rounding). Used to enforce a fixed robot/insertive/
+    receptive split in the scene point clouds (e.g. (0.5, 0.25, 0.25))."""
+    raw = [r * total for r in ratios]
+    counts = [int(x) for x in raw]  # floor (ratios are non-negative)
+    rem = int(total - sum(counts))
+    order = sorted(range(len(ratios)), key=lambda i: raw[i] - counts[i], reverse=True)
+    for k in range(max(rem, 0)):
+        counts[order[k % len(counts)]] += 1
+    return tuple(counts)
+
+
 class ScenePointCloud(ManagerTermBase):
-    """Combined pointcloud from robot + insertive + receptive in robot base frame.
+    """Combined pointcloud from robot + insertive + receptive in a configurable frame.
 
     At init: samples canonical points from all robot body meshes, insertive object,
     and receptive object. Transforms all to world frame using default poses, concatenates,
@@ -539,8 +553,18 @@ class ScenePointCloud(ManagerTermBase):
     (robot body index or object) and its local-frame coordinates.
 
     At runtime: transforms each point from its local frame to world frame using current
-    body/object poses, then transforms all to robot base frame. No runtime FPS — the
-    selected points are fixed for the entire training run.
+    body/object poses, then transforms all to the reference frame given by ``ref_cfg``.
+    No runtime FPS — the selected points are fixed for the entire training run.
+
+    The output frame is set by the ``ref_cfg`` param (a ``SceneEntityCfg``):
+      * Articulation WITH ``body_names`` (e.g. ``wrist_3_link``) -> end-effector frame.
+        Preferred: the task is wrist-centric, so EE-frame points are nearly invariant
+        to arm pose and learn much better than base-frame points.
+      * Articulation WITHOUT ``body_names`` -> robot root (base) frame.
+      * Unset -> defaults to ``robot_cfg`` (base frame) for back-compat.
+
+    The reference-frame transform is applied at runtime only; the canonical-points
+    cache is frame-agnostic, so switching frames does not invalidate cached points.
 
     Returns flattened ``[num_envs, num_points * 3]``.
     """
@@ -567,6 +591,18 @@ class ScenePointCloud(ManagerTermBase):
         # overfit to a specific point selection that doesn't reproduce at deploy.
         self.resample_on_reset_robot: bool = cfg.params.get("resample_on_reset_robot", False)
 
+        # Enforced per-source split (robot, insertive, receptive). When given, the
+        # canonical selection devotes exactly these fractions of num_points to each
+        # source (e.g. (0.5, 0.25, 0.25)); None keeps the legacy fixed _BUDGET_SPLIT.
+        # NOTE: the teacher/expert ScenePC must stay on the legacy split (the JIT
+        # expert was trained on it), so this is opt-in per obs term, not global.
+        self.class_ratios = cfg.params.get("class_ratios", None)
+        self._budget = (
+            ratio_to_counts(self.class_ratios, self.num_points)
+            if self.class_ratios is not None
+            else self._BUDGET_SPLIT
+        )
+
         robot_cfg: SceneEntityCfg = cfg.params["robot_cfg"]
         ins_cfg: SceneEntityCfg = cfg.params["insertive_cfg"]
         rec_cfg: SceneEntityCfg = cfg.params["receptive_cfg"]
@@ -574,6 +610,23 @@ class ScenePointCloud(ManagerTermBase):
         self.robot: Articulation = env.scene[robot_cfg.name]
         self.insertive: RigidObject = env.scene[ins_cfg.name]
         self.receptive: RigidObject = env.scene[rec_cfg.name]
+
+        # -- Output reference frame --
+        # The final PC is expressed in this frame. ``ref_cfg`` is a SceneEntityCfg:
+        #   * Articulation WITH body_names (e.g. wrist_3_link) -> end-effector frame.
+        #     Strongly preferred: the task is wrist-centric, so EE-frame points are
+        #     nearly invariant to arm pose and far more effective for learning.
+        #   * Articulation WITHOUT body_names -> robot root (base) frame.
+        # Defaults to ``robot_cfg`` (base frame) for back-compat when unset.
+        # ``.get`` only substitutes the default for a MISSING key; an explicit
+        # ``ref_cfg=None`` (NotEECentric configs) must also fall back to the robot
+        # base frame -- hence the explicit ``or robot_cfg``.
+        ref_cfg: SceneEntityCfg = cfg.params.get("ref_cfg", robot_cfg) or robot_cfg
+        self.ref_asset = env.scene[ref_cfg.name]
+        self.ref_body_idx: int | None = None
+        if ref_cfg.body_names and isinstance(self.ref_asset, Articulation):
+            ref_cfg.resolve(env.scene)
+            self.ref_body_idx = ref_cfg.body_ids[0]  # type: ignore
 
         device = env.device
 
@@ -734,7 +787,7 @@ class ScenePointCloud(ManagerTermBase):
             "rec:" + ",".join(sorted(rec_usd_paths)),
             f"num_points:{self.num_points}",
             f"oversample:{oversample}",
-            f"budget:{self._BUDGET_SPLIT[0]},{self._BUDGET_SPLIT[1]},{self._BUDGET_SPLIT[2]}",
+            f"budget:{self._budget[0]},{self._budget[1]},{self._budget[2]}",
         ])
         return hashlib.sha256(parts.encode()).hexdigest()[:16]
 
@@ -903,7 +956,7 @@ class ScenePointCloud(ManagerTermBase):
 
             # Deterministic per-source first-N selection (avoids global-FPS's
             # num_envs / physics-warmup dependence).
-            robot_target, ins_target, rec_target = self._BUDGET_SPLIT
+            robot_target, ins_target, rec_target = self._budget
             n_robot_avail = int((task_source == self._SRC_ROBOT).sum().item())
             n_ins_avail = int((task_source == self._SRC_INSERTIVE).sum().item())
             n_rec_avail = int((task_source == self._SRC_RECEPTIVE).sum().item())
@@ -1043,16 +1096,27 @@ class ScenePointCloud(ManagerTermBase):
 
         return pts_world
 
+    def _get_ref_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (pos_w, quat_w) of the output reference frame, shape [N, 3] and [N, 4]."""
+        if self.ref_body_idx is not None:
+            return (
+                self.ref_asset.data.body_pos_w[:, self.ref_body_idx],
+                self.ref_asset.data.body_quat_w[:, self.ref_body_idx],
+            )
+        return self.ref_asset.data.root_pos_w, self.ref_asset.data.root_quat_w
+
     def __call__(
         self,
         env: ManagerBasedEnv,
         robot_cfg: SceneEntityCfg,
         insertive_cfg: SceneEntityCfg,
         receptive_cfg: SceneEntityCfg,
+        ref_cfg: SceneEntityCfg | None = None,
         num_points: int = 512,
         oversample: int = 2,
         resample_on_reset: bool = False,
         resample_on_reset_robot: bool = False,
+        class_ratios: tuple[float, float, float] | None = None,
         visualize: bool = False,
         visualize_env_ids: list[int] | None = None,
     ) -> torch.Tensor:
@@ -1219,14 +1283,875 @@ class ScenePointCloud(ManagerTermBase):
                 if vis_chunks:
                     marker.visualize(translations=torch.cat(vis_chunks, dim=0))
 
-        # -- Transform to robot base frame --
-        base_pos_w = self.robot.data.root_pos_w  # (N, 3)
-        base_quat_w = self.robot.data.root_quat_w  # (N, 4)
-        base_quat_inv = math_utils.quat_inv(base_quat_w)
+        # -- Transform to the output reference frame --
+        # Robot base frame by default; end-effector (e.g. wrist_3_link) frame when
+        # ``ref_cfg`` carries body_names. See ``__init__`` / ``_get_ref_pose_w``.
+        ref_pos_w, ref_quat_w = self._get_ref_pose_w()  # (N, 3), (N, 4)
+        ref_quat_inv = math_utils.quat_inv(ref_quat_w)
 
-        pts_base = math_utils.quat_apply(
-            base_quat_inv.unsqueeze(1).expand(-1, P, -1),
-            pts_world - base_pos_w.unsqueeze(1),
+        pts_ref = math_utils.quat_apply(
+            ref_quat_inv.unsqueeze(1).expand(-1, P, -1),
+            pts_world - ref_pos_w.unsqueeze(1),
         )
 
-        return pts_base.reshape(N, -1)
+        return pts_ref.reshape(N, -1)
+
+
+class OccludedScenePointCloud(ScenePointCloud):
+    """Robot-only point cloud in the front-camera frame with sim2real augmentation.
+
+    Subclass of :class:`ScenePointCloud` for the no-object sim2real scene. It
+    samples a dense robot point cloud **area-weighted across all robot bodies**
+    (big links get proportionally more points, so coverage is even rather than
+    concentrated on the many small gripper meshes), then on every step:
+
+        transform robot cloud -> front-camera optical frame
+          -> frustum cull (keep only points inside the camera FOV, in front)
+          -> HPR self-occlusion (keep only points not occluded from the camera)
+          -> edge bleed (boundary skirt toward the table)
+          -> low-frequency surface bias
+          -> light dropout
+          -> resample to a fixed ``num_points``.
+
+    Visibility (frustum + occlusion) uses pure geometry -- projection and the
+    Katz HPR convex hull -- **no ray tracing**, matching what the real D455 +
+    FoundationStereo will produce at eval time.
+
+    Output is expressed in the **front-camera optical frame** (z forward, x
+    right, y down), flattened to ``[num_envs, num_points * 3]`` -- the same frame
+    the real camera point cloud arrives in.
+
+    The augmentation runs on CPU (numpy/scipy) so keep ``num_envs`` modest --
+    this term is intended for sanity-checking, not large-scale training.
+
+    Visualization (when ``visualize=True``) draws the final camera-visible
+    augmented cloud (red) as markers for the ``visualize_env_ids`` envs.
+    """
+
+    # opengl -> optical (ROS) convention: rotate 180 deg about the local x-axis.
+    _QUAT_X180 = (0.0, 1.0, 0.0, 0.0)  # (w, x, y, z)
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        # NOTE: deliberately skip ScenePointCloud.__init__ (it requires
+        # insertive/receptive scene entities, which this scene does not have).
+        ManagerTermBase.__init__(self, cfg, env)
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp import pc_sim2real
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp import pc_sim2real_torch
+
+        self._aug = pc_sim2real  # numpy reference (AugParams lives here)
+        self._augt = pc_sim2real_torch  # batched GPU pipeline (used at runtime)
+        device = env.device
+
+        self.num_points: int = cfg.params.get("num_points", 2000)
+        oversample: int = cfg.params.get("oversample", 3)
+
+        # Enforced (robot, insertive, receptive) split. When set, BOTH stages honor it:
+        #   1. the DENSE pre-occlusion cloud is allocated per-class by this ratio (so
+        #      more DISTINCT object points survive the z-buffer cull -> real signal for
+        #      the maxpool encoder), and
+        #   2. the final resample is STRATIFIED to these exact output counts.
+        # None -> legacy area-weighted dense sample + uniform resample.
+        self.class_ratios = cfg.params.get("class_ratios", None)
+
+        robot_cfg: SceneEntityCfg = cfg.params["robot_cfg"]
+        self.robot: Articulation = env.scene[robot_cfg.name]
+
+        # Flags so any inherited helper that branches on them behaves single-task.
+        self.num_task_types = 1
+        self.is_multitask = False
+        self.selected_local_per_env = None
+        self.resample_on_reset = False
+        self.resample_on_reset_robot = False
+
+        # -- Optional output reference frame --
+        # By default the cloud stays in the front-camera optical frame (the frame the
+        # real D455 + FoundationStereo cloud arrives in). When ``ref_cfg`` carries
+        # body_names (e.g. wrist_3_link), the final cloud is instead re-expressed in
+        # that body's (end-effector) frame -- nearly arm-pose-invariant, matching the
+        # clean ScenePointCloud's EE-frame option. The occlusion itself is unchanged
+        # (still computed from the camera viewpoint); only the output coordinates move.
+        # NOTE: at deploy, apply the SAME camera->EE transform (known from the camera
+        # extrinsics + wrist FK) to the real cloud, or the frame won't match training.
+        ref_cfg: SceneEntityCfg | None = cfg.params.get("ref_cfg", None)
+        self.ref_asset = None
+        self.ref_body_idx: int | None = None
+        if ref_cfg is not None:
+            self.ref_asset = env.scene[ref_cfg.name]
+            if ref_cfg.body_names and isinstance(self.ref_asset, Articulation):
+                ref_cfg.resolve(env.scene)
+                self.ref_body_idx = ref_cfg.body_ids[0]  # type: ignore
+
+        # -- Optional scene objects to ALSO sample (insertive / receptive) --
+        # The dense cloud becomes robot + objects, so the SAME camera-frame HPR /
+        # frustum occlusion is computed jointly: the robot occludes objects, an
+        # object occludes the robot, and objects occlude each other -- no special
+        # cross-object code, it just falls out of one shared visibility pass.
+        # Each rigid object is a RigidObject moved by its root pose at runtime.
+        # Source codes reuse the parent's constants (robot=0, ins=1, rec=2) so the
+        # visualization can colour them distinctly.
+        self.object_assets: list[RigidObject] = []
+        self.object_src_codes: list[int] = []
+        for key, src_code in (("insertive_cfg", self._SRC_INSERTIVE), ("receptive_cfg", self._SRC_RECEPTIVE)):
+            ocfg = cfg.params.get(key, None)
+            if ocfg is not None:
+                self.object_assets.append(env.scene[ocfg.name])
+                self.object_src_codes.append(src_code)
+
+        # -- Dense scene cloud, area-weighted across ALL robot bodies + objects --
+        robot_prim_path_env0 = self.robot.cfg.prim_path.replace("env_.*", "env_0")
+        env_prefix = robot_prim_path_env0.rsplit("/", 1)[0]  # ".../env_0"
+        (self.dense_local, self.dense_body_idx, self.dense_obj_idx,
+         self.dense_source) = self._sample_scene_cloud_area_weighted(
+            robot_prim_path_env0, env_prefix, total=self.num_points * oversample, device=device,
+        )
+        n_obj = int((self.dense_obj_idx >= 0).sum())
+        print(f"[OccludedScenePointCloud] dense scene cloud: {self.dense_local.shape[0]} points "
+              f"({self.dense_local.shape[0] - n_obj} robot + {n_obj} object, "
+              f"{'ratio ' + str(self.class_ratios) if self.class_ratios else 'area-weighted'} over "
+              f"{len(self.robot.body_names)} bodies + {len(self.object_assets)} objects) "
+              f"-> {self.num_points} in camera frame")
+
+        # Per-class output targets (src_code, count) for the stratified final resample.
+        # Summed counts == num_points exactly; None -> legacy uniform resample.
+        self._out_targets = None
+        if self.class_ratios is not None:
+            nr, ni, nrec = ratio_to_counts(self.class_ratios, self.num_points)
+            self._out_targets = [
+                (self._SRC_ROBOT, nr), (self._SRC_INSERTIVE, ni), (self._SRC_RECEPTIVE, nrec),
+            ]
+            print(f"[OccludedScenePointCloud] enforced output split robot/ins/rec = {nr}/{ni}/{nrec}")
+
+        # -- Optional PER-PRIM labeling --
+        # When enabled, the cloud is the SAME ratio-enforced occluded cloud, but each output
+        # point additionally carries the SOURCE PRIM it belongs to (robot body link /
+        # insertive / receptive) as an extra trailing channel. A downstream model can then
+        # select which prims to consume (drop individual links, all robot links, or an object)
+        # and zero-pad to a fixed size AT TRAINING TIME. No per-prim cap / padding is applied
+        # here. Off by default -> legacy flat cloud, so existing datasets / experts are
+        # unaffected. Requires class_ratios (the ratio-enforced cloud) to be set.
+        self.per_prim: bool = cfg.params.get("per_prim", False)
+        if self.per_prim:
+            self._build_prim_ids()
+
+        # -- Fixed front-camera offset (relative to the /Robot root prim) --
+        # Defaults match camera_align_cfg.py front_camera (opengl convention).
+        off_pos = cfg.params.get("camera_offset_pos", (1.0770121, -0.1679045, 0.4486344))
+        off_quat_opengl = cfg.params.get("camera_offset_quat", (0.70564552, 0.46613815, 0.25072644, 0.47107948))
+        self.cam_offset_pos = torch.tensor(off_pos, dtype=torch.float32, device=device)  # (3,)
+        # Convert opengl-convention offset to optical (z forward) once at init.
+        q_opengl = torch.tensor(off_quat_opengl, dtype=torch.float32, device=device)
+        q_x180 = torch.tensor(self._QUAT_X180, dtype=torch.float32, device=device)
+        self.cam_offset_quat = math_utils.quat_mul(q_opengl, q_x180)  # (4,) optical
+        self.bg_plane_z: float = cfg.params.get("bg_plane_z", -0.02)
+
+        # -- Extrinsics domain randomization (per-env, resampled on reset) --
+        # The calibrated offset above is the CENTER; each env samples an offset in
+        # a box/cone around it so the policy is robust to real-rig miscalibration.
+        # ``camera_offset_pos_range`` is +/- meters per axis (uniform);
+        # ``camera_offset_rot_range_deg`` is the max angle (uniform in +/-, random
+        # axis). Both default to 0 -> a single fixed (calibrated) extrinsic.
+        self._off_pos_range = torch.tensor(
+            cfg.params.get("camera_offset_pos_range", (0.0, 0.0, 0.0)), dtype=torch.float32, device=device
+        )  # (3,)
+        self._off_rot_range = float(cfg.params.get("camera_offset_rot_range_deg", 0.0)) * (torch.pi / 180.0)
+        self._dr_extrinsics = bool(self._off_pos_range.abs().sum() > 0 or self._off_rot_range > 0)
+        # Per-env offset buffers (start at the calibrated center).
+        N = env.num_envs
+        self.cam_offset_pos_env = self.cam_offset_pos.unsqueeze(0).repeat(N, 1).contiguous()  # (N, 3)
+        self.cam_offset_quat_env = self.cam_offset_quat.unsqueeze(0).repeat(N, 1).contiguous()  # (N, 4) optical
+
+        # -- Augmentation params (overridable via cfg.params["aug_params"]) --
+        aug_params = cfg.params.get("aug_params", None)
+        self.aug_params = aug_params if aug_params is not None else pc_sim2real.AugParams()
+        # Per-env RNG seed base. Fixed per env => stable noise pattern across
+        # steps (occlusion still updates as the robot moves), nicer for video.
+        self._rng_seed: int = cfg.params.get("rng_seed", 0)
+        # Device-resident RNG for the batched torch augmentation (no host syncs).
+        self._generator = torch.Generator(device=device)
+        self._generator.manual_seed(int(self._rng_seed))
+        # Occlusion / z-buffer grid (Hz, Wz). The scatter-min buffer is
+        # N*Hz*Wz floats, so this trades occlusion fidelity for memory at scale.
+        self._zbuf_hw: tuple[int, int] = tuple(
+            cfg.params.get("occlusion_grid", pc_sim2real_torch.DEFAULT_ZBUF_HW)
+        )
+        # Sanity overlay: also draw the OLD numpy-pipeline visibility (frustum +
+        # Katz HPR) in a distinct colour, to eyeball torch (z-buffer) vs numpy.
+        self._viz_compare_numpy: bool = cfg.params.get("viz_compare_numpy", False)
+        # When True, visualize the FULL augmented obs cloud (incl. edge bleed +
+        # fliers) instead of the occluded source-coloured visibility -- lets you
+        # see the flier outliers against the real overlay.
+        self._visualize_augmented: bool = cfg.params.get("visualize_augmented", False)
+
+        # -- Optional per-point segmentation channel --
+        # When enabled, the obs is (num_points, 4): xyz + a class label per point,
+        # so the policy can tell robot / insertive / receptive apart instead of
+        # inferring it from geometry. Labels are configurable; the default matches
+        # the user's scheme (robot=0, insertive=-1, receptive=+1). The label rides
+        # through the augmentation via point_source (see augment_pointcloud_batched).
+        self.include_segmentation: bool = cfg.params.get("include_segmentation", False)
+        seg = cfg.params.get("segmentation_labels", None) or {"robot": 0.0, "insertive": -1.0, "receptive": 1.0}
+        # LUT indexed by source code: _SRC_ROBOT=0, _SRC_INSERTIVE=1, _SRC_RECEPTIVE=2.
+        self._seg_lut = torch.tensor(
+            [seg["robot"], seg["insertive"], seg["receptive"]], dtype=torch.float32, device=device
+        )
+
+        # -- Visualization --
+        # -- Optional real point-cloud overlay (sim-vs-real comparison) --
+        # A .ply captured by the real front camera (FoundationStereo), in the
+        # SAME camera optical frame as our output. Rendered as a distinct color
+        # so the sim2real domain gap is directly visible. Viz-only; does not
+        # affect the returned observation.
+        self.overlay_local: torch.Tensor | None = None
+        overlay_path = cfg.params.get("overlay_pc_path", None)
+        if overlay_path:
+            self.overlay_local = self._load_overlay_pc(
+                overlay_path, cfg.params.get("overlay_pc_max_points", 6000), device,
+            )
+            print(f"[OccludedScenePointCloud] overlay real cloud: {self.overlay_local.shape[0]} points "
+                  f"from {overlay_path}")
+
+        self.visualize_enabled = cfg.params.get("visualize", False)
+        if self.visualize_enabled:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+            self.visualize_env_ids = cfg.params.get("visualize_env_ids", [0])
+            # One marker per source so robot / insertive / receptive are visually
+            # distinct in the sanity check: robot=red, insertive=green, receptive=blue.
+            src_colors = {
+                self._SRC_ROBOT: ("robot", (1.0, 0.1, 0.1)),
+                self._SRC_INSERTIVE: ("insertive", (0.1, 0.9, 0.2)),
+                self._SRC_RECEPTIVE: ("receptive", (1.0, 0.2, 1.0)),  # magenta (blue clashes with table strips)
+            }
+            self._src_markers: dict[int, object] = {}
+            for code, (label, color) in src_colors.items():
+                m_cfg = VisualizationMarkersCfg(
+                    prim_path=f"/Visuals/sim2real_pc_{label}",
+                    markers={
+                        "pt": sim_utils.SphereCfg(
+                            radius=0.01,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+                        ),
+                    },
+                )
+                self._src_markers[code] = VisualizationMarkers(m_cfg)
+
+            # Optional augmented-cloud marker (red) -- the full obs cloud with
+            # edge bleed + fliers, for showing the synthetic outliers.
+            self._aug_marker = None
+            if self._visualize_augmented:
+                aug_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/sim2real_pc_augmented",
+                    markers={
+                        "pt": sim_utils.SphereCfg(
+                            radius=0.01,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.1, 0.1)),
+                        ),
+                    },
+                )
+                self._aug_marker = VisualizationMarkers(aug_cfg)
+
+            # Optional numpy-pipeline comparison marker (yellow).
+            self._numpy_marker = None
+            if self._viz_compare_numpy:
+                np_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/sim2real_pc_numpy",
+                    markers={
+                        "pt": sim_utils.SphereCfg(
+                            radius=0.01,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.85, 0.1)),
+                        ),
+                    },
+                )
+                self._numpy_marker = VisualizationMarkers(np_cfg)
+
+            self._overlay_marker = None
+            if self.overlay_local is not None:
+                overlay_color = tuple(cfg.params.get("overlay_pc_color", (0.1, 0.4, 1.0)))
+                overlay_marker_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/sim2real_pc_real",
+                    markers={
+                        "pt": sim_utils.SphereCfg(
+                            radius=0.01,
+                            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=overlay_color),
+                        ),
+                    },
+                )
+                self._overlay_marker = VisualizationMarkers(overlay_marker_cfg)
+
+    def _load_overlay_pc(self, path: str, max_points: int, device) -> torch.Tensor:
+        """Load a .ply point cloud (front-camera optical frame) -> (P, 3) tensor."""
+        import trimesh
+
+        mesh = trimesh.load(path, process=False)
+        pts = np.asarray(mesh.vertices, dtype=np.float32)
+        if max_points and pts.shape[0] > max_points:
+            rng = np.random.default_rng(0)
+            pts = pts[rng.choice(pts.shape[0], size=max_points, replace=False)]
+        return torch.from_numpy(pts).to(device)
+
+    # ------------------------------------------------------------------------
+    # Area-weighted scene mesh sampling (robot bodies + rigid objects)
+    # ------------------------------------------------------------------------
+    def _sample_scene_cloud_area_weighted(
+        self, robot_prim_path_env0: str, env_prefix: str, total: int, device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample ``total`` points over all robot bodies AND scene objects, with
+        the per-source budget allocated proportional to each source's mesh area.
+
+        A "source" is either a robot body (transformed at runtime by that body's
+        pose) or a rigid object (transformed by its root pose). pytorch3d's
+        ``sample_points_from_meshes`` is already area-uniform within a source; the
+        per-source area weighting keeps the overall surface density consistent so
+        small parts (gripper meshes, the peg) aren't over- or under-sampled
+        relative to the big arm links.
+
+        Returns ``(local (M,3), body_idx (M,), obj_idx (M,), source (M,))`` in each
+        source's local frame. For robot points ``obj_idx == -1`` and ``body_idx``
+        is the articulation body index; for object points ``body_idx == 0`` and
+        ``obj_idx`` indexes ``self.object_assets``. ``source`` is the colour code
+        (robot=0, insertive=1, receptive=2).
+        """
+        from pytorch3d.ops import sample_points_from_meshes
+
+        debug = os.environ.get("UWLAB_PC_DEBUG") == "1"
+        if debug:
+            self._debug_enumerate_robot_meshes(robot_prim_path_env0)
+
+        # Collect every source as (meshes, area, kind, idx, src_code, seed).
+        sources: list[dict] = []
+        for body_idx_int, body_name in enumerate(self.robot.body_names):
+            try:
+                meshes, area = self._load_body_meshes(f"{robot_prim_path_env0}/{body_name}", device)
+            except Exception as e:
+                if debug:
+                    print(f"[PC_DEBUG] body '{body_name}': _load_body_meshes raised {type(e).__name__}: {e}")
+                meshes, area = None, 0.0
+            if debug:
+                print(f"[PC_DEBUG] body '{body_name}': meshes={0 if meshes is None else len(meshes)} area={area:.5f}")
+            if meshes is not None and area > 0.0:
+                sources.append(dict(meshes=meshes, area=area, kind="robot", idx=body_idx_int,
+                                    src=self._SRC_ROBOT, seed=42 + body_idx_int))
+
+        for obj_i, asset in enumerate(self.object_assets):
+            obj_prim = asset.cfg.prim_path.replace("env_.*", "env_0").replace("{ENV_REGEX_NS}", env_prefix)
+            try:
+                meshes, area = self._load_body_meshes(obj_prim, device)
+            except Exception as e:
+                if debug:
+                    print(f"[PC_DEBUG] object '{obj_prim}': _load_body_meshes raised {type(e).__name__}: {e}")
+                meshes, area = None, 0.0
+            if debug:
+                print(f"[PC_DEBUG] object '{obj_prim}': meshes={0 if meshes is None else len(meshes)} area={area:.5f}")
+            if meshes is not None and area > 0.0:
+                sources.append(dict(meshes=meshes, area=area, kind="object", idx=obj_i,
+                                    src=self.object_src_codes[obj_i], seed=1000 + obj_i))
+
+        total_area = sum(s["area"] for s in sources)
+
+        # Per-source point budget. Legacy: area-weighted over ALL sources (robot wins
+        # by surface area -> ~90%+ robot). With class_ratios: split `total` into per-class
+        # budgets by ratio FIRST, then area-weight WITHIN each class. This raises the
+        # dense object density so more DISTINCT peg/hole points survive occlusion.
+        if self.class_ratios is not None:
+            cls_dense = ratio_to_counts(self.class_ratios, total)  # (robot, ins, rec)
+            cls_budget = {self._SRC_ROBOT: cls_dense[0], self._SRC_INSERTIVE: cls_dense[1],
+                          self._SRC_RECEPTIVE: cls_dense[2]}
+            cls_area: dict[int, float] = {}
+            for s in sources:
+                cls_area[s["src"]] = cls_area.get(s["src"], 0.0) + s["area"]
+
+            def _n_for(s) -> int:
+                ca = cls_area.get(s["src"], 0.0)
+                budget = cls_budget.get(s["src"], 0)
+                if ca <= 0.0 or budget <= 0:
+                    return 0
+                return max(1, int(round(budget * s["area"] / ca)))
+        else:
+            def _n_for(s) -> int:
+                return max(1, int(round(total * s["area"] / total_area)))
+
+        local_parts: list[torch.Tensor] = []
+        body_idx_parts: list[int] = []
+        obj_idx_parts: list[int] = []
+        source_parts: list[int] = []
+        for s in sources:
+            n_b = _n_for(s)
+            if n_b <= 0:
+                continue
+            with utils.temporary_seed(s["seed"]):
+                pts = sample_points_from_meshes(s["meshes"], n_b)[0]  # (n_b, 3) local
+            local_parts.append(pts)
+            n = pts.shape[0]
+            if s["kind"] == "robot":
+                body_idx_parts.extend([s["idx"]] * n)
+                obj_idx_parts.extend([-1] * n)
+            else:
+                body_idx_parts.extend([0] * n)
+                obj_idx_parts.extend([s["idx"]] * n)
+            source_parts.extend([s["src"]] * n)
+
+        local = torch.cat(local_parts, dim=0).to(device)
+        body_idx = torch.tensor(body_idx_parts, dtype=torch.long, device=device)
+        obj_idx = torch.tensor(obj_idx_parts, dtype=torch.long, device=device)
+        source = torch.tensor(source_parts, dtype=torch.long, device=device)
+
+        if debug:
+            # Count points that land inside the d415 camera mesh's local bbox to
+            # confirm the wrist camera is actually getting sampled.
+            self._debug_count_in_mesh(
+                robot_prim_path_env0, "robotiq_base_link", "d415_and_cable",
+                local[obj_idx < 0], body_idx[obj_idx < 0], device,
+            )
+        return local, body_idx, obj_idx, source
+
+    def _debug_count_in_mesh(self, robot_prim_path_env0, body_name, mesh_leaf,
+                             local, body_idx, device) -> None:
+        import numpy as _np
+        import omni.usd
+        from isaaclab.sim import get_all_matching_child_prims
+
+        bidx = list(self.robot.body_names).index(body_name)
+        body_path = f"{robot_prim_path_env0}/{body_name}"
+        hits = get_all_matching_child_prims(
+            body_path, lambda p: p.IsA(UsdGeom.Mesh) and p.GetName() == mesh_leaf
+        )
+        if not hits:
+            print(f"[PC_DEBUG] mesh '{mesh_leaf}' not found under {body_name}")
+            return
+        stage = omni.usd.get_context().get_stage()
+        body_prim = stage.GetPrimAtPath(body_path)
+        body_inv = _np.linalg.inv(_np.array(omni.usd.get_world_transform_matrix(body_prim)).T)
+        tm = utils.prim_to_trimesh(hits[0], relative_to_world=False)
+        tm.apply_transform(body_inv @ _np.array(omni.usd.get_world_transform_matrix(hits[0])).T)
+        lo = torch.tensor(tm.vertices.min(0), dtype=torch.float32, device=device)
+        hi = torch.tensor(tm.vertices.max(0), dtype=torch.float32, device=device)
+        body_pts = local[body_idx == bidx]
+        inside = ((body_pts >= lo) & (body_pts <= hi)).all(dim=1).sum().item()
+        print(f"[PC_DEBUG] body '{body_name}' total sampled pts={body_pts.shape[0]}, "
+              f"inside '{mesh_leaf}' bbox={inside}")
+
+    def _debug_enumerate_robot_meshes(self, robot_prim_path_env0: str) -> None:
+        """Print every UsdGeom.Mesh prim under the robot root, with area + per-body
+        classification. Gated by ``UWLAB_PC_DEBUG=1``; used to track down meshes
+        (e.g. the wrist camera) that aren't getting sampled."""
+        import omni.usd
+        from isaaclab.sim import get_all_matching_child_prims
+
+        body_name_set = set(self.robot.body_names)
+        all_meshes = get_all_matching_child_prims(robot_prim_path_env0, lambda p: p.IsA(UsdGeom.Mesh))
+        print(f"[PC_DEBUG] === {len(all_meshes)} total UsdGeom.Mesh prims under {robot_prim_path_env0} ===")
+        for p in all_meshes:
+            path = str(p.GetPath())
+            # which articulation body (if any) is this mesh under?
+            rel = path[len(robot_prim_path_env0) + 1:] if path.startswith(robot_prim_path_env0) else path
+            top = rel.split("/")[0] if rel else ""
+            under_body = top if top in body_name_set else f"NOT-A-BODY({top})"
+            try:
+                tm = utils.prim_to_trimesh(p, relative_to_world=False)
+                area = float(tm.area)
+            except Exception as e:
+                area = -1.0
+                print(f"[PC_DEBUG]   prim_to_trimesh FAILED: {type(e).__name__}: {e}")
+            kind = "collision" if "/collisions/" in path else "visual"
+            print(f"[PC_DEBUG]   [{kind:9s}] body={under_body:24s} area={area:.6f}  {path}")
+
+    def _load_body_meshes(self, body_prim_path: str, device):
+        """Load the camera-visible meshes under a robot body as a pytorch3d ``Meshes``.
+
+        What the external camera physically sees = the renderable **visual**
+        meshes, PLUS any **collision-only** geometry that stands in for a real
+        prop with no visual twin -- notably the wrist-mounted D415 camera
+        (``robotiq_base_link/collisions/d415_and_cable``), which is collision-only
+        in the USD but is a real object the external camera observes.
+
+        Selection rule (paths are scoped ``.../visuals/...`` vs ``.../collisions/...``):
+          - all visual meshes (the appearance), and
+          - collision meshes whose name has no same-named visual sibling
+            (collision-only props), skipping collision duplicates of visuals so
+            the gripper isn't double-weighted.
+
+        Returns ``(Meshes | None, total_area)`` with vertices in the body-local frame.
+        """
+        import numpy as _np
+        import omni.usd
+        from isaaclab.sim import get_all_matching_child_prims
+        from pytorch3d.structures import Meshes
+
+        all_meshes = get_all_matching_child_prims(body_prim_path, lambda p: p.IsA(UsdGeom.Mesh))
+        if not all_meshes:
+            return None, 0.0
+        visual_prims = [p for p in all_meshes if "/collisions/" not in str(p.GetPath())]
+        collision_prims = [p for p in all_meshes if "/collisions/" in str(p.GetPath())]
+        visual_names = {p.GetName() for p in visual_prims}
+        # collision-only extras (e.g. the d415 camera): a collision mesh with no
+        # same-named visual mesh in this body.
+        extra_prims = [p for p in collision_prims if p.GetName() not in visual_names]
+        use_prims = visual_prims + extra_prims
+        if not use_prims:
+            return None, 0.0
+
+        stage = omni.usd.get_context().get_stage()
+        body_prim = stage.GetPrimAtPath(body_prim_path)
+        body_world_tf = _np.array(omni.usd.get_world_transform_matrix(body_prim)).T
+        body_inv = _np.linalg.inv(body_world_tf)
+
+        # Merge all of this body's meshes into a SINGLE mesh (concatenate verts,
+        # offset faces). This must be one mesh, not a batch: the caller samples
+        # ``sample_points_from_meshes(meshes, n_b)[0]``, which would otherwise
+        # take points from only the first mesh and silently drop the rest (e.g.
+        # the wrist d415 camera, which is a second mesh under robotiq_base_link).
+        verts_list, faces_list, total_area = [], [], 0.0
+        vert_offset = 0
+        for cp in use_prims:
+            tm = utils.prim_to_trimesh(cp, relative_to_world=False)
+            coll_world_tf = _np.array(omni.usd.get_world_transform_matrix(cp)).T
+            tm.apply_transform(body_inv @ coll_world_tf)
+            total_area += float(tm.area)
+            verts_list.append(torch.from_numpy(tm.vertices.astype("float32")).to(device))
+            faces_list.append(torch.from_numpy(tm.faces.astype("int64")).to(device) + vert_offset)
+            vert_offset += tm.vertices.shape[0]
+        if not verts_list:
+            return None, 0.0
+        merged_verts = torch.cat(verts_list, dim=0)
+        merged_faces = torch.cat(faces_list, dim=0)
+        return Meshes(verts=[merged_verts], faces=[merged_faces]), total_area
+
+    # ------------------------------------------------------------------------
+    # Per-prim labeling
+    # ------------------------------------------------------------------------
+    def _build_prim_ids(self) -> None:
+        """Assign every dense point a PRIM id (robot body link / insertive / receptive) and
+        build the ordered prim-name table. This is the ONLY thing per-prim mode adds at
+        collection: the cloud itself is the normal ratio-enforced occluded cloud; each point
+        just additionally carries the prim it belongs to (rode through the resample as a label,
+        emitted as an extra channel). NO per-prim cap / padding here -- zero-padding is a
+        training-time concern (when a run selects a subset of prims).
+
+        Prim order: robot body links present in the dense cloud (articulation body-index
+        order), then scene objects (insertive, then receptive). ``prim_id`` indexes
+        ``self.prim_names``; objects/robot points absent from the dense cloud never appear.
+
+        Populates ``self.dense_prim_id (M,)`` (float, for label-gather) and
+        ``self.prim_names`` (the public id->name table the collector records)."""
+        robot_mask = self.dense_obj_idx < 0
+        prim_id = torch.full_like(self.dense_body_idx, -1)
+        prim_names: list[str] = []
+        next_id = 0
+        present_bodies = sorted(int(b) for b in self.dense_body_idx[robot_mask].unique().tolist())
+        for bi in present_bodies:
+            prim_id[robot_mask & (self.dense_body_idx == bi)] = next_id
+            prim_names.append(self.robot.body_names[bi])
+            next_id += 1
+        obj_label = {self._SRC_INSERTIVE: "insertive", self._SRC_RECEPTIVE: "receptive"}
+        for obj_i, src_code in enumerate(self.object_src_codes):
+            m = self.dense_obj_idx == obj_i
+            if not bool(m.any()):
+                continue
+            prim_id[m] = next_id
+            prim_names.append(obj_label.get(src_code, f"object_{obj_i}"))
+            next_id += 1
+
+        self.prim_names = prim_names
+        # Float so it rides the resample via the same gather as the seg label.
+        self.dense_prim_id = prim_id.to(torch.float32)
+        print(f"[OccludedScenePointCloud] PER-PRIM labeling: {len(prim_names)} prims "
+              f"(each output point tagged with its prim; no cap) -> {prim_names}")
+
+    # ------------------------------------------------------------------------
+    # Runtime transforms
+    # ------------------------------------------------------------------------
+    def _resample_extrinsics(self, env: ManagerBasedEnv) -> None:
+        """Resample per-env camera offsets (around the calibrated center) for envs
+        that just reset. No-op unless extrinsics DR is enabled."""
+        if not self._dr_extrinsics or not hasattr(env, "episode_length_buf"):
+            return
+        reset_mask = env.episode_length_buf == 0
+        n = int(reset_mask.sum())
+        if n == 0:
+            return
+        device = self.cam_offset_pos.device
+        # position: uniform box around the calibrated center
+        dp = (torch.rand(n, 3, generator=self._generator, device=device) * 2 - 1) * self._off_pos_range
+        self.cam_offset_pos_env[reset_mask] = self.cam_offset_pos.unsqueeze(0) + dp
+        # orientation: uniform angle in [-range, range] about a random axis
+        if self._off_rot_range > 0:
+            axis = torch.randn(n, 3, generator=self._generator, device=device)
+            axis = axis / axis.norm(dim=1, keepdim=True).clamp(min=1e-9)
+            ang = (torch.rand(n, generator=self._generator, device=device) * 2 - 1) * self._off_rot_range
+            dq = math_utils.quat_from_angle_axis(ang, axis)  # (n, 4)
+            self.cam_offset_quat_env[reset_mask] = math_utils.quat_mul(
+                dq, self.cam_offset_quat.unsqueeze(0).expand(n, -1)
+            )
+
+    def _camera_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Front-camera world pose (optical convention). Returns ``(pos (N,3), quat (N,4))``.
+
+        Uses the per-env offset buffers, so extrinsics DR (when enabled) gives each
+        env its own camera pose."""
+        root_pos_w = self.robot.data.root_pos_w  # (N, 3)
+        root_quat_w = self.robot.data.root_quat_w  # (N, 4)
+        cam_pos_w = root_pos_w + math_utils.quat_apply(root_quat_w, self.cam_offset_pos_env)
+        cam_quat_w = math_utils.quat_mul(root_quat_w, self.cam_offset_quat_env)
+        return cam_pos_w, cam_quat_w
+
+    def _ref_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """World pose of the output reference frame (``ref_cfg``). Returns ``(pos
+        (N,3), quat (N,4))`` -- the named body's pose when ``ref_body_idx`` is set
+        (end-effector frame), else the asset root pose (base frame)."""
+        if self.ref_body_idx is not None:
+            return (self.ref_asset.data.body_pos_w[:, self.ref_body_idx],
+                    self.ref_asset.data.body_quat_w[:, self.ref_body_idx])
+        return self.ref_asset.data.root_pos_w, self.ref_asset.data.root_quat_w
+
+    def _robot_points_cam(self, env: ManagerBasedEnv):
+        """Transform the dense scene cloud (robot + objects) into the front-camera
+        optical frame.
+
+        Robot points are placed by their articulation body pose; object points by
+        their rigid-object root pose. The result is one combined cloud, so the
+        downstream HPR / frustum visibility pass naturally handles robot<->object
+        and object<->object occlusion.
+
+        Returns ``(pts_cam (N,M,3), cam_pos_w (N,3), cam_quat_w (N,4))``.
+        """
+        N = env.num_envs
+        M = self.dense_local.shape[0]
+        device = env.device
+        local = self.dense_local.unsqueeze(0).expand(N, -1, -1)  # (N, M, 3)
+        pts_world = torch.zeros(N, M, 3, device=device)
+
+        # Robot points: per-point body transform.
+        robot_mask = self.dense_obj_idx < 0
+        if bool(robot_mask.any()):
+            bidx = self.dense_body_idx[robot_mask]  # (m,)
+            pos_per_pt = self.robot.data.body_pos_w[:, bidx]  # (N, m, 3)
+            quat_per_pt = self.robot.data.body_quat_w[:, bidx]  # (N, m, 4)
+            pts_world[:, robot_mask] = (
+                math_utils.quat_apply(quat_per_pt, local[:, robot_mask]) + pos_per_pt
+            )
+
+        # Object points: each object placed by its root pose.
+        for obj_i, asset in enumerate(self.object_assets):
+            omask = self.dense_obj_idx == obj_i
+            if not bool(omask.any()):
+                continue
+            m = int(omask.sum())
+            opos = asset.data.root_pos_w  # (N, 3)
+            oquat = asset.data.root_quat_w  # (N, 4)
+            pts_world[:, omask] = (
+                math_utils.quat_apply(oquat.unsqueeze(1).expand(-1, m, -1), local[:, omask])
+                + opos.unsqueeze(1)
+            )
+
+        cam_pos_w, cam_quat_w = self._camera_pose_w()
+        cam_quat_inv = math_utils.quat_inv(cam_quat_w)
+        pts_cam = math_utils.quat_apply(
+            cam_quat_inv.unsqueeze(1).expand(-1, M, -1),
+            pts_world - cam_pos_w.unsqueeze(1),
+        )  # (N, M, 3) optical frame
+        return pts_cam, cam_pos_w, cam_quat_w
+
+    def _visualize_sources(self, pts_cam: torch.Tensor, cam_pos_w: torch.Tensor, cam_quat_w: torch.Tensor) -> None:
+        """Draw the frustum+HPR-visible dense cloud, one marker colour per source.
+
+        Operates on the same per-point ``dense_source`` labels as the combined
+        cloud, so robot / insertive / receptive points stay distinguishable after
+        the joint occlusion pass.
+        """
+        params = self.aug_params
+        # Same visibility (frustum + z-buffer occlusion) as the obs, on-device, so
+        # the coloured sanity view matches exactly what the policy cloud is built
+        # from. (Edge-bleed / bias / dropout are obs-only; not shown here.)
+        valid = torch.ones(pts_cam.shape[:2], dtype=torch.bool, device=pts_cam.device)
+        if params.enable_frustum_cull:
+            valid = valid & self._augt.frustum_cull_mask(pts_cam, params)
+        if params.enable_hpr:
+            valid = valid & self._augt.zbuffer_visible_mask(pts_cam, valid, params, self._zbuf_hw)
+
+        # accumulate world-frame survivors per source across viz envs
+        per_src: dict[int, list[torch.Tensor]] = {code: [] for code in self._src_markers}
+        for vid in self.visualize_env_ids:
+            m = valid[vid]  # (M,)
+            if not bool(m.any()):
+                continue
+            p = pts_cam[vid][m]  # (m, 3)
+            world = math_utils.quat_apply(
+                cam_quat_w[vid].unsqueeze(0).expand(p.shape[0], -1), p
+            ) + cam_pos_w[vid]
+            src = self.dense_source[m]
+            for code in per_src:
+                sel = world[src == code]
+                if sel.shape[0] > 0:
+                    per_src[code].append(sel)
+        for code, marker in self._src_markers.items():
+            pts = per_src[code]
+            if pts:
+                marker.visualize(translations=torch.cat(pts, dim=0))
+
+        # Optional: overlay the OLD numpy pipeline's visibility (frustum + Katz
+        # HPR) in yellow, on the SAME dense cloud, for a torch-vs-numpy check.
+        if self._numpy_marker is not None:
+            np_world = []
+            for vid in self.visualize_env_ids:
+                p = pts_cam[vid].detach().cpu().numpy()
+                idx = np.arange(p.shape[0])
+                if params.enable_frustum_cull:
+                    fx, fy, cx, cy = params.intrinsics()
+                    keep = self._aug.frustum_cull(p, fx, fy, cx, cy, params.img_width, params.img_height, params.near)
+                    p, idx = p[keep], idx[keep]
+                if len(p) and params.enable_hpr:
+                    vis = self._aug.occlude_hpr(p, np.zeros(3, dtype=np.float32), params.hpr_radius_scale)
+                    p, idx = p[vis], idx[vis]
+                if len(p) == 0:
+                    continue
+                p_t = torch.from_numpy(p.astype(np.float32)).to(pts_cam.device)
+                np_world.append(
+                    math_utils.quat_apply(cam_quat_w[vid].unsqueeze(0).expand(p_t.shape[0], -1), p_t)
+                    + cam_pos_w[vid]
+                )
+            if np_world:
+                self._numpy_marker.visualize(translations=torch.cat(np_world, dim=0))
+
+        if os.environ.get("UWLAB_PC_DEBUG") == "1":
+            label = {self._SRC_ROBOT: "robot", self._SRC_INSERTIVE: "insertive", self._SRC_RECEPTIVE: "receptive"}
+            counts = {label[c]: int(sum(t.shape[0] for t in per_src[c])) for c in per_src}
+            print(f"[PC_DEBUG] visible (frustum+HPR) per source: {counts}")
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        robot_cfg: SceneEntityCfg,
+        insertive_cfg: SceneEntityCfg | None = None,
+        receptive_cfg: SceneEntityCfg | None = None,
+        num_points: int = 2000,
+        oversample: int = 3,
+        class_ratios: tuple[float, float, float] | None = None,
+        ref_cfg: SceneEntityCfg | None = None,
+        camera_offset_pos=None,
+        camera_offset_quat=None,
+        camera_offset_pos_range=None,
+        camera_offset_rot_range_deg: float = 0.0,
+        bg_plane_z: float = -0.02,
+        aug_params=None,
+        rng_seed: int = 0,
+        occlusion_grid=None,
+        viz_compare_numpy: bool = False,
+        visualize_augmented: bool = False,
+        visualize: bool = False,
+        visualize_env_ids: list[int] | None = None,
+        overlay_pc_path: str | None = None,
+        overlay_pc_color=None,
+        overlay_pc_max_points: int = 6000,
+        include_segmentation: bool = False,
+        segmentation_labels: dict | None = None,
+        per_prim: bool = False,
+    ) -> torch.Tensor:
+        N = env.num_envs
+        device = env.device
+
+        self._resample_extrinsics(env)  # per-env extrinsics DR for just-reset envs (no-op if disabled)
+        pts_cam, cam_pos_w, cam_quat_w = self._robot_points_cam(env)  # (N, M, 3) optical
+
+        # Background (table) plane expressed in each env's camera frame, for the
+        # edge-bleed skirt. Table is horizontal at world z = base_z + bg_plane_z.
+        base_pos_w = self.robot.data.root_pos_w  # (N, 3)
+        normal_w = torch.tensor([0.0, 0.0, 1.0], device=device).expand(N, -1)
+        point_w = base_pos_w.clone()
+        point_w[:, 2] = point_w[:, 2] + self.bg_plane_z
+        cam_quat_inv = math_utils.quat_inv(cam_quat_w)
+        plane_normal_cam = math_utils.quat_apply(cam_quat_inv, normal_w)  # (N, 3)
+        plane_point_cam = math_utils.quat_apply(cam_quat_inv, point_w - cam_pos_w)  # (N, 3)
+
+        # Fully batched, on-device augmentation (frustum -> z-buffer occlusion ->
+        # edge bleed -> surface bias -> dropout -> resample). No host syncs.
+        # With segmentation on, also gather a per-output source code via the same
+        # resample indices (out_src: (N, num_points), values in {robot,ins,rec} codes).
+        # Source codes are threaded through the pipeline when we need a per-point
+        # label out (segmentation) OR when the final resample is stratified by class.
+        out_src = None
+        out_prim = None  # per-prim: per-output-point prim id, appended as the trailing channel
+        if self.per_prim:
+            # Per-prim labeling: the NORMAL ratio-enforced occluded cloud, plus a per-point prim
+            # id gathered through the same resample. No cap / padding (training-time concern).
+            out_t, out_src, out_prim = self._augt.augment_pointcloud_batched(
+                pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
+                self.num_points, self._zbuf_hw, self._generator,
+                point_source=self.dense_source,  # class codes: needed to stratify by class_ratios
+                class_targets=self._out_targets,
+                point_prim=self.dense_prim_id,
+            )
+            if not self.include_segmentation:
+                out_src = None  # class label requested only to stratify; don't emit a seg channel
+        elif self.include_segmentation or self._out_targets is not None:
+            out_t, out_src = self._augt.augment_pointcloud_batched(
+                pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
+                self.num_points, self._zbuf_hw, self._generator,
+                point_source=self.dense_source, class_targets=self._out_targets,
+            )
+        else:
+            out_t = self._augt.augment_pointcloud_batched(
+                pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
+                self.num_points, self._zbuf_hw, self._generator,
+            )  # (N, num_points, 3) camera frame
+
+        # -- Visualize the camera-visible cloud, coloured by source --
+        # We re-run only the *visibility* stages (frustum + HPR) on the combined
+        # cloud so each surviving point keeps its source label (robot / insertive
+        # / receptive). This is exactly the occlusion the policy obs is built on;
+        # the returned obs additionally applies edge-bleed / bias / dropout.
+        if self.visualize_enabled:
+            if self._aug_marker is not None:
+                # Draw the FULL augmented obs cloud (incl. fliers) so the
+                # synthetic outliers are visible against the real overlay.
+                aug_world = []
+                for vid in self.visualize_env_ids:
+                    pc = out_t[vid]  # (P, 3) camera frame, post-augmentation
+                    aug_world.append(
+                        math_utils.quat_apply(cam_quat_w[vid].unsqueeze(0).expand(pc.shape[0], -1), pc)
+                        + cam_pos_w[vid]
+                    )
+                if aug_world:
+                    self._aug_marker.visualize(translations=torch.cat(aug_world, dim=0))
+            else:
+                self._visualize_sources(pts_cam, cam_pos_w, cam_quat_w)
+
+            # Real-cloud overlay: same camera optical frame -> world via the sim
+            # camera pose, for the first visualize env.
+            if self._overlay_marker is not None and self.overlay_local is not None and self.visualize_env_ids:
+                vid = self.visualize_env_ids[0]
+                P = self.overlay_local.shape[0]
+                ov_world = math_utils.quat_apply(
+                    cam_quat_w[vid].unsqueeze(0).expand(P, -1), self.overlay_local,
+                ) + cam_pos_w[vid]
+                self._overlay_marker.visualize(translations=ov_world)
+
+        # Re-express the cloud from the camera optical frame into the output
+        # reference frame (e.g. end-effector), if configured. Camera-frame -> world
+        # -> ref. Done after visualization (which assumes camera frame) and before the
+        # seg channel is appended, so labels stay aligned.
+        if self.ref_asset is not None:
+            P = self.num_points
+            xyz_world = (
+                math_utils.quat_apply(cam_quat_w.unsqueeze(1).expand(-1, P, -1), out_t) + cam_pos_w.unsqueeze(1)
+            )
+            ref_pos_w, ref_quat_w = self._ref_pose_w()
+            ref_quat_inv = math_utils.quat_inv(ref_quat_w)
+            out_t = math_utils.quat_apply(
+                ref_quat_inv.unsqueeze(1).expand(-1, P, -1), xyz_world - ref_pos_w.unsqueeze(1)
+            )  # (N, num_points, 3) in the reference frame
+
+        # Append the per-point class label as a 4th channel -> (N, num_points, 4).
+        # Done after visualization (which expects xyz-only) and after fliers, so the
+        # label stays aligned with the final points.
+        if self.include_segmentation:
+            labels = self._seg_lut[out_src]  # (N, num_points) source code -> class label
+            out_t = torch.cat([out_t, labels.unsqueeze(-1)], dim=-1)  # (N, num_points, 4)
+
+        # PER-PRIM: append the per-point prim id as the FINAL channel (after xyz and any seg
+        # channel). The collector peels this last channel into a separate `scene_pc_prim_id`
+        # dataset; training uses it to select prims + zero-pad. Cloud values are unchanged.
+        if out_prim is not None:
+            out_t = torch.cat([out_t, out_prim.unsqueeze(-1)], dim=-1)  # (N, num_points, base+1)
+
+        return out_t.reshape(N, -1)

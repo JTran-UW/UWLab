@@ -1,0 +1,5 @@
+# Widen the POOLED global feature to 512 (encoder_dims[-1]) -- the usual PointNet capacity
+# bottleneck. Modest head. Pairs with pn_widepool1024 to isolate pooled-width effect (same head).
+model: {architecture: point_net, encoder_dims: [128, 256, 512], action_dims: [512, 256, 128], predict_std: false}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 512}
+data:  {num_points: null, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0}

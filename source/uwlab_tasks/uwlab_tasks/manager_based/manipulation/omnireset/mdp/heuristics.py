@@ -29,6 +29,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import ContactSensor
 from isaaclab.utils import configclass
 
 if TYPE_CHECKING:
@@ -153,6 +154,37 @@ def wrist_force_magnitude(
     robot: Articulation = env.scene[robot_cfg.name]
     wrench = robot.data.body_incoming_joint_wrench_b[:, _arm_tip_idx(robot), :3]  # (N, 3)
     return torch.norm(wrench, dim=-1, keepdim=True)
+
+
+# Filter order for the peg-mounted ContactSensor (see CONTACT_SENSOR_CFG_HELP in
+# sim2real_pc_cfg). force_matrix_w columns are [left finger, right finger, hole].
+_CONTACT_FILTER_GRIPPER_COLS = (0, 1)
+_CONTACT_FILTER_RECEPTIVE_COL = 2
+
+
+def object_contact_flags(
+    env: "ManagerBasedEnv",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("peg_contacts"),
+    threshold: float = 0.0,
+) -> torch.Tensor:
+    """Ground-truth (PhysX) binary contact flags, two per step.
+
+    Reads ``force_matrix_w`` (shape ``(N, 1, M, 3)``) from a ContactSensor mounted
+    on the insertive object (peg) and filtered, in this column order, to
+    ``[left_inner_finger, right_inner_finger, receptive_object]``. Unlike the
+    ``wrist_force_magnitude`` reaction-force proxy (noisy, can't separate which
+    body is touched), this is the solver's own pairwise contact force, so the two
+    flags cleanly segment the trajectory into reach / grasp-transport / insertion.
+
+    Returns ``(N, 2)``: ``[gripper_touching_peg, peg_touching_hole]`` (1.0/0.0),
+    where ``gripper`` fires if *either* finger is in contact above ``threshold``.
+    """
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    # (N, 1, M, 3) -> per-filter force magnitude (N, M).
+    mag = torch.norm(sensor.data.force_matrix_w, dim=-1).view(env.num_envs, -1)
+    gripper = (mag[:, _CONTACT_FILTER_GRIPPER_COLS].amax(dim=1) > threshold).float()
+    insertion = (mag[:, _CONTACT_FILTER_RECEPTIVE_COL] > threshold).float()
+    return torch.stack([gripper, insertion], dim=-1)
 
 
 def joint_speed_magnitude(

@@ -1,0 +1,6 @@
+# pn_xl_residual but REAL-ROBOT proprio: only the first 6 of 12 joint_pos dims (UR5e arm joints).
+# The last 6 joint_pos entries are Robotiq gripper mimic joints that do not exist on the real robot,
+# so a sim2real-deployable policy must not consume them. Everything else matches pn_xl_residual.yaml.
+model: {architecture: residual_point_net, encoder_dims: [1024, 1024, 1024], action_dims: [2048, 2048, 2048, 2048, 2048], predict_std: false}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 512}
+data:  {num_points: null, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0, joint_pos_dims: 6}

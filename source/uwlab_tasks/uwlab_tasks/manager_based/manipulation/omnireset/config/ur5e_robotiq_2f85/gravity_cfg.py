@@ -37,6 +37,13 @@ from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85,
 
 from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.rl_state_cfg import Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg, Ur5eRobotiq2f85RelativeOSCEvalAction
 
+# ScenePCObsCfg lives in the shared pc_obs_cfg module so rl_state_cfg's normal-gravity
+# PC env can use the identical obs/encoder parameterization (re-exported for back-compat).
+from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.pc_obs_cfg import (
+    ScenePCEECentricObsCfg,
+    ScenePCObsCfg,
+)
+
 from ... import mdp as task_mdp
 
 
@@ -116,98 +123,7 @@ class ZeroGSceneCfg(InteractiveSceneCfg):
 # ===========================================================================
 # Observations
 # ===========================================================================
-@configclass
-class ScenePCObsCfg:
-    """512-pt scene PC (robot+insertive+receptive) + proprio. Shared encoder compresses PC to 32d."""
-
-    @configclass
-    class GroupCfg(ObsGroup):
-        prev_actions = ObsTerm(func=task_mdp.last_action)
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
-        end_effector_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "axis_angle",
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    @configclass
-    class PointcloudCfg(ObsGroup):
-        scene_pc = ObsTerm(
-            func=task_mdp.ScenePointCloud,
-            params={
-                "robot_cfg": SceneEntityCfg("robot"),
-                "insertive_cfg": SceneEntityCfg("insertive_object"),
-                "receptive_cfg": SceneEntityCfg("receptive_object"),
-                "visualize": False,
-                "num_points": 512,
-                # Re-sample mesh points for ins/rec subsets at episode reset.
-                # Kills the "fixed-init point arrangement → absolute yaw"
-                # memorization channel. Hydra-overridable.
-                "resample_on_reset": False,
-                # Same idea but for robot points: per-env random subset of each
-                # body's oversampled mesh pool, re-rolled each reset. Forces the
-                # encoder to be agnostic to specific robot point selections so
-                # the trained teacher generalizes across env init RNG state at
-                # deploy time. Hydra-overridable.
-                "resample_on_reset_robot": False,
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    @configclass
-    class TimeLeftCfg(ObsGroup):
-        time_left = ObsTerm(func=task_mdp.time_left)
-
-        def __post_init__(self):
-            self.enable_corruption = False
-            self.concatenate_terms = True
-
-    @configclass
-    class SuccessClassifierCfg(ObsGroup):
-        """Obs for the auxiliary V_success head: kinematic state + time_left.
-
-        ee_pose is intentionally omitted — no offline FK utility exists, and
-        joint_pos is a bijection to ee_pose, so V_success can learn it.
-        """
-
-        prev_actions = ObsTerm(func=task_mdp.last_action)
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
-        insertive_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("insertive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "quat",
-            },
-        )
-        receptive_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
-            params={
-                "target_asset_cfg": SceneEntityCfg("receptive_object"),
-                "root_asset_cfg": SceneEntityCfg("robot"),
-                "rotation_repr": "quat",
-            },
-        )
-        time_left = ObsTerm(func=task_mdp.time_left)
-
-        def __post_init__(self):
-            self.enable_corruption = False
-            self.concatenate_terms = True
-
-    proprio: GroupCfg = GroupCfg()
-    pointcloud: PointcloudCfg = PointcloudCfg()
-    time_left: TimeLeftCfg = TimeLeftCfg()
-    success_classifier: SuccessClassifierCfg = SuccessClassifierCfg()
+# ``ScenePCObsCfg`` is imported from ``pc_obs_cfg`` (see imports above).
 
 
 @configclass
@@ -357,8 +273,15 @@ class ZeroGGPSEventCfg:
         mode="reset",
         params={
             "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
-            "probs": [0.5, 0.5],
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            # "reset_types": ["ZeroGAnywhere", "ZeroGPartialAssembly"],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            # "probs": [0.5, 0.5],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
             "curriculum_target": 0.5,
             "curriculum_kappa": 2.0,
@@ -868,6 +791,66 @@ class ZeroGStateSysidFullDRTrainCfg(ZeroGStateTrainCfg):
 
 ## ^^^ this is bugged because wrong action and robot
 
+
+@configclass
+class ZeroGGPSSysidFinetuneEventCfg(ZeroGGPSSysidFullDREventCfg):
+    """FullDR events but with ADR-curriculum arm sysid ramping OLD->NEW metadata.
+
+    Identical to ``ZeroGGPSSysidFullDREventCfg`` except ``randomize_arm_sysid``
+    uses the curriculum-capable ``randomize_arm_from_sysid`` (not ``_fixed``) so
+    ``scale_progress`` can be driven from 0 (old sysid = what the policy trained on)
+    to 1 (new sysid = target deployment params). The ADR curriculum
+    ``ZeroGSysidFinetuneCurriculumCfg.adr_sysid`` ramps this automatically.
+    """
+
+    randomize_arm_sysid = EventTerm(
+        func=task_mdp.randomize_arm_from_sysid,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "joint_names": [
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ],
+            "actuator_name": "arm",
+            "scale_range": (0.8, 1.2),
+            "friction_scale_range": (0.8, 1.2),
+            "delay_range": (0, 1),
+            "start_metadata_filename": "metadata_old.yaml",
+        },
+    )
+
+
+@configclass
+class ZeroGSysidFinetuneCurriculumCfg(ZeroGCurriculumCfg):
+    """Gravity curriculum + ADR sysid ramp for finetune (OLD->NEW sysid).
+
+    Gravity floor is pinned to 1.0 so we start at full gravity — the policy
+    is already trained on full gravity and we just need to ramp sysid.
+    """
+
+    adr_sysid = CurrTerm(
+        func=task_mdp.adr_sysid_curriculum,
+        params={
+            "event_term_names": ["randomize_arm_sysid"],
+            "reset_event_name": "reset_from_states",
+            "success_threshold_up": 0.90,
+            "success_threshold_down": 0.80,
+            "delta": 0.01,
+            "update_every_n_steps": 100,
+            "initial_scale_progress": 0.0,
+            "warmup_success_threshold": 0.80,
+        },
+    )
+
+    def __post_init__(self):
+        self.gravity_curriculum.params["floor"] = 1.0
+
+
 @configclass
 class ZeroGScenePCSysidSim2RealTrainCfg(ZeroGScenePCUniformTrainCfg):
     events: ZeroGGPSSysidFullDREventCfg = ZeroGGPSSysidFullDREventCfg()
@@ -875,8 +858,40 @@ class ZeroGScenePCSysidSim2RealTrainCfg(ZeroGScenePCUniformTrainCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        
+
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+@configclass
+class ZeroGScenePCSysidSim2RealTrainEECentricCfg(ZeroGScenePCSysidSim2RealTrainCfg):
+    """``ZeroGScenePCSysidSim2RealTrainCfg`` with EE-centric scene pointcloud obs.
+
+    Identical to the SysID-Train env (``...-ZeroG-ScenePC-SysID-Train-v0``) except
+    the scene pointcloud is expressed in the end-effector (``wrist_3_link``) frame
+    rather than the robot base frame. Scene, events, rewards, actions, and curriculum
+    are all inherited unchanged. ``ScenePCEECentricObsCfg`` lives in ``pc_obs_cfg`` so
+    both the ZeroG and normal-gravity PC envs share the same EE-centric parameterization.
+    """
+
+    observations: ScenePCEECentricObsCfg = ScenePCEECentricObsCfg()
+
+
+@configclass
+class ZeroGScenePCSysidFinetuneCfg(ZeroGScenePCSysidSim2RealTrainCfg):
+    """Finetune: load converged SysID policy, ADR curriculum ramps arm sysid OLD->NEW.
+
+    Identical to ``ZeroGScenePCSysidSim2RealTrainCfg`` except:
+    - events: ``ZeroGGPSSysidFinetuneEventCfg`` — arm sysid uses ADR-capable
+      ``randomize_arm_from_sysid`` with ``start_metadata_filename="metadata_old.yaml"``
+      so scale_progress=0 reproduces training-time dynamics and scale_progress=1
+      hits the new target sysid.
+    - curriculum: adds ``adr_sysid`` term on top of gravity curriculum.
+    Resume from seed-8/12 checkpoint; obs/action dims are unchanged so strict=False
+    is not required but won't hurt.
+    """
+
+    events: ZeroGGPSSysidFinetuneEventCfg = ZeroGGPSSysidFinetuneEventCfg()
+    curriculum: ZeroGSysidFinetuneCurriculumCfg = ZeroGSysidFinetuneCurriculumCfg()
 
 # Eval cfg's observations cfg: same as ScenePCObsCfg (proprio, pointcloud,
 # time_left, success_classifier) plus a diagnostic ``heuristics`` group used

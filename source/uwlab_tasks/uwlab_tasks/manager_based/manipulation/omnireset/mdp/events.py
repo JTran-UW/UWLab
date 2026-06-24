@@ -2378,6 +2378,10 @@ class MultiResetManager(ManagerTermBase):
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         self._lazy_initialized = False
+        # Sequential-sampling counter staged from a resumed checkpoint before _lazy_init
+        # has created ``self.seq_index`` (the instance exists at env creation, but its
+        # sequential state is only built on the first reset). Applied in _lazy_init.
+        self._pending_seq_index = None
 
     def _lazy_init(self):
         """Deferred init — called on first __call__ since IsaacLab's EventManager
@@ -2543,10 +2547,70 @@ class MultiResetManager(ManagerTermBase):
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
         self.state_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        # Sequential sampling (diversity ablation): deterministic round-robin over an
+        # interleaved flat list of all reset states. We pretend the reset types are
+        # interleaved into one list (0, 1, 2, 3, 0, 1, 2, 3, ...) and keep a running
+        # index; each reset grabs the next ``len(env_ids)`` entries and advances the
+        # index, wrapping at the end. Never materialized — computed by the math:
+        #   flat index g -> reset_type = g % R, cycle = g // R, state = cycle % n[tt][rt].
+        # One independent counter per task type so multi-task envs stay in their own
+        # dataset; the wrap length L is R * (max states across reset types).
+        self.sampling_mode: str = cfg.params.get("sampling_mode", "random")
+        if self.sampling_mode not in ("random", "sequential"):
+            raise ValueError(f"Unknown sampling_mode '{self.sampling_mode}' (expected 'random' or 'sequential')")
+        self.pair_num_states_t = [
+            torch.tensor(self.pair_num_states[tt], dtype=torch.long, device=self.device)
+            for tt in range(self.num_task_types)
+        ]
+        max_states_per_type = [max(self.pair_num_states[tt]) for tt in range(self.num_task_types)]
+        self.seq_cycle_len = torch.tensor(
+            [self.num_reset_types * m for m in max_states_per_type], dtype=torch.long, device=self.device
+        )
+        self.seq_index = torch.zeros(self.num_task_types, dtype=torch.long, device=self.device)
+        # Restore a sequential counter staged from a resumed checkpoint (see load_sequential_state).
+        if self._pending_seq_index is not None:
+            self.seq_index.copy_(self._pending_seq_index.to(self.device))
+            self._pending_seq_index = None
+        # Cumulative reset-type offsets into the concatenated flat dataset (matches flat_rt_labels order).
+        self.rt_state_offsets = [
+            torch.tensor(
+                [sum(self.pair_num_states[tt][:rt]) for rt in range(self.num_reset_types)],
+                dtype=torch.long, device=self.device,
+            )
+            for tt in range(self.num_task_types)
+        ]
+
         # One-shot reset-write sanity check: after the first reset, compare the realized
         # insertive/receptive poses against the dataset we sampled from. Catches silent
         # failures in MultiAsset heterogeneous writes (e.g. peg states landing in leg envs).
         self._reset_sanity_done = False
+
+    def get_sequential_state(self) -> dict | None:
+        """Checkpoint payload for sequential reset sampling, or ``None`` if not applicable.
+
+        Only sequential mode carries cross-reset state worth persisting (the round-robin
+        counter); random sampling is stateless. Returns a CPU snapshot of ``seq_index``.
+        Safe to call before the first reset (returns any value staged by load).
+        """
+        if getattr(self, "sampling_mode", "random") != "sequential":
+            return None
+        if not self._lazy_initialized:
+            return None if self._pending_seq_index is None else {"seq_index": self._pending_seq_index.clone()}
+        return {"seq_index": self.seq_index.detach().cpu().clone()}
+
+    def load_sequential_state(self, state: dict | None) -> None:
+        """Restore the sequential counter from a checkpoint payload.
+
+        Safe to call before or after lazy init: if the sequential state hasn't been
+        built yet (no reset has run), the value is staged and applied in ``_lazy_init``.
+        """
+        if not state or "seq_index" not in state:
+            return
+        seq_index = state["seq_index"]
+        if self._lazy_initialized and hasattr(self, "seq_index"):
+            self.seq_index.copy_(seq_index.to(self.device))
+        else:
+            self._pending_seq_index = seq_index.detach().cpu().clone()
 
     def _get_monitor_id(self, task_type_idx: int, reset_type_idx: torch.Tensor) -> torch.Tensor:
         """Composite index for the success monitor: task_type * num_reset_types + reset_type."""
@@ -2639,6 +2703,7 @@ class MultiResetManager(ManagerTermBase):
         curriculum_monitor_history_len: int = 100,
         success_monitor_history_len: int = 100,
         group_size: int = 1,
+        sampling_mode: str = "random",
     ) -> None:
         self._lazy_init()
 
@@ -2731,7 +2796,50 @@ class MultiResetManager(ManagerTermBase):
             ep_lengths = self._env.episode_length_buf[env_ids].float()
             self._env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
 
-        if self.curriculum_target is not None and hasattr(self, "curriculum_monitor"):
+        if self.sampling_mode == "sequential":
+            # Deterministic round-robin over the interleaved flat list of reset states.
+            # Grab the next `len(env_ids)` entries (per task type) and advance the counter,
+            # wrapping at the end. group_size replication is intentionally not applied here.
+            R = self.num_reset_types
+            env_task_types = (
+                self.task_type_ids[env_ids]
+                if self.is_multitask
+                else torch.zeros(len(env_ids), dtype=torch.long, device=self._env.device)
+            )
+            reset_type_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+            state_indices = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+            flat_state_ids = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+
+            for tt_idx in range(self.num_task_types):
+                tt_mask = env_task_types == tt_idx
+                n = int(tt_mask.sum())
+                if n == 0:
+                    continue
+                start = int(self.seq_index[tt_idx].item())
+                L = int(self.seq_cycle_len[tt_idx].item())
+                g = (start + torch.arange(n, device=self.device)) % L
+                self.seq_index[tt_idx] = (start + n) % L
+                rt = g % R
+                cycle = g // R
+                s = cycle % self.pair_num_states_t[tt_idx][rt]
+                reset_type_indices[tt_mask] = rt
+                state_indices[tt_mask] = s
+                flat_state_ids[tt_mask] = self.rt_state_offsets[tt_idx][rt] + s
+
+            self.task_id[env_ids] = reset_type_indices
+            self.state_id[env_ids] = flat_state_ids
+
+            for tt_idx in range(self.num_task_types):
+                for rt_idx in range(R):
+                    mask = (env_task_types == tt_idx) & (reset_type_indices == rt_idx)
+                    if not mask.any():
+                        continue
+                    current_env_ids = env_ids[mask]
+                    current_state_indices = state_indices[mask]
+                    states = sample_from_nested_dict(self.pair_datasets[tt_idx][rt_idx], current_state_indices)
+                    self._reset_to(states["initial_state"], env_ids=current_env_ids, is_relative=True)
+
+        elif self.curriculum_target is not None and hasattr(self, "curriculum_monitor"):
             state_indices = torch.empty(len(env_ids), dtype=torch.int64, device=self.device)
             env_task_types = self.task_type_ids[env_ids]
 
@@ -3321,7 +3429,9 @@ class randomize_arm_from_sysid(ManagerTermBase):
         self.joint_ids = self.robot.find_joints(cfg.params["joint_names"])[0]
         self.actuator_name: str = cfg.params["actuator_name"]
 
-        # Load sysid from robot metadata (co-located with USD)
+        # Load target sysid from robot metadata (co-located with USD). This is the
+        # endpoint of the curriculum (``scale_progress = 1``) -- i.e. the *current*
+        # (post-redo) real-robot parameters.
         metadata = utils.read_metadata_from_usd_directory(self.robot.cfg.spawn.usd_path)
         sysid = metadata["sysid"]
         self.armature = sysid["armature"]
@@ -3329,7 +3439,29 @@ class randomize_arm_from_sysid(ManagerTermBase):
         self.dynamic_ratio = sysid["dynamic_ratio"]
         self.viscous_friction = sysid["viscous_friction"]
 
-        # ADR progress: 0 = armature/friction are 0, 1 = full sysid randomization
+        # Optional curriculum START point (``scale_progress = 0``). When a
+        # ``start_metadata_filename`` is given (e.g. ``metadata_old.yaml``), the
+        # curriculum interpolates each sysid nominal OLD -> NEW as scale_progress
+        # ramps 0 -> 1, so a policy trained on the OLD params starts in-distribution
+        # and is finetuned onto the NEW params. When absent, the start point is zero
+        # (legacy behaviour: frictionless -> full sysid).
+        start_filename: str | None = cfg.params.get("start_metadata_filename")
+        self.has_start_metadata: bool = start_filename is not None
+        if self.has_start_metadata:
+            start_sysid = utils.read_metadata_from_usd_directory(
+                self.robot.cfg.spawn.usd_path, filename=start_filename
+            )["sysid"]
+            self.start_armature = start_sysid["armature"]
+            self.start_static_friction = start_sysid["static_friction"]
+            self.start_dynamic_ratio = start_sysid["dynamic_ratio"]
+            self.start_viscous_friction = start_sysid["viscous_friction"]
+        else:
+            self.start_armature = [0.0] * len(self.armature)
+            self.start_static_friction = [0.0] * len(self.static_friction)
+            self.start_dynamic_ratio = [0.0] * len(self.dynamic_ratio)
+            self.start_viscous_friction = [0.0] * len(self.viscous_friction)
+
+        # ADR progress: 0 = start point (zeros, or OLD sysid), 1 = full (NEW) sysid
         self.scale_progress: float = cfg.params.get("initial_scale_progress", 0.0)
 
     def __call__(
@@ -3343,6 +3475,7 @@ class randomize_arm_from_sysid(ManagerTermBase):
         delay_range: tuple[int, int] = (0, 2),
         initial_scale_progress: float = 0.0,
         friction_scale_range: tuple[float, float] | None = None,
+        start_metadata_filename: str | None = None,
     ):
         if env_ids is None:
             env_ids = torch.arange(env.scene.num_envs, device=self.robot.device)
@@ -3353,16 +3486,24 @@ class randomize_arm_from_sysid(ManagerTermBase):
         device = self.robot.device
         p = self.scale_progress
 
-        def _scale(nominal, lo_=lo, hi_=hi):
-            val = torch.as_tensor(nominal, device=device, dtype=torch.float32)
-            return val * (lo_ + torch.rand(N, n_joints, device=device) * (hi_ - lo_))
+        def _interp(start, target):
+            # Per-joint nominal linearly interpolated start -> target by progress p.
+            start_t = torch.as_tensor(start, device=device, dtype=torch.float32)
+            target_t = torch.as_tensor(target, device=device, dtype=torch.float32)
+            return start_t + p * (target_t - start_t)
 
-        # Armature and friction: scaled by ADR progress (0 → sysid)
-        arm_vals = _scale(self.armature) * p
-        sfric_vals = _scale(self.static_friction, flo, fhi) * p
-        dratio_vals = _scale(self.dynamic_ratio, flo, fhi) * p
+        def _scale(nominal, lo_=lo, hi_=hi):
+            # nominal: per-joint (n_joints,) tensor; broadcast U(lo, hi) over envs.
+            return nominal * (lo_ + torch.rand(N, n_joints, device=device) * (hi_ - lo_))
+
+        # Armature and friction: interpolate start -> sysid by ADR progress, then
+        # randomize. With the default zero start this reduces to ``sysid * U * p``
+        # (legacy); with an OLD-sysid start it ramps OLD -> NEW.
+        arm_vals = _scale(_interp(self.start_armature, self.armature))
+        sfric_vals = _scale(_interp(self.start_static_friction, self.static_friction), flo, fhi)
+        dratio_vals = _scale(_interp(self.start_dynamic_ratio, self.dynamic_ratio), flo, fhi)
         dfric_vals = torch.minimum(dratio_vals * sfric_vals, sfric_vals)
-        vfric_vals = _scale(self.viscous_friction, flo, fhi) * p
+        vfric_vals = _scale(_interp(self.start_viscous_friction, self.viscous_friction), flo, fhi)
 
         self.robot.write_joint_armature_to_sim(arm_vals, joint_ids=self.joint_ids, env_ids=env_ids)
         self.robot.write_joint_friction_coefficient_to_sim(
@@ -3373,12 +3514,18 @@ class randomize_arm_from_sysid(ManagerTermBase):
             env_ids=env_ids,
         )
 
-        # Motor delay scaled by ADR progress (if actuator supports it)
+        # Motor delay (if actuator supports it). In the zero-start (legacy) case it
+        # ramps 0 -> delay_range with progress. In OLD -> NEW finetune mode both
+        # endpoints were trained with the full delay range, so apply it from p=0.
         delay_lo, delay_hi = delay_range
         actuator = self.robot.actuators[self.actuator_name]
         if hasattr(actuator, "positions_delay_buffer"):
-            effective_hi = int(round(p * delay_hi))
-            effective_lo = min(delay_lo, effective_hi)
+            if self.has_start_metadata:
+                effective_hi = delay_hi
+                effective_lo = delay_lo
+            else:
+                effective_hi = int(round(p * delay_hi))
+                effective_lo = min(delay_lo, effective_hi)
             delays = torch.randint(effective_lo, effective_hi + 1, (N,), device=device, dtype=torch.int)
             actuator.positions_delay_buffer.set_time_lag(delays, env_ids)
             actuator.velocities_delay_buffer.set_time_lag(delays, env_ids)

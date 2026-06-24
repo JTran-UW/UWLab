@@ -1,0 +1,21 @@
+# Combination of the winning sweep axes: big_model's wide/deep action head +
+# subsample1024's 1024-pt clouds & large batch (dropout augmentation) + an even
+# wider set encoder [256,512,512] (512d pooled feature). Trained 75ep like big_model.
+# Question: do the three best-performing axes stack?
+model:
+  encoder_dims: [256, 512, 512]
+  action_dims: [1024, 512, 256, 128]
+  predict_std: false
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 75
+  batch_size: 1024
+
+data:
+  num_points: 1024
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

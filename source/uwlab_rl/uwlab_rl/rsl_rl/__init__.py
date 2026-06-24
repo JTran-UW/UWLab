@@ -13,4 +13,5 @@ from .on_policy_runner_rma import OnPolicyRunnerRMA
 from .on_policy_runner_with_classifier import OnPolicyRunnerWithClassifier
 from .on_policy_runner_with_success_critic import OnPolicyRunnerWithSuccessCritic
 from .ppo_rma import PPO_RMA
+from .success_critic_only_runner import SuccessCriticOnlyRunner
 from .rl_cfg import BehaviorCloningCfg, OffPolicyAlgorithmCfg, RslRlFancyPpoAlgorithmCfg, SuccessCriticCfg

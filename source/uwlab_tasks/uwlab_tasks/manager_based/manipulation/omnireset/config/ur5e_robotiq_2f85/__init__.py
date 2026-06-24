@@ -110,6 +110,100 @@ gym.register(
     },
 )
 
+# Diversity ablation: same as State-v0 but reset states are drawn by a deterministic
+# interleaved round-robin over all reset types (MultiResetManager sampling_mode=
+# "sequential") instead of i.i.d. random sampling. Holds the reset stream fixed so any
+# behavioral diversity across seeds is attributable to random network init, not resets.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Sequential-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCTrainSequentialCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# Video-eval variants for the seed-diversity study: subclass the env each policy was
+# trained on, but reset ONLY from ObjectAnywhereEEAnywhere (probs=[1.0]) and terminate
+# on success. With a fixed --seed every seed of a configuration sees identical reset
+# states. See video_eval_cfg.py and analysis/record_seed_videos.py.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:StateVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Sequential-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:StateSequentialVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-Uniform-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:ZeroGScenePCUniformVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-Train-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:ZeroGScenePCSysidVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-VideoEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.video_eval_cfg:ScenePCVideoEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+# Point-cloud pre-training WITHOUT gravity curriculum: base Stage-1 train cfg
+# (full DR + EXPLICIT actuator + normal gravity) with state obs replaced by 128-pt
+# wrist-frame PCs (shared encoder). Decouples PC obs from the ZeroG recipe that all
+# registered PC envs in gravity_cfg.py are bound to.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+# Same as ScenePC-v0 but the scene pointcloud is expressed in the end-effector
+# (wrist_3_link) frame instead of the robot base frame.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-EECentric-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPCEECentricTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
 # ===========================================================================
 # ZeroG (self-contained in gravity_cfg.py, GPS + truncated success)
 # ===========================================================================
@@ -170,6 +264,29 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCSysidSim2RealTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+# Same as ZeroG-ScenePC-SysID-Train-v0 but the scene pointcloud is expressed in the
+# end-effector (wrist_3_link) frame instead of the robot base frame.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-Train-EECentric-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCSysidSim2RealTrainEECentricCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+# we use these to finetune on the new sysid parameters
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ZeroG-ScenePC-SysID-Finetune-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.gravity_cfg:ZeroGScenePCSysidFinetuneCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
     },
 )
@@ -726,6 +843,9 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.bamdp_failures_cfg:Ur5eRobotiq2f85BAMDPFailuresTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+        # Critic-only V_success fitting for a frozen expert (BAMDP value
+        # feedback); select with --agent rsl_rl_success_critic_cfg_entry_point.
+        "rsl_rl_success_critic_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCSuccessCriticOnlyRunnerCfg",
     },
 )
 
@@ -736,5 +856,118 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.bamdp_failures_cfg:Ur5eRobotiq2f85BAMDPFailuresStudentEvalCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+# Sim2real point-cloud augmentation sanity-check env (no objects, robot-only PC)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-Sim2RealPC-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85Sim2RealPCCfg"},
+)
+
+# Data-collection env: Train cfg + calibrated/DR'd sim2real point-cloud obs group
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg"},
+)
+
+# Data-collection env + peg-mounted ContactSensor recording two ground-truth contact
+# flags/step (gripper<->peg, peg<->hole). Same distribution as DataCollectionPC-v0.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-Contact-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCContactCfg"},
+)
+
+# Per-prim occluded data-collection env: scene_pc is the normal ratio-enforced occluded cloud,
+# but each point carries its SOURCE prim id (robot link / insertive / receptive). No per-prim
+# budget or padding -- the collector peels the prim id into a parallel obs/scene_pc_prim_id
+# dataset (cloud stays pure xyz). Selecting prims (pc_parts) and zero-padding to a fixed size
+# happen at TRAIN time. Same distribution as DataCollectionPC-Contact-v0 (per_prim=True, seg off).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-PerPrim-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCPerPrimCfg"},
+)
+
+# Data-collection env recording the CLEAN vanilla ScenePointCloud (no sim2real occlusion /
+# noise), resample_on_reset=True. Same distribution as DataCollectionPC-v0; only the recorded
+# cloud's realism differs (clean full cloud vs occluded + noisy).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-Clean-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCCleanCfg"},
+)
+
+# BC-PointNet eval env: roll out a trained PointNet (play.py --bc_checkpoint) on the
+# sim2real PC obs. Same scene/action/reset as DataCollectionPC, minus the teacher group.
+# The rsl_rl agent cfg is only used for seed/clip_actions -- the --bc_checkpoint path
+# bypasses the runner entirely.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for SEGMENTED-cloud models (point_dim=4: xyz + per-point class label).
+# Same as BCPointNetEval but scene_pc carries the segmentation channel (matches the
+# contact_seg dataset). Use for models trained with point_dim=4.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetSegEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetSegEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for PER-PRIM models. scene_pc is the normal occluded cloud with a trailing
+# per-point prim-id channel; bc_utils peels that channel, keeps only the checkpoint's pc_parts,
+# and zero-pads to the trained size at inference. per_prim config must match the collection env.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetPerPrimEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetPerPrimEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for CLEAN-cloud models (point_dim=3, 512 pts, no sim2real occlusion).
+# Same as BCPointNetEval but scene_pc is the clean 512-pt ScenePointCloud (matches the
+# clean_scenepc dataset). Use for models trained on clean_scenepc_100k.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetCleanEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetCleanEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for CLEAN-cloud models trained with the scene_pc NOT EE-centric
+# (ref_cfg unset -> robot frame). Same as BCPointNetCleanEval but the clean ScenePointCloud
+# is expressed in the robot frame rather than the EE frame. Use for models trained that way.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetCleanNotEECentricEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetCleanNotEECentricEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )

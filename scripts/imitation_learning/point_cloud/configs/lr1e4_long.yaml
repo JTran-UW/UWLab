@@ -1,0 +1,19 @@
+# Variant of base: lower LR (3e-4 -> 1e-4) trained 2x longer (50 -> 100 epochs).
+# Question: does a slower, longer schedule reach a better minimum than base's 50ep?
+model:
+  encoder_dims: [64, 128, 256]
+  action_dims: [512, 256, 128, 64]
+  predict_std: false
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  epochs: 100
+  batch_size: 512
+
+data:
+  num_points: null
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

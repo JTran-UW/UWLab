@@ -75,3 +75,16 @@ tests/
 .uw-lab-docker-history
 
 tmp/
+
+# Local agent sessions + large analysis/checkpoint artifacts (not for VCS)
+/.claude/
+# Ignore analysis/ contents (data dumps, npz, figures) but allow-list specific
+# "timeless" analysis scripts worth versioning. Add a `!` line per script to keep.
+/analysis/*
+!/analysis/action_multimodality.py
+!/analysis/scenepc_select_checkpoints.py
+/teachers/
+
+*.pt
+*.png
+*.mp4

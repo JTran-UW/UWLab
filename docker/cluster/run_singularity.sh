@@ -284,6 +284,8 @@ singularity exec \
     -B /etc/pki:/etc/pki:ro \
     -B /etc/ssl:/etc/ssl:ro \
     "${FORWARDED_ENV_FLAGS[@]}" \
+    --env HOME=${DOCKER_USER_HOME} \
+    --env XDG_CACHE_HOME=${DOCKER_USER_HOME}/.cache \
     --env SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt \
     --env SSL_CERT_DIR=/etc/pki/tls/certs \
     --env REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt \
