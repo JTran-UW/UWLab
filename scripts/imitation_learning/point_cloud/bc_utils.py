@@ -36,6 +36,20 @@ _BC_PC_TERMS = {"scene_pc"}
 # losses) is ignored at deploy, exactly as the trainer ignored it.
 _BC_PROPRIO_TERMS = {"joint_pos", "end_effector_pose"}
 
+# Prim-name -> segmentation label, mirroring train_point_net._SEG_LABEL (robot=0, insertive=-1,
+# receptive=+1). When a model was trained with append_prim_semantic, the seg channel was DERIVED from
+# the prim id; deploy re-derives the identical channel here from the live prim ids.
+_BC_OBJECT_PRIMS = ("insertive", "receptive")
+_BC_SEG_LABEL = {"robot": 0.0, "insertive": -1.0, "receptive": 1.0}
+
+
+def _prim_seg_lookup(names, device) -> torch.Tensor:
+    """(n_prims,) seg label indexed by prim id, from the checkpoint's pc_all_prim_names."""
+    return torch.tensor(
+        [_BC_SEG_LABEL[n if n in _BC_OBJECT_PRIMS else "robot"] for n in names],
+        device=device, dtype=torch.float32,
+    )
+
 
 def load_bc_pointnet(path: str, device: str) -> dict:
     """Reconstruct a PointNet (+ saved normalization stats) from a Lightning BC checkpoint.
@@ -67,23 +81,42 @@ def load_bc_pointnet(path: str, device: str) -> dict:
     model.load_state_dict({k[len("model.") :]: v for k, v in sd.items() if k.startswith("model.")})
     model.to(device).eval()
     norm = {k: sd[k].to(device) for k in ("proprio_mean", "proprio_std", "action_mean", "action_std")}
-    # PER-PRIM deploy layout (None for legacy flat models). The live env emits ONE flat
-    # scene_pc term holding every prim's padded block concatenated in `pc_all_prim_names`
-    # order; we slice it by `pc_all_prim_caps` and keep only `pc_parts`, in that order --
-    # exactly the blocks the model trained on. See bc_actions.
-    pc_parts = hp.get("pc_parts", None)
-    pc_all_prim_names = hp.get("pc_all_prim_names", None)
-    pc_all_prim_caps = hp.get("pc_all_prim_caps", None)
+    # PER-PRIM deploy (None for legacy flat models). The live env emits scene_pc with a trailing
+    # per-point prim-id channel; bc_actions peels it, keeps only `pc_parts`' prims (mapped via
+    # `pc_all_prim_names`), and zero-pads to `pc_pad_target` -- the size the model trained on.
     return {
         "model": model, "hp": hp, **norm,
         # point_dim / proprio_dim are surfaced here (not just on the model) so bc_actions can
         # assemble inputs identically for an eager model OR a baked JIT policy (load_bc_jit).
         "point_dim": int(model.point_dim),
         "proprio_dim": int(norm["proprio_mean"].shape[0]),
-        "pc_parts": pc_parts,
-        "pc_all_prim_names": pc_all_prim_names,
-        "pc_all_prim_caps": pc_all_prim_caps,
+        "pc_parts": hp.get("pc_parts", None),
+        "pc_all_prim_names": hp.get("pc_all_prim_names", None),
+        "pc_pad_target": hp.get("pc_pad_target", None),
+        # If set, the model's last cloud channel is a seg label DERIVED from the prim id (not present
+        # in the live cloud); bc_actions re-derives and appends it before select+pad.
+        "append_prim_semantic": bool(hp.get("append_prim_semantic", False)),
     }
+
+
+def _select_pad_batched(
+    xyz: torch.Tensor, prim_id: torch.Tensor, selected_ids: torch.Tensor, target: int
+) -> torch.Tensor:
+    """Per-prim deploy: keep points whose prim id is in ``selected_ids`` and zero-pad to a fixed
+    ``target`` size, batched over envs. ``xyz`` is ``(N, M, C)``, ``prim_id`` ``(N, M)``.
+
+    Mirrors the trainer's ``_select_and_pad`` but deterministic (no random subset) and batched:
+    selected points come first (stable argsort of the mask), the rest of each row is zeroed.
+    When an env has more than ``target`` selected points the extra are dropped (rare; only if
+    pc_pad_target < the selection's max count)."""
+    N, M, C = xyz.shape
+    mask = torch.isin(prim_id.long(), selected_ids)  # (N, M)
+    counts = mask.sum(1)  # (N,)
+    order = torch.argsort(mask.to(torch.int8), dim=1, descending=True, stable=True)  # selected first
+    take = order[:, :target]  # (N, target)
+    gathered = torch.gather(xyz, 1, take.unsqueeze(-1).expand(-1, -1, C))  # (N, target, C)
+    pad = torch.arange(target, device=xyz.device).unsqueeze(0) >= counts.unsqueeze(1)  # (N, target)
+    return gathered.masked_fill(pad.unsqueeze(-1), 0.0)
 
 
 def bc_actions(bc: dict, obs, group_name: str) -> torch.Tensor:
@@ -99,26 +132,26 @@ def bc_actions(bc: dict, obs, group_name: str) -> torch.Tensor:
     g = obs[group_name]
     keys = list(g.keys())
     pc_key = next(k for k in keys if k in _BC_PC_TERMS)
-    # point_dim (3 or 4) is baked into the policy; the live scene_pc must match.
-    pc = g[pc_key].reshape(g[pc_key].shape[0], -1, bc["point_dim"])
-    # PER-PRIM models: the live cloud is every prim's padded block concatenated in
-    # `pc_all_prim_names` order. Slice by the stored caps and keep only `pc_parts`, in the
-    # SAME order the model trained on. (Legacy flat models leave pc_all_prim_names None.)
     if bc.get("pc_all_prim_names"):
+        # PER-PRIM: the live term is (N, M, raw + 1) -- the raw cloud channels plus a trailing
+        # prim-id channel. Peel the prim id, keep only points whose prim is in pc_parts, and zero-pad
+        # to the trained size (see _select_pad_batched). (Legacy flat models leave this None.)
+        seg_appended = bc.get("append_prim_semantic", False)
+        # When the model was trained with append_prim_semantic, its point_dim INCLUDES that derived
+        # seg channel, which is NOT in the live cloud -> the live cloud has point_dim-1 raw channels.
+        raw = bc["point_dim"] - (1 if seg_appended else 0)
+        full = g[pc_key].reshape(g[pc_key].shape[0], -1, raw + 1)
         names = list(bc["pc_all_prim_names"])
-        caps = [int(c) for c in bc["pc_all_prim_caps"]]
         parts = list(bc["pc_parts"]) if bc.get("pc_parts") else names
-        total = sum(caps)
-        assert pc.shape[1] == total, (
-            f"live scene_pc has {pc.shape[1]} points but per-prim layout expects {total} "
-            f"(prims={names}, caps={caps}); eval env per_prim config must match training."
-        )
-        off = {}
-        acc = 0
-        for n, c in zip(names, caps):
-            off[n] = (acc, acc + c)
-            acc += c
-        pc = torch.cat([pc[:, off[p][0]:off[p][1], :] for p in parts], dim=1)
+        selected_ids = torch.tensor([names.index(p) for p in parts], device=full.device)
+        xyz, pid = full[..., :raw], full[..., raw]
+        if seg_appended:  # re-derive the seg label from prim id and append: [xyz, seg]
+            seg = _prim_seg_lookup(names, full.device)[pid.long()]
+            xyz = torch.cat([xyz, seg.unsqueeze(-1)], dim=-1)
+        pc = _select_pad_batched(xyz, pid, selected_ids, int(bc["pc_pad_target"]))
+    else:
+        # point_dim (3 or 4) is baked into the policy; the live scene_pc must match.
+        pc = g[pc_key].reshape(g[pc_key].shape[0], -1, bc["point_dim"])
     proprio_keys = [k for k in keys if k in _BC_PROPRIO_TERMS]
     # Real-robot proprio trim: the model's proprio_dim (== saved proprio_mean length) may be SMALLER
     # than the live obs provides. That deficit is the trailing joint_pos entries -- the last 6 of the
@@ -234,7 +267,8 @@ def export_bc_jit(bc: dict, out_path: str, device: str = "cpu") -> torch.jit.Scr
         "predict_std": predict_std,
         "pc_parts": bc.get("pc_parts"),
         "pc_all_prim_names": bc.get("pc_all_prim_names"),
-        "pc_all_prim_caps": bc.get("pc_all_prim_caps"),
+        "pc_pad_target": bc.get("pc_pad_target"),
+        "append_prim_semantic": bc.get("append_prim_semantic", False),
     }
     with open(out_path + ".meta.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -260,5 +294,6 @@ def load_bc_jit(path: str, device: str) -> dict:
         "proprio_dim": meta["proprio_dim"],
         "pc_parts": meta.get("pc_parts"),
         "pc_all_prim_names": meta.get("pc_all_prim_names"),
-        "pc_all_prim_caps": meta.get("pc_all_prim_caps"),
+        "pc_pad_target": meta.get("pc_pad_target"),
+        "append_prim_semantic": meta.get("append_prim_semantic", False),
     }

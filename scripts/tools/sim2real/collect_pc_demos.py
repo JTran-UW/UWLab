@@ -103,18 +103,41 @@ def main():
     obs_keys = list(group_obs.keys())
     print(f"[collect] recording obs group '{args_cli.obs_group}' terms: {obs_keys}")
 
-    # Point-cloud channel count: 3 (xyz) or 4 (xyz + per-point segmentation label).
-    # Inferred from the live flat dim / num_points so it follows include_segmentation
-    # automatically (no hardcoded 3). Used to reshape scene_pc on save and recorded as
-    # an attr so the trainer rebuilds the right point_dim.
+    # -- Per-prim labeling discovery --
+    # A PER-PRIM PC obs term (OccludedScenePointCloud with per_prim=True) exposes ``prim_names``
+    # (the id->name table) on its instance and appends a per-point prim id as the FINAL channel
+    # of scene_pc. When present, we peel that last channel into a separate ``scene_pc_prim_id``
+    # dataset and record the name table, so training can select prims + zero-pad. Absent ->
+    # legacy flat scene_pc (no prim id).
+    pc_term_name = next((k for k in obs_keys if k in _PC_TERMS), None)
+    prim_names = None
+    if pc_term_name is not None:
+        om = env.unwrapped.observation_manager
+        for name, tcfg in zip(
+            om._group_obs_term_names[args_cli.obs_group], om._group_obs_term_cfgs[args_cli.obs_group]
+        ):
+            if name == pc_term_name:
+                prim_names = getattr(tcfg.func, "prim_names", None)
+                break
+    per_prim = prim_names is not None
+
+    # Point-cloud channel count: 3 (xyz) or 4 (xyz + per-point segmentation label). Inferred
+    # from the live flat dim / num_points. For per-prim the live term has ONE extra trailing
+    # channel (the prim id), which we peel off -> base pc_point_dim is one less.
     pc_point_dim = 3
     pc_num_points = group_cfg.scene_pc.params.get("num_points") if hasattr(group_cfg, "scene_pc") else None
     if pc_num_points:
         for k in obs_keys:
             if k in _PC_TERMS:
-                pc_point_dim = int(group_obs[k].shape[1] // pc_num_points)
+                total_ch = int(group_obs[k].shape[1] // pc_num_points)
+                pc_point_dim = total_ch - 1 if per_prim else total_ch
                 break
-    print(f"[collect] point-cloud channels: {pc_point_dim} (num_points={pc_num_points})")
+    if per_prim:
+        print(f"[collect] PER-PRIM cloud: {pc_num_points} points, {pc_point_dim} ch + prim-id channel "
+              f"-> obs/{pc_term_name} (xyz) + obs/{pc_term_name}_prim_id (int)")
+        print(f"[collect]   prims ({len(prim_names)}): {prim_names}")
+    else:
+        print(f"[collect] point-cloud channels: {pc_point_dim} (num_points={pc_num_points})")
 
     h5 = None
     data_grp = None
@@ -126,6 +149,11 @@ def main():
         data_grp.attrs["obs_group"] = args_cli.obs_group
         data_grp.attrs["obs_keys"] = obs_keys
         data_grp.attrs["pc_point_dim"] = pc_point_dim
+        if per_prim:
+            # Per-prim: the trainer reads the id->name table to map each point's prim id
+            # (obs/<pc_term>_prim_id) to a name, then selects via pc_parts + zero-pads.
+            data_grp.attrs["pc_term"] = pc_term_name
+            data_grp.attrs["pc_prim_names"] = prim_names
     else:
         print("[collect] --no_save: benchmark mode, HDF5 will NOT be written.", flush=True)
 
@@ -151,6 +179,14 @@ def main():
         for k in obs_keys:
             arr = np.stack(ep_obs[k])  # (T, term_dim)
             if k in _PC_TERMS:
+                if per_prim:
+                    # Live term is (T, N, pc_point_dim + 1): peel the trailing prim-id channel
+                    # into its own int dataset; keep the xyz(+seg) cloud under the term name.
+                    arr = arr.reshape(arr.shape[0], -1, pc_point_dim + 1)
+                    og.create_dataset(k, data=arr[:, :, :pc_point_dim], compression=comp)
+                    og.create_dataset(f"{k}_prim_id", data=arr[:, :, pc_point_dim].astype(np.int16),
+                                      compression=comp)
+                    continue
                 arr = arr.reshape(arr.shape[0], -1, pc_point_dim)  # (T, num_points, pc_point_dim)
             og.create_dataset(k, data=arr, compression=comp)
         n_saved += 1

@@ -1363,6 +1363,24 @@ class OccludedScenePointCloud(ScenePointCloud):
         self.resample_on_reset = False
         self.resample_on_reset_robot = False
 
+        # -- Optional output reference frame --
+        # By default the cloud stays in the front-camera optical frame (the frame the
+        # real D455 + FoundationStereo cloud arrives in). When ``ref_cfg`` carries
+        # body_names (e.g. wrist_3_link), the final cloud is instead re-expressed in
+        # that body's (end-effector) frame -- nearly arm-pose-invariant, matching the
+        # clean ScenePointCloud's EE-frame option. The occlusion itself is unchanged
+        # (still computed from the camera viewpoint); only the output coordinates move.
+        # NOTE: at deploy, apply the SAME camera->EE transform (known from the camera
+        # extrinsics + wrist FK) to the real cloud, or the frame won't match training.
+        ref_cfg: SceneEntityCfg | None = cfg.params.get("ref_cfg", None)
+        self.ref_asset = None
+        self.ref_body_idx: int | None = None
+        if ref_cfg is not None:
+            self.ref_asset = env.scene[ref_cfg.name]
+            if ref_cfg.body_names and isinstance(self.ref_asset, Articulation):
+                ref_cfg.resolve(env.scene)
+                self.ref_body_idx = ref_cfg.body_ids[0]  # type: ignore
+
         # -- Optional scene objects to ALSO sample (insertive / receptive) --
         # The dense cloud becomes robot + objects, so the SAME camera-frame HPR /
         # frustum occlusion is computed jointly: the robot occludes objects, an
@@ -1402,6 +1420,18 @@ class OccludedScenePointCloud(ScenePointCloud):
                 (self._SRC_ROBOT, nr), (self._SRC_INSERTIVE, ni), (self._SRC_RECEPTIVE, nrec),
             ]
             print(f"[OccludedScenePointCloud] enforced output split robot/ins/rec = {nr}/{ni}/{nrec}")
+
+        # -- Optional PER-PRIM labeling --
+        # When enabled, the cloud is the SAME ratio-enforced occluded cloud, but each output
+        # point additionally carries the SOURCE PRIM it belongs to (robot body link /
+        # insertive / receptive) as an extra trailing channel. A downstream model can then
+        # select which prims to consume (drop individual links, all robot links, or an object)
+        # and zero-pad to a fixed size AT TRAINING TIME. No per-prim cap / padding is applied
+        # here. Off by default -> legacy flat cloud, so existing datasets / experts are
+        # unaffected. Requires class_ratios (the ratio-enforced cloud) to be set.
+        self.per_prim: bool = cfg.params.get("per_prim", False)
+        if self.per_prim:
+            self._build_prim_ids()
 
         # -- Fixed front-camera offset (relative to the /Robot root prim) --
         # Defaults match camera_align_cfg.py front_camera (opengl convention).
@@ -1788,6 +1818,47 @@ class OccludedScenePointCloud(ScenePointCloud):
         return Meshes(verts=[merged_verts], faces=[merged_faces]), total_area
 
     # ------------------------------------------------------------------------
+    # Per-prim labeling
+    # ------------------------------------------------------------------------
+    def _build_prim_ids(self) -> None:
+        """Assign every dense point a PRIM id (robot body link / insertive / receptive) and
+        build the ordered prim-name table. This is the ONLY thing per-prim mode adds at
+        collection: the cloud itself is the normal ratio-enforced occluded cloud; each point
+        just additionally carries the prim it belongs to (rode through the resample as a label,
+        emitted as an extra channel). NO per-prim cap / padding here -- zero-padding is a
+        training-time concern (when a run selects a subset of prims).
+
+        Prim order: robot body links present in the dense cloud (articulation body-index
+        order), then scene objects (insertive, then receptive). ``prim_id`` indexes
+        ``self.prim_names``; objects/robot points absent from the dense cloud never appear.
+
+        Populates ``self.dense_prim_id (M,)`` (float, for label-gather) and
+        ``self.prim_names`` (the public id->name table the collector records)."""
+        robot_mask = self.dense_obj_idx < 0
+        prim_id = torch.full_like(self.dense_body_idx, -1)
+        prim_names: list[str] = []
+        next_id = 0
+        present_bodies = sorted(int(b) for b in self.dense_body_idx[robot_mask].unique().tolist())
+        for bi in present_bodies:
+            prim_id[robot_mask & (self.dense_body_idx == bi)] = next_id
+            prim_names.append(self.robot.body_names[bi])
+            next_id += 1
+        obj_label = {self._SRC_INSERTIVE: "insertive", self._SRC_RECEPTIVE: "receptive"}
+        for obj_i, src_code in enumerate(self.object_src_codes):
+            m = self.dense_obj_idx == obj_i
+            if not bool(m.any()):
+                continue
+            prim_id[m] = next_id
+            prim_names.append(obj_label.get(src_code, f"object_{obj_i}"))
+            next_id += 1
+
+        self.prim_names = prim_names
+        # Float so it rides the resample via the same gather as the seg label.
+        self.dense_prim_id = prim_id.to(torch.float32)
+        print(f"[OccludedScenePointCloud] PER-PRIM labeling: {len(prim_names)} prims "
+              f"(each output point tagged with its prim; no cap) -> {prim_names}")
+
+    # ------------------------------------------------------------------------
     # Runtime transforms
     # ------------------------------------------------------------------------
     def _resample_extrinsics(self, env: ManagerBasedEnv) -> None:
@@ -1823,6 +1894,15 @@ class OccludedScenePointCloud(ScenePointCloud):
         cam_pos_w = root_pos_w + math_utils.quat_apply(root_quat_w, self.cam_offset_pos_env)
         cam_quat_w = math_utils.quat_mul(root_quat_w, self.cam_offset_quat_env)
         return cam_pos_w, cam_quat_w
+
+    def _ref_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """World pose of the output reference frame (``ref_cfg``). Returns ``(pos
+        (N,3), quat (N,4))`` -- the named body's pose when ``ref_body_idx`` is set
+        (end-effector frame), else the asset root pose (base frame)."""
+        if self.ref_body_idx is not None:
+            return (self.ref_asset.data.body_pos_w[:, self.ref_body_idx],
+                    self.ref_asset.data.body_quat_w[:, self.ref_body_idx])
+        return self.ref_asset.data.root_pos_w, self.ref_asset.data.root_quat_w
 
     def _robot_points_cam(self, env: ManagerBasedEnv):
         """Transform the dense scene cloud (robot + objects) into the front-camera
@@ -1947,6 +2027,7 @@ class OccludedScenePointCloud(ScenePointCloud):
         num_points: int = 2000,
         oversample: int = 3,
         class_ratios: tuple[float, float, float] | None = None,
+        ref_cfg: SceneEntityCfg | None = None,
         camera_offset_pos=None,
         camera_offset_quat=None,
         camera_offset_pos_range=None,
@@ -1964,6 +2045,7 @@ class OccludedScenePointCloud(ScenePointCloud):
         overlay_pc_max_points: int = 6000,
         include_segmentation: bool = False,
         segmentation_labels: dict | None = None,
+        per_prim: bool = False,
     ) -> torch.Tensor:
         N = env.num_envs
         device = env.device
@@ -1988,7 +2070,20 @@ class OccludedScenePointCloud(ScenePointCloud):
         # Source codes are threaded through the pipeline when we need a per-point
         # label out (segmentation) OR when the final resample is stratified by class.
         out_src = None
-        if self.include_segmentation or self._out_targets is not None:
+        out_prim = None  # per-prim: per-output-point prim id, appended as the trailing channel
+        if self.per_prim:
+            # Per-prim labeling: the NORMAL ratio-enforced occluded cloud, plus a per-point prim
+            # id gathered through the same resample. No cap / padding (training-time concern).
+            out_t, out_src, out_prim = self._augt.augment_pointcloud_batched(
+                pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
+                self.num_points, self._zbuf_hw, self._generator,
+                point_source=self.dense_source,  # class codes: needed to stratify by class_ratios
+                class_targets=self._out_targets,
+                point_prim=self.dense_prim_id,
+            )
+            if not self.include_segmentation:
+                out_src = None  # class label requested only to stratify; don't emit a seg channel
+        elif self.include_segmentation or self._out_targets is not None:
             out_t, out_src = self._augt.augment_pointcloud_batched(
                 pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
                 self.num_points, self._zbuf_hw, self._generator,
@@ -2031,11 +2126,32 @@ class OccludedScenePointCloud(ScenePointCloud):
                 ) + cam_pos_w[vid]
                 self._overlay_marker.visualize(translations=ov_world)
 
+        # Re-express the cloud from the camera optical frame into the output
+        # reference frame (e.g. end-effector), if configured. Camera-frame -> world
+        # -> ref. Done after visualization (which assumes camera frame) and before the
+        # seg channel is appended, so labels stay aligned.
+        if self.ref_asset is not None:
+            P = self.num_points
+            xyz_world = (
+                math_utils.quat_apply(cam_quat_w.unsqueeze(1).expand(-1, P, -1), out_t) + cam_pos_w.unsqueeze(1)
+            )
+            ref_pos_w, ref_quat_w = self._ref_pose_w()
+            ref_quat_inv = math_utils.quat_inv(ref_quat_w)
+            out_t = math_utils.quat_apply(
+                ref_quat_inv.unsqueeze(1).expand(-1, P, -1), xyz_world - ref_pos_w.unsqueeze(1)
+            )  # (N, num_points, 3) in the reference frame
+
         # Append the per-point class label as a 4th channel -> (N, num_points, 4).
         # Done after visualization (which expects xyz-only) and after fliers, so the
         # label stays aligned with the final points.
         if self.include_segmentation:
             labels = self._seg_lut[out_src]  # (N, num_points) source code -> class label
             out_t = torch.cat([out_t, labels.unsqueeze(-1)], dim=-1)  # (N, num_points, 4)
+
+        # PER-PRIM: append the per-point prim id as the FINAL channel (after xyz and any seg
+        # channel). The collector peels this last channel into a separate `scene_pc_prim_id`
+        # dataset; training uses it to select prims + zero-pad. Cloud values are unchanged.
+        if out_prim is not None:
+            out_t = torch.cat([out_t, out_prim.unsqueeze(-1)], dim=-1)  # (N, num_points, base+1)
 
         return out_t.reshape(N, -1)

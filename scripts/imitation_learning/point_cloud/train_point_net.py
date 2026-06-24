@@ -15,6 +15,10 @@ The PC term is ``scene_pc`` (``(T, num_points, 3)``); every *other* obs term
 the dataset's ``obs_keys`` attr -- into the proprio vector. The whole dataset is loaded
 into RAM (the machine has ~1 TB; a 100k-demo set is ~50 GB).
 
+This is just the training entry point: the dataset lives in ``pc_dataset.py``
+(:class:`PCDemoDataset`) and the Lightning model in ``pc_bc_module.py``
+(:class:`PointNetBC`); ``bc_utils.py`` is the matching deploy/eval path.
+
 Usage::
 
     python scripts/imitation_learning/point_cloud/train_point_net.py \\
@@ -34,246 +38,20 @@ import sys
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 
-import h5py
-import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, random_split
 
 import lightning as L
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
-# Policy modules live next to this script.
+# Dataset + Lightning model live next to this script (importable regardless of caller cwd).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from flatten_mlp import FlattenMLP  # noqa: E402
-from point_net import PointNet  # noqa: E402
-from residual_point_net import ResidualPointNet  # noqa: E402
-
-_ARCHITECTURES = {
-    "point_net": PointNet,
-    "flatten_mlp": FlattenMLP,
-    "residual_point_net": ResidualPointNet,
-}
-
-# Obs terms that are point clouds (stored (T, num_points, point_dim)) -> the PointNet set input.
-_PC_TERMS = {"scene_pc"}
-# Proprio is an explicit ALLOWLIST (not "everything that isn't a PC"). This guarantees that
-# recording extra obs terms in the collection env -- privileged poses, contact flags, etc.,
-# kept "on the side" for future aux losses -- never silently changes the policy input. Any
-# stored obs term not in _PC_TERMS or _PROPRIO_TERMS is aux metadata and is ignored by the
-# model. {joint_pos, end_effector_pose} reproduces every existing dataset's 18d proprio.
-_PROPRIO_TERMS = {"joint_pos", "end_effector_pose"}
-# Privileged scene-state targets for the OPTIONAL auxiliary linear-probe loss (predicted from the
-# pooled PC feature; NOT a policy input). Ordered list -> deterministic concat. Terms absent from a
-# dataset are skipped; if none are present (or aux_weight=0) the aux loss is silently disabled.
-_AUX_TERMS = ["insertive_asset_pose", "receptive_asset_pose", "insertive_in_receptive"]
+from pc_bc_module import _ARCHITECTURES, PointNetBC  # noqa: E402
+from pc_dataset import _AUX_TERMS, PCDemoDataset  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-class PCDemoDataset(Dataset):
-    """All (point_cloud, proprio, action) timesteps from an HDF5 demo file, in RAM.
-
-    ``proprio`` is the concatenation of every non-PC obs term, in the dataset's
-    ``obs_keys`` order. If ``num_points`` is smaller than the stored cloud size, each
-    ``__getitem__`` randomly subsamples that many points (cheap PC augmentation).
-    """
-
-    def __init__(self, path: str, num_points: int | None = None, success_only: bool = True):
-        super().__init__()
-        with h5py.File(path, "r") as f:
-            data = f["data"]
-            obs_keys = list(data.attrs["obs_keys"])
-            pc_key = next(k for k in obs_keys if k in _PC_TERMS)
-            # Allowlist + preserve stored order (eval in bc_utils rebuilds the same order).
-            self.proprio_keys = [k for k in obs_keys if k in _PROPRIO_TERMS]
-            # Aux-probe targets present in this dataset, in the fixed _AUX_TERMS order.
-            self.aux_keys = [k for k in _AUX_TERMS if k in obs_keys]
-
-            demos = sorted(data.keys(), key=lambda s: int(s.split("_")[1]))
-            if success_only:
-                demos = [d for d in demos if bool(data[d].attrs.get("success", True))]
-
-            total = sum(data[d]["actions"].shape[0] for d in demos)
-            pc_shape = data[demos[0]]["obs"][pc_key].shape  # (T, n_pts, point_dim)
-            n_pts = pc_shape[1]
-            point_dim = pc_shape[2]  # 3 = xyz, 4 = xyz + segmentation label
-            proprio_dim = sum(data[demos[0]]["obs"][k].shape[1] for k in self.proprio_keys)
-            aux_dim = sum(data[demos[0]]["obs"][k].shape[1] for k in self.aux_keys)
-            action_dim = data[demos[0]]["actions"].shape[1]
-
-            # Preallocate once and fill (avoids the 2x peak of np.concatenate).
-            self.points = np.empty((total, n_pts, point_dim), dtype=np.float32)
-            self.proprio = np.empty((total, proprio_dim), dtype=np.float32)
-            self.actions = np.empty((total, action_dim), dtype=np.float32)
-            self.aux = np.empty((total, aux_dim), dtype=np.float32) if aux_dim else None
-
-            i = 0
-            for d in demos:
-                g = data[d]
-                t = g["actions"].shape[0]
-                self.points[i : i + t] = g["obs"][pc_key][:]
-                self.proprio[i : i + t] = np.concatenate([g["obs"][k][:] for k in self.proprio_keys], axis=1)
-                self.actions[i : i + t] = g["actions"][:]
-                if self.aux is not None:
-                    self.aux[i : i + t] = np.concatenate([g["obs"][k][:] for k in self.aux_keys], axis=1)
-                i += t
-
-            self.expert_success_rate = float(data.attrs.get("expert_success_rate", float("nan")))
-
-        self.points = torch.from_numpy(self.points)
-        self.proprio = torch.from_numpy(self.proprio)
-        self.actions = torch.from_numpy(self.actions)
-        self.aux = torch.from_numpy(self.aux) if self.aux is not None else None
-        self.n_pts = n_pts
-        self.point_dim = point_dim
-        self.proprio_dim = proprio_dim
-        self.aux_dim = aux_dim
-        self.action_dim = action_dim
-        self.subsample = num_points if (num_points and num_points < n_pts) else None
-
-    def __len__(self):
-        return self.points.shape[0]
-
-    def __getitem__(self, idx):
-        pts = self.points[idx]
-        if self.subsample is not None:
-            sel = torch.randint(0, self.n_pts, (self.subsample,))
-            pts = pts[sel]
-        # aux is an empty (0,) tensor when the dataset has no aux-probe targets.
-        aux = self.aux[idx] if self.aux is not None else self.points.new_zeros(0)
-        return pts, self.proprio[idx], self.actions[idx], aux
-
-
-# ---------------------------------------------------------------------------
-# Lightning module
-# ---------------------------------------------------------------------------
-def build_policy(
-    architecture: str,
-    encoder_dims: list[int],
-    action_dims: list[int],
-    proprio_dim: int,
-    action_dim: int,
-    predict_std: bool,
-    point_dim: int,
-    num_points: int,
-):
-    cls = _ARCHITECTURES[architecture]
-    kwargs = dict(
-        encoder_hidden_dims=encoder_dims,
-        action_hidden_dims=action_dims,
-        proprio_dim=proprio_dim,
-        action_dim=action_dim,
-        predict_std=predict_std,
-        point_dim=point_dim,
-    )
-    if architecture == "flatten_mlp":
-        kwargs["num_points"] = num_points
-    return cls(**kwargs)
-
-
-class PointNetBC(L.LightningModule):
-    """Behavior-cloning wrapper around a point-cloud policy with proprio/action z-scoring."""
-
-    def __init__(
-        self,
-        architecture: str,
-        proprio_dim: int,
-        action_dim: int,
-        encoder_dims: list[int],
-        action_dims: list[int],
-        predict_std: bool,
-        lr: float,
-        weight_decay: float,
-        proprio_mean: torch.Tensor,
-        proprio_std: torch.Tensor,
-        action_mean: torch.Tensor,
-        action_std: torch.Tensor,
-        point_dim: int,
-        num_points: int,
-        aux_dim: int = 0,
-        aux_weight: float = 0.0,
-        aux_mean: torch.Tensor | None = None,
-        aux_std: torch.Tensor | None = None,
-    ):
-        super().__init__()
-        self.save_hyperparameters(
-            ignore=["proprio_mean", "proprio_std", "action_mean", "action_std", "aux_mean", "aux_std"]
-        )
-        self.model = build_policy(
-            architecture=architecture,
-            encoder_dims=encoder_dims,
-            action_dims=action_dims,
-            proprio_dim=proprio_dim,
-            action_dim=action_dim,
-            predict_std=predict_std,
-            point_dim=point_dim,
-            num_points=num_points,
-        )
-        # Normalization stats travel with the checkpoint (and back out at deploy time).
-        self.register_buffer("proprio_mean", proprio_mean)
-        self.register_buffer("proprio_std", proprio_std)
-        self.register_buffer("action_mean", action_mean)
-        self.register_buffer("action_std", action_std)
-        # Auxiliary linear probe: pooled PC feature -> privileged object-pose targets. Enabled only
-        # when the dataset has aux targets AND aux_weight>0. A single Linear (no nonlinearity) so the
-        # representational burden falls on the shared encoder (gradients flow through `pooled`).
-        self.use_aux = aux_dim > 0 and aux_weight > 0.0
-        if self.use_aux:
-            self.aux_probe = torch.nn.Linear(self.model.pooled_dim, aux_dim)
-            self.register_buffer("aux_mean", aux_mean)
-            self.register_buffer("aux_std", aux_std)
-
-    def _action_loss(self, out, action):
-        if self.model.predict_std:
-            mean, log_std = out
-            return torch.nn.functional.gaussian_nll_loss(mean, action, torch.exp(2 * log_std))
-        return torch.nn.functional.mse_loss(out, action)
-
-    def _step(self, batch, stage: str):
-        points, proprio, action, aux = batch
-        proprio = (proprio - self.proprio_mean) / self.proprio_std
-        action = (action - self.action_mean) / self.action_std
-        # Single forward; also grab the pooled feature for the aux probe.
-        out, pooled = self.model(points, proprio, return_pooled=True)
-        action_loss = self._action_loss(out, action)
-
-        total = action_loss
-        bs = points.shape[0]
-        if self.use_aux:
-            aux_t = (aux - self.aux_mean) / self.aux_std
-            aux_loss = torch.nn.functional.mse_loss(self.aux_probe(pooled), aux_t)
-            total = action_loss + self.hparams.aux_weight * aux_loss
-            self.log(f"{stage}/aux_loss", aux_loss, batch_size=bs, sync_dist=True)
-
-        # An action-space (denormalized, per-dim RMS) error is the interpretable metric.
-        with torch.no_grad():
-            mean = out[0] if isinstance(out, tuple) else out
-            act_mae = ((mean - action).abs() * self.action_std).mean()
-        # val/loss = pure ACTION loss -> checkpoint selection + comparability stay on the BC objective,
-        # independent of aux_weight. The optimizer still minimizes `total` (action + aux).
-        self.log(f"{stage}/loss", action_loss, prog_bar=True, batch_size=bs, sync_dist=True)
-        self.log(f"{stage}/total_loss", total, batch_size=bs, sync_dist=True)
-        self.log(f"{stage}/action_mae", act_mae, prog_bar=(stage == "val"), batch_size=bs, sync_dist=True)
-        return total
-
-    def training_step(self, batch, _):
-        return self._step(batch, "train")
-
-    def validation_step(self, batch, _):
-        return self._step(batch, "val")
-
-    def configure_optimizers(self):
-        opt = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.trainer.max_epochs)
-        return {"optimizer": opt, "lr_scheduler": sched}
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Config (dataclasses, populated from YAML + CLI overrides)
 # ---------------------------------------------------------------------------
@@ -295,10 +73,11 @@ class OptimConfig:
     weight_decay: float = 1e-4
     epochs: int = 50
     batch_size: int = 512
-    # Weight on the auxiliary linear-probe loss (predict privileged object poses from the pooled
-    # PC feature). 0 = off. The probe is linear, so gradients shape the ENCODER's representation.
-    # val/loss (checkpoint-selection metric) stays the pure action loss regardless.
+    # Aux object-pose probe loss weight (linear probe off the pooled feature; shapes the encoder).
+    # 0 = off; val/loss stays the pure action loss regardless.
     aux_weight: float = 0.0
+    # BC action loss weight. 1 = normal BC; 0 (with aux_weight>0) = pure state-extraction probe.
+    action_weight: float = 1.0
 
 
 @dataclass
@@ -308,6 +87,28 @@ class DataConfig:
     num_workers: int = 8
     no_success_filter: bool = False  # False -> successful demos only
     seed: int = 0
+    # First N of the 12 joint_pos dims to feed the policy. joint_pos = 6 arm + 6 gripper-mimic; the
+    # gripper joints don't exist on the real robot, so use 6 for sim2real. None = all 12 (sim-only).
+    joint_pos_dims: int | None = None
+    # PER-PRIM datasets: prim names to keep (drops individual links / all robot links / an object).
+    # None = every prim. Ignored for legacy flat datasets.
+    pc_parts: list[str] | None = None
+    # PER-PRIM datasets: append a per-point seg label derived from the prim (robot=0/insertive=-1/
+    # receptive=+1) as a 4th channel -> model trains on [xyz, seg]. Deploy re-derives it. Flat: ignored.
+    append_prim_semantic: bool = False
+
+
+@dataclass
+class AugConfig:
+    # Train-only PC dropout (zeroes points; val stays clean). Per-category dicts {robot,insertive,
+    # receptive}; needs a per-prim dataset or seg labels (point_dim==4). Order: prim -> point.
+    # e.g. aug: {prim_dropout: {robot: 0.3}, point_dropout: {robot: 0.05}}
+    #
+    # prim_dropout: per-prim -> drop each prim of the category INDEPENDENTLY (robot:0.3 = each link
+    # on its own); seg-label datasets -> drop the WHOLE category at once.
+    prim_dropout: dict | None = None
+    # point_dropout: prob each point of the category is zeroed independently (sparse/missing returns).
+    point_dropout: dict | None = None
 
 
 @dataclass
@@ -315,6 +116,7 @@ class TrainConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    aug: AugConfig = field(default_factory=AugConfig)
 
     @classmethod
     def from_yaml(cls, path: str | None) -> "TrainConfig":
@@ -322,7 +124,7 @@ class TrainConfig:
         if path and os.path.exists(path):
             with open(path) as f:
                 raw = yaml.safe_load(f) or {}
-            for section in ("model", "optim", "data"):
+            for section in ("model", "optim", "data", "aug"):
                 for k, v in (raw.get(section) or {}).items():
                     cfg._set(k, v, where=f"{path}:{section}")
             print(f"[train] loaded config: {path}")
@@ -330,7 +132,7 @@ class TrainConfig:
 
     def _set(self, key: str, value, where: str = "override"):
         """Set ``key`` on whichever section declares it (keys are unique across sections)."""
-        for section in (self.model, self.optim, self.data):
+        for section in (self.model, self.optim, self.data, self.aug):
             if hasattr(section, key):
                 setattr(section, key, value)
                 return
@@ -341,7 +143,7 @@ class TrainConfig:
             self._set(k, v, where="CLI")
 
     def as_flat_dict(self) -> dict:
-        return {**asdict(self.model), **asdict(self.optim), **asdict(self.data)}
+        return {**asdict(self.model), **asdict(self.optim), **asdict(self.data), **asdict(self.aug)}
 
 
 _DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "base.yaml")
@@ -366,12 +168,23 @@ def parse_args():
     p.add_argument("--lr", type=float)
     p.add_argument("--weight_decay", type=float)
     p.add_argument("--aux_weight", type=float, help="Weight on the aux object-pose probe loss (0=off).")
+    p.add_argument("--action_weight", type=float,
+                   help="Weight on the BC action loss (1=normal). 0 + aux_weight>0 = pure pose probe.")
     p.add_argument("--architecture", type=str, choices=tuple(_ARCHITECTURES))
     p.add_argument("--encoder_dims", type=int, nargs="+")
     p.add_argument("--action_dims", type=int, nargs="+")
     p.add_argument("--predict_std", action="store_true", default=argparse.SUPPRESS,
                    help="Gaussian NLL head (mean+std) instead of MSE.")
     p.add_argument("--num_points", type=int, help="Subsample to this many points per cloud.")
+    p.add_argument("--joint_pos_dims", type=int,
+                   help="Use only the first N of 12 joint_pos dims (6=arm only; last 6 gripper joints "
+                        "do not exist on the real robot). Default: all 12.")
+    p.add_argument("--pc_parts", type=str, nargs="+",
+                   help="PER-PRIM datasets: prim names to use (e.g. wrist_3_link insertive receptive). "
+                        "Default: all prims in the dataset.")
+    p.add_argument("--append_prim_semantic", action="store_true", default=argparse.SUPPRESS,
+                   help="PER-PRIM datasets: append a derived seg label (robot/insertive/receptive) as a "
+                        "4th cloud channel (point_dim 3->4).")
     p.add_argument("--val_frac", type=float)
     p.add_argument("--num_workers", type=int)
     p.add_argument("--no_success_filter", action="store_true", default=argparse.SUPPRESS,
@@ -395,11 +208,18 @@ def main():
     L.seed_everything(cfg.data.seed, workers=True)
     torch.set_float32_matmul_precision("high")  # H100 tensor cores
 
-    full = PCDemoDataset(rt.dataset, num_points=cfg.data.num_points, success_only=not cfg.data.no_success_filter)
+    full = PCDemoDataset(rt.dataset, num_points=cfg.data.num_points,
+                         success_only=not cfg.data.no_success_filter, joint_pos_dims=cfg.data.joint_pos_dims,
+                         pc_parts=cfg.data.pc_parts, append_prim_semantic=cfg.data.append_prim_semantic)
     print(
         f"[train] loaded {len(full)} timesteps | points={full.n_pts} proprio={full.proprio_dim} "
         f"action={full.action_dim} | expert_sr={full.expert_success_rate:.1f}%"
+        + (f" | joint_pos_dims={cfg.data.joint_pos_dims} (arm-only, real-robot)" if cfg.data.joint_pos_dims else "")
     )
+    if full.pc_parts is not None:
+        print(f"[train] PER-PRIM cloud: parts={full.pc_parts} -> {full.n_pts} pts "
+              f"(selected points zero-padded to pc_pad_target={full.pc_pad_target})"
+              + (" | +derived seg channel ([xyz,seg], point_dim=4)" if full._append_seg else ""))
 
     n_val = max(1, int(len(full) * cfg.data.val_frac))
     n_train = len(full) - n_val
@@ -430,6 +250,14 @@ def main():
         raise ValueError(f"unknown architecture '{cfg.model.architecture}', choose from {tuple(_ARCHITECTURES)}")
     num_points = cfg.data.num_points or full.n_pts
 
+    # Point/prim dropout needs per-point category info: either a per-prim dataset (prim_id, preferred)
+    # or the legacy segmentation-label channel (point_dim==4).
+    if (cfg.aug.point_dropout or cfg.aug.prim_dropout) and not (full.per_prim or full.point_dim == 4):
+        raise ValueError(
+            f"point/prim dropout needs a per-prim dataset (scene_pc_prim_id) or segmentation labels "
+            f"(point_dim==4); this dataset is flat with point_dim={full.point_dim}. Drop the aug config."
+        )
+
     model = PointNetBC(
         architecture=cfg.model.architecture,
         proprio_dim=full.proprio_dim,
@@ -449,11 +277,21 @@ def main():
         aux_weight=cfg.optim.aux_weight,
         aux_mean=aux_mean,
         aux_std=aux_std,
+        action_weight=cfg.optim.action_weight,
+        aux_keys=full.aux_keys,
+        pc_parts=full.pc_parts,
+        pc_all_prim_names=full.pc_all_prim_names,
+        pc_pad_target=full.pc_pad_target,
+        point_dropout=cfg.aug.point_dropout,
+        prim_dropout=cfg.aug.prim_dropout,
+        append_prim_semantic=full._append_seg,
     )
     print(
         f"[train] architecture={cfg.model.architecture} num_points={num_points} "
         f"point_dim={full.point_dim} ({'xyz+seg' if full.point_dim == 4 else 'xyz'})"
     )
+    if cfg.aug.point_dropout or cfg.aug.prim_dropout:
+        print(f"[train] PC DROPOUT (train-only): point={cfg.aug.point_dropout} prim={cfg.aug.prim_dropout}")
     if use_aux:
         print(f"[train] AUX probe ON: weight={cfg.optim.aux_weight} targets={full.aux_keys} (dim={full.aux_dim})")
     elif cfg.optim.aux_weight > 0:

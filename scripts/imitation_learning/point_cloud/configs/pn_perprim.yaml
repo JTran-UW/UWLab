@@ -1,0 +1,17 @@
+# Per-prim PointNet BC: train on a PER-PRIM-labeled cloud (a ratio-enforced occluded cloud
+# where each point carries its source prim id), selecting which prims to feed the model via
+# `pc_parts`. Collected by OmniReset-...-DataCollectionPC-PerPrim-v0 (scene_pc + scene_pc_prim_id).
+#
+# pc_parts picks the prims to KEEP (by name); points of other prims are dropped, and the kept
+# points are zero-PADDED to `num_points` at training time. null = keep every prim.
+# Examples to ablate "what does the robot point cloud buy us?":
+#   - just the objects:         [insertive, receptive]
+#   - objects + the wrist link: [wrist_3_link, insertive, receptive]
+#   - everything (default):     null
+# num_points = the fixed output size the selected points are padded/subsampled to. null -> the
+# full stored cloud size (so keeping all prims reproduces the occluded cloud exactly). Set it
+# smaller when selecting a subset to save compute (e.g. objects-only -> num_points: 512).
+model: {architecture: point_net, encoder_dims: [256, 512, 512], action_dims: [512, 512, 256], predict_std: false}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 512}
+data:  {num_points: null, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0,
+        joint_pos_dims: 6, pc_parts: null}

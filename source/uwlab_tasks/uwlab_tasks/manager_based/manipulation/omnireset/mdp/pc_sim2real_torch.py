@@ -246,6 +246,7 @@ def augment_pointcloud_batched(
     generator: torch.Generator | None = None,
     point_source: torch.Tensor | None = None,
     class_targets=None,
+    point_prim: torch.Tensor | None = None,
 ):
     """Full batched pipeline: frustum -> z-buffer occlusion -> edge bleed ->
     surface bias -> dropout -> resample.
@@ -263,10 +264,20 @@ def augment_pointcloud_batched(
             PC carries each point's class label through cull/dropout/resample. Edge-bleed
             skirt points inherit their parent point's code (skirt ``i`` derives from
             point ``i``), and fliers don't reindex, so the mapping stays exact.
+        class_targets: optional ``[(class_code, count), ...]`` -- enforce a fixed per-class
+            output split (needs ``point_source``); see :func:`stratified_resample_gather_idx`.
+        point_prim: optional ``(M,)`` per-point PRIM id (which robot link / object), gathered
+            through the SAME resample indices like ``point_source``. This is the per-prim
+            labeling: the cloud is the normal (ratio-enforced) occluded cloud, and each output
+            point additionally carries the prim it belongs to -- NO per-prim cap / padding here
+            (that is a training-time concern). Returned as the last element.
 
-    Returns:
-        ``(N, num_points, 3)`` augmented cloud, OR -- when ``point_source`` is given --
-        a tuple ``(cloud, out_source)`` with ``out_source`` of shape ``(N, num_points)``.
+    Returns (depending on which labels were requested):
+        ``out``                            when neither label requested,
+        ``(out, out_source)``              when only ``point_source`` requested,
+        ``(out, out_source, out_prim)``    when ``point_prim`` requested (``out_source`` is
+                                           ``None`` if ``point_source`` was not given).
+        ``out`` is ``(N, num_points, 3)``; labels are ``(N, num_points)``.
     """
     N, M, _ = points.shape
     valid = torch.ones(N, M, dtype=torch.bool, device=points.device)
@@ -277,8 +288,9 @@ def augment_pointcloud_batched(
         valid = valid & zbuffer_visible_mask(points, valid, params, zbuf_hw)
 
     all_pts, all_valid = points, valid
-    # Source code aligned with all_pts' point axis (doubled when edge-bleed cats a skirt).
+    # Labels aligned with all_pts' point axis (doubled when edge-bleed cats a skirt).
     all_source = point_source
+    all_prim = point_prim
     if params.enable_edge_bleed:
         skirt, skirt_valid = edge_bleed_batched(
             points, valid, params, plane_point, plane_normal, zbuf_hw, generator
@@ -287,6 +299,8 @@ def augment_pointcloud_batched(
         all_valid = torch.cat([valid, skirt_valid], dim=1)
         if point_source is not None:
             all_source = torch.cat([point_source, point_source])  # skirt inherits parent code
+        if point_prim is not None:
+            all_prim = torch.cat([point_prim, point_prim])  # skirt inherits parent prim
 
     if class_targets is not None and all_source is None:
         raise ValueError("class_targets requires point_source (per-point class codes) to stratify by.")
@@ -306,6 +320,9 @@ def augment_pointcloud_batched(
     out = torch.gather(all_pts, 1, gather_idx.unsqueeze(-1).expand(-1, -1, 3))
     if params.enable_flier:
         out = apply_fliers(out, params, generator)  # displaces points in place; no reindex
+    if point_prim is not None:
+        out_source = all_source[gather_idx] if point_source is not None else None
+        return out, out_source, all_prim[gather_idx]  # (N, num_points) prim id per output point
     if point_source is None:
         return out
     out_source = all_source[gather_idx]  # (N, num_points) — same indices as the cloud

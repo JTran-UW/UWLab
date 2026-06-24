@@ -1,0 +1,12 @@
+# pn_xl_residual_arm6 + per-prim ROBOT-PART DROPOUT augmentation.
+# Same arch/optim/data as pn_xl_residual_arm6.yaml (XL residual PointNet, arm-only 6d joint_pos),
+# trained on a PER-PRIM dataset (demos/perprim_eeframe_100k.hdf5: scene_pc xyz + scene_pc_prim_id).
+# Each of the 16 robot link prims is independently dropped (zeroed) with prob 0.3 at TRAINING time
+# (val stays clean) -> robustness to a real-world cloud that misses some robot parts.
+# Order: prim_dropout (whole link) -> point_dropout (individual points; off here).
+# append_prim_semantic: derive a per-point seg label (robot=0/insertive=-1/receptive=+1) from the
+# prim id and append it -> model trains on [xyz, seg] (point_dim 4). Deploy re-derives it.
+model: {architecture: residual_point_net, encoder_dims: [1024, 1024, 1024], action_dims: [2048, 2048, 2048, 2048, 2048], predict_std: false}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 512}
+data:  {num_points: null, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0, joint_pos_dims: 6, append_prim_semantic: true}
+aug:   {prim_dropout: {robot: 0.3}, point_dropout: {}}

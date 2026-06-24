@@ -338,6 +338,12 @@ class Ur5eRobotiq2f85BCPointNetSegEvalCfg(Ur5eRobotiq2f85BCPointNetEvalCfg):
             "insertive": -1.0,
             "receptive": 1.0,
         }
+        # Match the contact-seg COLLECTION frame: end-effector (wrist_3_link), not
+        # camera. Models trained on the EE-frame contact dataset must be evaluated on
+        # an EE-frame cloud or the frame won't match (same gotcha as the clean side).
+        self.observations.data_collect.scene_pc.params["ref_cfg"] = SceneEntityCfg(
+            "robot", body_names="wrist_3_link"
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -371,10 +377,44 @@ def _peg_contact_sensor_cfg() -> ContactSensorCfg:
 
 @configclass
 class ContactDataCollectObsCfg(DataCollectionPCObservationsCfg.DataCollectObsCfg):
-    """``data_collect`` student group + the ground-truth contact flags, appended
-    last so proprio = joint_pos + end_effector_pose (18d) is unchanged. Like
-    ``wrist_force``, ``contact_flags`` is recorded metadata, NOT a policy input
-    (train_point_net.py / bc_utils.py exclude it from proprio)."""
+    """``data_collect`` student group + privileged aux targets + the ground-truth
+    contact flags, all appended AFTER joint_pos + end_effector_pose so the 18d
+    proprio is unchanged. Like ``wrist_force``, these are recorded metadata, NOT a
+    policy input (train_point_net.py / bc_utils.py exclude them from proprio via the
+    {joint_pos, end_effector_pose} allowlist)."""
+
+    # --- Aux targets recorded ON THE SIDE (metadata, NOT a policy input) ---
+    # Privileged scene state for the trainer's optional aux loss (_AUX_TERMS =
+    # [insertive_asset_pose, receptive_asset_pose, insertive_in_receptive]). Mirrors
+    # the CLEAN collect config so occluded datasets have the same schema and can be
+    # used for aux-loss training. Object poses are in the EE (wrist_3_link) frame to
+    # match the EE-frame cloud; insertive_in_receptive is peg-in-hole frame.
+    insertive_asset_pose = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+
+    receptive_asset_pose = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("receptive_object"),
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "rotation_repr": "axis_angle",
+        },
+    )
+
+    insertive_in_receptive = ObsTerm(
+        func=task_mdp.target_asset_pose_in_root_asset_frame,
+        params={
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_cfg": SceneEntityCfg("receptive_object"),
+            "rotation_repr": "axis_angle",
+        },
+    )
 
     contact_flags = ObsTerm(
         func=task_mdp.object_contact_flags,
@@ -416,6 +456,14 @@ class Ur5eRobotiq2f85DataCollectionPCContactCfg(Ur5eRobotiq2f85DataCollectionPCR
         self.observations.data_collect.scene_pc.params["segmentation_labels"] = {
             "robot": 0.0, "insertive": -1.0, "receptive": 1.0,
         }
+        # Express the occluded cloud in the END-EFFECTOR (wrist_3_link) frame instead
+        # of the camera frame -- nearly arm-pose-invariant, matching the clean
+        # ScenePointCloud. Occlusion is still computed from the camera viewpoint; only
+        # the output coordinates are wrist-relative. At real-robot deploy, apply the
+        # same camera->wrist transform (extrinsics + FK) to the incoming D455 cloud.
+        self.observations.data_collect.scene_pc.params["ref_cfg"] = SceneEntityCfg(
+            "robot", body_names="wrist_3_link"
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -561,3 +609,44 @@ class Ur5eRobotiq2f85BCPointNetCleanNotEECentricEvalCfg(Ur5eRobotiq2f85BCPointNe
 
         # we unset it, so it becomes the robot cfg. This is what some older runs were trained on.
         self.observations.data_collect.scene_pc.params["ref_cfg"] = None
+
+
+# ----------------------------------------------------------------------------
+# PER-PRIM occluded data-collection env: cloud partitioned by source prim
+# ----------------------------------------------------------------------------
+# The occluded scene_pc is the SAME ratio-enforced occluded cloud, but each output point
+# additionally carries the SOURCE PRIM it belongs to (each robot body link + insertive +
+# receptive) as a trailing channel. The collector peels that channel into a separate
+# `scene_pc_prim_id` dataset, so a BC run can choose -- via its `pc_parts` config -- which
+# prims to feed the model (drop individual links, all robot links, or an object) and
+# zero-pad to a fixed size AT TRAINING TIME. No per-prim cap / padding at collection.
+# The seg channel is OFF (the prim id is the finer signal). EE (wrist_3_link) frame, and
+# the contact + aux side terms are inherited from the Contact cfg for reuse.
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCPerPrimCfg(Ur5eRobotiq2f85DataCollectionPCContactCfg):
+    """Occluded data-collection env that records a PER-PRIM-LABELED point cloud (ratio-enforced
+    occluded cloud + a per-point prim id). See :class:`OccludedScenePointCloud` ``per_prim``
+    and ``collect_pc_demos.py`` (per-prim prim-id split)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.observations.data_collect.scene_pc.params
+        p["per_prim"] = True
+        # Prim id carries the source signal -> drop the redundant seg channel.
+        p["include_segmentation"] = False
+
+
+@configclass
+class Ur5eRobotiq2f85BCPointNetPerPrimEvalCfg(Ur5eRobotiq2f85BCPointNetEvalCfg):
+    """BC eval for models trained on a PER-PRIM cloud. The live env emits scene_pc with a
+    trailing per-point prim-id channel; ``bc_utils.bc_actions`` peels it, keeps only the
+    model's ``pc_parts``, and zero-pads to the trained size. The per_prim config MUST match
+    collection (same robot) so the live prim ids match the trained ones."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.observations.data_collect.scene_pc.params
+        p["per_prim"] = True
+        p["include_segmentation"] = False
+        # Match the per-prim COLLECTION frame: end-effector (wrist_3_link).
+        p["ref_cfg"] = SceneEntityCfg("robot", body_names="wrist_3_link")

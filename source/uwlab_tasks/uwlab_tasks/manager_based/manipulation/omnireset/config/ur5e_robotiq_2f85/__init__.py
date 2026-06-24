@@ -884,6 +884,18 @@ gym.register(
     kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCContactCfg"},
 )
 
+# Per-prim occluded data-collection env: scene_pc is the normal ratio-enforced occluded cloud,
+# but each point carries its SOURCE prim id (robot link / insertive / receptive). No per-prim
+# budget or padding -- the collector peels the prim id into a parallel obs/scene_pc_prim_id
+# dataset (cloud stays pure xyz). Selecting prims (pc_parts) and zero-padding to a fixed size
+# happen at TRAIN time. Same distribution as DataCollectionPC-Contact-v0 (per_prim=True, seg off).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-PerPrim-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCPerPrimCfg"},
+)
+
 # Data-collection env recording the CLEAN vanilla ScenePointCloud (no sim2real occlusion /
 # noise), resample_on_reset=True. Same distribution as DataCollectionPC-v0; only the recorded
 # cloud's realism differs (clean full cloud vs occluded + noisy).
@@ -917,6 +929,19 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetSegEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for PER-PRIM models. scene_pc is the normal occluded cloud with a trailing
+# per-point prim-id channel; bc_utils peels that channel, keeps only the checkpoint's pc_parts,
+# and zero-pads to the trained size at inference. per_prim config must match the collection env.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetPerPrimEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetPerPrimEvalCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )
