@@ -51,8 +51,8 @@ parser.add_argument(
     "--camera",
     type=str,
     default="front_camera",
-    choices=["front_camera", "side_camera", "wrist_camera"],
-    help="Which camera to align",
+    choices=["front_camera", "side_camera", "wrist_camera", "orbbec"],
+    help="Which camera to align ('orbbec' maps to the front_orbbec scene camera)",
 )
 parser.add_argument("--real_image", type=str, default=None, help="Path to reference real RGB image (png/jpg)")
 parser.add_argument(
@@ -86,12 +86,16 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.c
     CameraAlignEnvCfg,
 )
 
-# ---- RGB key lookup ----
+# ---- RGB key lookup (keyed by scene sensor name) ----
 CAMERA_TO_RGB = {
     "front_camera": "front_rgb",
+    "front_orbbec": "front_orbbec_rgb",
     "side_camera": "side_rgb",
     "wrist_camera": "wrist_rgb",
 }
+
+# ---- CLI alias → scene sensor name ----
+CAMERA_ALIASES = {"orbbec": "front_orbbec"}
 
 
 class CameraAligner:
@@ -358,7 +362,8 @@ def main():
     fig, ax = plt.subplots(figsize=(8, 6))
     plt.ion()
 
-    aligner = CameraAligner(env, args_cli.camera, real_img, fig, ax)
+    camera_key = CAMERA_ALIASES.get(args_cli.camera, args_cli.camera)
+    aligner = CameraAligner(env, camera_key, real_img, fig, ax)
     aligner.action = action
     aligner.obs = obs
 
