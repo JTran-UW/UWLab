@@ -15,6 +15,12 @@ Mirrors the sim2real tooling pattern:
   scripts_v2/tools/sim2real/align_cameras.py    →  align sim camera to real photo
   scripts_v2/tools/sim2real/scene_capture.py    →  align real scene to sim photo
 
+It also dumps a dense robot point cloud (.npy) sampled with the same area-weighted
+mesh sampler the Sim2RealPC env uses.  Overlay this fixed sim cloud on a real
+camera capture and ICP/eyeball-fit the camera extrinsics to it (the saved cloud is
+the alignment target; cf. overlay_orbbec_pc.py).  Defaults: robot-only, robot-base
+frame.  Pass --no-save_pc to skip, --pc_frame world / --pc_include_objects to vary.
+
 Usage:
     python scripts_v2/tools/sim2real/scene_capture.py \
         --enable_cameras \
@@ -45,6 +51,31 @@ parser.add_argument(
     help="Root directory of the OmniReset dataset",
 )
 parser.add_argument("--output", type=str, default=None, help="Output image path (default: scene_capture_<cam>_idx<idx>.png)")
+# ---- robot point-cloud dump (for sim2real extrinsics matching) ----
+parser.add_argument(
+    "--save_pc",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Also sample a dense robot point cloud and save it as .npy (use --no-save_pc to skip).",
+)
+parser.add_argument(
+    "--pc_output", type=str, default=None,
+    help="Output point-cloud path (default: scene_capture_<cam>_idx<idx>_pc_<frame>.npy)",
+)
+parser.add_argument(
+    "--pc_frame", type=str, default="base", choices=["base", "world"],
+    help="Frame to express the saved cloud in: 'base'=robot root frame (default, natural for "
+    "extrinsics matching), 'world'=sim world frame (matches overlay_orbbec_pc.py synthetic_world.npy).",
+)
+parser.add_argument(
+    "--pc_points", type=int, default=4096,
+    help="Per-class point budget for the dense sampler; the saved cloud has ~pc_points*pc_oversample points.",
+)
+parser.add_argument("--pc_oversample", type=int, default=3, help="Dense-cloud oversample factor.")
+parser.add_argument(
+    "--pc_include_objects", action="store_true",
+    help="Also sample the insertive/receptive objects into the cloud (default: robot-only).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -58,7 +89,11 @@ import os  # noqa: E402
 
 import gymnasium as gym  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
+
+import isaaclab.utils.math as math_utils  # noqa: E402
+from isaaclab.managers import ObservationTermCfg, SceneEntityCfg  # noqa: E402
 
 import uwlab_tasks  # noqa: F401
 from uwlab_tasks.manager_based.manipulation.omnireset import mdp as task_mdp  # noqa: E402
@@ -110,6 +145,96 @@ def load_reset_state(env, dataset_dir, reset_type, idx):
     return task_mdp.sample_state_data_set(dataset["initial_state"], idx_t, env.device)
 
 
+def build_robot_pc_term(env, num_points, oversample, include_objects):
+    """Instantiate an OccludedScenePointCloud term just to sample the dense robot cloud.
+
+    We reuse the exact area-weighted mesh sampler the Sim2RealPC env uses (so the
+    saved cloud matches the synthetic cloud overlay_orbbec_pc.py aligns against),
+    but we only consume its ``dense_local`` / ``dense_body_idx`` -- the occlusion /
+    augmentation pipeline is never run.
+    """
+    params = {
+        "robot_cfg": SceneEntityCfg("robot"),
+        "num_points": num_points,
+        "oversample": oversample,
+        "visualize": False,
+    }
+    if include_objects:
+        params["insertive_cfg"] = SceneEntityCfg("insertive_object")
+        params["receptive_cfg"] = SceneEntityCfg("receptive_object")
+    term_cfg = ObservationTermCfg(func=task_mdp.OccludedScenePointCloud, params=params)
+    return task_mdp.OccludedScenePointCloud(term_cfg, env)
+
+
+def dense_cloud_to_world(term):
+    """Transform the term's dense local cloud (env 0) into world coordinates.
+
+    Robot points ride their body pose; object points (when sampled) ride the
+    object's root pose -- mirrors OccludedScenePointCloud._transform_to_world_env.
+    """
+    robot = term.robot
+    bp = robot.data.body_pos_w[0]  # (B, 3)
+    bq = robot.data.body_quat_w[0]  # (B, 4)
+    local = term.dense_local  # (M, 3)
+    obj_idx = term.dense_obj_idx  # (M,)  -1 for robot points
+    world = torch.empty_like(local)
+
+    robot_mask = obj_idx < 0
+    bidx = term.dense_body_idx[robot_mask]
+    world[robot_mask] = math_utils.quat_apply(bq[bidx], local[robot_mask]) + bp[bidx]
+
+    for oi, asset in enumerate(term.object_assets):
+        m = obj_idx == oi
+        if m.any():
+            n = int(m.sum())
+            pos = asset.data.root_pos_w[0]
+            quat = asset.data.root_quat_w[0]
+            world[m] = math_utils.quat_apply(quat.unsqueeze(0).expand(n, -1), local[m]) + pos
+    return world
+
+
+def world_to_base(points_world, robot):
+    """Express world-frame points in the robot root (base) frame of env 0."""
+    root_pos = robot.data.root_pos_w[0]
+    root_quat = robot.data.root_quat_w[0]
+    inv = math_utils.quat_inv(root_quat.unsqueeze(0)).expand(points_world.shape[0], -1)
+    return math_utils.quat_apply(inv, points_world - root_pos)
+
+
+def save_robot_pc(env):
+    """Sample the dense robot cloud at the current pose and save it as .npy."""
+    term = build_robot_pc_term(env, args_cli.pc_points, args_cli.pc_oversample, args_cli.pc_include_objects)
+    points_world = dense_cloud_to_world(term)
+    robot = env.scene["robot"]
+    if args_cli.pc_frame == "base":
+        points = world_to_base(points_world, robot)
+    else:
+        points = points_world
+    pts_np = points.cpu().numpy().astype(np.float32)
+
+    camera_key = CAMERA_ALIASES.get(args_cli.camera, args_cli.camera)
+    out_path = args_cli.pc_output or f"scene_capture_{camera_key}_idx{args_cli.idx}_pc_{args_cli.pc_frame}.npy"
+    np.save(out_path, pts_np)
+
+    root_pos = robot.data.root_pos_w[0].cpu().numpy()
+    root_quat = robot.data.root_quat_w[0].cpu().numpy()
+    print(
+        f"Saved robot point cloud ({pts_np.shape[0]} pts, frame={args_cli.pc_frame}, "
+        f"objects={'on' if args_cli.pc_include_objects else 'off'}) to {out_path}"
+    )
+    print(f"  robot root (world): pos={np.round(root_pos, 4).tolist()}  quat(wxyz)={np.round(root_quat, 4).tolist()}")
+
+    # ---- interactive HTML view next to the .npy ----
+    try:
+        from visualize_pc import save_pointcloud_html
+
+        html_path = os.path.splitext(out_path)[0] + ".html"
+        save_pointcloud_html(pts_np, html_path, title=os.path.basename(html_path))
+        print(f"Saved interactive point-cloud view to {html_path}")
+    except Exception as e:  # don't lose the .npy if plotly is missing / errors
+        print(f"[warn] skipped interactive HTML ({type(e).__name__}: {e})")
+
+
 def main():
     env = gym.make("OmniReset-Ur5eRobotiq2f85-CameraAlign-v0", cfg=CameraAlignEnvCfg()).unwrapped
     env.reset()
@@ -139,6 +264,10 @@ def main():
     out_path = args_cli.output or f"scene_capture_{camera_key}_idx{args_cli.idx}.png"
     plt.imsave(out_path, img[..., :3])
     print(f"Saved sim view to {out_path}")
+
+    # ---- save a dense robot point cloud (for sim2real extrinsics matching) ----
+    if args_cli.save_pc:
+        save_robot_pc(env)
 
     # ---- print the first 6 robot joint angles ----
     robot = env.scene["robot"]
