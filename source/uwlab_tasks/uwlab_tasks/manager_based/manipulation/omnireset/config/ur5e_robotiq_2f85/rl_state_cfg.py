@@ -783,7 +783,7 @@ class CommandsReachingCfg:
         resampling_time_range=(1e6, 1e6),
         ee_asset_cfg=SceneEntityCfg("robot", body_names="wrist_3_link"),
         target_asset_cfg=SceneEntityCfg("target_marker"),
-        success_position_threshold=0.03,
+        success_position_threshold=0.15,
         success_orientation_threshold=0.2,
     )
 
@@ -1088,12 +1088,12 @@ class RewardsReachingCfg:
         params={
             "ee_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
             "target_asset_cfg": SceneEntityCfg("target_marker"),
-            "success_position_threshold": 0.03,
+            "success_position_threshold": 0.15,
             "success_orientation_threshold": 0.2,
         },
     )
 
-    dense_success_reward = RewTerm(func=task_mdp.dense_success_reward, weight=0.1, params={"std": 1.0})
+    dense_success_reward = RewTerm(func=task_mdp.dense_success_reward_no_angle, weight=0.1, params={"std": 1.0})
 
     success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
 
@@ -1131,9 +1131,9 @@ class TerminationsReachingCfg:
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
-    # first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode)
+    # first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode, time_out=True)
 
-    # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1})
+    # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 2})
 
 
 @configclass

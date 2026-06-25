@@ -297,6 +297,16 @@ def dense_success_reward(env: ManagerBasedRLEnv, std: float, context: str = "pro
     return torch.mean(stacked, dim=0)
 
 
+def dense_success_reward_no_angle(env: ManagerBasedRLEnv, std: float, context: str = "progress_context") -> torch.Tensor:
+
+    context_term: ManagerTermBase = env.reward_manager.get_term_cfg(context).func  # type: ignore
+    xyz_distance: torch.Tensor = getattr(context_term, "xyz_distance")
+
+    # Normalize the distances by std
+    xyz_distance = torch.exp(-xyz_distance / std)
+    return torch.mean(xyz_distance, dim=0)
+
+
 def success_reward(env: ManagerBasedRLEnv, context: str = "progress_context") -> torch.Tensor:
     context_term: ManagerTermBase = env.reward_manager.get_term_cfg(context).func  # type: ignore
     orientation_aligned: torch.Tensor = getattr(context_term, "orientation_aligned")
