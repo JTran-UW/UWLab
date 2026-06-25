@@ -1,7 +1,9 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
+from collections import deque
 import math
 import os
 import random
+import statistics
 import time
 from dataclasses import dataclass
 
@@ -68,18 +70,24 @@ class Args:
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
     """the frequency of updates for the target nerworks"""
-    alpha: float = 0.2
+    alpha: float = 0.001
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
     save_model: bool = False
     """if toggled, periodically save model checkpoints to runs/{run_name}/ (and upload to wandb if --track)"""
-    save_interval: int = 100_000
+    save_interval: int = 1_000_000
     """checkpoint save interval, in global_step units (transitions)"""
     use_tanh: bool = False
     """use tanh layer after policy"""
     obs_normalization: bool = True
     """use obs normalization"""
+    num_updates: int = 1
+    """Num updates per step"""
+    target_entropy_ratio: float = 1.0
+    """ratio of target entropy"""
+    use_layer_norm: bool = False
+    """use layer norm"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -98,20 +106,24 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, hidden_dim=256, use_layer_norm=False):
         super().__init__()
-        self.fc1 = nn.Linear(
-            np.array(env.single_observation_space["critic"].shape).prod() + np.prod(env.single_action_space.shape),
-            256,
+        self.net = nn.Sequential(
+            nn.Linear(
+                np.array(env.single_observation_space["critic"].shape).prod() + np.prod(env.single_action_space.shape),
+                hidden_dim,
+            ),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
         )
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
+        x = self.net(x)
         return x
 
 
@@ -120,21 +132,28 @@ LOG_STD_MIN = -5
 
 
 class Actor(nn.Module):
-    def __init__(self, env, action_scale=None, action_bias=None, use_tanh=False):
+    def __init__(self, env, action_scale=None, action_bias=None, hidden_dim=256, use_layer_norm=False, use_tanh=False, init_trick=False):
         super().__init__()
-        self.fc1 = nn.Linear(np.array(env.single_observation_space["policy"].shape).prod(), 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
-        self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+        self.net = nn.Sequential(
+            nn.Linear(np.array(env.single_observation_space["policy"].shape).prod(), hidden_dim),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+        )
+        self.fc_mean = nn.Linear(hidden_dim, np.prod(env.single_action_space.shape))
+        self.fc_logstd = nn.Linear(hidden_dim, np.prod(env.single_action_space.shape))
         self.use_tanh = use_tanh
 
         # Initial exploration tricks
-        # nn.init.orthogonal_(self.fc_mean.weight, gain=0.01)
-        # nn.init.zeros_(self.fc_mean.bias)
+        if init_trick:
+            nn.init.orthogonal_(self.fc_mean.weight, gain=0.01)
+            nn.init.zeros_(self.fc_mean.bias)
 
-        # std_0 = 0.15
-        # nn.init.zeros_(self.fc_logstd.weight)
-        # nn.init.constant_(self.fc_logstd.bias, math.log(std_0))
+            std_0 = 0.15
+            nn.init.zeros_(self.fc_logstd.weight)
+            nn.init.constant_(self.fc_logstd.bias, math.log(std_0))
 
         # action rescaling    
         if action_scale != None and action_bias != None:
@@ -163,8 +182,7 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.net(x)
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
@@ -230,16 +248,13 @@ if __name__ == "__main__":
 
     max_action = float(envs.single_action_space.high[0])
 
-    # ACTION_SCALE = (0.02, 0.02, 0.02, 0.02, 0.02, 0.2, 1.0)
-    # ACTION_BIAS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    # actor = Actor(envs, action_scale=ACTION_SCALE, action_bias=ACTION_BIAS).to(device)
     if args.obs_normalization:
         actor_obs_normalizer = EmpiricalNormalization(shape=envs.single_observation_space["policy"].shape, device=device)
         critic_obs_normalizer = EmpiricalNormalization(shape=envs.single_observation_space["critic"].shape, device=device)
 
-    actor = Actor(envs, use_tanh=args.use_tanh).to(device)
-    qf1 = SoftQNetwork(envs).to(device)
-    qf2 = SoftQNetwork(envs).to(device)
+    actor = Actor(envs, use_tanh=args.use_tanh, use_layer_norm=args.use_layer_norm).to(device)
+    qf1 = SoftQNetwork(envs, use_layer_norm=args.use_layer_norm).to(device)
+    qf2 = SoftQNetwork(envs, use_layer_norm=args.use_layer_norm).to(device)
     qf1_target = SoftQNetwork(envs).to(device)
     qf2_target = SoftQNetwork(envs).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
@@ -249,7 +264,7 @@ if __name__ == "__main__":
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
+        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item() * args.target_entropy_ratio
         # log_alpha = torch.zeros(1, requires_grad=True, device=device)
         # alpha = log_alpha.exp().item()
         alpha = torch.tensor(args.alpha)
@@ -273,6 +288,14 @@ if __name__ == "__main__":
         normalize_obs = actor_obs_normalizer.forward
         normalize_critic_obs = critic_obs_normalizer.forward
 
+    # Logging stuff
+    rewbuffer = deque(maxlen=1000)
+    lenbuffer = deque(maxlen=1000)
+    successbuffer = deque(maxlen=1000)
+    total_episodes = 0
+    num_success_episodes_log = 0
+    num_episodes_log = 0
+
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     global_step = 0
@@ -294,99 +317,69 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
-            for info in infos["final_info"]:
+            context_term = envs.env.env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
+            is_env_success = getattr(context_term, "success")
+            for i, info in enumerate(infos["final_info"]):
                 if info is not None:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                    break
+                    rewbuffer.extend([info["episode"]["r"]])
+                    lenbuffer.extend([info["episode"]["l"]])
+                    num_episodes_log += 1
+                    num_success_episodes_log += 1 if is_env_success[i] else 0
+                    total_episodes += 1
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
         # for idx, trunc in enumerate(truncations):
         #     if trunc:
         #         real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations | truncations, infos)
+        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
+            for upd_i in range(args.num_updates):
+                data = rb.sample(args.batch_size)
 
-            policy_obs = data.policy_observations
-            next_policy_obs = data.next_policy_observations
-            critic_obs = data.critic_observations
-            next_critic_obs = data.next_critic_observations
-            
-            if args.obs_normalization:
-                policy_obs = normalize_obs(data.policy_observations)
-                next_policy_obs = normalize_obs(data.next_policy_observations)
-                critic_obs = normalize_critic_obs(data.critic_observations)
-                next_critic_obs = normalize_critic_obs(data.next_critic_observations)
+                policy_obs = data.policy_observations
+                next_policy_obs = data.next_policy_observations
+                critic_obs = data.critic_observations
+                next_critic_obs = data.next_critic_observations
 
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(next_policy_obs)
-                qf1_next_target = qf1_target(next_critic_obs, next_state_actions)
-                qf2_next_target = qf2_target(next_critic_obs, next_state_actions)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                # min_qf_next_target = torch.min(qf1_next_target, qf2_next_target)
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+                if args.obs_normalization:
+                    policy_obs = normalize_obs(data.policy_observations)
+                    next_policy_obs = normalize_obs(data.next_policy_observations)
+                    critic_obs = normalize_critic_obs(data.critic_observations)
+                    next_critic_obs = normalize_critic_obs(data.next_critic_observations)
 
-            qf1_a_values = qf1(critic_obs, data.actions).view(-1)
-            qf2_a_values = qf2(critic_obs, data.actions).view(-1)
+                with torch.no_grad():
+                    next_state_actions, next_state_log_pi, _ = actor.get_action(next_policy_obs)
+                    qf1_next_target = qf1_target(next_critic_obs, next_state_actions)
+                    qf2_next_target = qf2_target(next_critic_obs, next_state_actions)
+                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                    next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
-            # if global_step > 10_000_000:
-            #     import matplotlib.pyplot as plt
-            #     fig, (ax_q, ax_a) = plt.subplots(1, 2, figsize=(14, 5))
+                qf1_a_values = qf1(critic_obs, data.actions).view(-1)
+                qf2_a_values = qf2(critic_obs, data.actions).view(-1)
 
-            #     ax_q.hist(torch.min(qf1_next_target, qf2_next_target).cpu().detach().numpy(),
-            #             bins=50, label=r"$\min(Q_{1,\mathrm{tgt}}(s',a'),\;Q_{2,\mathrm{tgt}}(s',a'))$",
-            #             alpha=0.4)
-            #     ax_q.hist((-alpha * next_state_log_pi).cpu().detach().numpy(),
-            #             bins=50, label=r"$-\alpha \cdot \log \pi(a'|s')$  (entropy bonus)",
-            #             alpha=0.4)
-            #     ax_q.hist(next_q_value.cpu().detach().numpy(),
-            #             bins=50, label=r"TD target  $r + \gamma (1-d)\,[\min Q_\mathrm{tgt} - \alpha\log\pi]$",
-            #             alpha=0.4)
-            #     ax_q.hist(qf1_a_values.cpu().detach().numpy(),
-            #             bins=50, label=r"Online $Q_1(s, a)$  (prediction)",
-            #             alpha=0.4)
-            #     ax_q.set_xlabel("Q-value")
-            #     ax_q.set_ylabel("count")
-            #     ax_q.set_title(f"Q-value distributions @ global_step={global_step}  (alpha={alpha:.4f})")
-            #     ax_q.legend(loc="upper left", fontsize=9)
+                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                qf_loss = qf1_loss + qf2_loss
 
-            #     ax_a.hist(next_state_actions[:, 0].cpu().detach().numpy(),
-            #             bins=50, color="C3", alpha=0.7,
-            #             label="dim 0 of  a' ~ π(·|s')")
-            #     ax_a.set_xlabel("action[0]")
-            #     ax_a.set_ylabel("count")
-            #     ax_a.set_title("Sampled next-state action (dim 0)")
-            #     ax_a.legend(loc="upper left", fontsize=9)
+                # optimize the model
+                q_optimizer.zero_grad()
+                qf_loss.backward()
+                q_optimizer.step()
 
-            #     fig.tight_layout()
-            #     plt.show()
-
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
-
-            # optimize the model
-            q_optimizer.zero_grad()
-            qf_loss.backward()
-            q_optimizer.step()
-
-            if global_step % (args.policy_frequency * args.num_envs) == 0:  # TD 3 Delayed update support
-                for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                if global_step % (args.policy_frequency * args.num_envs) == 0:  # TD 3 Delayed update support
+                    # for _ in range(
+                    #     args.policy_frequency
+                    # ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
                     pi, log_pi, _ = actor.get_action(policy_obs)
                     qf1_pi = qf1(critic_obs, pi)
                     qf2_pi = qf2(critic_obs, pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    # actor_loss = min_qf_pi.mean()
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
                     actor_optimizer.zero_grad()
@@ -403,30 +396,67 @@ if __name__ == "__main__":
                         a_optimizer.step()
                         alpha = log_alpha.exp().item()
 
-            # update the target networks
-            if global_step % (args.target_network_frequency * args.num_envs) == 0:
-                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                # update the target networks
+                if global_step % (args.target_network_frequency * args.num_envs) == 0:
+                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-            if global_step % (100 * args.num_envs) == 0:
+            if global_step % (25 * args.num_envs) == 0:
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("losses/log_pi", log_pi.mean().item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(global_step / (time.time() - start_time)),
-                    global_step,
-                )
+                sps = int(global_step / (time.time() - start_time))
+                writer.add_scalar("charts/SPS", sps, global_step)
+                samples_per_sec = sps * args.num_updates * args.batch_size
+                writer.add_scalar("charts/samples_per_sec", samples_per_sec, global_step)
+
+                if len(rewbuffer) > 0:
+                    writer.add_scalar("charts/episodic_return", statistics.mean(rewbuffer), global_step)
+                    writer.add_scalar("charts/episodic_length", statistics.mean(lenbuffer), global_step)
+                
+                writer.add_scalar("charts/success_rate", num_success_episodes_log / num_episodes_log, global_step)
+                num_success_episodes_log = 0
+                num_episodes_log = 0
+
+                writer.add_scalar("charts/num_episodes", total_episodes, global_step)
+
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+
+                # ─── pretty console log ───
+                elapsed = time.time() - start_time
+                progress = global_step / args.total_timesteps
+                eta_sec = (elapsed / max(progress, 1e-9)) * (1 - progress)
+                eta_str = f"{int(eta_sec // 3600):d}h{int((eta_sec % 3600) // 60):02d}m"
+
+                ep_ret = statistics.mean(rewbuffer) if len(rewbuffer) > 0 else float("nan")
+                ep_len = statistics.mean(lenbuffer) if len(lenbuffer) > 0 else float("nan")
+                pad = 22
+                bar = "─" * 60
+                header = f" step={global_step:,}  ({progress*100:5.1f}%)  ETA={eta_str} "
+                lines = [
+                    f"\n{bar}",
+                    f"{header.center(60, '─')}",
+                    f"{'SPS:':>{pad}} {sps:,d}",
+                    f"{'episodes done:':>{pad}} {total_episodes:,d}",
+                    f"{'mean episodic return:':>{pad}} {ep_ret:>10.3f}",
+                    f"{'mean episode length:':>{pad}} {ep_len:>10.2f}",
+                    f"{'qf1 / qf2 value:':>{pad}} {qf1_a_values.mean().item():>10.3f}  /  {qf2_a_values.mean().item():>10.3f}",
+                    f"{'qf_loss:':>{pad}} {(qf_loss.item() / 2.0):>10.4f}",
+                    f"{'actor_loss:':>{pad}} {actor_loss.item():>10.4f}",
+                    f"{'log_pi (mean):':>{pad}} {log_pi.mean().item():>10.3f}",
+                    f"{'alpha:':>{pad}} {alpha:>10.4f}"
+                    + (f"   alpha_loss={alpha_loss.item():.4f}" if args.autotune else ""),
+                    bar,
+                ]
+
+                print("\n".join(lines), flush=True)
 
         # Periodic checkpoint save (after training starts so model isn't all-zeros)
         if args.save_model and global_step > args.learning_starts:

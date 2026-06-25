@@ -1127,11 +1127,11 @@ class TerminationsCfg:
 class TerminationsReachingCfg:
     """Termination terms for the MDP."""
 
-    time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+    time_out = DoneTerm(func=task_mdp.time_out) #, time_out=True)
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
-    # first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode, time_out=True)
+    first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode, time_out=True)
 
     # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 2})
 
