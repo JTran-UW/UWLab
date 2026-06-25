@@ -265,6 +265,52 @@
             ]
         },
         {
+            "name": "Train CleanRL SAC (Reaching)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/jtran/miniconda3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/cleanrl/cleanrl/sac_continuous_action.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/jtran/miniconda3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--seed", "1",
+                "--env-id", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Reaching-OffPolicy-v0",
+                "--total-timesteps", "50000000",
+                "--num_envs", "1000",
+                "--headless"
+            ]
+        },
+        {
+            "name": "Train Holosoma FastSAC Reaching (No Dense Reward Bug)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/jtran/miniconda3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/holosoma/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/jtran/miniconda3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--task", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Reaching-OffPolicy-v0",
+                "--num_envs", "2048",
+                "--headless",
+                "--run_name", "FastSAC-Reaching-No-Dense-Reward-Bug",
+                "agent.target_entropy_ratio=-1.0",
+                "agent.num_updates=2.0",
+                "agent.critic_learning_rate=3e-4",
+                "agent.actor_learning_rate=5e-5",
+                "agent.tau=0.125"
+            ]
+        },
+        {
             "name": "Visualize All Resets Single Image (env_uwlab)",
             "type": "debugpy",
             "request": "launch",

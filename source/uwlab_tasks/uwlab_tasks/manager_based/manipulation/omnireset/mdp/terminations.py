@@ -864,13 +864,15 @@ def consecutive_success_state(env: ManagerBasedRLEnv, num_consecutive_successes:
 
 def terminate_first_episode(env: ManagerBasedRLEnv):
     to_terminate = torch.zeros_like(env.episode_length_buf, dtype=bool)
-    if env.common_step_counter > env.max_episode_length:
+    if env.common_step_counter >= env.max_episode_length:
         return to_terminate
 
     # Get envs on the first episode
+    first_episode_envs = torch.argwhere(env.episode_length_buf >= env.common_step_counter)
+    if len(first_episode_envs) == 0:
+        return to_terminate
 
     num_envs_to_terminate = env.num_envs / env.max_episode_length
-    first_episode_envs = torch.argwhere(env.episode_length_buf >= env.common_step_counter)
     if num_envs_to_terminate > 1:
         indices = first_episode_envs[torch.randint(high=len(first_episode_envs), size=(int(num_envs_to_terminate),))]
         to_terminate[indices] = True
