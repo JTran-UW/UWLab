@@ -74,40 +74,11 @@ class IsaacLabVectorEnv(VectorEnv):
         self.ep_return += reward
         self.ep_length += 1
         done = terminations | truncations
-        finished_idx = done.nonzero(as_tuple=True)[0]
+        infos["ep_reward"] = self.ep_return[done]
+        infos["ep_length"] = self.ep_length[done]
 
-        # IsaacLab passes its extras dict through as `infos`; we want to keep
-        # `final_obs` (the pre-reset observation per env) so SAC can bootstrap
-        # off the real terminal state. We expose it gymnasium-VectorEnv-style
-        # under `final_observation` (list of per-env Optional[obs]).
-        isaac_final_obs = infos.get("final_obs") if isinstance(infos, dict) else None
+        self.ep_return[done] = 0
+        self.ep_length[done] = 0
 
-        cleanrl_infos = {}
-        if len(finished_idx) > 0:
-            # Episode stats per cleanrl convention.
-            cleanrl_infos["final_info"] = [None] * self.num_envs
-            for i in finished_idx.tolist():
-                cleanrl_infos["final_info"][i] = {
-                    "episode": {
-                        "r": self.ep_return[i].item(),
-                        "l": self.ep_length[i].item(),
-                    }
-                }
-
-            # Surface the pre-reset obs from IsaacLab. Dict-obs envs return
-            # `{"policy": tensor_NxD, "critic": tensor_NxD'}`; we slice per env.
-            if isaac_final_obs is not None:
-                final_obs_list = [None] * self.num_envs
-                if isinstance(isaac_final_obs, dict):
-                    for i in finished_idx.tolist():
-                        final_obs_list[i] = {k: v[i] for k, v in isaac_final_obs.items()}
-                else:
-                    for i in finished_idx.tolist():
-                        final_obs_list[i] = isaac_final_obs[i]
-                cleanrl_infos["final_observation"] = final_obs_list
-
-            self.ep_return[finished_idx] = 0
-            self.ep_length[finished_idx] = 0
-
-        return next_obs, reward, terminations, truncations, cleanrl_infos
+        return next_obs, reward, terminations, truncations, infos
 

@@ -283,7 +283,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     gpu_global_rank = int(os.getenv("RANK", "0"))
     is_rank_zero = (not args_cli.distributed) or gpu_global_rank == 0
     if agent_cfg.logger == "wandb" and is_rank_zero:
-        run_name = f"{os.path.basename(log_dir)}_{args_cli.task}"
+        run_name = args_cli.run_name if args_cli.run_name else f"{os.path.basename(log_dir)}_{args_cli.task}"
         os.makedirs(log_dir, exist_ok=True)
         wandb.init(
             project=agent_cfg.wandb_project,
@@ -301,7 +301,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "resume_path": args_cli.resume_path,
             },
             dir=log_dir,
-            sync_tensorboard=False,
+            sync_tensorboard=True,
         )
 
     # create runner from rsl-rl

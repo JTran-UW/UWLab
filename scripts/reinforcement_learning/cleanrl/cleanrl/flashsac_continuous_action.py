@@ -48,27 +48,25 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the environment id of the task"""
-    num_learning_iterations: int = 25000
-    """total iterations of the experiments"""
+    total_timesteps: int = 1000000
+    """total timesteps of the experiments"""
     num_envs: int = 1
     """the number of parallel game environments"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    tau: float = 0.125
+    tau: float = 0.005
     """target smoothing coefficient (default: 0.005)"""
-    batch_size: int = 16384
+    batch_size: int = 256
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 10
+    learning_starts: int = 5e3
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
-    q_lr: float = 3e-4
+    q_lr: float = 1e-3
     """the learning rate of the Q network network optimizer"""
-    alpha_lr: float = 3e-4
-    """the learning rate of alpha"""
-    policy_frequency: int = 4
+    policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
     """the frequency of updates for the target nerworks"""
@@ -84,16 +82,12 @@ class Args:
     """use tanh layer after policy"""
     obs_normalization: bool = True
     """use obs normalization"""
-    num_updates: int = 8
+    num_updates: int = 1
     """Num updates per step"""
     target_entropy_ratio: float = 1.0
     """ratio of target entropy"""
-    use_layer_norm: bool = True
+    use_layer_norm: bool = False
     """use layer norm"""
-    weight_decay: float = 0.001
-    """the weight decay of the optimizer"""
-    logging_interval: int = 100
-    """the interval to log the metrics"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -111,16 +105,8 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 
 # ALGO LOGIC: initialize agent here:
-class DistributionalQNetwork(nn.Module):
-    def __init__(
-        self,
-        env,
-        hidden_dim=768,
-        num_atoms=101,
-        v_min=-20.0,
-        v_max=20.0,
-        use_layer_norm=True
-    ):
+class SoftQNetwork(nn.Module):
+    def __init__(self, env, hidden_dim=256, use_layer_norm=False):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(
@@ -128,118 +114,51 @@ class DistributionalQNetwork(nn.Module):
                 hidden_dim,
             ),
             nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2) if use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4) if use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 4, num_atoms)
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
         )
-        self.v_min = v_min
-        self.v_max = v_max
-        self.num_atoms = num_atoms
-        self.q_support = torch.linspace(v_min, v_max, num_atoms, device="cuda")
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
         x = self.net(x)
         return x
 
-    def projection(
-        self,
-        obs,
-        actions,
-        rewards,
-        bootstrap,
-        discount
-    ):
-        delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
-        batch_size = rewards.shape[0]
-        # import pdb; pdb.set_trace()
 
-        target_z = rewards.unsqueeze(1) + bootstrap.unsqueeze(1) * discount.unsqueeze(1) * self.q_support
-        target_z = target_z.clamp(self.v_min, self.v_max)
-        b = (target_z - self.v_min) / delta_z
-        lower = torch.floor(b).long()
-        upper = torch.ceil(b).long()
-
-        is_integer = upper == lower
-        lower_mask = torch.logical_and((lower > 0), is_integer)
-        upper_mask = torch.logical_and((lower == 0), is_integer)
-
-        lower = torch.where(lower_mask, lower - 1, lower)
-        upper = torch.where(upper_mask, upper + 1, upper)
-
-        next_dist = F.softmax(self(obs, actions), dim=1)
-        proj_dist = torch.zeros_like(next_dist)
-        offset = (
-            torch.linspace(0, (batch_size - 1) * self.num_atoms, batch_size, device=device)
-            .unsqueeze(1)
-            .expand(batch_size, self.num_atoms)
-            .long()
-        )
-
-        # Additional safety check for indices
-        lower_indices = (lower + offset).view(-1)
-        upper_indices = (upper + offset).view(-1)
-        max_index = proj_dist.numel() - 1
-
-        lower_indices = torch.clamp(lower_indices, 0, max_index)
-        upper_indices = torch.clamp(upper_indices, 0, max_index)
-
-        proj_dist.view(-1).index_add_(0, lower_indices, (next_dist * (upper.float() - b)).view(-1))
-        proj_dist.view(-1).index_add_(0, upper_indices, (next_dist * (b - lower.float())).view(-1))
-        return proj_dist
-    
-    def get_value(self, probs: torch.Tensor) -> torch.Tensor:
-        """Calculate value from logits using support"""
-        return torch.sum(probs * self.q_support, dim=-1)
-
-
-LOG_STD_MAX = 0
+LOG_STD_MAX = 2
 LOG_STD_MIN = -5
+
+class FlashSACBlock(nn.Module):
+    def __init__(self, hidd)
 
 
 class Actor(nn.Module):
-    def __init__(self, env, action_scale=None, action_bias=None, hidden_dim=512, use_layer_norm=False, use_tanh=False, init_trick=False):
+    def __init__(self, env, action_scale=None, action_bias=None, hidden_dim=256, use_layer_norm=False, use_tanh=False, init_trick=False):
         super().__init__()
-        input_dim = np.array(env.single_observation_space["policy"].shape).prod()
-        action_dim = np.prod(env.single_action_space.shape)
-        self.use_layer_norm = use_layer_norm
-        self.device = "cuda"
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim, device=self.device),
-            nn.LayerNorm(hidden_dim, device=self.device) if self.use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2, device=self.device),
-            nn.LayerNorm(hidden_dim // 2, device=self.device) if self.use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4, device=self.device),
-            nn.LayerNorm(hidden_dim // 4, device=self.device) if self.use_layer_norm else nn.Identity(),
-            nn.SiLU(),
+            nn.Linear(np.array(env.single_observation_space["policy"].shape).prod(), hidden_dim),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity(),
+            nn.ReLU(),
         )
-        self.fc_mu = nn.Sequential(
-            nn.Linear(hidden_dim // 4, action_dim, device=self.device),
-        )
-        self.fc_logstd = nn.Linear(hidden_dim // 4, action_dim, device=self.device)
-        nn.init.constant_(self.fc_mu[0].weight, 0.0)
-        nn.init.constant_(self.fc_mu[0].bias, 0.0)
-        nn.init.constant_(self.fc_logstd.weight, 0.0)
-        nn.init.constant_(self.fc_logstd.bias, 0.0)
+        self.fc_mean = nn.Linear(hidden_dim, np.prod(env.single_action_space.shape))
+        self.fc_logstd = nn.Linear(hidden_dim, np.prod(env.single_action_space.shape))
         self.use_tanh = use_tanh
 
         # Initial exploration tricks
         if init_trick:
-            nn.init.orthogonal_(self.fc_mu.weight, gain=0.01)
-            nn.init.zeros_(self.fc_mu.bias)
+            nn.init.orthogonal_(self.fc_mean.weight, gain=0.01)
+            nn.init.zeros_(self.fc_mean.bias)
 
             std_0 = 0.15
             nn.init.zeros_(self.fc_logstd.weight)
             nn.init.constant_(self.fc_logstd.bias, math.log(std_0))
 
-        # action rescaling
+        # action rescaling    
         if action_scale != None and action_bias != None:
             action_scale = action_scale
             action_bias = action_bias
@@ -267,7 +186,7 @@ class Actor(nn.Module):
 
     def forward(self, x):
         x = self.net(x)
-        mean = self.fc_mu(x)
+        mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
         log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
@@ -337,14 +256,14 @@ if __name__ == "__main__":
         critic_obs_normalizer = EmpiricalNormalization(shape=envs.single_observation_space["critic"].shape, device=device)
 
     actor = Actor(envs, use_tanh=args.use_tanh, use_layer_norm=args.use_layer_norm).to(device)
-    qf1 = DistributionalQNetwork(envs, use_layer_norm=args.use_layer_norm).to(device)
-    qf2 = DistributionalQNetwork(envs, use_layer_norm=args.use_layer_norm).to(device)
-    qf1_target = DistributionalQNetwork(envs).to(device)
-    qf2_target = DistributionalQNetwork(envs).to(device)
+    qf1 = SoftQNetwork(envs, use_layer_norm=args.use_layer_norm).to(device)
+    qf2 = SoftQNetwork(envs, use_layer_norm=args.use_layer_norm).to(device)
+    qf1_target = SoftQNetwork(envs).to(device)
+    qf2_target = SoftQNetwork(envs).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.AdamW(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
+    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
     if args.autotune:
@@ -353,7 +272,7 @@ if __name__ == "__main__":
         # alpha = log_alpha.exp().item()
         alpha = torch.tensor(args.alpha)
         log_alpha = torch.tensor([torch.log(alpha)], requires_grad=True, device=device)
-        a_optimizer = optim.AdamW([log_alpha], lr=args.alpha_lr, betas=(0.9, 0.95))
+        a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
         alpha = args.alpha
 
@@ -375,6 +294,7 @@ if __name__ == "__main__":
     # Logging stuff
     rewbuffer = deque(maxlen=1000)
     lenbuffer = deque(maxlen=1000)
+    successbuffer = deque(maxlen=1000)
     total_episodes = 0
     num_success_episodes_log = 0
     num_episodes_log = 0
@@ -382,33 +302,39 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     global_step = 0
-    while global_step < args.num_learning_iterations:
+    while global_step < args.total_timesteps:
+        global_step += args.num_envs
         # ALGO LOGIC: put action logic here
-        # if global_step < args.learning_starts:
-        #     actions = torch.tensor([envs.single_action_space.sample() for _ in range(envs.num_envs)])
-        # else:
-        with torch.no_grad():
+        if global_step < args.learning_starts:
+            actions = torch.tensor([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+        else:
             policy_obs = obs["policy"]
             if args.obs_normalization:
                 policy_obs = normalize_obs(policy_obs, update=False)
 
-        actions, _, _ = actor.get_action(policy_obs)
-        actions = actions.detach()
+            actions, _, _ = actor.get_action(policy_obs)
+            actions = actions.detach()
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        dones = terminations | truncations
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        rewbuffer.extend(infos["ep_reward"].cpu().tolist())
-        lenbuffer.extend(infos["ep_length"].cpu().tolist())
-        num_episodes_log += dones.int().sum()
-        total_episodes += dones.int().sum()
-        num_success_episodes_log += infos["ep_success"].sum()
+        if "final_info" in infos:
+            context_term = envs.env.env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
+            is_env_success = getattr(context_term, "success")
+            for i, info in enumerate(infos["final_info"]):
+                if info is not None:
+                    rewbuffer.extend([info["episode"]["r"]])
+                    lenbuffer.extend([info["episode"]["l"]])
+                    num_episodes_log += 1
+                    num_success_episodes_log += 1 if is_env_success[i] else 0
+                    total_episodes += 1
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
-        real_next_obs[truncations.bool()] = infos["final_obs"]
+        # for idx, trunc in enumerate(truncations):
+        #     if trunc:
+        #         real_next_obs[idx] = infos["final_observation"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -430,90 +356,67 @@ if __name__ == "__main__":
                     critic_obs = normalize_critic_obs(data.critic_observations)
                     next_critic_obs = normalize_critic_obs(data.next_critic_observations)
 
-                bootstrap = (~data.dones.bool()).float()
-
                 with torch.no_grad():
-                    next_state_actions, next_state_log_probs, _ = actor.get_action(next_policy_obs)
-                    discount = args.gamma
+                    next_state_actions, next_state_log_pi, _ = actor.get_action(next_policy_obs)
+                    qf1_next_target = qf1_target(next_critic_obs, next_state_actions)
+                    qf2_next_target = qf2_target(next_critic_obs, next_state_actions)
+                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                    next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
-                    qf1_target_dist = qf1_target.projection(
-                        next_critic_obs,
-                        next_state_actions,
-                        data.rewards.squeeze(-1) - discount * torch.ones(args.batch_size, device="cuda") * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1),
-                        bootstrap.squeeze(-1),
-                        discount * torch.ones(args.batch_size, device="cuda"),
-                    )
-                    qf2_target_dist = qf2_target.projection(
-                        next_critic_obs,
-                        next_state_actions,
-                        data.rewards.squeeze(-1) - discount * torch.ones(args.batch_size, device="cuda") * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1),
-                        bootstrap.squeeze(-1),
-                        discount * torch.ones(args.batch_size, device="cuda"),
-                    )
-                    qf1_target_values = qf1_target.get_value(qf1_target_dist)
-                    qf2_target_values = qf2_target.get_value(qf2_target_dist)
-                    target_value_max = torch.max(qf1_target_values, qf2_target_values)
-                    target_value_min = torch.min(qf1_target_values, qf2_target_values)
-                    
-                qf1_outputs = qf1(critic_obs, data.actions)
-                qf2_outputs = qf2(critic_obs, data.actions)
-                qf1_log_probs = F.log_softmax(qf1_outputs, dim=-1)
-                qf2_log_probs = F.log_softmax(qf2_outputs, dim=-1)
-                qf1_loss = -torch.sum(qf1_target_dist * qf1_log_probs, dim=-1)
-                qf2_loss = -torch.sum(qf2_target_dist * qf2_log_probs, dim=-1)
-                qf_loss = torch.stack([qf1_loss, qf2_loss]).mean(dim=1).sum(dim=0)
+                qf1_a_values = qf1(critic_obs, data.actions).view(-1)
+                qf2_a_values = qf2(critic_obs, data.actions).view(-1)
+
+                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                qf_loss = qf1_loss + qf2_loss
 
                 # optimize the model
                 q_optimizer.zero_grad()
                 qf_loss.backward()
                 q_optimizer.step()
 
-                if args.num_updates > 1:
-                    if upd_i % args.policy_frequency == 1:
-                        pi, log_pi, _ = actor.get_action(policy_obs)
-                        qf1_pi = qf1(critic_obs, pi)
-                        qf2_pi = qf2(critic_obs, pi)
-                        qf1_probs = F.softmax(qf1_pi)
-                        qf2_probs = F.softmax(qf2_pi)
-                        qf1_value = qf1.get_value(qf1_probs)
-                        qf2_value = qf2.get_value(qf2_probs)
-                        mean_qf_pi = torch.stack([qf1_value, qf2_value]).mean(dim=0)
-                        actor_loss = ((alpha * log_pi) - mean_qf_pi).mean()
+                if global_step % (args.policy_frequency * args.num_envs) == 0:  # TD 3 Delayed update support
+                    # for _ in range(
+                    #     args.policy_frequency
+                    # ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                    pi, log_pi, _ = actor.get_action(policy_obs)
+                    qf1_pi = qf1(critic_obs, pi)
+                    qf2_pi = qf2(critic_obs, pi)
+                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
-                        actor_optimizer.zero_grad()
-                        actor_loss.backward()
-                        actor_optimizer.step()
+                    actor_optimizer.zero_grad()
+                    actor_loss.backward()
+                    actor_optimizer.step()
 
-                        if args.autotune:
-                            with torch.no_grad():
-                                _, log_pi, _ = actor.get_action(policy_obs)
-                            alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                    if args.autotune:
+                        with torch.no_grad():
+                            _, log_pi, _ = actor.get_action(policy_obs)
+                        alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
-                            a_optimizer.zero_grad()
-                            alpha_loss.backward()
-                            a_optimizer.step()
-                            alpha = log_alpha.exp().item()
-                else:
-                    raise ValueError("Num updates <=1 is not supported")
+                        a_optimizer.zero_grad()
+                        alpha_loss.backward()
+                        a_optimizer.step()
+                        alpha = log_alpha.exp().item()
 
                 # update the target networks
-                if global_step % args.target_network_frequency == 0:
+                if global_step % (args.target_network_frequency * args.num_envs) == 0:
                     for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                         target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                     for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                         target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-            if global_step % args.logging_interval == 0:
-                writer.add_scalar("losses/qf1_values", qf1_target_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf2_values", qf2_target_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf1_loss", qf1_loss.mean().item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.mean().item(), global_step)
+            if global_step % (25 * args.num_envs) == 0:
+                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
+                writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
+                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
+                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 sps = int(global_step / (time.time() - start_time))
                 writer.add_scalar("charts/SPS", sps, global_step)
-                samples_per_sec = sps * args.num_envs * args.num_updates * args.batch_size
+                samples_per_sec = sps * args.num_updates * args.batch_size
                 writer.add_scalar("charts/samples_per_sec", samples_per_sec, global_step)
 
                 if len(rewbuffer) > 0:
@@ -531,7 +434,7 @@ if __name__ == "__main__":
 
                 # ─── pretty console log ───
                 elapsed = time.time() - start_time
-                progress = global_step / args.num_learning_iterations
+                progress = global_step / args.total_timesteps
                 eta_sec = (elapsed / max(progress, 1e-9)) * (1 - progress)
                 eta_str = f"{int(eta_sec // 3600):d}h{int((eta_sec % 3600) // 60):02d}m"
 
@@ -547,7 +450,7 @@ if __name__ == "__main__":
                     f"{'episodes done:':>{pad}} {total_episodes:,d}",
                     f"{'mean episodic return:':>{pad}} {ep_ret:>10.3f}",
                     f"{'mean episode length:':>{pad}} {ep_len:>10.2f}",
-                    f"{'qf1 / qf2 value:':>{pad}} {qf1_target_values.mean().item():>10.3f}  /  {qf2_target_values.mean().item():>10.3f}",
+                    f"{'qf1 / qf2 value:':>{pad}} {qf1_a_values.mean().item():>10.3f}  /  {qf2_a_values.mean().item():>10.3f}",
                     f"{'qf_loss:':>{pad}} {(qf_loss.item() / 2.0):>10.4f}",
                     f"{'actor_loss:':>{pad}} {actor_loss.item():>10.4f}",
                     f"{'log_pi (mean):':>{pad}} {log_pi.mean().item():>10.3f}",
@@ -585,8 +488,6 @@ if __name__ == "__main__":
                 print(f"[ckpt] saved {ckpt_path}")
                 if args.track:
                     wandb.save(ckpt_path, base_path=ckpt_dir, policy="now")
-        
-        global_step += 1
 
     # Final checkpoint at end of training
     if args.save_model:

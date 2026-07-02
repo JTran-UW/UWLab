@@ -70,6 +70,7 @@ class AsymmetricReplayBufferSamples(NamedTuple):
     next_critic_observations: th.Tensor
     dones: th.Tensor
     rewards: th.Tensor
+    # effective_n_steps: int
 
 def get_action_dim(action_space: spaces.Space) -> int:
     """
@@ -467,6 +468,7 @@ class AsymmetricReplayBuffer(BaseBuffer):
     rewards: th.tensor
     dones: th.tensor
     timeouts: th.tensor
+    effective_n_steps: int
 
     def __init__(
         self,
@@ -475,6 +477,7 @@ class AsymmetricReplayBuffer(BaseBuffer):
         action_space: spaces.Space,
         device: th.device | str = "auto",
         n_envs: int = 1,
+        n_steps: int = 1,
         optimize_memory_usage: bool = False,
         handle_timeout_termination: bool = False,
     ):
