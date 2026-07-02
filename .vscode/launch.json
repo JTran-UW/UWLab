@@ -286,6 +286,35 @@
             ]
         },
         {
+            "name": "Train CleanRL FastSAC (Reaching)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/jtran/miniconda3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/cleanrl/cleanrl/fastsac_continuous_action.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/jtran/miniconda3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--seed", "2",
+                "--env-id", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Reaching-OffPolicy-v0",
+                "--num_learning_iterations", "50000000",
+                "--num_envs", "8192",
+                "--headless",
+                "--batch_size", "8192",
+                "--buffer_size", "5000000",
+                "--track",
+                "--wandb_project_name", "omnireset_fastsac",
+                "--run_name", "CleanRL-FastSAC-Reaching",
+                "--target_entropy_ratio", "-1.0",
+                "--num_updates", "8",
+                "--target_network_frequency", "2"
+            ]
+        },
+        {
             "name": "Train Holosoma FastSAC Reaching (No Dense Reward Bug)",
             "type": "debugpy",
             "request": "launch",
