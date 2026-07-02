@@ -314,18 +314,14 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        dones = terminations | truncations
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            context_term = envs.env.env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
-            is_env_success = getattr(context_term, "success")
-            for i, info in enumerate(infos["final_info"]):
-                if info is not None:
-                    rewbuffer.extend([info["episode"]["r"]])
-                    lenbuffer.extend([info["episode"]["l"]])
-                    num_episodes_log += 1
-                    num_success_episodes_log += 1 if is_env_success[i] else 0
-                    total_episodes += 1
+        rewbuffer.extend(infos["ep_reward"].cpu().tolist())
+        lenbuffer.extend(infos["ep_length"].cpu().tolist())
+        num_episodes_log += dones.int().sum()
+        total_episodes += dones.int().sum()
+        num_success_episodes_log += infos["ep_success"].sum()
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
@@ -406,8 +402,6 @@ if __name__ == "__main__":
             if global_step % (25 * args.num_envs) == 0:
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)

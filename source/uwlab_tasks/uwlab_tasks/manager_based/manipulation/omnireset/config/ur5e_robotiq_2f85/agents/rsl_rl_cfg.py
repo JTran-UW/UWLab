@@ -54,7 +54,7 @@ class Base_PPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class Base_FastSACRunnerCfg(RslRlOffPolicyRunnerCfg):
-    save_interval = 100
+    save_interval = 1000
     resume = False
     experiment_name = "ur5e_robotiq_2f85_omnireset_agent"
     wandb_project = "omnireset_fastsac"
