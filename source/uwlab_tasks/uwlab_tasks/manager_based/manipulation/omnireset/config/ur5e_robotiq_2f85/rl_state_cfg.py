@@ -472,7 +472,7 @@ class BaseReachingEventCfg:
     reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
 
 @configclass
-class TrainEventCfg(BaseEventCfg):
+class TrainEventCfg(BaseEventNoDRCfg):
     """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
 
     reset_from_reset_states = EventTerm(
@@ -547,6 +547,23 @@ class TrainReachingEventCfg(BaseReachingEventCfg):
 
 @configclass
 class TrainEasyEventCfg(BaseEventNoDRCfg):
+    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+        },
+    )
+
+@configclass
+class TrainEasyEventWithDRCfg(BaseEventCfg):
     """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
 
     reset_from_reset_states = EventTerm(
@@ -1263,6 +1280,12 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainFinetuneSuboptimalCfg(Ur5eRobotiq2f85Rl
 class Ur5eRobotiq2f85RelCartesianOSCTrainEasyCfg(Ur5eRobotiq2f85RlStateCfg):
 
     events: TrainEasyEventCfg = TrainEasyEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainEasyWithDRCfg(Ur5eRobotiq2f85RlStateCfg):
+
+    events: TrainEasyEventWithDRCfg = TrainEasyEventWithDRCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 @configclass
