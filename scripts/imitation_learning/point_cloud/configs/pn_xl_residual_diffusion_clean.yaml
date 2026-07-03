@@ -1,0 +1,7 @@
+# pn_xl_residual but with a DIFFUSION action head (DDPM train / DDIM sample, few steps).
+# Identical encoder/optim/data to pn_xl_residual.yaml (the 79% clean MSE baseline) so the ONLY
+# change is regression head -> diffusion head: tests whether a multimodal head beats the unimodal-MSE
+# ceiling on the clean (unoccluded) full point cloud. clean_scenepc_100k.hdf5 (512pt, point_dim=3).
+model: {architecture: diffusion_point_net, encoder_dims: [1024, 1024, 1024], action_dims: [2048, 2048, 2048, 2048, 2048], predict_std: false, num_train_timesteps: 100, num_sample_steps: 10}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 512}
+data:  {num_points: null, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0}

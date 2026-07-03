@@ -282,6 +282,69 @@ class State_DAggerFastRunnerCfg(State_DAggerSplitRunnerCfg):
 
 
 @configclass
+class StudentTeacherPointCloudPolicyCfg:
+    """Policy cfg for a PointNet student + JIT teacher (point-cloud -> point-cloud DAgger).
+
+    The student is the SAME PointNet class as the offline BC trainer
+    (``uwlab_rl.networks.point_net``); ``encoder_dims`` / ``action_dims`` /
+    ``architecture`` mirror the BC config so a BC checkpoint can initialize it.
+    ``pointcloud_groups`` lists which ``obs_groups['policy']`` groups are flat
+    point clouds (reshaped to ``(N, point_dim)``); the rest are treated as proprio.
+    """
+
+    class_name: str = "StudentTeacherPointCloud"
+    teacher_jit_path: str = ""
+    pointcloud_groups: list[str] = MISSING
+    point_dim: int = 4  # 3 = xyz; 4 = xyz + per-point segmentation label (matches CleanSeg BC)
+    architecture: str = "residual_point_net"  # or "point_net"
+    # Arch/sizing deferred — set to match the BC run we distill-init from before launching.
+    encoder_dims: list[int] = MISSING
+    action_dims: list[int] = MISSING
+    activation: str = "elu"
+    init_noise_std: float = 0.1
+    noise_std_type: str = "scalar"
+    student_obs_normalization: bool = True
+    # DEXTRAH-style (μ, σ) weighted-loss params (only for DistillationDAggerWeighted).
+    predict_std: bool = False  # student PointNet emits a second log-std head
+    teacher_returns_std: bool = False  # teacher JIT returns (mean, std) tuple
+
+
+@configclass
+class PC_DAggerSplitRunnerCfg(Depth_DAggerSplitRunnerCfg):
+    """Online DAgger with a PointNet student + JIT PC teacher via ``DistillationRunnerSplit``.
+
+    Same split-pool runner + DEXTRAH-cadence DAgger algorithm as the depth/state
+    variants (so ``Metrics/success_student_*`` / ``success_teacher_*`` stay
+    comparable), but the student consumes point clouds. Student obs = a proprio
+    group + a flat ``scene_pc`` group; teacher obs = the ScenePC-expert group.
+
+    Arch/sizing (``encoder_dims`` / ``action_dims``) intentionally left MISSING —
+    set them (and ``teacher_jit_path``) on launch or in a subclass. Plain MSE-on-mean
+    by default; flip to ``DistillationDAggerWeighted`` + ``predict_std=True`` +
+    ``teacher_returns_std=True`` for the DEXTRAH inverse-variance-weighted loss.
+    """
+
+    class_name: str = "DistillationRunnerSplit"
+    experiment_name: str = "ur5e_robotiq_2f85_pc_dagger_split"
+    num_steps_per_env: int = 1
+    max_iterations: int = 200000
+    student_fraction: float = 0.95
+    eval_fraction: float = 0.1
+    obs_groups: dict = {
+        "policy": ["proprio", "scene_pc"],
+        "teacher": ["teacher"],
+    }
+    algorithm: DistillationDAggerAlgorithmCfg = DistillationDAggerAlgorithmCfg(
+        beta_anneal_iters=0,
+        num_learning_epochs=1,
+        gradient_length=1,
+    )
+    policy: StudentTeacherPointCloudPolicyCfg = StudentTeacherPointCloudPolicyCfg(
+        pointcloud_groups=["scene_pc"],
+    )
+
+
+@configclass
 class Base_DAggerRunnerCfg(Base_PPORunnerCfg):
     algorithm = RslRlFancyPpoAlgorithmCfg(
         value_loss_coef=1.0,

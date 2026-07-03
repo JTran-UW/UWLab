@@ -1,0 +1,7 @@
+# pn_xl_residual (the 79%/92% clean MSE baseline arch) retrained on the DAGGER-AGGREGATED dataset:
+# clean_scenepc_100k (expert demos) + dagger_round1_clean (20k student-visited states, expert-labeled).
+# Tests whether covering the student's visited-state distribution closes the BC gap (coverage problem)
+# vs not (action-multimodality problem). Identical arch/optim/data to pn_xl_residual.yaml.
+model: {architecture: residual_point_net, encoder_dims: [1024, 1024, 1024], action_dims: [2048, 2048, 2048, 2048, 2048], predict_std: false}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 512}
+data:  {num_points: null, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0}

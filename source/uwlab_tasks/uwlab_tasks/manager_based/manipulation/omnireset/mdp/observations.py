@@ -580,6 +580,16 @@ class ScenePointCloud(ManagerTermBase):
 
         self.num_points: int = cfg.params.get("num_points", 512)
         oversample: int = cfg.params.get("oversample", 2)
+        # Optional per-point segmentation channel (same scheme as OccludedScenePointCloud): when
+        # enabled the cloud is (num_points, 4) = xyz + a per-point class label, so the policy can tell
+        # robot / insertive / receptive apart instead of inferring it from geometry. LUT is indexed by
+        # source code (_SRC_ROBOT=0 / _SRC_INSERTIVE=1 / _SRC_RECEPTIVE=2). Occluded subclass sets its
+        # own copy in its __init__ and appends in its own __call__, so this only drives the clean path.
+        self.include_segmentation: bool = cfg.params.get("include_segmentation", False)
+        _seg = cfg.params.get("segmentation_labels", None) or {"robot": 0.0, "insertive": -1.0, "receptive": 1.0}
+        self._seg_lut = torch.tensor(
+            [_seg["robot"], _seg["insertive"], _seg["receptive"]], dtype=torch.float32, device=env.device
+        )
         # See MeshPointCloud.resample_on_reset — same idea but for the ins/rec
         # subsets of the scene PC. Robot points stay fixed (robot has no
         # rotational symmetry the network could exploit).
@@ -1119,7 +1129,11 @@ class ScenePointCloud(ManagerTermBase):
         class_ratios: tuple[float, float, float] | None = None,
         visualize: bool = False,
         visualize_env_ids: list[int] | None = None,
+        include_segmentation: bool = False,
+        segmentation_labels: dict | None = None,
     ) -> torch.Tensor:
+        # include_segmentation / segmentation_labels are consumed in __init__ (-> self.include_segmentation,
+        # self._seg_lut); they appear here only so the ObservationManager accepts them as term params.
         N = env.num_envs
         P = self.num_points
         device = env.device
@@ -1293,6 +1307,18 @@ class ScenePointCloud(ManagerTermBase):
             ref_quat_inv.unsqueeze(1).expand(-1, P, -1),
             pts_world - ref_pos_w.unsqueeze(1),
         )
+
+        # Optional 4th channel: per-point class label (robot/insertive/receptive). The per-point
+        # source code is constant for the run; pick the per-env table (multi-task / resampled path)
+        # or the shared single-task table, then map through the label LUT.
+        if self.include_segmentation:
+            if self.is_multitask or self.selected_local_per_env is not None:
+                tt_ids = self.task_type_ids if self.is_multitask else torch.zeros(N, dtype=torch.long, device=device)
+                src_per_env = self.selected_source_type_task[tt_ids]              # (N, P)
+            else:
+                src_per_env = self.selected_source_type.unsqueeze(0).expand(N, P)  # (N, P)
+            labels = self._seg_lut[src_per_env]                                   # (N, P) class label
+            pts_ref = torch.cat([pts_ref, labels.unsqueeze(-1)], dim=-1)          # (N, P, 4)
 
         return pts_ref.reshape(N, -1)
 

@@ -258,13 +258,13 @@ class Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg(Ur5eRobotiq2f85RelCartes
     def __post_init__(self):
         super().__post_init__()
 
-        # self.events.reset_from_reset_states.params["probs"] = [0.25, 0.25, 0.25, 0.25]
-        self.events.reset_from_reset_states.params["probs"] = [0.34, 0.33, 0.33]
+        self.events.reset_from_reset_states.params["probs"] = [0.25, 0.25, 0.25, 0.25]
+        # self.events.reset_from_reset_states.params["probs"] = [0.34, 0.33, 0.33]
         self.events.reset_from_reset_states.params["reset_types"] = [
             "ObjectAnywhereEEAnywhere",
             "ObjectRestingEEGrasped",
             "ObjectAnywhereEEGrasped",
-            # "ObjectPartiallyAssembledEEGrasped",
+            "ObjectPartiallyAssembledEEGrasped",
         ]
         self.terminations.success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 2})
 
@@ -609,6 +609,170 @@ class Ur5eRobotiq2f85BCPointNetCleanNotEECentricEvalCfg(Ur5eRobotiq2f85BCPointNe
 
         # we unset it, so it becomes the robot cfg. This is what some older runs were trained on.
         self.observations.data_collect.scene_pc.params["ref_cfg"] = None
+
+
+# ----------------------------------------------------------------------------
+# CLEAN + SEGMENTATION variants (point_dim=4): does a per-point class label
+# (robot=0/insertive=-1/receptive=+1) beat inferring class from geometry? I.e. is the
+# clean-PC ceiling a POINT-SEPARABILITY problem for the PointNet? Same clean
+# ScenePointCloud / EE frame / 4-path collection reset dist as the 3D clean env; the
+# ONLY difference is the appended seg channel (base ScenePointCloud.include_segmentation).
+# ----------------------------------------------------------------------------
+_SEG_LABELS = {"robot": 0.0, "insertive": -1.0, "receptive": 1.0}
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCCleanSegCfg(Ur5eRobotiq2f85DataCollectionPCCleanCfg):
+    """Clean-cloud data collection WITH the per-point segmentation channel ON -> scene_pc is
+    (num_points, 4). Identical scene / action / sysid / 4-path reset distribution to the clean env."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.data_collect.scene_pc.params["include_segmentation"] = True
+        self.observations.data_collect.scene_pc.params["segmentation_labels"] = dict(_SEG_LABELS)
+
+
+@configclass
+class Ur5eRobotiq2f85BCPointNetCleanSegEvalCfg(Ur5eRobotiq2f85BCPointNetCleanEvalCfg):
+    """BC eval for models trained on the CLEAN + SEG cloud (point_dim=4, 512 pts). Same single-path
+    HARD reset / action / success as the clean eval; the live cloud carries the matching seg channel."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.data_collect.scene_pc.params["include_segmentation"] = True
+        self.observations.data_collect.scene_pc.params["segmentation_labels"] = dict(_SEG_LABELS)
+
+
+# ----------------------------------------------------------------------------
+# CANONICAL (non-resampled) CLEAN + SEG variants: resample_on_reset=False -> the
+# 512-pt FPS subset is fixed for the whole run, so the SAME points are emitted every
+# episode (only their world transform changes with the scene). This ablates the
+# per-reset FPS-resampling stochasticity that every other clean env uses. Sanity check:
+# if the ceiling is a PERCEPTION / point-separability problem, a fixed canonical cloud
+# (deterministic point identity) should help; if it's a DATA-COVERAGE / hard-reset
+# problem, fixing the cloud won't move the number. Seg channel kept ON so the ONLY
+# delta vs Ur5eRobotiq2f85...CleanSeg is resample_on_reset.
+# ----------------------------------------------------------------------------
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCCleanSegCanonicalCfg(Ur5eRobotiq2f85DataCollectionPCCleanSegCfg):
+    """Clean+seg data collection with the FPS subset FIXED for the run (resample_on_reset=False).
+    Identical scene / action / sysid / 4-path reset distribution to the CleanSeg env; only the
+    per-reset point resampling is turned off."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.data_collect.scene_pc.params["resample_on_reset"] = False
+
+
+@configclass
+class Ur5eRobotiq2f85BCPointNetCleanSegCanonicalEvalCfg(Ur5eRobotiq2f85BCPointNetCleanSegEvalCfg):
+    """BC eval for models trained on the CANONICAL (non-resampled) clean+seg cloud. Same single-path
+    HARD reset / action / success / seg channel as the CleanSeg eval; the live cloud's FPS subset is
+    fixed for the run (resample_on_reset=False) to match the canonical collection env."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.data_collect.scene_pc.params["resample_on_reset"] = False
+
+
+# ----------------------------------------------------------------------------
+# ONLINE-DAgger env: PointNet student <- JIT ScenePC teacher (point-cloud DAgger)
+# ----------------------------------------------------------------------------
+# Distills the ScenePC JIT expert into a PointNet student ONLINE via the
+# rsl_rl DistillationRunnerSplit (see PC_DAggerSplitRunnerCfg): the student rolls
+# out, the frozen teacher labels the student-visited states, and the student
+# regresses to the teacher each step. Unlike the offline BC pipeline (train on
+# TEACHER-trajectory states), the student sees its OWN state distribution -- the
+# DAgger fix for compounding covariate shift.
+#
+# THREE FLAT obs groups (the DAgger runner routes them via obs_groups):
+#   * ``proprio``   -- joint_pos + end_effector_pose (18d), the student proprio.
+#   * ``scene_pc``  -- the CLEAN+SEG ScenePointCloud (512x4 = 2048d flat), EE frame,
+#                      byte-for-byte the same cloud the 79.8% CleanSeg BC student uses,
+#                      so online DAgger is a clean single-variable swap vs offline BC.
+#   * ``teacher``   -- the ScenePC-expert input (1561d), consumed by the JIT teacher.
+# Separate flat groups (not the concatenate_terms=False ``data_collect`` group) so
+# StudentTeacherPointCloud can split points from proprio.
+@configclass
+class PCDAggerCleanSegObservationsCfg:
+    """Flat 3-group obs layout for point-cloud online DAgger (CleanSeg student cloud)."""
+
+    # Expert (teacher) input -- 1561d, matches teachers/patrick_jit_expert.pt.
+    teacher: TeacherProprioWithPCCfg = TeacherProprioWithPCCfg()
+
+    @configclass
+    class ProprioCfg(ObsGroup):
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+            self.history_length = 1
+
+    @configclass
+    class ScenePCCfg(ObsGroup):
+        # Clean ScenePointCloud, EE (wrist_3_link) frame, 512 pts, 256/128/128 split --
+        # identical to CleanDataCollectObsCfg.scene_pc. Seg channel turned on in the
+        # env __post_init__ (-> (512, 4), point_dim=4).
+        scene_pc = ObsTerm(
+            func=task_mdp.ScenePointCloud,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "insertive_cfg": SceneEntityCfg("insertive_object"),
+                "receptive_cfg": SceneEntityCfg("receptive_object"),
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "num_points": 512,
+                "class_ratios": (0.5, 0.25, 0.25),
+                "resample_on_reset": True,
+                "visualize": False,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+            self.history_length = 1
+
+    proprio: ProprioCfg = ProprioCfg()
+    scene_pc: ScenePCCfg = ScenePCCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85PCDAggerCleanSegCfg(Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg):
+    """Online point-cloud DAgger env: PointNet student + ScenePC JIT teacher.
+
+    Same scene / action term / sysid + OSC gains / JIT-expert teacher wiring as the
+    data-collection env, but the observations are the flat 3-group DAgger layout and
+    the reset distribution is the broad 4-path mix (diverse student-visited states for
+    DAgger coverage). Pair with ``PC_DAggerSplitRunnerCfg`` and launch with
+    ``agent.policy.teacher_jit_path=<scenepc expert jit>`` (+ ``--enable_cameras`` is
+    NOT needed -- the cloud is mesh-sampled, no camera).
+    """
+
+    observations: PCDAggerCleanSegObservationsCfg = PCDAggerCleanSegObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Seg channel ON -> scene_pc is (512, 4); student point_dim=4 (matches CleanSeg BC).
+        self.observations.scene_pc.scene_pc.params["include_segmentation"] = True
+        self.observations.scene_pc.scene_pc.params["segmentation_labels"] = dict(_SEG_LABELS)
+        # Broad 4-path reset distribution so the student rolls out across the full state
+        # space (DAgger needs coverage of the states the student actually visits).
+        self.events.reset_from_reset_states.params["probs"] = [0.25, 0.25, 0.25, 0.25]
+        self.events.reset_from_reset_states.params["reset_types"] = [
+            "ObjectAnywhereEEAnywhere",
+            "ObjectRestingEEGrasped",
+            "ObjectAnywhereEEGrasped",
+            "ObjectPartiallyAssembledEEGrasped",
+        ]
 
 
 # ----------------------------------------------------------------------------

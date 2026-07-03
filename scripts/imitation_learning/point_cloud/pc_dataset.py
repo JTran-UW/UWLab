@@ -52,8 +52,14 @@ class PCDemoDataset(Dataset):
 
     def __init__(self, path: str, num_points: int | None = None, success_only: bool = True,
                  joint_pos_dims: int | None = None, pc_parts: list[str] | None = None,
-                 append_prim_semantic: bool = False):
+                 append_prim_semantic: bool = False, history_len: int = 1):
         super().__init__()
+        # history_len > 1 turns this into a SEQUENCE dataset for the history-conditioned policy
+        # (HistoryPointNet): __getitem__ returns a window of the last `history_len` timesteps WITHIN
+        # the same episode -- (points, prim_id, proprio, action, valid) each with a leading time axis
+        # -- left-padded with zeros (and valid=False) at episode starts. history_len == 1 keeps the
+        # original flat single-timestep behavior (5-tuple with the aux target).
+        self.history_len = int(history_len)
         # append_prim_semantic (per-prim datasets only): derive a per-point segmentation label from
         # each point's source prim (robot=0 / insertive=-1 / receptive=+1) and APPEND it as an extra
         # cloud channel, so the model trains on [xyz, seg] (point_dim 3 -> 4). Giving the network the
@@ -134,11 +140,26 @@ class PCDemoDataset(Dataset):
             self.proprio = np.empty((total, proprio_dim), dtype=np.float32)
             self.actions = np.empty((total, action_dim), dtype=np.float32)
             self.aux = np.empty((total, aux_dim), dtype=np.float32) if aux_dim else None
+            # Global index where each timestep's EPISODE begins, so a history window never crosses an
+            # episode boundary (it clamps to this start and left-pads the rest). Only used when
+            # history_len > 1; cheap to always build.
+            self.ep_start = np.empty(total, dtype=np.int64)
+            # Steps until each timestep's EPISODE ends (0 = final step of its demo). Lets the trainer
+            # bucket the action-error metric by trajectory phase -- the last few steps (the precise
+            # insertion corrections) vs the earlier free-space approach. Always built; cheap.
+            self.steps_from_end = np.empty(total, dtype=np.int64)
+            # Optional per-step EXPERT action std (raw action units), written by collect_pc_demos when
+            # the expert reported it. Enables DEXTRAH inverse-variance BC loss weighting. Absent (older
+            # / mean-only datasets) -> has_expert_std=False and a zeros placeholder downstream.
+            self.has_expert_std = "expert_action_std" in data[demos[0]]
+            self.expert_std = np.empty((total, action_dim), dtype=np.float32) if self.has_expert_std else None
 
             i = 0
             for d in demos:
                 g = data[d]
                 t = g["actions"].shape[0]
+                self.ep_start[i : i + t] = i
+                self.steps_from_end[i : i + t] = np.arange(t - 1, -1, -1)
                 self.points[i : i + t] = g["obs"][pc_key][:]
                 if per_prim:
                     self.prim_id[i : i + t] = g["obs"][prim_id_key][:]
@@ -146,6 +167,8 @@ class PCDemoDataset(Dataset):
                     [_slice(g["obs"][k][:], k) for k in self.proprio_keys], axis=1
                 )
                 self.actions[i : i + t] = g["actions"][:]
+                if self.has_expert_std:
+                    self.expert_std[i : i + t] = g["expert_action_std"][:]
                 if self.aux is not None:
                     self.aux[i : i + t] = np.concatenate([g["obs"][k][:] for k in self.aux_keys], axis=1)
                 i += t
@@ -157,6 +180,15 @@ class PCDemoDataset(Dataset):
         self.proprio = torch.from_numpy(self.proprio)
         self.actions = torch.from_numpy(self.actions)
         self.aux = torch.from_numpy(self.aux) if self.aux is not None else None
+        self.ep_start = torch.from_numpy(self.ep_start)
+        self.steps_from_end = torch.from_numpy(self.steps_from_end)
+        # (total, action_dim) expert std, or a constant-shape zeros placeholder (has_expert_std=False)
+        # so every __getitem__ returns the same tuple regardless of dataset provenance.
+        self.expert_std = (
+            torch.from_numpy(self.expert_std)
+            if self.expert_std is not None
+            else torch.zeros(total, action_dim, dtype=torch.float32)
+        )
         self.per_prim = per_prim
         self.n_load = n_load
         self.n_pts = n_pts if per_prim else n_load
@@ -194,7 +226,10 @@ class PCDemoDataset(Dataset):
         out_pid[:k] = sel_pid
         return out, out_pid
 
-    def __getitem__(self, idx):
+    def _frame(self, idx):
+        """Assemble a SINGLE timestep's cloud: per-prim select+pad (+ optional derived seg channel)
+        or flat subsample. Returns ``(pts (n_pts, point_dim), pid)`` -- ``pid`` is the per-point
+        prim id ``(n_pts,)`` for per-prim datasets, else the shared empty ``(0,)`` placeholder."""
         pts = self.points[idx]
         if self.per_prim:
             pts, pid = self._select_and_pad(pts, self.prim_id[idx])
@@ -207,6 +242,45 @@ class PCDemoDataset(Dataset):
                 sel = torch.randint(0, self.n_pts, (self.subsample,))
                 pts = pts[sel]
             pid = self._empty_pid  # flat datasets carry no per-point prim id
+        return pts, pid
+
+    def _history_item(self, idx):
+        """Window of the last ``history_len`` timesteps ending at ``idx``, clamped to the episode
+        start and LEFT-padded with zeros. Returns ``(points, prim_id, proprio, action, valid)`` each
+        with a leading time axis (padded frames first); ``valid`` (H,) is False for the pad frames.
+        The action at each timestep is that step's executed action -- the per-token BC target."""
+        H = self.history_len
+        lo = max(int(self.ep_start[idx]), idx - H + 1)
+        real = list(range(lo, idx + 1))                     # real frames, oldest -> newest
+        n = len(real)
+        pad = H - n                                          # left-pad count
+
+        frames = [self._frame(j) for j in real]
+        pts_real = torch.stack([f[0] for f in frames])       # (n, n_pts, point_dim)
+        points = pts_real.new_zeros(H, *pts_real.shape[1:])  # left-pad with zeros
+        points[pad:] = pts_real
+
+        if self.per_prim:
+            pid_real = torch.stack([f[1] for f in frames])   # (n, n_pts)
+            prim_id = pid_real.new_full((H, pid_real.shape[1]), -1)  # pad frames -> id -1 (never dropped)
+            prim_id[pad:] = pid_real
+        else:
+            prim_id = self._empty_pid.new_zeros(H, 0)        # (H, 0): flat datasets carry no prim id
+
+        proprio = self.proprio.new_zeros(H, self.proprio_dim)
+        proprio[pad:] = self.proprio[lo : idx + 1]
+        action = self.actions.new_zeros(H, self.action_dim)
+        action[pad:] = self.actions[lo : idx + 1]
+        valid = torch.zeros(H, dtype=torch.bool)
+        valid[pad:] = True
+        return points, prim_id, proprio, action, valid
+
+    def __getitem__(self, idx):
+        if self.history_len > 1:
+            return self._history_item(idx)
+        pts, pid = self._frame(idx)
         # aux is an empty (0,) tensor when the dataset has no aux-probe targets.
         aux = self.aux[idx] if self.aux is not None else self.points.new_zeros(0)
-        return pts, pid, self.proprio[idx], self.actions[idx], aux
+        # steps_from_end (scalar) buckets the %-error metric by trajectory phase; expert_std
+        # (action_dim,) drives inverse-variance loss weighting (zeros when the dataset lacks it).
+        return pts, pid, self.proprio[idx], self.actions[idx], aux, self.steps_from_end[idx], self.expert_std[idx]

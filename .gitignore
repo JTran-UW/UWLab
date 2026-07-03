@@ -84,6 +84,8 @@ tmp/
 !/analysis/action_multimodality.py
 !/analysis/scenepc_select_checkpoints.py
 /teachers/
+*.hdf5
+*.tsv
 
 *.pt
 *.png
