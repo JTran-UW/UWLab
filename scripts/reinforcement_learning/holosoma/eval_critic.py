@@ -213,6 +213,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 actions = policy({"actor_obs": actor_obs})
             new_obs, rew, dones, extras = env.step(actions)
 
+            import pdb; pdb.set_trace()
+
             # Get policy critic on current obs/actions
             critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=-1)
             critic_output = critic(critic_obs, actions)
@@ -221,10 +223,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             # Get expert critic value on current obs/actions (if available)
             if expert_critic is not None:
-                expert_critic_obs = torch.cat([new_obs[k] for k in critic_obs_keys], dim=-1)
                 if expert_is_fastsac:
+                    expert_critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=-1)
                     expert_critic_output = expert_critic(expert_critic_obs, actions)
                 else:
+                    expert_critic_obs = torch.cat([new_obs[k] for k in critic_obs_keys], dim=-1)
                     expert_critic_output = rew + 0.99 * expert_critic(expert_critic_obs)
                 expert_critic_values.append(expert_critic_output.mean().cpu().item())
 

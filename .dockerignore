@@ -50,5 +50,11 @@ PegInsertive/
 /peg_state_rl_expert_seed42.pt.*
 # Stray installers / large blobs that occasionally land at the repo root
 /Miniconda3-latest-Linux-x86_64.sh
-/*.sif
-/*.tar
+# Container image blobs anywhere in tree (docker/uw-lab-base.sif, docker/exports/*.tar, etc.)
+**/*.sif
+**/*.tar
+**/*.deb
+docker/exports/
+# Root-level odds and ends
+/env.bin
+/Untitled
