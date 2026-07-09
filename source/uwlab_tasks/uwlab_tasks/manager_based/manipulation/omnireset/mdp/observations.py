@@ -235,6 +235,21 @@ def get_actuator_delay(
     return lag.view(env.num_envs, 1).to(dtype=torch.float32, device=env.device)
 
 
+def joint_pos_last_n(
+    env: ManagerBasedEnv,
+    n: int = 6,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Last ``n`` DOFs of the asset's joint positions, in articulation DOF order.
+
+    For the UR5e + Robotiq 2F-85 the 12 DOFs are ordered arm-then-gripper, so the
+    default ``n=6`` yields the six gripper joints (``finger_joint``,
+    ``right_outer_knuckle``, the two inner knuckles, the two inner-finger knuckles).
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.joint_pos[:, -n:]
+
+
 def time_left(env) -> torch.Tensor:
     if hasattr(env, "episode_length_buf"):
         life_left = 1 - (env.episode_length_buf.float() / env.max_episode_length)

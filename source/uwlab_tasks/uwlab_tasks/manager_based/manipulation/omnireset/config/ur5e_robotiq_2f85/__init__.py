@@ -99,6 +99,14 @@ gym.register(
     kwargs={"env_cfg_entry_point": f"{__name__}.camera_align_cfg:CameraAlignEnvCfg"},
 )
 
+# Register open-loop action-playback env (scripts_v2/tools/sim2real/playback_actions.py)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Playback-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.playback_cfg:Ur5eRobotiq2f85PlaybackCfg"},
+)
+
 # Register RL state environments
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-v0",
