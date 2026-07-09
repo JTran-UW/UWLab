@@ -236,7 +236,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Match the most recent run directory for this run_name (or any run if no name set).
         run_dir_pattern = f".*_{re.escape(agent_cfg.run_name)}" if agent_cfg.run_name else ".*"
         try:
-            resume_path = get_checkpoint_path(log_root_path, run_dir_pattern)
+            resume_path = get_checkpoint_path(log_root_path, run_dir_pattern, checkpoint="model_.*.pt")
             agent_cfg.resume = True
             print(
                 f"[INFO] SLURM requeue detected (SLURM_RESTART_COUNT={os.getenv('SLURM_RESTART_COUNT')}). "

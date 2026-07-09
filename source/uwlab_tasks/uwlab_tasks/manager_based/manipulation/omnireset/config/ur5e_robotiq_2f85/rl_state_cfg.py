@@ -308,7 +308,7 @@ class BaseEventCfg:
     # mode: startup (randomize dynamics)
     robot_material = EventTerm(
         func=task_mdp.randomize_rigid_body_material,  # type: ignore
-        mode="startup",
+        mode="reset",
         params={
             "static_friction_range": (0.3, 1.2),
             "dynamic_friction_range": (0.2, 1.0),
@@ -321,7 +321,7 @@ class BaseEventCfg:
 
     insertive_object_material = EventTerm(
         func=task_mdp.randomize_rigid_body_material,  # type: ignore
-        mode="startup",
+        mode="reset",
         params={
             "static_friction_range": (1.0, 2.0),
             "dynamic_friction_range": (0.9, 1.9),
@@ -334,7 +334,7 @@ class BaseEventCfg:
 
     receptive_object_material = EventTerm(
         func=task_mdp.randomize_rigid_body_material,  # type: ignore
-        mode="startup",
+        mode="reset",
         params={
             "static_friction_range": (0.2, 0.6),
             "dynamic_friction_range": (0.15, 0.5),
@@ -347,7 +347,7 @@ class BaseEventCfg:
 
     table_material = EventTerm(
         func=task_mdp.randomize_rigid_body_material,  # type: ignore
-        mode="startup",
+        mode="reset",
         params={
             "static_friction_range": (0.3, 0.6),
             "dynamic_friction_range": (0.2, 0.5),
@@ -360,7 +360,7 @@ class BaseEventCfg:
 
     randomize_robot_mass = EventTerm(
         func=task_mdp.randomize_rigid_body_mass,
-        mode="startup",
+        mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "mass_distribution_params": (0.7, 1.3),
@@ -372,7 +372,7 @@ class BaseEventCfg:
 
     randomize_insertive_object_mass = EventTerm(
         func=task_mdp.randomize_rigid_body_mass,
-        mode="startup",
+        mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("insertive_object"),
             # we assume insertive object is somewhere between 20g and 200g
@@ -385,7 +385,7 @@ class BaseEventCfg:
 
     randomize_receptive_object_mass = EventTerm(
         func=task_mdp.randomize_rigid_body_mass,
-        mode="startup",
+        mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("receptive_object"),
             "mass_distribution_params": (0.5, 1.5),
@@ -397,7 +397,7 @@ class BaseEventCfg:
 
     randomize_table_mass = EventTerm(
         func=task_mdp.randomize_rigid_body_mass,
-        mode="startup",
+        mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("table"),
             "mass_distribution_params": (0.5, 1.5),

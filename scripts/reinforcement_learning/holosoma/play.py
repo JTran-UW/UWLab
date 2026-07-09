@@ -50,6 +50,16 @@ parser.add_argument(
     help="Path to save the recorded replay buffer. Defaults to <log_dir>/play_transitions.pt.",
 )
 parser.add_argument(
+    "--record_n_steps",
+    type=int,
+    default=1,
+    help=(
+        "n-step return horizon to tag the recorded replay buffer with. Transitions are "
+        "always stored as single steps in temporal order; SimpleReplayBuffer builds the "
+        "n-step returns at sample time. Set this to match the FastSAC training num_steps."
+    ),
+)
+parser.add_argument(
     "--single_env_rb",
     action="store_true",
     default=False,
@@ -136,6 +146,7 @@ def record_transitions_to_replay_buffer(
     task_name: str,
     device: str,
     gamma: float = 0.99,
+    n_steps: int = 1,
     single_env_rb: bool = False,
 ) -> None:
     """Run a policy for ``num_steps`` and save transitions in SimpleReplayBuffer format.
@@ -146,6 +157,21 @@ def record_transitions_to_replay_buffer(
 
     Transitions are stored so the output can be reloaded for off-policy training
     (e.g. warm-starting FastSAC from a PPO expert).
+
+    N-step returns: single-step transitions are recorded in temporal order per env
+    (with ``dones``/``truncations``), which is exactly the layout ``SimpleReplayBuffer``
+    walks to build n-step returns at *sample* time (see the ``n_steps > 1`` branch of
+    ``SimpleReplayBuffer.sample``). ``n_steps`` is therefore recorded for provenance and
+    to construct the recording buffer consistently; it does not change the stored bytes.
+    The consumer (``FastSACAgent.load_expert_replay_buffer``) must build the expert buffer
+    with the agent's ``num_steps`` for the n-step returns to actually take effect at train
+    time.
+
+    Caveat: on a truncated/terminated step IsaacLab auto-resets and returns the *post-reset*
+    observation, and the raw-tensor step path here does not expose the true terminal
+    observation. The sampler stops the n-step accumulation at the first done/truncation, so
+    the terminal transition bootstraps from the post-reset obs — a pre-existing limitation
+    shared with 1-step recording, not introduced by n-step.
     """
     n_env = env.num_envs
     n_act = env.num_actions
@@ -163,7 +189,7 @@ def record_transitions_to_replay_buffer(
         n_obs=n_obs,
         n_act=n_act,
         n_critic_obs=n_critic_obs,
-        n_steps=1,
+        n_steps=n_steps,
         gamma=gamma,
         device=device,
     )
@@ -240,6 +266,7 @@ def record_transitions_to_replay_buffer(
             "ptr": total,
             "n_env": 1,
             "buffer_size": total,
+            "n_steps": n_steps,
             "global_step": 0,
         }
         torch.save(payload, output_path)
@@ -266,6 +293,8 @@ def record_transitions_to_replay_buffer(
             "n_obs": n_obs,
             "n_act": n_act,
             "n_critic_obs": n_critic_obs,
+            "n_steps": n_steps,
+            "gamma": gamma,
             "actor_obs_keys": actor_obs_keys,
             "critic_obs_keys": critic_obs_keys,
             "task": task_name,
@@ -371,6 +400,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 task_name=args_cli.task,
                 device=agent_cfg.device,
                 gamma=getattr(agent_cfg.algorithm, "gamma", 0.99) if hasattr(agent_cfg, "algorithm") else 0.99,
+                n_steps=args_cli.record_n_steps,
                 single_env_rb=args_cli.single_env_rb,
             )
             env.close()
@@ -398,6 +428,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 task_name=args_cli.task,
                 device=agent_cfg.device,
                 gamma=float(runner.alg_cfg.get("gamma", 0.99)),
+                n_steps=args_cli.record_n_steps,
                 single_env_rb=args_cli.single_env_rb,
             )
             env.close()

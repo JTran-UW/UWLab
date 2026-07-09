@@ -3,7 +3,21 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to play a checkpoint if an RL agent from RSL-RL."""
+"""Compare a FastSAC distributional critic against empirical Monte Carlo return distributions.
+
+Per outer iteration:
+  1. env.reset(), then broadcast env_0's physics state to all envs so they share s0.
+  2. Sample actions a_i from the actor (stochastic) at s0. Record Q distribution at (s0, a_i)
+     — averaged across ensemble critics and across envs (since s0 is shared, this is the
+     policy's expected Q-distribution at s0 marginalized over the actor's action noise).
+  3. Take one step with those actions, then keep sampling stochastically until every env
+     has terminated at least once.
+  4. Compute per-env discounted MC returns, bin into a histogram with the same support as
+     the Q atoms, softmax-normalize the counts.
+  5. Overlay the two distributions on a single plot; save to ``q_vs_mc.png``.
+
+Repeats until the sim app is stopped (Ctrl-C).
+"""
 
 """Launch Isaac Sim Simulator first."""
 
@@ -16,12 +30,7 @@ from isaaclab.app import AppLauncher
 import cli_args  # isort: skip
 
 # add argparse arguments
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
-)
+parser = argparse.ArgumentParser(description="Compare FastSAC critic distribution to Monte Carlo returns.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
@@ -33,10 +42,11 @@ parser.add_argument(
     action="store_true",
     help="Use the pre-trained checkpoint from Nucleus.",
 )
-parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-parser.add_argument("--expert_checkpoint", type=str, default=None, help="Path to an RSL-RL (PPO) checkpoint .pt file. If set, loads an OnPolicyRunner from that checkpoint and passes its policy and critic to FastSACAgent as BC regularization targets.")
-parser.add_argument("--fastsac_expert_checkpoint", type=str, default=None, help="Path to a FastSAC checkpoint .pt file to use as expert Q function for critic comparison.")
-parser.add_argument("--plot_rewards", action="store_true", default=False, help="Plot individual reward components over time.")
+parser.add_argument(
+    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
+)
+parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for Monte Carlo return computation.")
+parser.add_argument("--output_path", type=str, default="q_vs_mc.png", help="Output path for the comparison plot.")
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -44,9 +54,6 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video
-if args_cli.video:
-    args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -59,14 +66,10 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import os
-import time
+import numpy as np
 import torch
-import tqdm
-from tensordict import TensorDict
 
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 from holosoma.agents.fast_sac.fast_sac_agent import FastSACAgent
-from holosoma.agents.fast_sac.fast_sac_utils import SimpleReplayBuffer
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -76,13 +79,10 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.assets import retrieve_file_path
-from isaaclab.utils.dict import print_dict
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
 from vecenv_wrapper import HolosomaVecEnvWrapper
-from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.agents.rsl_rl_cfg import Base_PPORunnerCfg
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
@@ -91,30 +91,78 @@ from uwlab_tasks.utils.hydra import hydra_task_config
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 
+
+def _broadcast_env0_state_to_all(env_wrapper) -> None:
+    """After ``env.reset()``, overwrite every env's articulation + rigid-object physics state
+    with env_0's state, offset by each env's origin so the local pose is identical everywhere.
+
+    This forces s0 to be shared across all envs while leaving the reset event manager's
+    bookkeeping (task index, success monitor state) untouched.
+    """
+    unwrapped = env_wrapper.unwrapped  # ManagerBasedRLEnv
+    scene = unwrapped.scene
+    env_origins = scene.env_origins  # [n, 3]
+    origin_0 = env_origins[0]
+    n = scene.num_envs
+    device = unwrapped.device
+    all_env_ids = torch.arange(n, device=device)
+
+    # Articulations
+    for _, articulation in scene._articulations.items():
+        pos_w0 = articulation.data.root_pos_w[0]           # [3]
+        quat_w0 = articulation.data.root_quat_w[0]         # [4]
+        linvel_w0 = articulation.data.root_lin_vel_w[0]    # [3]
+        angvel_w0 = articulation.data.root_ang_vel_w[0]    # [3]
+        # Position: env_0 local pose + per-env origin
+        local_pos = pos_w0 - origin_0                      # [3]
+        pos_all = (local_pos.unsqueeze(0) + env_origins).contiguous()   # [n, 3]
+        quat_all = quat_w0.unsqueeze(0).expand(n, -1).contiguous()      # [n, 4]
+        pose_all = torch.cat([pos_all, quat_all], dim=-1).contiguous()  # [n, 7]
+        vel_all = torch.cat([linvel_w0, angvel_w0]).unsqueeze(0).expand(n, -1).contiguous()  # [n, 6]
+        joint_pos_all = articulation.data.joint_pos[0:1].expand(n, -1).contiguous()
+        joint_vel_all = articulation.data.joint_vel[0:1].expand(n, -1).contiguous()
+
+        articulation.write_root_pose_to_sim(pose_all, env_ids=all_env_ids)
+        articulation.write_root_velocity_to_sim(vel_all, env_ids=all_env_ids)
+        articulation.write_joint_state_to_sim(joint_pos_all, joint_vel_all, env_ids=all_env_ids)
+        # Align PD targets with the new joint state to avoid the controller snapping back.
+        articulation.set_joint_position_target(joint_pos_all, env_ids=all_env_ids)
+        articulation.set_joint_velocity_target(joint_vel_all, env_ids=all_env_ids)
+
+    # Rigid objects
+    for _, rigid_obj in scene._rigid_objects.items():
+        pos_w0 = rigid_obj.data.root_pos_w[0]
+        quat_w0 = rigid_obj.data.root_quat_w[0]
+        linvel_w0 = rigid_obj.data.root_lin_vel_w[0]
+        angvel_w0 = rigid_obj.data.root_ang_vel_w[0]
+        local_pos = pos_w0 - origin_0
+        pos_all = (local_pos.unsqueeze(0) + env_origins).contiguous()
+        quat_all = quat_w0.unsqueeze(0).expand(n, -1).contiguous()
+        pose_all = torch.cat([pos_all, quat_all], dim=-1).contiguous()
+        vel_all = torch.cat([linvel_w0, angvel_w0]).unsqueeze(0).expand(n, -1).contiguous()
+
+        rigid_obj.write_root_pose_to_sim(pose_all, env_ids=all_env_ids)
+        rigid_obj.write_root_velocity_to_sim(vel_all, env_ids=all_env_ids)
+
+    scene.write_data_to_sim()
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Play with RSL-RL agent."""
-    # grab task name for checkpoint path
-    task_name = args_cli.task.split(":")[-1]
-    train_task_name = task_name.replace("-Play", "")
-
+    """Compare FastSAC critic distribution to MC returns."""
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-
-    # make config compatible with installed rsl-rl version
     agent_cfg = cli_args.sanitize_rsl_rl_cfg(agent_cfg)
-
-    # set the environment seed
-    # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
+    # resolve checkpoint path
+    log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     if args_cli.use_pretrained_checkpoint:
+        task_name = args_cli.task.split(":")[-1]
+        train_task_name = task_name.replace("-Play", "")
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
         if not resume_path:
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
@@ -125,29 +173,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     log_dir = os.path.dirname(resume_path)
-
-    # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
-    # convert to single-agent instance if required by the RL algorithm
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
-
-    # wrap for video recording
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during training.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
     env = HolosomaVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
@@ -156,143 +187,128 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner = FastSACAgent(env, agent_cfg, log_dir=None, device=agent_cfg.device)
     runner.setup()
     runner.load(resume_path)
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-    critic = runner.get_inference_critic(device=env.unwrapped.device)
+
+    device = env.unwrapped.device
+
+    # Access the raw pieces so we can (a) stochastically sample from the actor and
+    # (b) read the categorical Q-distribution rather than a scalar Q value.
+    actor = runner.actor.to(device)
+    qnet = runner.qnet.to(device)
+    obs_normalizer = runner.obs_normalizer.to(device)
+    critic_obs_normalizer = runner.critic_obs_normalizer.to(device)
+    actor.eval()
+    qnet.eval()
+    obs_normalizer.eval()
+    critic_obs_normalizer.eval()
+
     actor_obs_keys = agent_cfg.actor_obs_keys
     critic_obs_keys = agent_cfg.critic_obs_keys
 
-    expert_policy = None
-    expert_critic = None
-    expert_is_fastsac = False
+    # Distributional Q-network support (categorical over atoms in [v_min, v_max])
+    v_min = float(qnet.v_min)
+    v_max = float(qnet.v_max)
+    num_atoms = int(qnet.num_atoms)
+    q_support = qnet.q_support.detach().cpu().numpy()  # [num_atoms]
 
-    if args_cli.fastsac_expert_checkpoint:
-        fastsac_expert_resume_path = retrieve_file_path(args_cli.fastsac_expert_checkpoint)
-        fastsac_expert_runner = FastSACAgent(env, agent_cfg, log_dir=None, device=agent_cfg.device)
-        fastsac_expert_runner.setup()
-        fastsac_expert_runner.load(fastsac_expert_resume_path)
-        expert_policy = fastsac_expert_runner.get_inference_policy(device=env.unwrapped.device)
-        expert_critic = fastsac_expert_runner.get_inference_critic(device=env.unwrapped.device)
-        expert_is_fastsac = True
-        print(f"[INFO] Loaded FastSAC expert checkpoint from: {fastsac_expert_resume_path}")
-    elif args_cli.expert_checkpoint:
-        expert_rsl_env = RslRlVecEnvWrapper(env.env, clip_actions=agent_cfg.clip_actions)
-        expert_ppo_cfg = cli_args.sanitize_rsl_rl_cfg(Base_PPORunnerCfg())
-        expert_resume_path = retrieve_file_path(args_cli.expert_checkpoint)
-        expert_runner = OnPolicyRunner(expert_rsl_env, expert_ppo_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        expert_runner.load(expert_resume_path)
-        expert_policy = expert_runner.get_inference_policy(device=agent_cfg.device)
-        expert_critic = expert_runner.get_inference_critic(device=agent_cfg.device)
+    edges = np.linspace(v_min, v_max, num_atoms + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    bin_width = (v_max - v_min) / num_atoms
 
-    dt = env.unwrapped.step_dt
-
-    # reset environment — use reset() so RecordVideo initializes its recorder
-    obs, _ = env.reset()
-    timestep = 0
-    # simulate environment
-
-    expert_critic_values = []
-    critic_values = []
-    true_rewards = []
-
-    reward_components: dict[str, list[float]] = {}
-    if args_cli.plot_rewards:
-        rm = env.unwrapped.reward_manager
-        for name in rm._term_names:
-            reward_components[name] = []
-
-    while simulation_app.is_running():
-        start_time = time.time()
-        # run everything in inference mode
-        with torch.inference_mode():
-            actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=-1)
-            if expert_is_fastsac:
-                actions = expert_policy({"actor_obs": actor_obs})
-            elif expert_policy is not None:
-                actions = expert_policy(obs)
-            else:
-                actions = policy({"actor_obs": actor_obs})
-            new_obs, rew, dones, extras = env.step(actions)
-
-            import pdb; pdb.set_trace()
-
-            # Get policy critic on current obs/actions
-            critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=-1)
-            critic_output = critic(critic_obs, actions)
-            critic_value = critic_output.mean()
-            critic_values.append(critic_value.cpu().item())
-
-            # Get expert critic value on current obs/actions (if available)
-            if expert_critic is not None:
-                if expert_is_fastsac:
-                    expert_critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=-1)
-                    expert_critic_output = expert_critic(expert_critic_obs, actions)
-                else:
-                    expert_critic_obs = torch.cat([new_obs[k] for k in critic_obs_keys], dim=-1)
-                    expert_critic_output = rew + 0.99 * expert_critic(expert_critic_obs)
-                expert_critic_values.append(expert_critic_output.mean().cpu().item())
-
-            true_rewards.append(rew.mean().cpu().item())
-
-            if args_cli.plot_rewards:
-                step_rew = rm._step_reward * dt
-                for idx, name in enumerate(rm._term_names):
-                    reward_components[name].append(step_rew[:, idx].mean().cpu().item())
-
-            obs = new_obs
-
-        timestep += 1
-        if args_cli.video:
-            # Exit the play loop after recording one video; don't break on dones
-            if timestep == args_cli.video_length:
-                break
-        elif dones.any():
-            break
-
-    # Monte Carlo discounted return: G_t = sum_{k=0}^{N-t-1} gamma^k * r_{t+k}
-    GAMMA = 0.99
-    mc_returns = [0.0] * len(true_rewards)
-    running = 0.0
-    for i in range(len(true_rewards) - 1, -1, -1):
-        running = true_rewards[i] + GAMMA * running
-        mc_returns[i] = running
+    GAMMA = args_cli.gamma
+    obs_normalization = runner.obs_normalization
 
     import matplotlib.pyplot as plt
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    if expert_critic_values:
-        ax.plot(expert_critic_values, label="Expert Critic")
-    ax.plot(critic_values, label="Policy Critic")
-    ax.plot(true_rewards, label="True Reward (mean across envs)", linestyle="--")
-    ax.plot(mc_returns, label=f"MC Return (γ={GAMMA})", linestyle=":")
-    ax.set_xlabel("step")
-    ax.set_ylabel("value")
-    ax.legend()
-    fig.savefig("critic_comparison.png")
 
-    if args_cli.plot_rewards and reward_components:
-        fig2, ax2 = plt.subplots(figsize=(12, 6))
-        for name, values in reward_components.items():
-            ax2.plot(values, label=name)
-        ax2.plot(true_rewards, label="Total Reward", linewidth=2, color="black", linestyle="--")
-        ax2.set_xlabel("step")
-        ax2.set_ylabel("reward")
-        ax2.set_title("Reward Components Over Time")
-        ax2.legend(fontsize="small", loc="best")
-        fig2.tight_layout()
-        fig2.savefig("reward_components.png")
-        print(f"[INFO] Saved reward components plot to: reward_components.png")
+    n_env = env.num_envs
+    print(f"[INFO] Running with num_envs={n_env}, γ={GAMMA}, v_min={v_min}, v_max={v_max}, num_atoms={num_atoms}")
 
-        # time delay for real-time evaluation
-        # sleep_time = dt - (time.time() - start_time)
-        # if args_cli.real_time and sleep_time > 0:
-        #     time.sleep(sleep_time)
+    iteration = 0
+    while simulation_app.is_running():
+        # ---- 1. Reset every env, then force all envs to share env_0's state ----
+        obs, _ = env.reset()
+        _broadcast_env0_state_to_all(env)
+        obs = env.get_observations()
 
-    # close the simulator
+        # ---- 2. Stochastic action at s0 + record Q distribution ----
+        with torch.inference_mode():
+            actor_obs_0 = torch.cat([obs[k] for k in actor_obs_keys], dim=-1)
+            critic_obs_0 = torch.cat([obs[k] for k in critic_obs_keys], dim=-1)
+
+            norm_actor_obs_0 = obs_normalizer(actor_obs_0, update=False) if obs_normalization else actor_obs_0
+            norm_critic_obs_0 = (
+                critic_obs_normalizer(critic_obs_0, update=False) if obs_normalization else critic_obs_0
+            )
+
+            # get_actions_and_log_probs samples via rsample() → stochastic policy noise
+            actions_0, _ = actor.get_actions_and_log_probs(norm_actor_obs_0)
+
+            # Raw distributional logits: [num_critics, batch, num_atoms]
+            q_logits = qnet(norm_critic_obs_0, actions_0)
+            q_probs = torch.softmax(q_logits, dim=-1)                # per-critic PMF
+            q_probs_over_batch = q_probs.mean(dim=0)                 # avg over critic ensemble → [batch, num_atoms]
+            q_dist = q_probs_over_batch.mean(dim=0).cpu().numpy()    # avg over envs (shared s0) → [num_atoms]
+
+        # ---- 3a. First rollout step (contributes r_0 at γ^0=1) ----
+        new_obs, rew, dones, _extras = env.step(actions_0)
+        active_mask = ~dones.bool()                                            # envs that haven't terminated yet
+        returns = rew.clone()                                                  # r_0
+        discount = torch.full((n_env,), GAMMA, device=device, dtype=rew.dtype) # γ^1 for the next step
+        obs = new_obs
+
+        # ---- 3b. Continue stochastic rollout until every env has terminated ----
+        while active_mask.any():
+            with torch.inference_mode():
+                actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=-1)
+                norm_actor_obs = obs_normalizer(actor_obs, update=False) if obs_normalization else actor_obs
+                actions, _ = actor.get_actions_and_log_probs(norm_actor_obs)
+            new_obs, rew, dones, _extras = env.step(actions)
+            # Add γ^t * r_t only for envs that were still active going into this step
+            returns = returns + torch.where(active_mask, discount * rew, torch.zeros_like(rew))
+            discount = discount * GAMMA
+            active_mask = active_mask & (~dones.bool())
+            obs = new_obs
+
+        mc_returns = returns.detach().cpu().numpy()  # [n_env]
+
+        # ---- 4. Bin MC returns onto the Q support, softmax-normalize ----
+        counts, _ = np.histogram(mc_returns, bins=edges)
+        x = counts.astype(np.float64)
+        x -= x.max()  # numerical stability
+        exp_x = np.exp(x)
+        mc_pmf = exp_x / exp_x.sum()
+
+        # ---- 5. Overlay both distributions ----
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.bar(centers, q_dist, width=bin_width * 0.9, alpha=0.55, label="Q distribution (critic)", color="tab:blue")
+        ax.bar(
+            centers, mc_pmf, width=bin_width * 0.9, alpha=0.55,
+            label="MC returns (softmax-normed histogram)", color="tab:orange",
+        )
+        q_exp = float(np.sum(q_dist * q_support))
+        mc_mean = float(mc_returns.mean())
+        mc_std = float(mc_returns.std())
+        ax.set_xlabel("Return")
+        ax.set_ylabel("Probability")
+        ax.set_title(
+            f"Q vs MC returns — iter {iteration} | "
+            f"E[Q]={q_exp:.3f}  MC mean={mc_mean:.3f}  MC std={mc_std:.3f}  n={n_env}"
+        )
+        ax.legend()
+        ax.set_xlim(v_min, v_max)
+        fig.tight_layout()
+        fig.savefig(args_cli.output_path, dpi=100)
+        plt.show()
+        plt.close(fig)
+
+        print(
+            f"[iter {iteration:04d}] MC mean={mc_mean:.4f}  MC std={mc_std:.4f}  "
+            f"E[Q]={q_exp:.4f}  → {args_cli.output_path}"
+        )
+        iteration += 1
+
     env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
     simulation_app.close()
