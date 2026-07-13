@@ -106,6 +106,7 @@ import rsl_rl.runners.distillation_runner as _distillation_runner_module
 from uwlab_rl.rsl_rl.distillation_dagger import DistillationDAgger
 from uwlab_rl.rsl_rl.distillation_dagger_weighted import DistillationDAggerWeighted
 from uwlab_rl.rsl_rl.distillation_runner_split import DistillationRunnerSplit
+from uwlab_rl.rsl_rl.student_teacher_history_pointcloud import StudentTeacherHistoryPointCloud
 from uwlab_rl.rsl_rl.student_teacher_mlp import StudentTeacherMLP
 from uwlab_rl.rsl_rl.student_teacher_pointcloud import StudentTeacherPointCloud
 from uwlab_rl.rsl_rl.student_teacher_vision import StudentTeacherVision
@@ -115,6 +116,7 @@ _distillation_runner_module.StudentTeacherVision = StudentTeacherVision
 _distillation_runner_module.StudentTeacherVisionRecurrent = StudentTeacherVisionRecurrent
 _distillation_runner_module.StudentTeacherMLP = StudentTeacherMLP
 _distillation_runner_module.StudentTeacherPointCloud = StudentTeacherPointCloud
+_distillation_runner_module.StudentTeacherHistoryPointCloud = StudentTeacherHistoryPointCloud
 _distillation_runner_module.DistillationDAgger = DistillationDAgger
 _distillation_runner_module.DistillationDAggerWeighted = DistillationDAggerWeighted
 _distillation_runner_module.DistillationRunnerSplit = DistillationRunnerSplit
@@ -314,6 +316,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # the default actor-MLP exporter would silently drop the encoder. Detect by attr.
         if isinstance(policy_nn, StudentTeacherVision):
             export_vision_student_as_jit(policy_nn, path=export_model_dir, filename="depth_policy.pt")
+        elif isinstance(policy_nn, StudentTeacherPointCloud):
+            # PointNet student forward takes (points, proprio) — the flat-actor exporter
+            # would trace garbage (or crash). No PointNet exporter exists yet; skip.
+            print("[INFO]: Skipping JIT/ONNX export for StudentTeacherPointCloud (no exporter).")
         else:
             export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
             export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")

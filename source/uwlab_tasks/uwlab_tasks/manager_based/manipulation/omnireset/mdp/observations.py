@@ -3,8 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import dataclasses
 import hashlib
 import os
+import re
 
 import numpy as np
 import torch
@@ -1438,16 +1440,57 @@ class OccludedScenePointCloud(ScenePointCloud):
                 self.object_assets.append(env.scene[ocfg.name])
                 self.object_src_codes.append(src_code)
 
+        # -- Optional robot-body include-list --
+        # ``robot_body_names``: list of regex patterns resolved against
+        # ``self.robot.body_names``; only matching bodies contribute points (e.g.
+        # gripper-only clouds for policies that shouldn't see the arm). None (default)
+        # -> all bodies, the legacy behavior. Body indices stay ABSOLUTE articulation
+        # indices, so the runtime per-body pose transform is untouched.
+        # ``include_wrist_camera_mesh``: when False, the collision-only wrist D415
+        # camera mesh is NOT sampled (see _load_body_meshes).
+        self._include_wrist_cam: bool = cfg.params.get("include_wrist_camera_mesh", True)
+        # ``occlude_excluded_bodies``: excluded bodies still get sampled as OCCLUDER-ONLY
+        # points (``occluder_points`` budget, area-weighted, D415 mount kept) -- they feed
+        # the z-buffer so the arm still hides the gripper/objects behind it, but can never
+        # appear in the output cloud. Off by default (legacy: excluded bodies vanish).
+        self._occlude_excluded: bool = cfg.params.get("occlude_excluded_bodies", False)
+        self._occluder_points: int = cfg.params.get("occluder_points", 6144)
+        # Occluder points are splatted over a (2r+1)^2 z-buffer neighbourhood: one cell
+        # per point is far too sparse to block a big surface (arm ~5-12k cells vs a few
+        # thousand front-face occluder samples). r=2 -> ~13mm footprint at 0.5m.
+        self._occluder_splat: int = int(cfg.params.get("occluder_splat_radius", 2))
+        body_patterns: list[str] | None = cfg.params.get("robot_body_names", None)
+        self._robot_body_include: set[int] | None = None
+        if body_patterns is not None:
+            self._robot_body_include = {
+                i for i, name in enumerate(self.robot.body_names)
+                if any(re.fullmatch(pat, name) for pat in body_patterns)
+            }
+            # An explicit EMPTY list means "no robot output points at all" (objects-only
+            # cloud; pair with occlude_excluded_bodies=True + a zero robot class ratio so
+            # the whole robot still blocks the view). Non-empty patterns matching nothing
+            # are a user error.
+            if not self._robot_body_include and body_patterns:
+                raise ValueError(
+                    f"[OccludedScenePointCloud] robot_body_names patterns {body_patterns} matched no "
+                    f"bodies; available: {list(self.robot.body_names)}"
+                )
+            included = [self.robot.body_names[i] for i in sorted(self._robot_body_include)]
+            excluded = [n for n in self.robot.body_names if n not in included]
+            print(f"[OccludedScenePointCloud] robot bodies INCLUDED ({len(included)}): {included}")
+            print(f"[OccludedScenePointCloud] robot bodies EXCLUDED ({len(excluded)}): {excluded}")
+
         # -- Dense scene cloud, area-weighted across ALL robot bodies + objects --
         robot_prim_path_env0 = self.robot.cfg.prim_path.replace("env_.*", "env_0")
         env_prefix = robot_prim_path_env0.rsplit("/", 1)[0]  # ".../env_0"
         (self.dense_local, self.dense_body_idx, self.dense_obj_idx,
-         self.dense_source) = self._sample_scene_cloud_area_weighted(
+         self.dense_source, self.dense_occluder) = self._sample_scene_cloud_area_weighted(
             robot_prim_path_env0, env_prefix, total=self.num_points * oversample, device=device,
         )
         n_obj = int((self.dense_obj_idx >= 0).sum())
+        n_occ = int(self.dense_occluder.sum())
         print(f"[OccludedScenePointCloud] dense scene cloud: {self.dense_local.shape[0]} points "
-              f"({self.dense_local.shape[0] - n_obj} robot + {n_obj} object, "
+              f"({self.dense_local.shape[0] - n_obj - n_occ} robot + {n_obj} object + {n_occ} occluder-only, "
               f"{'ratio ' + str(self.class_ratios) if self.class_ratios else 'area-weighted'} over "
               f"{len(self.robot.body_names)} bodies + {len(self.object_assets)} objects) "
               f"-> {self.num_points} in camera frame")
@@ -1461,6 +1504,24 @@ class OccludedScenePointCloud(ScenePointCloud):
                 (self._SRC_ROBOT, nr), (self._SRC_INSERTIVE, ni), (self._SRC_RECEPTIVE, nrec),
             ]
             print(f"[OccludedScenePointCloud] enforced output split robot/ins/rec = {nr}/{ni}/{nrec}")
+
+        # -- Zero-pad fully occluded classes --
+        # When a class has ZERO visible points in an env (e.g. peg fully hidden behind the
+        # gripper), the stratified resample's default fills that class's slots from the env's
+        # full visible set (ratio drifts, no explicit signal). With ``zero_pad_missing_class``
+        # those slots become (0,0,0) in the OUTPUT frame instead — an explicit "class absent"
+        # signal. Seg labels on padded slots keep the slot's OWN class code (slot layout is
+        # fixed by _out_targets), so a 4D cloud reads "insertive: all zeros". Requires
+        # class_ratios. Real-side deploys must replicate the same convention.
+        self.zero_pad_missing: bool = cfg.params.get("zero_pad_missing_class", False)
+        self._slot_codes: torch.Tensor | None = None
+        if self.zero_pad_missing:
+            if self._out_targets is None:
+                raise ValueError("[OccludedScenePointCloud] zero_pad_missing_class requires class_ratios.")
+            self._slot_codes = torch.cat(
+                [torch.full((cnt,), code, dtype=torch.long, device=device) for code, cnt in self._out_targets]
+            )  # (num_points,) class code each output slot belongs to
+            print("[OccludedScenePointCloud] zero_pad_missing_class=True (fully occluded class -> zeros)")
 
         # -- Optional PER-PRIM labeling --
         # When enabled, the cloud is the SAME ratio-enforced occluded cloud, but each output
@@ -1504,6 +1565,16 @@ class OccludedScenePointCloud(ScenePointCloud):
         # -- Augmentation params (overridable via cfg.params["aug_params"]) --
         aug_params = cfg.params.get("aug_params", None)
         self.aug_params = aug_params if aug_params is not None else pc_sim2real.AugParams()
+        # -- Focal length (mm): ``focal_length_mm`` overrides the AugParams default;
+        # ``focal_length_mm_range`` is +/- mm, resampled per env on reset with the
+        # extrinsics (intrinsics DR for the frustum/z-buffer FOV).
+        focal_override = cfg.params.get("focal_length_mm", None)
+        if focal_override is not None:
+            self.aug_params = dataclasses.replace(self.aug_params, focal_length_mm=float(focal_override))
+        self._focal_center: float = float(self.aug_params.focal_length_mm)
+        self._focal_range: float = float(cfg.params.get("focal_length_mm_range", 0.0))
+        self._dr_extrinsics = self._dr_extrinsics or self._focal_range > 0
+        self.focal_mm_env = torch.full((N,), self._focal_center, dtype=torch.float32, device=device)  # (N,)
         # Per-env RNG seed base. Fixed per env => stable noise pattern across
         # steps (occlusion still updates as the robot moves), nicer for video.
         self._rng_seed: int = cfg.params.get("rng_seed", 0)
@@ -1662,6 +1733,9 @@ class OccludedScenePointCloud(ScenePointCloud):
         # Collect every source as (meshes, area, kind, idx, src_code, seed).
         sources: list[dict] = []
         for body_idx_int, body_name in enumerate(self.robot.body_names):
+            # Optional include-list (e.g. gripper-only cloud). Indices stay absolute.
+            if self._robot_body_include is not None and body_idx_int not in self._robot_body_include:
+                continue
             try:
                 meshes, area = self._load_body_meshes(f"{robot_prim_path_env0}/{body_name}", device)
             except Exception as e:
@@ -1712,12 +1786,36 @@ class OccludedScenePointCloud(ScenePointCloud):
             def _n_for(s) -> int:
                 return max(1, int(round(total * s["area"] / total_area)))
 
+        # -- Occluder-only sources: EXCLUDED robot bodies still physically block the
+        # camera's view of the gripper/objects. When enabled, sample them too (with the
+        # D415 stand-in kept -- the real mount occludes), flagged so the augmentation
+        # keeps them for the z-buffer but never selects them into the output.
+        occ_sources: list[dict] = []
+        if self._occlude_excluded and self._robot_body_include is not None:
+            for body_idx_int, body_name in enumerate(self.robot.body_names):
+                if body_idx_int in self._robot_body_include:
+                    continue
+                try:
+                    meshes, area = self._load_body_meshes(
+                        f"{robot_prim_path_env0}/{body_name}", device, keep_d415=True
+                    )
+                except Exception:
+                    meshes, area = None, 0.0
+                if meshes is not None and area > 0.0:
+                    occ_sources.append(dict(meshes=meshes, area=area, kind="robot", idx=body_idx_int,
+                                            src=self._SRC_ROBOT, seed=42 + body_idx_int))
+            occ_area = sum(s["area"] for s in occ_sources)
+            for s in occ_sources:
+                s["n_occ"] = max(1, int(round(self._occluder_points * s["area"] / occ_area)))
+
         local_parts: list[torch.Tensor] = []
         body_idx_parts: list[int] = []
         obj_idx_parts: list[int] = []
         source_parts: list[int] = []
-        for s in sources:
-            n_b = _n_for(s)
+        occluder_parts: list[bool] = []
+        for s in sources + occ_sources:
+            is_occ = "n_occ" in s
+            n_b = s["n_occ"] if is_occ else _n_for(s)
             if n_b <= 0:
                 continue
             with utils.temporary_seed(s["seed"]):
@@ -1731,11 +1829,13 @@ class OccludedScenePointCloud(ScenePointCloud):
                 body_idx_parts.extend([0] * n)
                 obj_idx_parts.extend([s["idx"]] * n)
             source_parts.extend([s["src"]] * n)
+            occluder_parts.extend([is_occ] * n)
 
         local = torch.cat(local_parts, dim=0).to(device)
         body_idx = torch.tensor(body_idx_parts, dtype=torch.long, device=device)
         obj_idx = torch.tensor(obj_idx_parts, dtype=torch.long, device=device)
         source = torch.tensor(source_parts, dtype=torch.long, device=device)
+        occluder = torch.tensor(occluder_parts, dtype=torch.bool, device=device)
 
         if debug:
             # Count points that land inside the d415 camera mesh's local bbox to
@@ -1744,7 +1844,7 @@ class OccludedScenePointCloud(ScenePointCloud):
                 robot_prim_path_env0, "robotiq_base_link", "d415_and_cable",
                 local[obj_idx < 0], body_idx[obj_idx < 0], device,
             )
-        return local, body_idx, obj_idx, source
+        return local, body_idx, obj_idx, source, occluder
 
     def _debug_count_in_mesh(self, robot_prim_path_env0, body_name, mesh_leaf,
                              local, body_idx, device) -> None:
@@ -1797,7 +1897,7 @@ class OccludedScenePointCloud(ScenePointCloud):
             kind = "collision" if "/collisions/" in path else "visual"
             print(f"[PC_DEBUG]   [{kind:9s}] body={under_body:24s} area={area:.6f}  {path}")
 
-    def _load_body_meshes(self, body_prim_path: str, device):
+    def _load_body_meshes(self, body_prim_path: str, device, keep_d415: bool | None = None):
         """Load the camera-visible meshes under a robot body as a pytorch3d ``Meshes``.
 
         What the external camera physically sees = the renderable **visual**
@@ -1828,6 +1928,13 @@ class OccludedScenePointCloud(ScenePointCloud):
         # collision-only extras (e.g. the d415 camera): a collision mesh with no
         # same-named visual mesh in this body.
         extra_prims = [p for p in collision_prims if p.GetName() not in visual_names]
+        # ``keep_d415`` overrides the cfg flag -- occluder-only sampling always keeps the
+        # D415 stand-in (the physical camera mount blocks the view even when the OUTPUT
+        # cloud excludes it).
+        if not (self._include_wrist_cam if keep_d415 is None else keep_d415):
+            # Gripper-only clouds may want pure gripper geometry: drop the wrist
+            # D415 camera stand-in (collision-only, name contains "d415").
+            extra_prims = [p for p in extra_prims if "d415" not in p.GetName().lower()]
         use_prims = visual_prims + extra_prims
         if not use_prims:
             return None, 0.0
@@ -1924,6 +2031,10 @@ class OccludedScenePointCloud(ScenePointCloud):
             self.cam_offset_quat_env[reset_mask] = math_utils.quat_mul(
                 dq, self.cam_offset_quat.unsqueeze(0).expand(n, -1)
             )
+        # focal length: uniform in [-range, range] around the center
+        if self._focal_range > 0:
+            df = (torch.rand(n, generator=self._generator, device=device) * 2 - 1) * self._focal_range
+            self.focal_mm_env[reset_mask] = self._focal_center + df
 
     def _camera_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Front-camera world pose (optical convention). Returns ``(pos (N,3), quat (N,4))``.
@@ -2006,9 +2117,11 @@ class OccludedScenePointCloud(ScenePointCloud):
         # from. (Edge-bleed / bias / dropout are obs-only; not shown here.)
         valid = torch.ones(pts_cam.shape[:2], dtype=torch.bool, device=pts_cam.device)
         if params.enable_frustum_cull:
-            valid = valid & self._augt.frustum_cull_mask(pts_cam, params)
+            valid = valid & self._augt.frustum_cull_mask(pts_cam, params, focal_mm=self.focal_mm_env)
         if params.enable_hpr:
-            valid = valid & self._augt.zbuffer_visible_mask(pts_cam, valid, params, self._zbuf_hw)
+            valid = valid & self._augt.zbuffer_visible_mask(
+                pts_cam, valid, params, self._zbuf_hw, focal_mm=self.focal_mm_env
+            )
 
         # accumulate world-frame survivors per source across viz envs
         per_src: dict[int, list[torch.Tensor]] = {code: [] for code in self._src_markers}
@@ -2073,6 +2186,8 @@ class OccludedScenePointCloud(ScenePointCloud):
         camera_offset_quat=None,
         camera_offset_pos_range=None,
         camera_offset_rot_range_deg: float = 0.0,
+        focal_length_mm: float | None = None,
+        focal_length_mm_range: float = 0.0,
         bg_plane_z: float = -0.02,
         aug_params=None,
         rng_seed: int = 0,
@@ -2087,6 +2202,12 @@ class OccludedScenePointCloud(ScenePointCloud):
         include_segmentation: bool = False,
         segmentation_labels: dict | None = None,
         per_prim: bool = False,
+        robot_body_names: list[str] | None = None,
+        include_wrist_camera_mesh: bool = True,
+        zero_pad_missing_class: bool = False,
+        occlude_excluded_bodies: bool = False,
+        occluder_points: int = 6144,
+        occluder_splat_radius: int = 2,
     ) -> torch.Tensor:
         N = env.num_envs
         device = env.device
@@ -2112,28 +2233,43 @@ class OccludedScenePointCloud(ScenePointCloud):
         # label out (segmentation) OR when the final resample is stratified by class.
         out_src = None
         out_prim = None  # per-prim: per-output-point prim id, appended as the trailing channel
+        pad_mask = None  # zero-pad: (N, num_points) True on slots of fully occluded classes
+        occ_mask = self.dense_occluder if bool(self.dense_occluder.any()) else None
         if self.per_prim:
             # Per-prim labeling: the NORMAL ratio-enforced occluded cloud, plus a per-point prim
             # id gathered through the same resample. No cap / padding (training-time concern).
-            out_t, out_src, out_prim = self._augt.augment_pointcloud_batched(
+            out_t, out_src, out_prim, *rest = self._augt.augment_pointcloud_batched(
                 pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
                 self.num_points, self._zbuf_hw, self._generator,
                 point_source=self.dense_source,  # class codes: needed to stratify by class_ratios
                 class_targets=self._out_targets,
                 point_prim=self.dense_prim_id,
+                return_pad_mask=self.zero_pad_missing,
+                occluder_mask=occ_mask,
+                occluder_splat_radius=self._occluder_splat,
+                focal_mm=self.focal_mm_env,
             )
+            pad_mask = rest[0] if rest else None
             if not self.include_segmentation:
                 out_src = None  # class label requested only to stratify; don't emit a seg channel
         elif self.include_segmentation or self._out_targets is not None:
-            out_t, out_src = self._augt.augment_pointcloud_batched(
+            out_t, out_src, *rest = self._augt.augment_pointcloud_batched(
                 pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
                 self.num_points, self._zbuf_hw, self._generator,
                 point_source=self.dense_source, class_targets=self._out_targets,
+                return_pad_mask=self.zero_pad_missing,
+                occluder_mask=occ_mask,
+                occluder_splat_radius=self._occluder_splat,
+                focal_mm=self.focal_mm_env,
             )
+            pad_mask = rest[0] if rest else None
         else:
             out_t = self._augt.augment_pointcloud_batched(
                 pts_cam, self.aug_params, plane_point_cam, plane_normal_cam,
                 self.num_points, self._zbuf_hw, self._generator,
+                occluder_mask=occ_mask,
+                occluder_splat_radius=self._occluder_splat,
+                focal_mm=self.focal_mm_env,
             )  # (N, num_points, 3) camera frame
 
         # -- Visualize the camera-visible cloud, coloured by source --
@@ -2181,6 +2317,14 @@ class OccludedScenePointCloud(ScenePointCloud):
             out_t = math_utils.quat_apply(
                 ref_quat_inv.unsqueeze(1).expand(-1, P, -1), xyz_world - ref_pos_w.unsqueeze(1)
             )  # (N, num_points, 3) in the reference frame
+
+        # Zero-pad fully occluded classes: coords -> (0,0,0) in the OUTPUT frame (must run
+        # AFTER the ref-frame re-expression, or zeros would land at the camera origin), and
+        # seg labels -> the slot's own class code (so 4D reads "class X: all zeros").
+        if pad_mask is not None and bool(pad_mask.any()):
+            out_t = torch.where(pad_mask.unsqueeze(-1), torch.zeros_like(out_t), out_t)
+            if out_src is not None:
+                out_src = torch.where(pad_mask, self._slot_codes.unsqueeze(0).expand_as(out_src), out_src)
 
         # Append the per-point class label as a 4th channel -> (N, num_points, 4).
         # Done after visualization (which expects xyz-only) and after fliers, so the

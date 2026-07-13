@@ -100,14 +100,7 @@ class DistillationDAggerWeighted(DistillationDAgger):
         cnt = 0
 
         aux_enabled = bool(getattr(self.policy, "aux_enabled", False))
-        # Per-key aux loss accumulators discovered from the policy (no
-        # hard-coded key list — keys come from AuxTargetCfg via the policy's
-        # ``aux_heads`` ModuleDict).
-        aux_keys: list[str] = list(getattr(self.policy, "aux_keys", []))
-        sum_aux_train: dict[str, float] = {k: 0.0 for k in aux_keys}
-        sum_aux_eval: dict[str, float] = {k: 0.0 for k in aux_keys}
-        cnt_aux_train = 0
-        cnt_aux_eval = 0
+        has_action_history = hasattr(self.policy, "record_executed_action")
         train_mask = (~self.eval_mask).to(self.device) if self.eval_mask is not None else None
         eval_mask = self.eval_mask.to(self.device) if self.eval_mask is not None else None
         aux_coeff = float(getattr(self, "aux_coeff", 1.0))
@@ -115,14 +108,17 @@ class DistillationDAggerWeighted(DistillationDAgger):
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            for obs, _, privileged_mu, dones in self.storage.generator():
-                # Student forward. Single encoder pass returns (μ, σ, aux_pred);
-                # aux_pred is None when aux_enabled=False.
+            for obs, stored_actions, privileged_mu, dones in self.storage.generator():
+                # Student (μ, σ) — single encoder pass, optionally with aux.
                 if aux_enabled:
                     student_mu, student_sigma, student_aux = self.policy.forward_all_heads(obs)
                 else:
                     student_mu, student_sigma = self.policy.act_inference_with_std(obs)
-                    student_aux = None
+                    aux_pred, aux_target = None, None
+                # Replay is time-ordered: re-feed the stored EXECUTED action so a stateful history
+                # student's window rebuilds exactly as it stood during rollout.
+                if has_action_history:
+                    self.policy.record_executed_action(stored_actions)
 
                 # Re-run teacher to get σ (teacher μ is already in privileged_actions).
                 # Frozen JIT forward — cheap (215d → 7d MLP + gSDE head).

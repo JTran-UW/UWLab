@@ -52,7 +52,9 @@ args_cli = parser.parse_args()
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+import json
 import os
+import sys
 
 import gymnasium as gym
 import h5py
@@ -62,6 +64,11 @@ from tqdm import tqdm
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
+
+# PC observation signature builder (lives with the BC training code).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "..", "imitation_learning", "point_cloud"))
+from pc_signature import signature_from_obs_group  # noqa: E402
 
 # Terms whose flat output is a point cloud; reshaped to (T, num_points, 3) on save.
 # Everything else is stored as its natural (T, feature_dim) per-step vector.
@@ -186,6 +193,13 @@ def main():
         data_grp.attrs["obs_keys"] = obs_keys
         data_grp.attrs["pc_point_dim"] = pc_point_dim
         data_grp.attrs["has_expert_std"] = has_std
+        # PC observation signature (classes / per-class budget / frame / proprio layout),
+        # extracted from the live obs group cfg. Travels dataset -> ckpt hparams -> JIT meta
+        # so the real-eval harness can configure its perception pipeline (pc_signature.py).
+        pc_sig = signature_from_obs_group(group_cfg)
+        if pc_sig is not None:
+            data_grp.attrs["pc_signature"] = json.dumps(pc_sig)
+            print(f"[collect] pc_signature: {json.dumps(pc_sig)}")
         if per_prim:
             # Per-prim: the trainer reads the id->name table to map each point's prim id
             # (obs/<pc_term>_prim_id) to a name, then selects via pc_parts + zero-pads.

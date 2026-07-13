@@ -27,7 +27,9 @@ PYTORCH_INDEX_URL = ["https://download.pytorch.org/whl/cu118"]
 # Extra dependencies for RL agents
 EXTRAS_REQUIRE = {
     "rsl-rl": [
-        "rsl-rl-lib @ git+https://github.com/patrickhaoy/rsl_rl.git@main",
+        # yandaboa fork branch carries the strict=False checkpoint-load fix that
+        # train.py relies on for resume; patrickhaoy/rsl_rl@main lacks it.
+        "rsl-rl-lib @ git+https://github.com/yandaboa/rsl_rl.git@pat/strict-load-ratio-diag",
     ],
 }
 

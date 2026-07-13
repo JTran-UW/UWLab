@@ -78,6 +78,11 @@ class DistillationDAgger(Distillation):
             else:
                 action = student_action
 
+        # Stateful history students keep a rolling (state, executed-action) window: tell the
+        # policy which action was ACTUALLY applied (student / teacher / mixed) this step.
+        if hasattr(self.policy, "record_executed_action"):
+            self.policy.record_executed_action(action)
+
         self.transition.actions = action
         self.transition.privileged_actions = teacher_action
         self.transition.observations = obs
@@ -94,7 +99,8 @@ class DistillationDAgger(Distillation):
         by those group names.
         """
         aux_enabled = bool(getattr(self.policy, "aux_enabled", False))
-        use_custom = (self.eval_mask is not None) or aux_enabled
+        has_action_history = hasattr(self.policy, "record_executed_action")
+        use_custom = (self.eval_mask is not None) or aux_enabled or has_action_history
 
         # Unfreeze vision backbone once the warmup window ends (no-op if
         # ``encoder_freeze_iters <= 0`` or already unfrozen).
@@ -115,12 +121,16 @@ class DistillationDAgger(Distillation):
             for epoch in range(self.num_learning_epochs):
                 self.policy.reset(hidden_states=self.last_hidden_states)
                 self.policy.detach_hidden_states()
-                for obs, _, privileged_actions, dones in self.storage.generator():
+                for obs, stored_actions, privileged_actions, dones in self.storage.generator():
                     if aux_enabled:
                         actions, aux_pred = self.policy.forward_with_aux(obs)
                     else:
                         actions = self.policy.act_inference(obs)
                         aux_pred = None
+                    # Replay is time-ordered: re-feed the stored EXECUTED action so the history
+                    # window rebuilds exactly as it stood during rollout.
+                    if has_action_history:
+                        self.policy.record_executed_action(stored_actions)
 
                     if train_mask is not None:
                         actions_m = actions[train_mask]

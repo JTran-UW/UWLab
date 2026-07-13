@@ -12,6 +12,8 @@ input assembly lives in ``bc_utils.py``.
 
 from __future__ import annotations
 
+import json
+
 import h5py
 import numpy as np
 import torch
@@ -92,6 +94,9 @@ class PCDemoDataset(Dataset):
         with h5py.File(path, "r") as f:
             data = f["data"]
             obs_keys = list(data.attrs["obs_keys"])
+            # Collection-time PC observation signature (pc_signature.py), stamped by
+            # collect_pc_demos/collect_dagger_pc. None for datasets that predate it.
+            self.pc_signature = json.loads(data.attrs["pc_signature"]) if "pc_signature" in data.attrs else None
             pc_key = next(k for k in obs_keys if k in _PC_TERMS)
             # Allowlist + preserve stored order (eval in bc_utils rebuilds the same order).
             self.proprio_keys = [k for k in obs_keys if k in _PROPRIO_TERMS]
