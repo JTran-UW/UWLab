@@ -90,6 +90,21 @@ def main():
     # per-env episode-final success (survives reset; only the counter is cleared)
     success_ref = env.unwrapped.reward_manager.get_term_cfg("progress_context").func.success
 
+    # -- Trivial-episode filter --
+    # Episodes that RESET already at the goal (e.g. the ObjectPartiallyAssembledEEGrasped path)
+    # terminate as soon as the success term's consecutive-success streak fills, yielding
+    # ~(num_consecutive_successes + 1)-step "demos" with no task content (~14% of clean_seg_100k
+    # was a length-3 spike). Read the streak length off the env's success termination and skip
+    # any demo at or under that length. Falls back to 0 (no filtering) if the term/param is absent.
+    min_demo_len = 0
+    try:
+        succ_cfg = env.unwrapped.termination_manager.get_term_cfg("success")
+        min_demo_len = int(succ_cfg.params.get("num_consecutive_successes", 0)) + 1
+    except (KeyError, ValueError, AttributeError):
+        pass
+    print(f"[collect] trivial-episode filter: dropping demos with length <= {min_demo_len} "
+          f"(from success term num_consecutive_successes)")
+
     pbar = tqdm(total=args_cli.num_demos, desc="demos", unit="demo", smoothing=0.1)
     obs, _ = env.reset()
 
@@ -139,6 +154,27 @@ def main():
     else:
         print(f"[collect] point-cloud channels: {pc_point_dim} (num_points={pc_num_points})")
 
+    # -- Expert std discovery (for DEXTRAH inverse-variance BC weighting) --
+    # If the expert exposes its action-distribution std we record it per step, so the BC trainer can
+    # weight supervision by (1/sigma)^2. Two export styles are supported: a JIT whose forward returns
+    # (mean, std), or one with a `compute_distribution(obs) -> (mean, std)` method (the extended
+    # rsl_rl exporter). Neither present -> mean-only dataset (plain MSE downstream). Probed once here.
+    has_dist_method = hasattr(expert, "compute_distribution")
+
+    def expert_forward(teacher_obs):
+        """Return (mean, std_or_None) for the expert on the teacher obs, whichever export style."""
+        out = expert.compute_distribution(teacher_obs) if has_dist_method else expert(teacher_obs)
+        if isinstance(out, (tuple, list)):
+            return out[0], (out[1] if len(out) > 1 else None)
+        return out, None
+
+    with torch.no_grad():
+        _, _probe_std = expert_forward(obs["teacher"])
+    has_std = _probe_std is not None
+    print(f"[collect] expert reports std: {has_std}"
+          + ("" if has_std else " -- mean-only dataset; downstream inverse-variance weighting "
+             "(action_var_weighting) will be UNAVAILABLE. Re-export the expert with a std head to enable it."))
+
     h5 = None
     data_grp = None
     if not args_cli.no_save:
@@ -149,6 +185,7 @@ def main():
         data_grp.attrs["obs_group"] = args_cli.obs_group
         data_grp.attrs["obs_keys"] = obs_keys
         data_grp.attrs["pc_point_dim"] = pc_point_dim
+        data_grp.attrs["has_expert_std"] = has_std
         if per_prim:
             # Per-prim: the trainer reads the id->name table to map each point's prim id
             # (obs/<pc_term>_prim_id) to a name, then selects via pc_parts + zero-pads.
@@ -157,16 +194,19 @@ def main():
     else:
         print("[collect] --no_save: benchmark mode, HDF5 will NOT be written.", flush=True)
 
-    # per-env rolling buffers: one list-of-steps per recorded obs term, plus actions.
+    # per-env rolling buffers: one list-of-steps per recorded obs term, plus actions (and, when the
+    # expert reports it, the per-step expert action std for inverse-variance BC weighting).
     buf_obs = {k: [[] for _ in range(num_envs)] for k in obs_keys}
     buf_act = [[] for _ in range(num_envs)]
+    buf_std = [[] for _ in range(num_envs)]
 
     n_saved = 0
     n_attempted = 0
     n_success = 0  # expert eval: episodes where success was True at episode end
+    n_trivial = 0  # successful episodes dropped by the trivial-episode length filter
     comp = "gzip" if args_cli.compress else None
 
-    def save_demo(ep_obs, ep_act, success):
+    def save_demo(ep_obs, ep_act, success, ep_std=None):
         nonlocal n_saved
         if args_cli.no_save:  # benchmark mode: count it, write nothing
             n_saved += 1
@@ -175,6 +215,8 @@ def main():
         g.attrs["num_samples"] = len(ep_act)
         g.attrs["success"] = bool(success)
         g.create_dataset("actions", data=np.stack(ep_act), compression=comp)
+        if ep_std is not None:  # per-step expert action std (raw action units) for BC var-weighting
+            g.create_dataset("expert_action_std", data=np.stack(ep_std), compression=comp)
         og = g.create_group("obs")
         for k in obs_keys:
             arr = np.stack(ep_obs[k])  # (T, term_dim)
@@ -194,16 +236,18 @@ def main():
     it = 0
     while n_saved < args_cli.num_demos and it < args_cli.max_iters:
         with torch.no_grad():
-            out = expert(obs["teacher"])
-        action = out[0] if isinstance(out, (tuple, list)) else out  # (N, 7) expert mean
+            action, std = expert_forward(obs["teacher"])  # (N, 7) expert mean (+ std if reported)
 
-        # buffer the (obs, action) pair BEFORE stepping
+        # buffer the (obs, action[, std]) tuple BEFORE stepping
         obs_np = {k: obs[args_cli.obs_group][k].detach().cpu().numpy() for k in obs_keys}
         act_np = action.detach().cpu().numpy()
+        std_np = std.detach().cpu().numpy() if has_std else None
         for e in range(num_envs):
             for k in obs_keys:
                 buf_obs[k][e].append(obs_np[k][e])
             buf_act[e].append(act_np[e])
+            if has_std:
+                buf_std[e].append(std_np[e])
 
         obs, _, terminated, truncated, _ = env.step(action)
         done = (terminated | truncated).detach().cpu().numpy()
@@ -215,10 +259,15 @@ def main():
                 n_attempted += 1
                 n_success += int(bool(succ[e]))  # expert eval metric
                 if (succ[e] or args_cli.keep_failures) and len(buf_act[e]) > 0:
-                    save_demo({k: buf_obs[k][e] for k in obs_keys}, buf_act[e], succ[e])
+                    if len(buf_act[e]) <= min_demo_len:  # already-at-goal episode: no task content
+                        n_trivial += 1
+                    else:
+                        save_demo({k: buf_obs[k][e] for k in obs_keys}, buf_act[e], succ[e],
+                                  ep_std=(buf_std[e] if has_std else None))
                 for k in obs_keys:
                     buf_obs[k][e] = []
                 buf_act[e] = []
+                buf_std[e] = []
                 if n_saved >= args_cli.num_demos:
                     break
         if n_saved > saved_before:
@@ -235,12 +284,16 @@ def main():
         data_grp.attrs["total"] = n_saved
         data_grp.attrs["expert_success_rate"] = expert_sr
         data_grp.attrs["episodes_attempted"] = n_attempted
+        data_grp.attrs["min_demo_len_filter"] = min_demo_len
+        data_grp.attrs["trivial_episodes_filtered"] = n_trivial
         h5.close()
         print(f"[collect] DONE: wrote {n_saved} demos to {args_cli.out}", flush=True)
     else:
         print(f"[collect] DONE (no_save): {n_saved} demos completed over {it} env steps", flush=True)
     print(f"[collect] EXPERT EVAL: success {n_success}/{n_attempted} episodes "
           f"({expert_sr:.1f}%)", flush=True)
+    print(f"[collect] TRIVIAL FILTER: dropped {n_trivial} successful episodes with length <= "
+          f"{min_demo_len}", flush=True)
     if expert_sr < 50.0:
         print(f"[collect] WARNING: expert success rate {expert_sr:.1f}% is low -- check the "
               f"expert / env / action scale before trusting these demos.", flush=True)

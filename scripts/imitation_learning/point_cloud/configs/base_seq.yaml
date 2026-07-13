@@ -1,0 +1,37 @@
+# Base history-conditioned (sequence) PointNet BC config -- the default for train_point_net_seq.py.
+#
+# Mirrors base.yaml but for the history_point_net policy: adds the window length (data.history_len)
+# and the causal-Transformer geometry (model.d_model / n_heads / n_layers / transformer_dropout).
+# Any key can be overridden on the CLI (e.g. --history_len 8 --d_model 512). Runtime/IO args
+# (--dataset, --devices, --wandb_project, --run_name) are CLI-only.
+
+model:
+  architecture: history_point_net
+  # Per-point set encoder MLP (in=point_dim -> hidden dims); last dim is the pooled state feature.
+  encoder_dims: [512, 1024, 1024]
+  # Per-token action head MLP hidden dims (input is each state token's d_model hidden state).
+  action_dims: [512, 256]
+  # false: MSE regression head. true: Gaussian NLL head that also predicts a per-dim std.
+  predict_std: false
+  # Causal-Transformer geometry.
+  d_model: 512
+  n_heads: 4
+  n_layers: 4
+  transformer_dropout: 0.1
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 50
+  batch_size: 256
+
+data:
+  # null = use the full stored cloud. Set an int to randomly subsample per step.
+  num_points: null
+  # Past timesteps per training window (REQUIRED >1 for this architecture; the dataset yields sequences).
+  history_len: 8
+  val_frac: 0.05
+  num_workers: 8
+  # false = train on successful demos only (recommended for BC).
+  no_success_filter: false
+  seed: 0

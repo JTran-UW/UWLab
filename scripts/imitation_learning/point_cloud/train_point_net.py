@@ -15,7 +15,10 @@ The PC term is ``scene_pc`` (``(T, num_points, 3)``); every *other* obs term
 the dataset's ``obs_keys`` attr -- into the proprio vector. The whole dataset is loaded
 into RAM (the machine has ~1 TB; a 100k-demo set is ~50 GB).
 
-This is just the training entry point: the dataset lives in ``pc_dataset.py``
+This is the entry point for the FEED-FORWARD architectures (point_net / flatten_mlp /
+residual_point_net / diffusion_point_net). The history-conditioned sequence policy has its own
+entry point, ``train_point_net_seq.py``, which reuses the scaffolding here (``add_common_args`` /
+``build_config`` / ``run_training``). The dataset lives in ``pc_dataset.py``
 (:class:`PCDemoDataset`) and the Lightning model in ``pc_bc_module.py``
 (:class:`PointNetBC`); ``bc_utils.py`` is the matching deploy/eval path.
 
@@ -48,7 +51,7 @@ from lightning.pytorch.loggers import WandbLogger
 
 # Dataset + Lightning model live next to this script (importable regardless of caller cwd).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pc_bc_module import _ARCHITECTURES, PointNetBC  # noqa: E402
+from pc_bc_module import _ARCHITECTURES, _SEQUENCE_ARCHITECTURES, PointNetBC  # noqa: E402
 from pc_dataset import _AUX_TERMS, PCDemoDataset  # noqa: E402
 
 
@@ -65,6 +68,9 @@ class ModelConfig:
     action_dims: list[int] = field(default_factory=lambda: [256, 128])
     # False: MSE head. True: Gaussian-NLL head that also predicts a per-dim std.
     predict_std: bool = False
+    # diffusion_point_net only: DDPM training steps + DDIM sampling steps (a few). Ignored otherwise.
+    num_train_timesteps: int = 100
+    num_sample_steps: int = 10
 
 
 @dataclass
@@ -78,6 +84,13 @@ class OptimConfig:
     aux_weight: float = 0.0
     # BC action loss weight. 1 = normal BC; 0 (with aux_weight>0) = pure state-extraction probe.
     action_weight: float = 1.0
+    # DEXTRAH inverse-variance loss weighting: weight each action dim's supervision by
+    # (1/expert_sigma)^2. Needs a dataset collected with per-step expert std (collect_pc_demos.py with
+    # an expert that reports std). Weights are z-space-converted + normalized to mean 1 so the loss
+    # scale matches plain MSE. False = plain MSE / Gaussian-NLL.
+    action_var_weighting: bool = False
+    # Floor on the (z-scored) expert std before inverting -> caps the max per-dim weight at (1/floor)^2.
+    var_weight_sigma_floor: float = 0.05
 
 
 @dataclass
@@ -147,13 +160,21 @@ class TrainConfig:
 
 
 _DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "base.yaml")
+# Feed-forward architectures this entry point handles. The history-conditioned sequence policy has its
+# own trainer (``train_point_net_seq.py``) since its config/CLI (window length, Transformer geometry)
+# and its sequence dataset differ; both share the scaffolding below (add_common_args/run_training).
+_FLAT_ARCHITECTURES = tuple(a for a in _ARCHITECTURES if a not in _SEQUENCE_ARCHITECTURES)
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Train a point-cloud BC policy on a PC demo dataset.")
+def add_common_args(p: argparse.ArgumentParser, default_config: str):
+    """Register the runtime/IO args and the config-override flags shared by every PC-BC trainer.
+
+    ``--architecture`` is intentionally NOT added here -- each entry point adds it with its own
+    architecture set (feed-forward vs sequence). Override flags use ``default=None`` so only flags
+    actually passed override the YAML (see :func:`build_config`)."""
     # --- runtime / IO (CLI-only) ---
     p.add_argument("--dataset", type=str, required=True, help="HDF5 demo file from collect_pc_demos.py.")
-    p.add_argument("--config", type=str, default=_DEFAULT_CONFIG, help="YAML model/training config.")
+    p.add_argument("--config", type=str, default=default_config, help="YAML model/training config.")
     p.add_argument("--wandb_project", type=str, default="pc_bc")
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--out_dir", type=str, default="logs/pc_bc")
@@ -170,7 +191,10 @@ def parse_args():
     p.add_argument("--aux_weight", type=float, help="Weight on the aux object-pose probe loss (0=off).")
     p.add_argument("--action_weight", type=float,
                    help="Weight on the BC action loss (1=normal). 0 + aux_weight>0 = pure pose probe.")
-    p.add_argument("--architecture", type=str, choices=tuple(_ARCHITECTURES))
+    p.add_argument("--action_var_weighting", action="store_true", default=argparse.SUPPRESS,
+                   help="DEXTRAH inverse-variance loss weighting (needs a dataset with per-step expert std).")
+    p.add_argument("--var_weight_sigma_floor", type=float,
+                   help="Floor on the z-scored expert std before inverting (caps the max weight).")
     p.add_argument("--encoder_dims", type=int, nargs="+")
     p.add_argument("--action_dims", type=int, nargs="+")
     p.add_argument("--predict_std", action="store_true", default=argparse.SUPPRESS,
@@ -190,9 +214,14 @@ def parse_args():
     p.add_argument("--no_success_filter", action="store_true", default=argparse.SUPPRESS,
                    help="Train on failed episodes too.")
     p.add_argument("--seed", type=int)
-    ns = p.parse_args()
+    return p
 
-    cfg = TrainConfig.from_yaml(ns.config)
+
+def build_config(ns, cfg_cls):
+    """Build a (runtime, cfg) pair from parsed args: load the YAML, apply only the CLI flags that were
+    actually passed (present as dataclass keys), and split off the runtime/IO namespace. ``cfg_cls`` is
+    :class:`TrainConfig` for the flat trainer or its sequence subclass for ``train_point_net_seq.py``."""
+    cfg = cfg_cls.from_yaml(ns.config)
     override_keys = set(cfg.as_flat_dict())  # only these map into the dataclass
     overrides = {k: getattr(ns, k) for k in override_keys if getattr(ns, k, None) is not None}
     cfg.apply_overrides(overrides)
@@ -203,17 +232,41 @@ def parse_args():
     return runtime, cfg
 
 
-def main():
-    rt, cfg = parse_args()
+def parse_args():
+    p = argparse.ArgumentParser(description="Train a feed-forward point-cloud BC policy on a PC demo dataset.")
+    add_common_args(p, _DEFAULT_CONFIG)
+    p.add_argument("--architecture", type=str, choices=_FLAT_ARCHITECTURES)
+    return build_config(p.parse_args(), TrainConfig)
+
+
+def run_training(rt, cfg):
+    """Shared training scaffolding for every PC-BC architecture: load the dataset, z-score on the train
+    split, build the Lightning model, and fit. Sequence-only config fields (``history_len``, Transformer
+    geometry) are read defensively with ``getattr`` so this runs unchanged for the flat trainer and for
+    ``train_point_net_seq.py`` (whose cfg subclass carries those fields)."""
     L.seed_everything(cfg.data.seed, workers=True)
     torch.set_float32_matmul_precision("high")  # H100 tensor cores
 
+    # The history-conditioned Transformer wants sequence windows; every other architecture wants the
+    # flat single-timestep dataset. Keep arch and window length in lockstep so a mismatch (e.g. the
+    # wrong trainer / a stray YAML key) fails loudly, not silently. history_len defaults to 1 (flat).
+    history_len = getattr(cfg.data, "history_len", 1)
+    is_sequence_arch = cfg.model.architecture in _SEQUENCE_ARCHITECTURES
+    if is_sequence_arch and history_len <= 1:
+        raise ValueError(f"architecture={cfg.model.architecture} needs data.history_len>1 (the window "
+                         f"length); use train_point_net_seq.py and set --history_len (e.g. 8).")
+    if not is_sequence_arch and history_len > 1:
+        raise ValueError(f"history_len={history_len}>1 only applies to a sequence architecture "
+                         f"({tuple(_SEQUENCE_ARCHITECTURES)}), not '{cfg.model.architecture}'.")
+
     full = PCDemoDataset(rt.dataset, num_points=cfg.data.num_points,
                          success_only=not cfg.data.no_success_filter, joint_pos_dims=cfg.data.joint_pos_dims,
-                         pc_parts=cfg.data.pc_parts, append_prim_semantic=cfg.data.append_prim_semantic)
+                         pc_parts=cfg.data.pc_parts, append_prim_semantic=cfg.data.append_prim_semantic,
+                         history_len=history_len)
     print(
         f"[train] loaded {len(full)} timesteps | points={full.n_pts} proprio={full.proprio_dim} "
         f"action={full.action_dim} | expert_sr={full.expert_success_rate:.1f}%"
+        + (f" | history_len={history_len}" if history_len > 1 else "")
         + (f" | joint_pos_dims={cfg.data.joint_pos_dims} (arm-only, real-robot)" if cfg.data.joint_pos_dims else "")
     )
     if full.pc_parts is not None:
@@ -278,6 +331,9 @@ def main():
         aux_mean=aux_mean,
         aux_std=aux_std,
         action_weight=cfg.optim.action_weight,
+        action_var_weighting=cfg.optim.action_var_weighting,
+        var_weight_sigma_floor=cfg.optim.var_weight_sigma_floor,
+        has_expert_std=full.has_expert_std,
         aux_keys=full.aux_keys,
         pc_parts=full.pc_parts,
         pc_all_prim_names=full.pc_all_prim_names,
@@ -285,11 +341,25 @@ def main():
         point_dropout=cfg.aug.point_dropout,
         prim_dropout=cfg.aug.prim_dropout,
         append_prim_semantic=full._append_seg,
+        num_train_timesteps=cfg.model.num_train_timesteps,
+        num_sample_steps=cfg.model.num_sample_steps,
+        # Sequence-only (history_point_net) knobs; PointNetBC ignores them for feed-forward archs.
+        history_len=history_len,
+        d_model=getattr(cfg.model, "d_model", 256),
+        n_heads=getattr(cfg.model, "n_heads", 4),
+        n_layers=getattr(cfg.model, "n_layers", 4),
+        transformer_dropout=getattr(cfg.model, "transformer_dropout", 0.1),
     )
     print(
         f"[train] architecture={cfg.model.architecture} num_points={num_points} "
         f"point_dim={full.point_dim} ({'xyz+seg' if full.point_dim == 4 else 'xyz'})"
     )
+    if cfg.optim.action_var_weighting:
+        print(f"[train] DEXTRAH inverse-variance loss weighting ON "
+              f"(expert std from dataset; sigma_floor={cfg.optim.var_weight_sigma_floor})")
+    elif full.has_expert_std:
+        print("[train] dataset has per-step expert std, but action_var_weighting is OFF (plain MSE). "
+              "Pass --action_var_weighting to use it.")
     if cfg.aug.point_dropout or cfg.aug.prim_dropout:
         print(f"[train] PC DROPOUT (train-only): point={cfg.aug.point_dropout} prim={cfg.aug.prim_dropout}")
     if use_aux:
@@ -337,6 +407,11 @@ def main():
     )
     trainer.fit(model, train_loader, val_loader)
     print(f"[train] DONE. best val/loss={ckpt_cb.best_model_score:.4f} -> {ckpt_cb.best_model_path}")
+
+
+def main():
+    rt, cfg = parse_args()
+    run_training(rt, cfg)
 
 
 if __name__ == "__main__":

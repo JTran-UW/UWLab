@@ -107,12 +107,14 @@ from uwlab_rl.rsl_rl.distillation_dagger import DistillationDAgger
 from uwlab_rl.rsl_rl.distillation_dagger_weighted import DistillationDAggerWeighted
 from uwlab_rl.rsl_rl.distillation_runner_split import DistillationRunnerSplit
 from uwlab_rl.rsl_rl.student_teacher_mlp import StudentTeacherMLP
+from uwlab_rl.rsl_rl.student_teacher_pointcloud import StudentTeacherPointCloud
 from uwlab_rl.rsl_rl.student_teacher_vision import StudentTeacherVision
 from uwlab_rl.rsl_rl.student_teacher_vision_recurrent import StudentTeacherVisionRecurrent
 
 _distillation_runner_module.StudentTeacherVision = StudentTeacherVision
 _distillation_runner_module.StudentTeacherVisionRecurrent = StudentTeacherVisionRecurrent
 _distillation_runner_module.StudentTeacherMLP = StudentTeacherMLP
+_distillation_runner_module.StudentTeacherPointCloud = StudentTeacherPointCloud
 _distillation_runner_module.DistillationDAgger = DistillationDAgger
 _distillation_runner_module.DistillationDAggerWeighted = DistillationDAggerWeighted
 _distillation_runner_module.DistillationRunnerSplit = DistillationRunnerSplit
@@ -159,9 +161,9 @@ def _import_bc_utils():
         os.path.dirname(os.path.abspath(__file__)), "..", "..", "imitation_learning", "point_cloud"
     )
     sys.path.insert(0, pc_bc_dir)
-    from bc_utils import bc_actions, load_bc_pointnet  # noqa: E402
+    from bc_utils import bc_actions, bc_reset, load_bc_pointnet  # noqa: E402
 
-    return load_bc_pointnet, bc_actions
+    return load_bc_pointnet, bc_actions, bc_reset
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -230,9 +232,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # BC PointNet eval bypasses the runner / JIT paths entirely.
-    bc = bc_actions = None
+    bc = bc_actions = bc_reset = None
     if bc_mode:
-        load_bc_pointnet, bc_actions = _import_bc_utils()
+        load_bc_pointnet, bc_actions, bc_reset = _import_bc_utils()
         bc = load_bc_pointnet(resume_path, agent_cfg.device)
     # Auto-detect whether the checkpoint is a TorchScript (JIT) file or a runner checkpoint.
     is_jit = False if bc_mode else _is_jit_checkpoint(resume_path)
@@ -355,9 +357,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print(f"Number of episodes: {num_episodes}")
                 print(f"Number of successes: {num_successes}")
             # reset recurrent states for episodes that have terminated.
-            # JIT reset() takes no arguments and resets all hidden states. The BC PointNet
-            # is feed-forward (no recurrent state), so nothing to reset.
-            if not is_jit and not bc_mode:
+            # JIT reset() takes no arguments and resets all hidden states. A feed-forward BC PointNet
+            # has no state to reset; a history-conditioned BC PointNet keeps a rolling (state, action)
+            # buffer, so clear it per-env on done (no-op for the feed-forward policies).
+            if bc_mode:
+                bc_reset(bc, dones)
+            elif not is_jit:
                 policy_nn.reset(dones)
 
         timestep += 1

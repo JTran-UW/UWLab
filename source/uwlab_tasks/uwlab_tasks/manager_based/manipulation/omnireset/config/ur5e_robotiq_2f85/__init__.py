@@ -914,6 +914,40 @@ gym.register(
     kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCCleanCfg"},
 )
 
+# CLEAN data collection WITH the per-point segmentation channel (scene_pc -> point_dim=4:
+# xyz + robot=0/insertive=-1/receptive=+1). Same clean cloud / 4-path reset distribution as
+# DataCollectionPC-Clean; only the extra seg channel differs.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-CleanSeg-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCCleanSegCfg"},
+)
+
+# CANONICAL clean+seg data collection: same as DataCollectionPC-CleanSeg but with the FPS
+# subset FIXED for the run (resample_on_reset=False) -> the same 512 points every episode.
+# Ablates the per-reset resampling stochasticity to test perception-vs-data-coverage.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-CleanSeg-Canonical-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCCleanSegCanonicalCfg"},
+)
+
+# ONLINE point-cloud DAgger: PointNet student <- ScenePC JIT teacher, distilled online via
+# DistillationRunnerSplit. Student obs = flat proprio + CleanSeg cloud; teacher obs = ScenePC
+# expert input. Launch with agent.policy.teacher_jit_path=<scenepc expert jit> and set the
+# student arch (agent.policy.encoder_dims / action_dims) to match the BC run being distilled.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-CleanSeg-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerCleanSegCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitRunnerCfg",
+    },
+)
+
 # BC-PointNet eval env: roll out a trained PointNet (play.py --bc_checkpoint) on the
 # sim2real PC obs. Same scene/action/reset as DataCollectionPC, minus the teacher group.
 # The rsl_rl agent cfg is only used for seed/clip_actions -- the --bc_checkpoint path
@@ -963,6 +997,31 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetCleanEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for CLEAN + SEG models (point_dim=4, 512 pts). Same single-path HARD reset as
+# BCPointNetCleanEval; the live clean cloud carries the matching per-point seg channel.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetCleanSegEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetCleanSegEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# BC-PointNet eval for CANONICAL (non-resampled) clean+seg models. Same single-path HARD reset
+# as BCPointNetCleanSegEval; the live cloud's FPS subset is fixed for the run
+# (resample_on_reset=False) to match the canonical collection env.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-BCPointNetCleanSegCanonicalEval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85BCPointNetCleanSegCanonicalEvalCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )
