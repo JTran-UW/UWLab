@@ -122,6 +122,7 @@ import rsl_rl.runners.distillation_runner as _distillation_runner_module
 from uwlab_rl.rsl_rl.distillation_dagger import DistillationDAgger
 from uwlab_rl.rsl_rl.distillation_dagger_weighted import DistillationDAggerWeighted
 from uwlab_rl.rsl_rl.distillation_runner_split import DistillationRunnerSplit
+from uwlab_rl.rsl_rl.student_teacher_history_pointcloud import StudentTeacherHistoryPointCloud
 from uwlab_rl.rsl_rl.student_teacher_mlp import StudentTeacherMLP
 from uwlab_rl.rsl_rl.student_teacher_pointcloud import StudentTeacherPointCloud
 from uwlab_rl.rsl_rl.student_teacher_vision import StudentTeacherVision
@@ -131,6 +132,7 @@ _distillation_runner_module.StudentTeacherVision = StudentTeacherVision
 _distillation_runner_module.StudentTeacherVisionRecurrent = StudentTeacherVisionRecurrent
 _distillation_runner_module.StudentTeacherMLP = StudentTeacherMLP
 _distillation_runner_module.StudentTeacherPointCloud = StudentTeacherPointCloud
+_distillation_runner_module.StudentTeacherHistoryPointCloud = StudentTeacherHistoryPointCloud
 _distillation_runner_module.DistillationDAgger = DistillationDAgger
 _distillation_runner_module.DistillationDAggerWeighted = DistillationDAggerWeighted
 _distillation_runner_module.DistillationRunnerSplit = DistillationRunnerSplit
@@ -386,8 +388,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner.load(resume_path, strict=False)
+        # load previously trained model. The cluster image bakes patrickhaoy/rsl_rl@main,
+        # whose OnPolicyRunner.load() predates the `strict` kwarg (the strict-load fix lives
+        # only on the yandaboa fork). Fall back to a plain load for same-arch resumes so
+        # cluster jobs don't crash before the image is rebuilt with the strict-capable fork.
+        import inspect as _inspect
+
+        if "strict" in _inspect.signature(runner.load).parameters:
+            runner.load(resume_path, strict=False)
+        else:
+            runner.load(resume_path)
         # Resume the deterministic reset stream from where the checkpoint left off.
         reset_mgr = find_reset_manager(env)
         if reset_mgr is not None:

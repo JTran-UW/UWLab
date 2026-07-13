@@ -3,14 +3,17 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""JIT-compile a trained BC point-cloud policy for fast real-eval inference.
+"""JIT-compile a trained BC or DAgger point-cloud policy for fast real-eval inference.
 
-Takes a Lightning checkpoint written by ``train_point_net.py`` and traces it into a
-self-contained ``torch.jit`` module whose ``forward(points, proprio) -> action`` has the
-proprio z-scoring and action de-normalization BAKED IN (so deploy needs only torch, no
-Lightning / config). A ``<output>.meta.json`` sidecar records the expected input layout
-(point_dim, num_points, proprio_dim, and the per-prim layout if any) so the eval harness
-can assemble inputs. Reload with ``bc_utils.load_bc_jit`` -- it drops straight into
+Takes a Lightning checkpoint written by ``train_point_net.py`` OR an rsl_rl DAgger
+distillation checkpoint (``logs/rsl_rl/.../model_*.pt``, class ``StudentTeacherPointCloud``)
+and traces it into a self-contained ``torch.jit`` module whose
+``forward(points, proprio) -> action`` has the proprio z-scoring and action
+de-normalization BAKED IN (so deploy needs only torch, no Lightning / rsl_rl / config).
+The expected input layout (point_dim, num_points, proprio_dim, per-prim layout, pc_signature)
+is embedded INSIDE the ``.pt`` (TorchScript extra file), so only that one file needs
+transferring to the inference machine; a ``<output>.meta.json`` sidecar with the same content
+is also written for auditing. Reload with ``bc_utils.load_bc_jit`` -- it drops straight into
 ``bc_utils.bc_actions`` (which feeds raw inputs when ``jit=True``).
 
 Usage::
@@ -76,31 +79,57 @@ def _benchmark(eager_bc: dict, jit_bc: dict, device: str, iters: int = 200) -> N
 
 
 def main():
-    p = argparse.ArgumentParser(description="JIT-compile a BC point-cloud policy for fast real eval.")
-    p.add_argument("--checkpoint", type=str, required=True, help="Lightning .ckpt from train_point_net.py")
+    p = argparse.ArgumentParser(description="JIT-compile a BC/DAgger point-cloud policy for fast real eval.")
+    p.add_argument("--checkpoint", type=str, required=True,
+                   help="Lightning .ckpt from train_point_net.py OR rsl_rl DAgger model_*.pt")
     p.add_argument("--output", type=str, required=True, help="Output JIT .pt path (sidecar <out>.meta.json too)")
     p.add_argument("--device", type=str, default="cpu", help="cpu (default; matches most real-eval rigs) or cuda")
     p.add_argument("--benchmark", action="store_true", help="Time eager vs JIT forward after export.")
+    p.add_argument("--num_points", type=int, default=None,
+                   help="Cloud size for the JIT meta (DAgger ckpts only; auto-read from the run's "
+                        "params/ sidecars when omitted -- Lightning ckpts store it themselves).")
+    p.add_argument("--export_std", action="store_true",
+                   help="Export forward(points, proprio) -> (action, std) instead of just the action "
+                        "(requires a predict_std checkpoint; std in env units). This is the teacher "
+                        "format StudentTeacherPointCloud(teacher_returns_std=True) consumes for "
+                        "DEXTRAH-style weighted distillation.")
     args = p.parse_args()
 
-    bc = load_bc_pointnet(args.checkpoint, args.device)
+    bc = load_bc_pointnet(args.checkpoint, args.device, num_points=args.num_points)
     print(f"[convert] loaded {args.checkpoint} | arch={bc['hp'].get('architecture', 'point_net')} "
           f"point_dim={bc['point_dim']} num_points={bc['hp']['num_points']} proprio_dim={bc['proprio_dim']}"
           + (f" | per-prim parts={bc['pc_parts']}" if bc.get("pc_all_prim_names") else ""))
+    if bc.get("pc_signature"):
+        import json
+        print(f"[convert] pc_signature: {json.dumps(bc['pc_signature'])}")
+    else:
+        print("[convert] pc_signature: NONE (old ckpt/dataset predates it, or DAgger params/ sidecars "
+              "missing) -- real eval will fall back to CLI-configured perception.")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
-    export_bc_jit(bc, args.output, device=args.device)
+    export_bc_jit(bc, args.output, device=args.device, export_std=args.export_std)
 
-    # End-to-end check: reload the JIT and confirm it matches the eager policy's action.
+    # End-to-end check: reload the JIT and confirm it matches the eager policy's action (+ std).
     jit_bc = load_bc_jit(args.output, args.device)
     n, pd, prd = int(bc["hp"]["num_points"]), bc["point_dim"], bc["proprio_dim"]
     pts, prop = torch.randn(2, n, pd, device=args.device), torch.randn(2, prd, device=args.device)
     with torch.no_grad():
         prn = (prop - bc["proprio_mean"]) / bc["proprio_std"]
         out = bc["model"](pts, prn)
-        mean = out[0] if bool(bc["hp"].get("predict_std", False)) else out
+        predict_std = bool(bc["hp"].get("predict_std", False))
+        mean = out[0] if predict_std else out
         eager_action = mean * bc["action_std"] + bc["action_mean"]
-        jit_action = jit_bc["model"](pts, prop)
+        jit_out = jit_bc["model"](pts, prop)
+    if args.export_std:
+        jit_action, jit_std = jit_out
+        from bc_utils import _BCPolicyJIT
+        eager_std = torch.exp(out[1].clamp(*_BCPolicyJIT.LOG_STD_LIMITS)) * bc["action_std"]
+        std_diff = (eager_std - jit_std).abs().max().item()
+        print(f"[convert] reloaded-JIT vs eager std max diff: {std_diff:.2e} | "
+              f"std range [{jit_std.min().item():.4f}, {jit_std.max().item():.4f}] (env units)")
+        assert std_diff < 1e-3, f"reloaded JIT std diverges from eager by {std_diff}"
+    else:
+        jit_action = jit_out
     diff = (eager_action - jit_action).abs().max().item()
     print(f"[convert] reloaded-JIT vs eager action max diff: {diff:.2e}")
     assert diff < 1e-3, f"reloaded JIT diverges from eager by {diff}"  # loose: op-fusion perturbs ~1e-5

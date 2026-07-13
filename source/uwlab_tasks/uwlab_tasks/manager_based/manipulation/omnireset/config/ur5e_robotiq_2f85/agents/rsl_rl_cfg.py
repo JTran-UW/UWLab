@@ -307,6 +307,9 @@ class StudentTeacherPointCloudPolicyCfg:
     # DEXTRAH-style (μ, σ) weighted-loss params (only for DistillationDAggerWeighted).
     predict_std: bool = False  # student PointNet emits a second log-std head
     teacher_returns_std: bool = False  # teacher JIT returns (mean, std) tuple
+    # BC-init: path to an offline PointNet-BC Lightning ckpt whose ``model.*`` weights warm-start the
+    # student encoder/trunk (strict=False -> a predict_std head-shape mismatch is tolerated). "" = scratch.
+    bc_init_path: str = ""
 
 
 @configclass
@@ -342,6 +345,141 @@ class PC_DAggerSplitRunnerCfg(Depth_DAggerSplitRunnerCfg):
     policy: StudentTeacherPointCloudPolicyCfg = StudentTeacherPointCloudPolicyCfg(
         pointcloud_groups=["scene_pc"],
     )
+
+
+@configclass
+class PC_DAggerSplitWeightedXLRunnerCfg(PC_DAggerSplitRunnerCfg):
+    """DEXTRAH inverse-variance-weighted online PC DAgger with an XL-residual student matching the
+    offline BC baseline (``[1024]*3`` encoder / ``[2048]*5`` head, point_dim=4 seg). Bakes in the
+    weighted loss (``DistillationDAggerWeighted`` + student ``predict_std`` + ``teacher_returns_std``)
+    and the XL sizing so only scalar overrides remain on launch: a ``--std`` ScenePC teacher JIT
+    (``agent.policy.teacher_jit_path``) and an optional BC warm-start (``agent.policy.bc_init_path``).
+    Split out as a subclass because hydra can't cleanly merge a list override into a MISSING field."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_pc_dagger_weighted_xl"
+    policy: StudentTeacherPointCloudPolicyCfg = StudentTeacherPointCloudPolicyCfg(
+        pointcloud_groups=["scene_pc"],
+        encoder_dims=[1024, 1024, 1024],
+        action_dims=[2048, 2048, 2048, 2048, 2048],
+        predict_std=True,
+        teacher_returns_std=True,
+    )
+
+    def __post_init__(self) -> None:
+        self.algorithm.class_name = "DistillationDAggerWeighted"
+
+
+@configclass
+class PC_DAggerSplitWeightedXLOccGripRunnerCfg(PC_DAggerSplitWeightedXLRunnerCfg):
+    """WeightedXL DAgger runner for the OCCLUDED GRIPPER-ONLY 3D cloud env
+    (``PC-DAgger-OccludedGripper-WeightedXL-v0``): identical to the CleanSeg WeightedXL
+    runner except the student consumes a 3-channel cloud (no seg) -> ``point_dim=3``,
+    and results log to a separate experiment dir."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_pc_dagger_weighted_xl_occgrip"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.policy.point_dim = 3
+
+
+@configclass
+class PC_DAggerSplitWeightedXLOccGripHardOnlyRunnerCfg(PC_DAggerSplitWeightedXLOccGripRunnerCfg):
+    """Occgrip 3D WeightedXL runner, HARD-reset-only env variant (separate experiment dir).
+    Also the runner for the BC-init finetune arm (pass ``agent.policy.bc_init_path``)."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_pc_dagger_weighted_xl_occgrip_hardonly"
+
+
+@configclass
+class PC_DAggerSplitWeightedXLOccFingersHardOnlyRunnerCfg(PC_DAggerSplitWeightedXLOccGripHardOnlyRunnerCfg):
+    """Fingers-only (arm/wrist occluder) variant of the occgrip hard-only runner."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_pc_dagger_weighted_xl_occfingers_hardonly"
+
+
+@configclass
+class PC_DAggerSplitWeightedXLOccObjectsHardOnlyRunnerCfg(PC_DAggerSplitWeightedXLOccFingersHardOnlyRunnerCfg):
+    """Objects-only cloud (whole robot = occluder) variant of the hard-only runner."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_pc_dagger_weighted_xl_occobjects_hardonly"
+
+
+@configclass
+class PC_DAggerSplitWeightedXLOccObjectsHardOnlyArm6RunnerCfg(PC_DAggerSplitWeightedXLOccObjectsHardOnlyRunnerCfg):
+    """Objects-only hard-only runner on the ARM-ONLY-proprio env (6 arm joints, no gripper
+    mimic joints — real-robot proprio). Only the experiment dir differs; the student's proprio
+    dim (12) is inferred from the env obs."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_pc_dagger_weighted_xl_occobjects_arm6_hardonly"
+
+
+@configclass
+class StudentTeacherHistoryPointCloudPolicyCfg:
+    """Policy cfg for a history-conditioned Transformer student + JIT teacher (PC DAgger).
+
+    The student is the SAME :class:`uwlab_rl.networks.history_point_net.HistoryPointNet` the
+    offline sequence BC trainer builds (``train_point_net_seq.py``); the arch fields mirror the
+    BC yaml so a sequence-BC checkpoint can initialize it. The student keeps a rolling per-env
+    window of the last ``history_len`` (state, executed-action) pairs — env obs stay single-frame.
+    """
+
+    class_name: str = "StudentTeacherHistoryPointCloud"
+    teacher_jit_path: str = ""
+    pointcloud_groups: list[str] = MISSING
+    point_dim: int = 3
+    architecture: str = "history_point_net"
+    # Per-point set encoder + per-token action head — mirror the BC config exactly.
+    encoder_dims: list[int] = MISSING
+    action_dims: list[int] = MISSING
+    # Causal-Transformer geometry (mirror the BC config exactly).
+    history_len: int = 16
+    d_model: int = 512
+    n_heads: int = 8
+    n_layers: int = 4
+    transformer_dropout: float = 0.1
+    activation: str = "elu"
+    init_noise_std: float = 0.1
+    noise_std_type: str = "scalar"
+    # z-scoring stats are baked from the BC ckpt (proprio/action mean+std buffers), not learned online.
+    student_obs_normalization: bool = False
+    predict_std: bool = False
+    teacher_returns_std: bool = False
+    bc_init_path: str = ""
+
+
+@configclass
+class PC_DAggerSplitWeightedHist16OccObjectsHardOnlyRunnerCfg(PC_DAggerSplitRunnerCfg):
+    """Weighted online DAgger with a HISTORY-16 Transformer student on the objects-only cloud
+    (hard-reset-only env). Same split runner / DEXTRAH weighted loss / cadence as the WeightedXL
+    feed-forward runners; only the student is the sequence policy. Arch mirrors
+    ``configs/pn_xl_residual_history_clean.yaml`` at ``history_len=16`` so the sequence-BC ckpt
+    (``occobjects_hardonly_hist16``) BC-inits exactly."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_pc_dagger_weighted_hist16_occobjects_hardonly"
+    policy: StudentTeacherHistoryPointCloudPolicyCfg = StudentTeacherHistoryPointCloudPolicyCfg(
+        pointcloud_groups=["scene_pc"],
+        point_dim=3,
+        encoder_dims=[256, 512, 512],
+        action_dims=[512, 256],
+        history_len=16,
+        d_model=512,
+        n_heads=8,
+        n_layers=4,
+        predict_std=True,
+        teacher_returns_std=True,
+    )
+
+    def __post_init__(self) -> None:
+        self.algorithm.class_name = "DistillationDAggerWeighted"
+
+
+@configclass
+class PC_DAggerSplitWeightedXLOccGripSegHardOnlyRunnerCfg(PC_DAggerSplitWeightedXLRunnerCfg):
+    """Occgrip 4D (seg) WeightedXL runner, HARD-reset-only: cloud is (1024, 4) so the
+    inherited ``point_dim=4`` is correct; only the experiment dir differs."""
+
+    experiment_name: str = "ur5e_robotiq_2f85_pc_dagger_weighted_xl_occgripseg_hardonly"
 
 
 @configclass

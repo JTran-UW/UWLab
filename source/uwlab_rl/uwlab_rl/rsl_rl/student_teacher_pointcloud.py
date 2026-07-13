@@ -70,6 +70,7 @@ class StudentTeacherPointCloud(StudentTeacher):
         student_obs_normalization: bool = True,
         predict_std: bool = False,
         teacher_returns_std: bool = False,
+        bc_init_path: str = "",
         **kwargs,
     ) -> None:
         # Bypass StudentTeacher.__init__ (asserts 1D obs + builds an MLP teacher).
@@ -156,6 +157,12 @@ class StudentTeacherPointCloud(StudentTeacher):
         # Clamp range for the PointNet's predicted log-std (matches StudentTeacherVision).
         self.log_std_limits = (-5.0, 2.0)
         self.distribution = None
+
+        # Optional BC warm-start: load an offline PointNet-BC ckpt into the student (encoder/trunk;
+        # a predict_std head-shape mismatch is tolerated via strict=False). Done last so it overwrites
+        # the freshly-built student weights.
+        if bc_init_path:
+            self.load_bc_checkpoint(bc_init_path, strict=False)
 
     # ------------------------------------------------------------------ obs plumbing
 
@@ -281,5 +288,17 @@ class StudentTeacherPointCloud(StudentTeacher):
         student_sd = {k[len("model.") :]: v for k, v in sd.items() if k.startswith("model.")}
         if not student_sd:
             raise ValueError(f"no 'model.*' keys found in {path}; is this a PointNetBC checkpoint?")
+        if not strict:
+            # strict=False tolerates missing/unexpected KEYS but STILL RAISES on a present key whose
+            # SHAPE differs (e.g. the final action-head layer: predict_std=False BC emits action_dim,
+            # this predict_std=True student emits action_dim*2). Drop those so the rest transfers.
+            model_sd = self.student.state_dict()
+            mismatched = [k for k, v in student_sd.items() if k in model_sd and model_sd[k].shape != v.shape]
+            for k in mismatched:
+                del student_sd[k]
+        else:
+            mismatched = []
         missing, unexpected = self.student.load_state_dict(student_sd, strict=strict)
-        print(f"[StudentTeacherPointCloud] BC-init from {path}: missing={list(missing)} unexpected={list(unexpected)}")
+        print(f"[StudentTeacherPointCloud] BC-init from {path}: loaded {len(student_sd)} keys, "
+              f"dropped {len(mismatched)} shape-mismatched {mismatched}, "
+              f"missing={list(missing)} unexpected={list(unexpected)}")

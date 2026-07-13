@@ -100,12 +100,13 @@ class DistillationDAggerWeighted(DistillationDAgger):
         cnt = 0
 
         aux_enabled = bool(getattr(self.policy, "aux_enabled", False))
+        has_action_history = hasattr(self.policy, "record_executed_action")
         train_mask = (~self.eval_mask).to(self.device) if self.eval_mask is not None else None
 
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            for obs, _, privileged_mu, dones in self.storage.generator():
+            for obs, stored_actions, privileged_mu, dones in self.storage.generator():
                 # Student (μ, σ) — single encoder pass, optionally with aux.
                 if aux_enabled:
                     student_mu, student_sigma, aux_pred = self.policy.forward_with_aux_and_std(obs)
@@ -113,6 +114,10 @@ class DistillationDAggerWeighted(DistillationDAgger):
                 else:
                     student_mu, student_sigma = self.policy.act_inference_with_std(obs)
                     aux_pred, aux_target = None, None
+                # Replay is time-ordered: re-feed the stored EXECUTED action so a stateful history
+                # student's window rebuilds exactly as it stood during rollout.
+                if has_action_history:
+                    self.policy.record_executed_action(stored_actions)
 
                 # Re-run teacher to get σ (teacher μ is already in privileged_actions).
                 # Frozen JIT forward — cheap (215d → 7d MLP + gSDE head).

@@ -940,6 +940,157 @@ gym.register(
     },
 )
 
+# Weighted (DEXTRAH inverse-variance) online PC DAgger, XL-residual student matching the BC baseline.
+# Same env as PC-DAgger-CleanSeg-v0; the runner bakes in weighted loss + XL sizing + predict_std, so
+# launch only needs a --std teacher JIT (agent.policy.teacher_jit_path) and an optional BC warm-start
+# (agent.policy.bc_init_path).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-CleanSeg-WeightedXL-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerCleanSegCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitWeightedXLRunnerCfg",
+    },
+)
+
+# Apples-to-apples EVAL env for DAgger checkpoints (play.py --checkpoint): same flat
+# proprio/scene_pc/teacher groups as the DAgger training env, but the BC canonical-eval
+# protocol (canonical cloud + single hard reset) so success rates are directly comparable
+# to the offline-BC CleanSegCanonicalEval numbers.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-CleanSeg-Eval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerCleanSegEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitWeightedXLRunnerCfg",
+    },
+)
+
+# FROM-SCRATCH online DAgger on the DEPLOYABLE cloud: occluded (frustum + z-buffer from the
+# calibrated extrinsic, FoundationStereo noise, extrinsics DR), robot points restricted to the
+# GRIPPER links (no arm, no wrist D415 mesh), NO seg channel -> (1024, 3) student cloud.
+# Weighted XL runner with point_dim=3; launch with agent.policy.teacher_jit_path=<--std teacher>
+# and NO bc_init_path (from scratch).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-OccludedGripper-WeightedXL-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerOccludedGripperCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitWeightedXLOccGripRunnerCfg",
+    },
+)
+
+# HARD-reset-only occgrip DAgger variants: train on the SAME single hard reset path
+# (ObjectAnywhereEEAnywhere) the honest eval uses, killing the 4-path reset-mix
+# train/eval mismatch. Both zero-pad fully occluded classes (explicit absence signal).
+# 3D variant (deployable, no seg) — from-scratch OR BC-init finetune (bc_init_path):
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-OccludedGripper-HardOnly-WeightedXL-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerOccGripHardOnlyCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitWeightedXLOccGripHardOnlyRunnerCfg",
+    },
+)
+
+# 4D variant (per-point seg label, sim-only probe of how much the label is worth):
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-OccludedGripperSeg-HardOnly-WeightedXL-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerOccGripSegHardOnlyCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitWeightedXLOccGripSegHardOnlyRunnerCfg",
+    },
+)
+
+# Expert-demo collection env matching the occgrip hard-only DAgger student cloud exactly
+# (occluded gripper-only 1024x3 EE-frame, zero-pad, hard reset path only). For the
+# offline-BC arm of the hard-only ablation (collect_pc_demos.py with a --std teacher JIT).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-OccGripHardOnly-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCOccGripHardOnlyCfg"},
+)
+
+# Same occgrip collection cloud, broad 4-path reset mix — BC data covering ALL reset
+# distributions (the DAgger finetune afterwards stays hard-only).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-OccGrip4Path-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCOccGrip4PathCfg"},
+)
+
+# FINGERS-ONLY variants: output points only from finger/knuckle/pad links (no wrist body,
+# no camera mount), with ALL excluded robot bodies sampled as occluder-only points so the
+# arm/wrist still hide what's behind them (proper self-occlusion).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-OccludedFingers-HardOnly-WeightedXL-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerOccFingersHardOnlyCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitWeightedXLOccFingersHardOnlyRunnerCfg",
+    },
+)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-OccFingers4Path-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCOccFingers4PathCfg"},
+)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-OccFingersHardOnly-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCOccFingersHardOnlyCfg"},
+)
+
+# OBJECTS-ONLY variants: zero robot points in the cloud (512/512 ins/rec), whole robot
+# (arm + gripper + D415 mount) is occluder-only. Ablates seeing vs feeling the gripper.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-OccludedObjects-HardOnly-WeightedXL-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerOccObjectsHardOnlyCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitWeightedXLOccObjectsHardOnlyRunnerCfg",
+    },
+)
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-DataCollectionPC-OccObjectsHardOnly-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85DataCollectionPCOccObjectsHardOnlyCfg"},
+)
+# Arm-only-proprio (real-robot) variant: joint_pos = 6 arm joints, no gripper mimic joints.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-OccludedObjects-HardOnly-Arm6-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerOccObjectsHardOnlyArm6Cfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitWeightedXLOccObjectsHardOnlyArm6RunnerCfg",
+    },
+)
+# History-16 Transformer student on the same objects-only hard-only env (same env cfg; only the
+# runner/policy differ — the student keeps its own rolling window, env obs stay single-frame).
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PC-DAgger-OccludedObjects-HardOnly-History16-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sim2real_pc_cfg:Ur5eRobotiq2f85PCDAggerOccObjectsHardOnlyCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PC_DAggerSplitWeightedHist16OccObjectsHardOnlyRunnerCfg",
+    },
+)
+
 # BC-PointNet eval env: roll out a trained PointNet (play.py --bc_checkpoint) on the
 # sim2real PC obs. Same scene/action/reset as DataCollectionPC, minus the teacher group.
 # The rsl_rl agent cfg is only used for seed/clip_actions -- the --bc_checkpoint path

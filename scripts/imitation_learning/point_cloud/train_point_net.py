@@ -53,6 +53,7 @@ from lightning.pytorch.loggers import WandbLogger
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pc_bc_module import _ARCHITECTURES, _SEQUENCE_ARCHITECTURES, PointNetBC  # noqa: E402
 from pc_dataset import _AUX_TERMS, PCDemoDataset  # noqa: E402
+from pc_signature import apply_training_adjustments  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +350,19 @@ def run_training(rt, cfg):
         n_heads=getattr(cfg.model, "n_heads", 4),
         n_layers=getattr(cfg.model, "n_layers", 4),
         transformer_dropout=getattr(cfg.model, "transformer_dropout", 0.1),
+        # Collection-time PC obs signature, updated with what training changed (cloud
+        # subsample, joint trim, per-prim selection). Rides in hparams -> ckpt -> JIT meta.
+        pc_signature=apply_training_adjustments(
+            full.pc_signature,
+            num_points=num_points,
+            point_dim=full.point_dim,
+            joint_pos_dims=cfg.data.joint_pos_dims,
+            proprio_dim=full.proprio_dim,
+            pc_parts=full.pc_parts,
+            pc_all_prim_names=full.pc_all_prim_names,
+            pc_pad_target=full.pc_pad_target,
+            append_prim_semantic=full._append_seg,
+        ),
     )
     print(
         f"[train] architecture={cfg.model.architecture} num_points={num_points} "

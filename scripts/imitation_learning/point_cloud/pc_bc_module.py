@@ -144,6 +144,7 @@ class PointNetBC(L.LightningModule):
         n_heads: int = 4,
         n_layers: int = 4,
         transformer_dropout: float = 0.1,
+        pc_signature: dict | None = None,  # PC obs signature (pc_signature.py); rides in hparams
     ):
         super().__init__()
         # pc_parts / pc_all_prim_names / pc_pad_target travel in the checkpoint hparams so deploy

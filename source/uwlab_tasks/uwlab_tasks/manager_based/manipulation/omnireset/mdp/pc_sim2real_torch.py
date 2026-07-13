@@ -45,15 +45,22 @@ from .pc_sim2real import AugParams
 DEFAULT_ZBUF_HW: tuple[int, int] = (192, 256)
 
 
-def _intrinsics(params: AugParams) -> tuple[float, float, float, float]:
-    fx = params.focal_length_mm / params.horizontal_aperture_mm * params.img_width
+def _intrinsics(params: AugParams, focal_mm: torch.Tensor | None = None):
+    """``(fx, fy, cx, cy)`` in pixels. ``focal_mm`` (optional per-env ``(N,)`` tensor)
+    makes fx/fy ``(N, 1)`` so they broadcast over the point axis."""
+    if focal_mm is None:
+        fx = params.focal_length_mm / params.horizontal_aperture_mm * params.img_width
+    else:
+        fx = (focal_mm / params.horizontal_aperture_mm * params.img_width).unsqueeze(-1)
     return fx, fx, params.img_width / 2.0, params.img_height / 2.0
 
 
-def frustum_cull_mask(points: torch.Tensor, params: AugParams) -> torch.Tensor:
+def frustum_cull_mask(
+    points: torch.Tensor, params: AugParams, focal_mm: torch.Tensor | None = None
+) -> torch.Tensor:
     """``(N, M)`` bool mask of points inside the camera FOV and in front of it."""
     x, y, z = points.unbind(-1)
-    fx, fy, cx, cy = _intrinsics(params)
+    fx, fy, cx, cy = _intrinsics(params, focal_mm)
     in_front = z > params.near
     zc = torch.where(in_front, z, torch.ones_like(z))
     u = fx * x / zc + cx
@@ -61,17 +68,26 @@ def frustum_cull_mask(points: torch.Tensor, params: AugParams) -> torch.Tensor:
     return in_front & (u >= 0) & (u < params.img_width) & (v >= 0) & (v < params.img_height)
 
 
-def _zbuffer(points: torch.Tensor, valid: torch.Tensor, params: AugParams, zbuf_hw: tuple[int, int]):
+def _zbuffer(points: torch.Tensor, valid: torch.Tensor, params: AugParams, zbuf_hw: tuple[int, int],
+             splat_mask: torch.Tensor | None = None, splat_radius: int = 0,
+             focal_mm: torch.Tensor | None = None):
     """Scatter-min depth buffer. Returns ``(buf, iu, iv, env_off, (Hz, Wz))``.
 
     ``buf`` is a flat ``(N*Hz*Wz,)`` tensor holding the nearest valid depth in
     each (env, cell); ``iu, iv`` are each point's integer grid coords; ``env_off``
     is the per-env flat-cell offset for indexing ``buf``.
+
+    ``splat_mask`` (``(M,)`` bool) + ``splat_radius``: the masked points are ALSO
+    scattered into every cell of their ``(2r+1)x(2r+1)`` neighbourhood. One point per
+    cell is far too sparse for a large occluder (an arm link spans thousands of cells
+    but gets a few hundred sample points); splatting gives each occluder point an area
+    footprint so surfaces behind it are actually blocked. Non-masked points keep their
+    single-cell precision.
     """
     N, M, _ = points.shape
     Hz, Wz = zbuf_hw
     x, y, z = points.unbind(-1)
-    fx, fy, cx, cy = _intrinsics(params)
+    fx, fy, cx, cy = _intrinsics(params, focal_mm)
     sx = Wz / params.img_width
     sy = Hz / params.img_height
     zc = torch.where(z > 1e-6, z, torch.ones_like(z))
@@ -84,17 +100,32 @@ def _zbuffer(points: torch.Tensor, valid: torch.Tensor, params: AugParams, zbuf_
     zfill = torch.where(valid, z, torch.full_like(z, inf)).reshape(-1)
     buf = torch.full((N * ncell,), inf, device=points.device, dtype=points.dtype)
     buf.scatter_reduce_(0, key, zfill, reduce="amin", include_self=True)
+    if splat_mask is not None and splat_radius > 0 and bool(splat_mask.any()):
+        sm = splat_mask.unsqueeze(0)  # (1, M) broadcast over envs
+        z_splat = torch.where(valid & sm, z, torch.full_like(z, inf))
+        for du in range(-splat_radius, splat_radius + 1):
+            for dv in range(-splat_radius, splat_radius + 1):
+                if du == 0 and dv == 0:
+                    continue
+                nu = (iu + du).clamp(0, Wz - 1)
+                nv = (iv + dv).clamp(0, Hz - 1)
+                nkey = (env_off + nv * Wz + nu).reshape(-1)
+                buf.scatter_reduce_(0, nkey, z_splat.reshape(-1), reduce="amin", include_self=True)
     return buf, iu, iv, env_off, (Hz, Wz)
 
 
 def zbuffer_visible_mask(
     points: torch.Tensor, valid: torch.Tensor, params: AugParams,
     zbuf_hw: tuple[int, int] = DEFAULT_ZBUF_HW, eps: float = 1e-3,
+    splat_mask: torch.Tensor | None = None, splat_radius: int = 0,
+    focal_mm: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``(N, M)`` bool mask: a point is visible iff it is the nearest (within
     ``eps``) at its z-buffer cell. Occluded points (something nearer at the same
-    cell) are dropped -- this is the GPU occlusion test."""
-    buf, iu, iv, env_off, (Hz, Wz) = _zbuffer(points, valid, params, zbuf_hw)
+    cell) are dropped -- this is the GPU occlusion test. ``splat_mask``/``splat_radius``
+    give the masked points (occluder-only samples) an area footprint in the buffer
+    (see :func:`_zbuffer`)."""
+    buf, iu, iv, env_off, (Hz, Wz) = _zbuffer(points, valid, params, zbuf_hw, splat_mask, splat_radius, focal_mm)
     min_z = buf[(env_off + iv * Wz + iu).reshape(-1)].reshape(points.shape[:2])
     return valid & (points[..., 2] <= min_z + eps)
 
@@ -103,6 +134,7 @@ def edge_bleed_batched(
     points: torch.Tensor, valid: torch.Tensor, params: AugParams,
     plane_point: torch.Tensor, plane_normal: torch.Tensor,
     zbuf_hw: tuple[int, int], generator: torch.Generator | None,
+    focal_mm: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One skirt candidate per point, bridging depth-edge points toward the bg plane.
 
@@ -114,7 +146,7 @@ def edge_bleed_batched(
     at ``2M``; the kept fraction reproduces the thin edge skirt statistically.
     """
     N, M, _ = points.shape
-    buf, iu, iv, env_off, (Hz, Wz) = _zbuffer(points, valid, params, zbuf_hw)
+    buf, iu, iv, env_off, (Hz, Wz) = _zbuffer(points, valid, params, zbuf_hw, focal_mm=focal_mm)
     z = points[..., 2]
     inf = torch.finfo(points.dtype).max
 
@@ -186,7 +218,8 @@ def resample_gather_idx(
 
 def stratified_resample_gather_idx(
     valid: torch.Tensor, source: torch.Tensor, class_targets, generator: torch.Generator | None,
-) -> torch.Tensor:
+    return_pad_mask: bool = False,
+):
     """``(N, sum(counts))`` indices that resample each class to its own target count,
     enforcing a fixed per-source split (e.g. robot/ins/rec = 50/25/25) in the output.
 
@@ -195,8 +228,13 @@ def stratified_resample_gather_idx(
     points (with replacement when fewer survive). If a class has ZERO survivors in an env
     (e.g. a fully occluded peg), those slots fall back to the env's full visible set so the
     points stay real and correctly labeled -- the enforced ratio then drifts only for that
-    rare frame rather than duplicating a single arbitrary point."""
+    rare frame rather than duplicating a single arbitrary point.
+
+    ``return_pad_mask=True`` additionally returns a ``(N, sum(counts))`` bool mask marking
+    the slots of classes with ZERO survivors, so the caller can zero-pad them instead of
+    keeping the fallback points (an explicit "this class is fully occluded" signal)."""
     parts = []
+    pad_parts = []
     for code, cnt in class_targets:
         if cnt <= 0:
             continue
@@ -207,7 +245,11 @@ def stratified_resample_gather_idx(
             fallback = resample_gather_idx(valid, cnt, generator)
             idx_c = torch.where(has_c.unsqueeze(1), idx_c, fallback)
         parts.append(idx_c)
-    return torch.cat(parts, dim=1)  # (N, num_points)
+        pad_parts.append((~has_c).unsqueeze(1).expand(-1, cnt))
+    idx = torch.cat(parts, dim=1)  # (N, num_points)
+    if return_pad_mask:
+        return idx, torch.cat(pad_parts, dim=1)  # (N, num_points) bool
+    return idx
 
 
 def resample_batched(
@@ -247,6 +289,10 @@ def augment_pointcloud_batched(
     point_source: torch.Tensor | None = None,
     class_targets=None,
     point_prim: torch.Tensor | None = None,
+    return_pad_mask: bool = False,
+    occluder_mask: torch.Tensor | None = None,
+    occluder_splat_radius: int = 2,
+    focal_mm: torch.Tensor | None = None,
 ):
     """Full batched pipeline: frustum -> z-buffer occlusion -> edge bleed ->
     surface bias -> dropout -> resample.
@@ -278,14 +324,29 @@ def augment_pointcloud_batched(
         ``(out, out_source, out_prim)``    when ``point_prim`` requested (``out_source`` is
                                            ``None`` if ``point_source`` was not given).
         ``out`` is ``(N, num_points, 3)``; labels are ``(N, num_points)``.
+        With ``return_pad_mask=True`` a ``(N, num_points)`` bool mask is appended LAST
+        (always as a tuple): True on slots whose class had zero visible points (see
+        :func:`stratified_resample_gather_idx`); all-False when ``class_targets`` is None.
+        The caller decides what to do with those slots (e.g. zero the coordinates AFTER
+        any frame re-expression -- the gathered fallback points are still returned).
     """
     N, M, _ = points.shape
     valid = torch.ones(N, M, dtype=torch.bool, device=points.device)
 
     if params.enable_frustum_cull:
-        valid = valid & frustum_cull_mask(points, params)
+        valid = valid & frustum_cull_mask(points, params, focal_mm)
     if params.enable_hpr:
-        valid = valid & zbuffer_visible_mask(points, valid, params, zbuf_hw)
+        valid = valid & zbuffer_visible_mask(
+            points, valid, params, zbuf_hw,
+            splat_mask=occluder_mask, splat_radius=occluder_splat_radius,
+            focal_mm=focal_mm,
+        )
+    # Occluder-only points: (M,) bool marking points that PARTICIPATE in the z-buffer
+    # (they block what's behind them, e.g. arm links a gripper-only cloud must still be
+    # occluded by) but can never appear in the output. Dropped from `valid` AFTER the
+    # visibility pass and BEFORE edge bleed, so they neither spawn skirts nor get selected.
+    if occluder_mask is not None:
+        valid = valid & ~occluder_mask.unsqueeze(0)
 
     all_pts, all_valid = points, valid
     # Labels aligned with all_pts' point axis (doubled when edge-bleed cats a skirt).
@@ -293,7 +354,7 @@ def augment_pointcloud_batched(
     all_prim = point_prim
     if params.enable_edge_bleed:
         skirt, skirt_valid = edge_bleed_batched(
-            points, valid, params, plane_point, plane_normal, zbuf_hw, generator
+            points, valid, params, plane_point, plane_normal, zbuf_hw, generator, focal_mm=focal_mm
         )
         all_pts = torch.cat([points, skirt], dim=1)
         all_valid = torch.cat([valid, skirt_valid], dim=1)
@@ -312,18 +373,29 @@ def augment_pointcloud_batched(
         keep = torch.rand(all_valid.shape, generator=generator, device=points.device) < params.dropout_keep
         all_valid = all_valid & keep
 
+    pad_mask = None
     if class_targets is not None:
         # Stratified resample: enforce a fixed per-source count split in the output.
-        gather_idx = stratified_resample_gather_idx(all_valid, all_source, class_targets, generator)
+        if return_pad_mask:
+            gather_idx, pad_mask = stratified_resample_gather_idx(
+                all_valid, all_source, class_targets, generator, return_pad_mask=True
+            )
+        else:
+            gather_idx = stratified_resample_gather_idx(all_valid, all_source, class_targets, generator)
     else:
         gather_idx = resample_gather_idx(all_valid, num_points, generator)  # (N, num_points)
+    if return_pad_mask and pad_mask is None:
+        pad_mask = torch.zeros_like(gather_idx, dtype=torch.bool)
     out = torch.gather(all_pts, 1, gather_idx.unsqueeze(-1).expand(-1, -1, 3))
     if params.enable_flier:
         out = apply_fliers(out, params, generator)  # displaces points in place; no reindex
     if point_prim is not None:
         out_source = all_source[gather_idx] if point_source is not None else None
-        return out, out_source, all_prim[gather_idx]  # (N, num_points) prim id per output point
-    if point_source is None:
-        return out
-    out_source = all_source[gather_idx]  # (N, num_points) — same indices as the cloud
-    return out, out_source
+        ret = (out, out_source, all_prim[gather_idx])  # (N, num_points) prim id per output point
+    elif point_source is None:
+        ret = (out,)
+    else:
+        ret = (out, all_source[gather_idx])  # (N, num_points) — same indices as the cloud
+    if return_pad_mask:
+        return (*ret, pad_mask)
+    return ret[0] if len(ret) == 1 else ret

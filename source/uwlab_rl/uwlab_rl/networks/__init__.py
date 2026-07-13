@@ -19,6 +19,7 @@ so the PointNet architecture has a single source of truth. See
 ``uwlab_rl.networks.point_net``.
 """
 
+from .history_point_net import HistoryPointNet
 from .point_net import MLP, PointNet, ResidualMLP, ResidualPointNet
 
-__all__ = ["MLP", "PointNet", "ResidualMLP", "ResidualPointNet"]
+__all__ = ["HistoryPointNet", "MLP", "PointNet", "ResidualMLP", "ResidualPointNet"]

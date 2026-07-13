@@ -39,14 +39,18 @@ from .rl_state_cfg import (
     Ur5eRobotiq2f85RlStateCfg,
 )
 
-# ICP-calibrated D455 front-camera extrinsics (opengl convention), shared by the
-# sanity env and the data-collection env. Real cloud aligned to the sim arm at a
-# recorded pose: RMS 49mm -> 7mm. See calibrate_extrinsics.py /
-# exported/sim2real_pc_sanity/calibrated_extrinsics.json. Original guess was
-# pos=(1.0770121, -0.1679045, 0.4486344), quat=(0.70564552, 0.46613815, 0.25072644, 0.47107948).
-CALIBRATED_CAMERA_OFFSET_POS = (1.001469, -0.1966215, 0.4574127)
-CALIBRATED_CAMERA_OFFSET_QUAT = (0.7301757, 0.4487978, 0.2351745, 0.4583852)
-
+# Orbbec front-camera extrinsics (opengl convention), from the 26-07-08 charuco +
+# hand-aligned calibration (diffusion_policy .../most_recent_hand_aligned_extrinsic.json,
+# optical convention there). The old D455 ICP values were 24cm / 15deg away.
+CALIBRATED_CAMERA_OFFSET_POS = (1.1152, -0.0124, 0.3519)
+CALIBRATED_CAMERA_OFFSET_QUAT = (0.6496617, 0.4610421, 0.3223779, 0.5113242)
+# Orbbec fx=998.50 px @ 1280 wide -> 16.35mm at the 20.955mm aperture (HFOV 65.3 deg;
+# the AugParams default 13.20mm = old D455-era 76.9 deg).
+CALIBRATED_FOCAL_LENGTH_MM = 16.35
+# Per-env DR around the calibrated center (training/collection only; sanity view stays fixed).
+CAMERA_OFFSET_POS_RANGE = (0.10, 0.10, 0.10)
+CAMERA_OFFSET_ROT_RANGE_DEG = 20
+FOCAL_LENGTH_MM_RANGE = 0.5  # +/- mm, ~ +/-1.5 deg HFOV
 
 @configclass
 class Sim2RealPCSceneCfg(RlStateSceneCfg):
@@ -86,20 +90,16 @@ class Sim2RealPCObservationsCfg:
                 # higher sim count so the densities are comparable.
                 "num_points": 4096,
                 "oversample": 3,
-                # D455 front-camera offset relative to the /Robot root prim
-                # (opengl convention). Output points are in this camera's optical
-                # frame. These are the ICP-CALIBRATED values (real cloud aligned to
-                # the sim arm at a recorded pose: RMS 49mm -> 7mm); the original
-                # camera_align_cfg guess was (1.0770121, -0.1679045, 0.4486344) /
-                # (0.70564552, 0.46613815, 0.25072644, 0.47107948). See
-                # calibrate_extrinsics.py and exported/.../calibrated_extrinsics.json.
+                # Calibrated Orbbec camera (offset rel. to the /Robot root prim, opengl
+                # convention; output points in its optical frame).
                 "camera_offset_pos": CALIBRATED_CAMERA_OFFSET_POS,
                 "camera_offset_quat": CALIBRATED_CAMERA_OFFSET_QUAT,
-                # Extrinsics domain randomization around the calibrated center
-                # (per-env, resampled each reset). 0 -> fixed for the sanity view.
-                # The data-collection env turns this on (see below).
+                "focal_length_mm": CALIBRATED_FOCAL_LENGTH_MM,
+                # NO DR: the sanity view must sit exactly at the calibrated camera so
+                # the sim cloud can be overlaid on a real .ply.
                 "camera_offset_pos_range": (0.0, 0.0, 0.0),
                 "camera_offset_rot_range_deg": 0.0,
+                "focal_length_mm_range": 0.0,
                 "bg_plane_z": -0.02,
                 "visualize": True,
                 "visualize_env_ids": [0],
@@ -200,13 +200,14 @@ class DataCollectionPCObservationsCfg(ObservationsCfg):
                 # pre-occlusion sample AND the final stratified resample). Area-weighting
                 # alone gives ~93% robot; the small peg/hole were starved (~3%/5%).
                 "class_ratios": (0.5, 0.25, 0.25),
-                # ICP-calibrated D455 extrinsics as the center...
+                # Calibrated Orbbec camera + per-env DR around it (extrinsics +
+                # focal, resampled on reset) for real-rig miscalibration robustness.
                 "camera_offset_pos": CALIBRATED_CAMERA_OFFSET_POS,
                 "camera_offset_quat": CALIBRATED_CAMERA_OFFSET_QUAT,
-                # ...with extrinsics domain randomization around it (per-env, on
-                # reset) so the student is robust to real-rig miscalibration.
-                "camera_offset_pos_range": (0.05, 0.05, 0.05),
-                "camera_offset_rot_range_deg": 5.0,
+                "focal_length_mm": CALIBRATED_FOCAL_LENGTH_MM,
+                "camera_offset_pos_range": CAMERA_OFFSET_POS_RANGE,
+                "camera_offset_rot_range_deg": CAMERA_OFFSET_ROT_RANGE_DEG,
+                "focal_length_mm_range": FOCAL_LENGTH_MM_RANGE,
                 "bg_plane_z": -0.02,
                 "visualize": False,
             },
@@ -773,6 +774,254 @@ class Ur5eRobotiq2f85PCDAggerCleanSegCfg(Ur5eRobotiq2f85DataCollectionPCRelCarte
             "ObjectAnywhereEEGrasped",
             "ObjectPartiallyAssembledEEGrasped",
         ]
+
+
+@configclass
+class Ur5eRobotiq2f85PCDAggerCleanSegEvalCfg(Ur5eRobotiq2f85PCDAggerCleanSegCfg):
+    """Apples-to-apples eval env for DAgger-trained PointNet students.
+
+    Keeps the flat ``proprio``/``scene_pc``/``teacher`` groups the DistillationRunnerSplit
+    checkpoint needs, but matches the BC ``BCPointNetCleanSegCanonicalEval-v0`` protocol:
+    CANONICAL cloud (no per-episode FPS resample) + single HARD reset path — so a success
+    rate here is directly comparable to the offline-BC numbers."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Canonical cloud: fixed FPS subset for the whole run (matches CleanSegCanonicalEval).
+        self.observations.scene_pc.scene_pc.params["resample_on_reset"] = False
+        # Single hard reset path (matches Ur5eRobotiq2f85BCPointNetEvalCfg).
+        self.events.reset_from_reset_states.params["probs"] = [1.0]
+        self.events.reset_from_reset_states.params["reset_types"] = ["ObjectAnywhereEEAnywhere"]
+
+
+# ----------------------------------------------------------------------------
+# ONLINE DAgger on the DEPLOYABLE cloud: occluded, gripper-only robot points, 3D
+# ----------------------------------------------------------------------------
+# Same 3-group DAgger layout, but the student cloud is what a real fixed depth
+# camera can actually produce: the OccludedScenePointCloud (frustum + z-buffer
+# visibility from the ICP-calibrated extrinsic, FoundationStereo-style noise,
+# extrinsics DR) with the robot restricted to the GRIPPER links only (no arm, no
+# wrist D415 mesh) and NO segmentation channel -> (1024, 3), point_dim=3. The
+# teacher group is unchanged (the ScenePC expert still sees its clean input).
+@configclass
+class PCDAggerOccludedGripperObservationsCfg(PCDAggerCleanSegObservationsCfg):
+    """Flat 3-group DAgger obs: proprio | occluded gripper-only 3D cloud | teacher."""
+
+    @configclass
+    class OccGripScenePCCfg(ObsGroup):
+        scene_pc = ObsTerm(
+            func=task_mdp.OccludedScenePointCloud,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                # sample the objects too -> shared frustum/z-buffer occlusion
+                "insertive_cfg": SceneEntityCfg("insertive_object"),
+                "receptive_cfg": SceneEntityCfg("receptive_object"),
+                # GRIPPER-ONLY robot points: all Robotiq links, but not the arm and
+                # not the collision-only wrist D415 camera mesh.
+                "robot_body_names": ["robotiq_base_link", ".*knuckle.*", ".*finger.*", ".*pad.*"],
+                "include_wrist_camera_mesh": False,
+                "num_points": 1024,
+                "oversample": 3,
+                # Gripper-only robot -> shift budget toward the objects vs the
+                # (0.5, 0.25, 0.25) used when the whole arm was in the cloud.
+                "class_ratios": (0.34, 0.33, 0.33),
+                # Calibrated Orbbec camera + per-env DR around it.
+                "camera_offset_pos": CALIBRATED_CAMERA_OFFSET_POS,
+                "camera_offset_quat": CALIBRATED_CAMERA_OFFSET_QUAT,
+                "focal_length_mm": CALIBRATED_FOCAL_LENGTH_MM,
+                "camera_offset_pos_range": CAMERA_OFFSET_POS_RANGE,
+                "camera_offset_rot_range_deg": CAMERA_OFFSET_ROT_RANGE_DEG,
+                "focal_length_mm_range": FOCAL_LENGTH_MM_RANGE,
+                "bg_plane_z": -0.02,
+                # EE (wrist_3_link) output frame -- occlusion still computed from the
+                # camera viewpoint; matches the BC/DAgger student frame convention.
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                # 3D cloud: no seg channel (deployable -- real clouds have no labels).
+                "include_segmentation": False,
+                "visualize": False,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+            self.history_length = 1
+
+    scene_pc: OccGripScenePCCfg = OccGripScenePCCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85PCDAggerOccludedGripperCfg(Ur5eRobotiq2f85PCDAggerCleanSegCfg):
+    """Online PC DAgger env on the occluded gripper-only 3D cloud (from-scratch
+    deployable-perception run). Same scene/action/teacher wiring and broad 4-path
+    reset as the CleanSeg DAgger env; only the student cloud differs."""
+
+    observations: PCDAggerOccludedGripperObservationsCfg = PCDAggerOccludedGripperObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # The CleanSeg parent __post_init__ force-enables the seg channel; this env
+        # is deliberately 3D (point_dim=3) -- turn it back off.
+        self.observations.scene_pc.scene_pc.params["include_segmentation"] = False
+        self.observations.scene_pc.scene_pc.params.pop("segmentation_labels", None)
+
+
+@configclass
+class Ur5eRobotiq2f85PCDAggerOccGripHardOnlyCfg(Ur5eRobotiq2f85PCDAggerOccludedGripperCfg):
+    """Occluded gripper-only 3D DAgger env, HARD reset path only.
+
+    Identical student cloud to :class:`Ur5eRobotiq2f85PCDAggerOccludedGripperCfg` plus
+    ``zero_pad_missing_class`` (fully occluded class -> explicit zeros), but ALL resets are
+    the hard ObjectAnywhereEEAnywhere path — the protocol the honest eval / offline-BC
+    numbers use, removing the 4-path reset-mix train/eval mismatch that sank the first
+    occgrip run (internal 0.885 vs 67.98% honest)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.scene_pc.scene_pc.params["zero_pad_missing_class"] = True
+        self.events.reset_from_reset_states.params["probs"] = [1.0]
+        self.events.reset_from_reset_states.params["reset_types"] = ["ObjectAnywhereEEAnywhere"]
+
+
+@configclass
+class Ur5eRobotiq2f85PCDAggerOccGripSegHardOnlyCfg(Ur5eRobotiq2f85PCDAggerCleanSegCfg):
+    """Occluded gripper-only 4D (seg) DAgger env, HARD reset path only.
+
+    Same occluded gripper-only cloud as the HardOnly 3D env, but the CleanSeg parent's
+    seg channel is KEPT -> (1024, 4), point_dim=4. Zero-padded slots of a fully occluded
+    class carry the slot's own class label (so the 4th channel reads "class X: absent")."""
+
+    observations: PCDAggerOccludedGripperObservationsCfg = PCDAggerOccludedGripperObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()  # parent enables include_segmentation + labels on scene_pc
+        self.observations.scene_pc.scene_pc.params["zero_pad_missing_class"] = True
+        self.events.reset_from_reset_states.params["probs"] = [1.0]
+        self.events.reset_from_reset_states.params["reset_types"] = ["ObjectAnywhereEEAnywhere"]
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCOccGrip4PathCfg(Ur5eRobotiq2f85DataCollectionPCRelCartesianOSCCfg):
+    """Expert-demo collection env whose recorded ``scene_pc`` EXACTLY matches the occgrip
+    DAgger student cloud (:class:`Ur5eRobotiq2f85PCDAggerOccGripHardOnlyCfg`): occluded,
+    gripper-only robot points (no arm / no wrist D415 mesh), 1024 pts, (0.34, 0.33, 0.33)
+    split, EE (wrist_3_link) output frame, zero-padded fully occluded classes, 3D (no seg).
+    Resets are the base collection env's broad 4-path mix — for BC datasets that should
+    cover ALL reset distributions (pair with a hard-only DAgger finetune afterwards).
+    Collect with a ``--std`` teacher JIT so ``expert_action_std`` is stored (weighted BC)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.observations.data_collect.scene_pc.params
+        p["robot_body_names"] = ["robotiq_base_link", ".*knuckle.*", ".*finger.*", ".*pad.*"]
+        p["include_wrist_camera_mesh"] = False
+        p["class_ratios"] = (0.34, 0.33, 0.33)
+        p["ref_cfg"] = SceneEntityCfg("robot", body_names="wrist_3_link")
+        p["zero_pad_missing_class"] = True
+
+
+# Fingers-only scope: only the finger/knuckle/pad links contribute OUTPUT points (the
+# robotiq_base_link wrist body + camera mount are excluded), and ALL excluded robot
+# bodies (arm + wrist + D415 mount) are sampled as OCCLUDER-ONLY points so the camera
+# still can't see the fingers/objects through them.
+_FINGER_BODY_PATTERNS = [".*knuckle.*", ".*finger.*", ".*pad.*"]
+
+
+@configclass
+class Ur5eRobotiq2f85PCDAggerOccFingersHardOnlyCfg(Ur5eRobotiq2f85PCDAggerOccGripHardOnlyCfg):
+    """Hard-only occluded DAgger env, FINGERS-ONLY robot points + arm/wrist self-occlusion."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.observations.scene_pc.scene_pc.params
+        p["robot_body_names"] = list(_FINGER_BODY_PATTERNS)
+        p["occlude_excluded_bodies"] = True
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCOccGripHardOnlyCfg(Ur5eRobotiq2f85DataCollectionPCOccGrip4PathCfg):
+    """Same occgrip collection cloud, but resets restricted to the single HARD path
+    (ObjectAnywhereEEAnywhere) — the offline-BC dataset then covers exactly the
+    distribution the hard-only DAgger runs train and are evaluated on."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_from_reset_states.params["probs"] = [1.0]
+        self.events.reset_from_reset_states.params["reset_types"] = ["ObjectAnywhereEEAnywhere"]
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCOccFingers4PathCfg(Ur5eRobotiq2f85DataCollectionPCOccGrip4PathCfg):
+    """Occluded collection env, FINGERS-ONLY robot points + arm/wrist self-occlusion,
+    broad 4-path reset mix. Matches :class:`Ur5eRobotiq2f85PCDAggerOccFingersHardOnlyCfg`'s
+    student cloud."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.observations.data_collect.scene_pc.params
+        p["robot_body_names"] = list(_FINGER_BODY_PATTERNS)
+        p["occlude_excluded_bodies"] = True
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCOccFingersHardOnlyCfg(Ur5eRobotiq2f85DataCollectionPCOccFingers4PathCfg):
+    """Fingers-only occluded collection env, HARD reset path only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_from_reset_states.params["probs"] = [1.0]
+        self.events.reset_from_reset_states.params["reset_types"] = ["ObjectAnywhereEEAnywhere"]
+
+
+# OBJECTS-ONLY cloud: zero robot output points (empty include-list + zero robot class
+# ratio -> 512/512 insertive/receptive), while the ENTIRE robot (arm + gripper + D415
+# mount) is occluder-only geometry. The policy still gets proprio (joint_pos + EE pose),
+# so this ablates whether the policy needs to SEE its gripper or just feel it.
+@configclass
+class Ur5eRobotiq2f85PCDAggerOccObjectsHardOnlyCfg(Ur5eRobotiq2f85PCDAggerOccFingersHardOnlyCfg):
+    """Hard-only occluded DAgger env, OBJECTS-ONLY cloud (whole robot = occluder)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.observations.scene_pc.scene_pc.params
+        p["robot_body_names"] = []
+        p["class_ratios"] = (0.0, 0.5, 0.5)
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionPCOccObjectsHardOnlyCfg(Ur5eRobotiq2f85DataCollectionPCOccFingersHardOnlyCfg):
+    """Objects-only occluded collection env, HARD reset path only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.observations.data_collect.scene_pc.params
+        p["robot_body_names"] = []
+        p["class_ratios"] = (0.0, 0.5, 0.5)
+
+
+# Arm joint names (real-robot proprio): the Robotiq gripper's 6 mimic joints exist only in
+# sim, so real-transfer policies must see joint_pos restricted to the 6 UR5e arm joints.
+_ARM_JOINT_NAMES = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+]
+
+
+@configclass
+class Ur5eRobotiq2f85PCDAggerOccObjectsHardOnlyArm6Cfg(Ur5eRobotiq2f85PCDAggerOccObjectsHardOnlyCfg):
+    """Objects-only hard-only DAgger env with REAL-ROBOT proprio: joint_pos = 6 arm joints only
+    (no gripper mimic joints -> student proprio 6 + 6 EE pose = 12d). Pair with a BC ckpt trained
+    with ``--joint_pos_dims 6``. DEFAULT going forward for any policy meant to transfer to real."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.proprio.joint_pos.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=list(_ARM_JOINT_NAMES)
+        )
 
 
 # ----------------------------------------------------------------------------
