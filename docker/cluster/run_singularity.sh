@@ -114,11 +114,13 @@ mkdir -p "$CLUSTER_UWLAB_DIR/logs"
 touch "$CLUSTER_UWLAB_DIR/logs/.keep"
 
 # copy the temporary uwlab directory with the latest changes to the compute node.
-# Exclude bulky persistent dirs (logs/, rbs/) — under `_latest` snapshot mode these
-# accumulate across jobs and can balloon to hundreds of GB. logs/ is provided to the
-# container via the persistent bind-mount below regardless, so excluding it here only
-# affects the per-job /tmp copy, not what the container sees.
-rsync -a --exclude="logs/" --exclude="rbs/" "$UWLAB_DIR_ARG" "$JOB_TMPDIR/"
+# Exclude bulky persistent dirs (logs/, rbs/, expert_rb/, tmp/) — under `_latest` snapshot mode
+# these accumulate across jobs and can balloon to hundreds of GB. logs/ and tmp/ (torch.compile's
+# inductor/triton cache) are provided to the container via persistent bind-mounts below regardless,
+# and expert_rb/ is reachable through the blanket $CLUSTER_MOUNT_DIR bind (both map to the same
+# /mmfs1 absolute path), so excluding them here only affects the per-job /tmp copy, not what the
+# container sees.
+rsync -a --exclude="logs/" --exclude="rbs/" --exclude="expert_rb/" --exclude="tmp/" "$UWLAB_DIR_ARG" "$JOB_TMPDIR/"
 # Get the directory name
 dir_name=$(basename "$UWLAB_DIR_ARG")
 

@@ -20,6 +20,21 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--video_name",
+    type=str,
+    default=None,
+    help="Filename prefix for the recorded video. Defaults to the checkpoint name (e.g. model_0025000).",
+)
+parser.add_argument(
+    "--checkpoint_dir",
+    type=str,
+    default=None,
+    help=(
+        "Directory of model_*.pt checkpoints to sweep: records one video per checkpoint, "
+        "reusing a single Isaac Sim instance. Implies video recording; ignores --checkpoint."
+    ),
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -51,12 +66,14 @@ parser.add_argument(
 )
 parser.add_argument(
     "--record_n_steps",
+    "--num_steps",
+    dest="record_n_steps",
     type=int,
     default=1,
     help=(
         "n-step return horizon to tag the recorded replay buffer with. Transitions are "
         "always stored as single steps in temporal order; SimpleReplayBuffer builds the "
-        "n-step returns at sample time. Set this to match the FastSAC training num_steps."
+        "n-step returns at sample time. Set this to match the FastSAC training agent.num_steps."
     ),
 )
 parser.add_argument(
@@ -90,7 +107,7 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
-if args_cli.video:
+if args_cli.video or args_cli.checkpoint_dir:
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -103,6 +120,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import glob
 import os
 import time
 import torch
@@ -329,7 +347,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.use_pretrained_checkpoint:
+    checkpoint_list: list[str] = []
+    if args_cli.checkpoint_dir:
+        checkpoint_list = sorted(glob.glob(os.path.join(args_cli.checkpoint_dir, "model_*.pt")))
+        if not checkpoint_list:
+            print(f"[INFO] No model_*.pt checkpoints found in: {args_cli.checkpoint_dir}")
+            return
+        resume_path = checkpoint_list[0]
+    elif args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
         if not resume_path:
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
@@ -344,20 +369,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
+    # pull the viewport camera back for eval/video (task default eye is (2.0, 0.0, 0.75))
+    if hasattr(env_cfg, "viewer"):
+        env_cfg.viewer.eye = (3.5, 0.0, 1.3)
+
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    record_video = args_cli.video or bool(args_cli.checkpoint_dir)
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if record_video else None)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # wrap for video recording
-    if args_cli.video:
+    # wrap for video recording (single-checkpoint mode only; sweep captures frames manually)
+    if args_cli.video and not args_cli.checkpoint_dir:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "play"),
             "step_trigger": lambda step: step == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
+            "name_prefix": args_cli.video_name or os.path.splitext(os.path.basename(resume_path))[0],
         }
         print("[INFO] Recording videos during training.")
         print_dict(video_kwargs, nesting=4)
@@ -379,6 +410,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.setup()
         runner.load(resume_path)
         policy = runner.get_inference_policy(device=env.unwrapped.device)
+        critic = runner.get_inference_critic(device=env.unwrapped.device)
         actor_obs_keys = agent_cfg.actor_obs_keys
         critic_obs_keys = agent_cfg.critic_obs_keys
 
@@ -440,6 +472,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
 
+    # --checkpoint_dir sweep: record one video per checkpoint, reusing this Isaac Sim instance.
+    if args_cli.checkpoint_dir:
+        import imageio.v2 as imageio
+
+        fps = int(env.unwrapped.metadata.get("render_fps", 30))
+        video_dir = os.path.join(log_dir, "videos", "play")
+        os.makedirs(video_dir, exist_ok=True)
+        for ckpt in checkpoint_list:
+            name = args_cli.video_name or os.path.splitext(os.path.basename(ckpt))[0]
+            print(f"[INFO] Recording {name} from checkpoint: {ckpt}")
+            runner.load(ckpt)
+            policy = runner.get_inference_policy(device=env.unwrapped.device)
+            env.unwrapped.reset()
+            obs = env.get_observations()
+            frames = []
+            for _ in range(args_cli.video_length):
+                with torch.inference_mode():
+                    if is_fastsac:
+                        actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=1)
+                        actions = policy({"actor_obs": actor_obs})
+                    else:
+                        actions = policy(obs)
+                    obs, _, _, _ = env.step(actions)
+                frame = env.unwrapped.render()
+                if frame is not None:
+                    frames.append(frame)
+            out_path = os.path.join(video_dir, f"{name}.mp4")
+            imageio.mimsave(out_path, frames, fps=fps)
+            print(f"[INFO] Saved {out_path} ({len(frames)} frames)")
+        env.close()
+        return
+
     dt = env.unwrapped.step_dt
 
     # reset environment
@@ -479,13 +543,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         device = env.unwrapped.device
         ever_success = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
 
-        # Per-episode initial peg (insertive_object) xy in env-local frame.
+        # Per-episode initial peg (insertive_object) xyz in env-local frame.
         # Captured at episode start; refreshed after each done.
         insertive = env.unwrapped.scene["insertive_object"]
+        receptive = env.unwrapped.scene["receptive_object"]
         env_origins = env.unwrapped.scene.env_origins  # [num_envs, 3]
-        init_peg_xy = (insertive.data.root_pos_w - env_origins)[:, :2].clone()
-        # Collected per completed episode: (x, y, success_bool)
-        episode_init_xys: list[torch.Tensor] = []
+        init_peg_xyz = (insertive.data.root_pos_w - env_origins)[:, :3].clone()
+        peghole_xyz_env0 = (receptive.data.root_pos_w[0] - env_origins[0])[:3].cpu().numpy()
+        # Collected per completed episode: (x, y, z, success_bool)
+        episode_init_xyzs: list[torch.Tensor] = []
         episode_successes: list[bool] = []
 
         pbar = tqdm.tqdm(total=target_episodes, desc="Eval episodes", unit="ep")
@@ -521,13 +587,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # then refresh init_peg_xy for those envs from the new post-reset peg pose.
             if n_done > 0:
                 done_idx = torch.nonzero(done_mask, as_tuple=False).flatten()
-                xy_cpu = init_peg_xy[done_idx].cpu()
+                xyz_cpu = init_peg_xyz[done_idx].cpu()
                 succ_cpu = successes[done_idx].cpu()
                 for k in range(done_idx.numel()):
-                    episode_init_xys.append(xy_cpu[k])
+                    episode_init_xyzs.append(xyz_cpu[k])
                     episode_successes.append(bool(succ_cpu[k]))
-                new_xy = (insertive.data.root_pos_w - env_origins)[:, :2]
-                init_peg_xy[done_mask] = new_xy[done_mask]
+                new_xyz = (insertive.data.root_pos_w - env_origins)[:, :3]
+                init_peg_xyz[done_mask] = new_xyz[done_mask]
             # Reset success flag for envs that just finished an episode.
             ever_success[done_mask] = False
         
@@ -535,23 +601,46 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         success_rate = successful_episodes / total_episodes if total_episodes > 0 else 0.0
         print(f"\n[EVAL] Episodes: {total_episodes}  |  Successes: {successful_episodes}  |  Success rate: {success_rate:.2%}")
 
-        # Plot 2D initial peg positions colored by episode outcome.
-        if len(episode_init_xys) > 0:
+        # Plot 3D initial peg positions colored by episode outcome.
+        if len(episode_init_xyzs) > 0:
             import matplotlib.pyplot as plt
-            xys = torch.stack(episode_init_xys).numpy()
+            xyzs = torch.stack(episode_init_xyzs).numpy()
             successes_np = torch.tensor(episode_successes).numpy()
-            fig, ax = plt.subplots(figsize=(7, 7))
-            ax.scatter(xys[successes_np, 0], xys[successes_np, 1],
-                       c="green", s=18, alpha=0.7, label=f"success ({int(successes_np.sum())})")
-            ax.scatter(xys[~successes_np, 0], xys[~successes_np, 1],
+            fig = plt.figure(figsize=(8, 7))
+            ax = fig.add_subplot(111, projection="3d")
+            # ax.scatter(xyzs[successes_np, 0], xyzs[successes_np, 1], xyzs[successes_np, 2],
+            #            c="green", s=18, alpha=0.7, label=f"success ({int(successes_np.sum())})")
+            ax.scatter(xyzs[~successes_np, 0], xyzs[~successes_np, 1], xyzs[~successes_np, 2],
                        c="red", s=18, alpha=0.7, label=f"failure ({int((~successes_np).sum())})")
-            ax.set_aspect("equal", adjustable="datalim")
+            ax.scatter(peghole_xyz_env0[0], peghole_xyz_env0[1], peghole_xyz_env0[2],
+                       c="blue", s=200, marker="*", label="peghole (env 0)", zorder=10)
             ax.set_xlabel("x (m, env-local)")
             ax.set_ylabel("y (m, env-local)")
-            ax.set_title(f"Initial peg xy by outcome  ({successful_episodes}/{total_episodes} = {success_rate:.1%})")
+            ax.set_zlabel("z (m, env-local)")
+
+            import numpy as np
+            from matplotlib.animation import FuncAnimation
+
+            # 3. Define the animation update function
+            def rotate(angle):
+                # Set the camera view (elevation, azimuth)
+                # azimuth loops from 0 to 360 degrees for a full spin
+                ax.view_init(elev=30, azim=angle)
+
+            # 4. Create the slow 360 rotation
+            ani = FuncAnimation(
+                fig, 
+                rotate, 
+                frames=np.arange(0, 360, 1), # 1 frame per degree for a slow, smooth spin
+                interval=50                  # 50 milliseconds pause between frames (~20 FPS)
+            )
+
+            ax.set_title(f"Initial peg xyz by outcome  ({successful_episodes}/{total_episodes} = {success_rate:.1%})")
             ax.legend(loc="best")
-            ax.grid(True, alpha=0.3)
-            out_path = os.path.join(log_dir, "eval_initial_peg_xy.png")
+            ckpt_name = os.path.splitext(os.path.basename(resume_path))[0]
+            plots_dir = os.path.join(log_dir, "plots", ckpt_name)
+            os.makedirs(plots_dir, exist_ok=True)
+            out_path = os.path.join(plots_dir, "eval_initial_peg_xyz.png")
             plt.tight_layout()
             plt.savefig(out_path, dpi=150)
             print(f"[EVAL] Saved initial-pose scatter plot to: {out_path}")
@@ -640,6 +729,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             else:
                 actions = policy(obs)
                 obs, _, dones, _ = env.step(actions)
+
+            critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=1)
+            print(critic(critic_obs, actions)[0])
 
         if args_cli.video:
             timestep += 1

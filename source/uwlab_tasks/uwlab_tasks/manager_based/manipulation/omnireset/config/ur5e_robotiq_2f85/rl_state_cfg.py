@@ -1119,6 +1119,114 @@ class ObservationsCfg:
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
 
+
+@configclass
+class ObservationsNoPrivilegedObsCfg:
+    """Observation specifications for the MDP."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Observations for policy group."""
+
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        insertive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        receptive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("receptive_object"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+            self.history_length = 5
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Critic observations for policy group."""
+
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        insertive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        receptive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("insertive_object"),
+                "root_asset_cfg": SceneEntityCfg("receptive_object"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+            self.history_length = 1
+
+    # observation groups
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
 @configclass
 class ObservationsReachingCfg:
     """Observation specifications for the MDP."""
@@ -1249,6 +1357,48 @@ class RewardsCfg:
 
     success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
 
+@configclass
+class RewardsScaledCfg:
+
+    # safety rewards
+
+    action_magnitude = RewTerm(func=task_mdp.action_l2_clamped, weight=-1e-4)
+
+    action_rate = RewTerm(func=task_mdp.action_rate_l2_clamped, weight=-1e-3)
+
+    joint_vel = RewTerm(
+        func=task_mdp.joint_vel_l2_clamped,
+        weight=-1e-3,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
+    )
+
+    abnormal_robot = RewTerm(func=task_mdp.abnormal_robot_state, weight=-10.0)
+
+    # task rewards
+
+    progress_context = RewTerm(
+        func=task_mdp.ProgressContext,  # type: ignore
+        weight=0.1,
+        params={
+            "insertive_asset_cfg": SceneEntityCfg("insertive_object"),
+            "receptive_asset_cfg": SceneEntityCfg("receptive_object"),
+        },
+    )
+
+    ee_asset_distance = RewTerm(
+        func=task_mdp.ee_asset_distance_tanh,
+        weight=0.1,
+        params={
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_offset_metadata_key": "gripper_offset",
+            "std": 1.0,
+        },
+    )
+
+    dense_success_reward = RewTerm(func=task_mdp.dense_success_reward, weight=0.1, params={"std": 1.0})
+
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
 
 @configclass
 class RewardsReachingCfg:
@@ -1302,9 +1452,38 @@ class TerminationsCfg:
     #     },
     # )
 
-    first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode)
+    # Nullable so submissions can disable it from the CLI via Hydra:
+    #   env.terminations.first_episode_termination=null
+    # IsaacLab's TerminationManager skips None-valued term fields.
+    first_episode_termination: DoneTerm | None = DoneTerm(func=task_mdp.terminate_first_episode)
 
     # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1})
+
+
+@configclass
+class TerminationsSuccessTerminationCfg:
+    """Termination terms for the MDP."""
+
+    time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+
+    abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
+
+    # Conservative failure: world Z only (cf. grasp_sampling check_grasp_success pos_above_ground on root_pos_w[:, 2])
+    # insertive_fell_too_low = DoneTerm(
+    #     func=task_mdp.object_root_w_z_below_threshold,
+    #     params={
+    #         "object_cfg": SceneEntityCfg("insertive_object"),
+    #         "min_world_z": -0.2,
+    #     },
+    # )
+
+    # Nullable so submissions can disable it from the CLI via Hydra:
+    #   env.terminations.first_episode_termination=null
+    # IsaacLab's TerminationManager skips None-valued term fields.
+    first_episode_termination: DoneTerm | None = DoneTerm(func=task_mdp.terminate_first_episode)
+
+    success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1})
+
 
 
 @configclass
@@ -1337,7 +1516,9 @@ class TerminationsReachingCfg:
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
-    first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode, time_out=True)
+    # Nullable so submissions can disable it from the CLI via Hydra:
+    #   env.terminations.first_episode_termination=null
+    first_episode_termination: DoneTerm | None = DoneTerm(func=task_mdp.terminate_first_episode, time_out=True)
 
     # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 2})
 
@@ -1484,6 +1665,162 @@ class Ur5eRobotiq2f85RlStateCfg(ManagerBasedRLEnvCfg):
         self.sim.render.enable_reflections = True
         self.sim.render.enable_dl_denoiser = True
 
+@configclass
+class Ur5eRobotiq2f85RlStateRewardScalingCfg(ManagerBasedRLEnvCfg):
+    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: ObservationsCfg = ObservationsCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    rewards: RewardsScaledCfg = RewardsScaledCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
+    events: BaseEventCfg = MISSING
+    commands: CommandsCfg = CommandsCfg()
+    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
+    variants = variants
+
+    def __post_init__(self):
+        self.decimation = 12
+        self.episode_length_s = 16.0
+        # simulation settings
+        self.sim.dt = 1 / 120.0
+
+        # Contact and solver settings
+        self.sim.physx.solver_type = 1
+        self.sim.physx.max_position_iteration_count = 192
+        self.sim.physx.max_velocity_iteration_count = 1
+        self.sim.physx.bounce_threshold_velocity = 0.02
+        self.sim.physx.friction_offset_threshold = 0.01
+        self.sim.physx.friction_correlation_distance = 0.0005
+
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
+        self.sim.physx.gpu_max_rigid_contact_count = 2**23
+        self.sim.physx.gpu_max_rigid_patch_count = 2**23
+        self.sim.physx.gpu_collision_stack_size = 2**31
+
+        # Render settings
+        self.sim.render.enable_dlssg = True
+        self.sim.render.enable_ambient_occlusion = True
+        self.sim.render.enable_reflections = True
+        self.sim.render.enable_dl_denoiser = True
+
+@configclass
+class Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationCfg(ManagerBasedRLEnvCfg):
+    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: ObservationsCfg = ObservationsCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    rewards: RewardsScaledCfg = RewardsScaledCfg()
+    terminations: TerminationsSuccessTerminationCfg = TerminationsSuccessTerminationCfg()
+    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
+    events: BaseEventCfg = MISSING
+    commands: CommandsCfg = CommandsCfg()
+    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
+    variants = variants
+
+    def __post_init__(self):
+        self.decimation = 12
+        self.episode_length_s = 16.0
+        # simulation settings
+        self.sim.dt = 1 / 120.0
+
+        # Contact and solver settings
+        self.sim.physx.solver_type = 1
+        self.sim.physx.max_position_iteration_count = 192
+        self.sim.physx.max_velocity_iteration_count = 1
+        self.sim.physx.bounce_threshold_velocity = 0.02
+        self.sim.physx.friction_offset_threshold = 0.01
+        self.sim.physx.friction_correlation_distance = 0.0005
+
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
+        self.sim.physx.gpu_max_rigid_contact_count = 2**23
+        self.sim.physx.gpu_max_rigid_patch_count = 2**23
+        self.sim.physx.gpu_collision_stack_size = 2**31
+
+        # Render settings
+        self.sim.render.enable_dlssg = True
+        self.sim.render.enable_ambient_occlusion = True
+        self.sim.render.enable_reflections = True
+        self.sim.render.enable_dl_denoiser = True
+
+
+@configclass
+class Ur5eRobotiq2f85RlStateNoPrivilegedObsCfg(ManagerBasedRLEnvCfg):
+    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: ObservationsNoPrivilegedObsCfg = ObservationsNoPrivilegedObsCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    rewards: RewardsCfg = RewardsCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
+    events: BaseEventCfg = MISSING
+    commands: CommandsCfg = CommandsCfg()
+    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
+    variants = variants
+
+    def __post_init__(self):
+        self.decimation = 12
+        self.episode_length_s = 16.0
+        # simulation settings
+        self.sim.dt = 1 / 120.0
+
+        # Contact and solver settings
+        self.sim.physx.solver_type = 1
+        self.sim.physx.max_position_iteration_count = 192
+        self.sim.physx.max_velocity_iteration_count = 1
+        self.sim.physx.bounce_threshold_velocity = 0.02
+        self.sim.physx.friction_offset_threshold = 0.01
+        self.sim.physx.friction_correlation_distance = 0.0005
+
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
+        self.sim.physx.gpu_max_rigid_contact_count = 2**23
+        self.sim.physx.gpu_max_rigid_patch_count = 2**23
+        self.sim.physx.gpu_collision_stack_size = 2**31
+
+        # Render settings
+        self.sim.render.enable_dlssg = True
+        self.sim.render.enable_ambient_occlusion = True
+        self.sim.render.enable_reflections = True
+        self.sim.render.enable_dl_denoiser = True
+
+@configclass
+class Ur5eRobotiq2f85RlStateSuccessTerminationCfg(ManagerBasedRLEnvCfg):
+    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: ObservationsCfg = ObservationsCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    rewards: RewardsCfg = RewardsCfg()
+    terminations: TerminationsSuccessTerminationCfg = TerminationsSuccessTerminationCfg()
+    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
+    events: BaseEventCfg = MISSING
+    commands: CommandsCfg = CommandsCfg()
+    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
+    variants = variants
+
+    def __post_init__(self):
+        self.decimation = 12
+        self.episode_length_s = 16.0
+        # simulation settings
+        self.sim.dt = 1 / 120.0
+
+        # Contact and solver settings
+        self.sim.physx.solver_type = 1
+        self.sim.physx.max_position_iteration_count = 192
+        self.sim.physx.max_velocity_iteration_count = 1
+        self.sim.physx.bounce_threshold_velocity = 0.02
+        self.sim.physx.friction_offset_threshold = 0.01
+        self.sim.physx.friction_correlation_distance = 0.0005
+
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
+        self.sim.physx.gpu_max_rigid_contact_count = 2**23
+        self.sim.physx.gpu_max_rigid_patch_count = 2**23
+        self.sim.physx.gpu_collision_stack_size = 2**31
+
+        # Render settings
+        self.sim.render.enable_dlssg = True
+        self.sim.render.enable_ambient_occlusion = True
+        self.sim.render.enable_reflections = True
+        self.sim.render.enable_dl_denoiser = True
 
 @configclass
 class Ur5eRobotiq2f85RlStateEasyCfg(ManagerBasedRLEnvCfg):
@@ -1530,6 +1867,45 @@ class Ur5eRobotiq2f85RlStateEvalCfg(ManagerBasedRLEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
     rewards: RewardsCfg = RewardsCfg()
+    terminations: TerminationsEvalCfg = TerminationsEvalCfg()
+    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
+    events: BaseEventCfg = MISSING
+    commands: CommandsCfg = CommandsCfg()
+    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
+    variants = variants
+
+    def __post_init__(self):
+        self.decimation = 12
+        self.episode_length_s = 16.0
+        # simulation settings
+        self.sim.dt = 1 / 120.0
+
+        # Contact and solver settings
+        self.sim.physx.solver_type = 1
+        self.sim.physx.max_position_iteration_count = 192
+        self.sim.physx.max_velocity_iteration_count = 1
+        self.sim.physx.bounce_threshold_velocity = 0.02
+        self.sim.physx.friction_offset_threshold = 0.01
+        self.sim.physx.friction_correlation_distance = 0.0005
+
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
+        self.sim.physx.gpu_max_rigid_contact_count = 2**23
+        self.sim.physx.gpu_max_rigid_patch_count = 2**23
+        self.sim.physx.gpu_collision_stack_size = 2**31
+
+        # Render settings
+        self.sim.render.enable_dlssg = True
+        self.sim.render.enable_ambient_occlusion = True
+        self.sim.render.enable_reflections = True
+        self.sim.render.enable_dl_denoiser = True
+
+@configclass
+class Ur5eRobotiq2f85RlStateEvalRewardScalingCfg(ManagerBasedRLEnvCfg):
+    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: ObservationsCfg = ObservationsCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    rewards: RewardsScaledCfg = RewardsScaledCfg()
     terminations: TerminationsEvalCfg = TerminationsEvalCfg()
     curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
     events: BaseEventCfg = MISSING
@@ -1649,6 +2025,34 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 @configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingCfg(Ur5eRobotiq2f85RlStateRewardScalingCfg):
+
+    events: TrainEventCfg = TrainEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationCfg(Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationCfg):
+
+    events: TrainEventCfg = TrainEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+# Training configuration (Stage 1: no curriculum, implicit actuator, no sysid DR)
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainNoPrivilegedObsCfg(Ur5eRobotiq2f85RlStateNoPrivilegedObsCfg):
+
+    events: TrainEventCfg = TrainEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+
+
+# Training configuration (Stage 1: no curriculum, implicit actuator, no sysid DR)
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainSuccessTerminationCfg(Ur5eRobotiq2f85RlStateSuccessTerminationCfg):
+
+    events: TrainEventCfg = TrainEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+@configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainNoDRCfg(Ur5eRobotiq2f85RlStateCfg):
 
     events: TrainEventNoDRCfg = TrainEventNoDRCfg()
@@ -1712,6 +2116,14 @@ class Ur5eRobotiq2f85RelCartesianOSCEvalCfg(Ur5eRobotiq2f85RlStateEvalCfg):
     events: TrainEvalEventCfg = TrainEvalEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
+
+# Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCEvalRewardScalingCfg(Ur5eRobotiq2f85RlStateEvalRewardScalingCfg):
+    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
+
+    events: TrainEvalEventCfg = TrainEvalEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
 @configclass
