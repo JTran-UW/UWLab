@@ -344,7 +344,7 @@ if __name__ == "__main__":
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.AdamW(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    actor_optimizer = optim.AdamW(list(actor.parameters()), lr=args.policy_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
 
     # Automatic entropy tuning
     if args.autotune:
