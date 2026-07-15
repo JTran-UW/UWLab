@@ -70,7 +70,7 @@ class AsymmetricReplayBufferSamples(NamedTuple):
     next_critic_observations: th.Tensor
     dones: th.Tensor
     rewards: th.Tensor
-    # effective_n_steps: int
+    effective_n_steps: th.Tensor
 
 def get_action_dim(action_space: spaces.Space) -> int:
     """
@@ -466,9 +466,8 @@ class AsymmetricReplayBuffer(BaseBuffer):
     next_critic_observations: th.tensor
     actions: th.tensor
     rewards: th.tensor
-    dones: th.tensor
-    timeouts: th.tensor
-    effective_n_steps: int
+    terminations: th.tensor
+    truncations: th.tensor
 
     def __init__(
         self,
@@ -478,8 +477,7 @@ class AsymmetricReplayBuffer(BaseBuffer):
         device: th.device | str = "auto",
         n_envs: int = 1,
         n_steps: int = 1,
-        optimize_memory_usage: bool = False,
-        handle_timeout_termination: bool = False,
+        gamma: float = 0.99,
     ):
         super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
 
@@ -490,33 +488,24 @@ class AsymmetricReplayBuffer(BaseBuffer):
         if psutil is not None:
             mem_available = psutil.virtual_memory().available
 
-        # there is a bug if both optimize_memory_usage and handle_timeout_termination are true
-        # see https://github.com/DLR-RM/stable-baselines3/issues/934
-        if optimize_memory_usage and handle_timeout_termination:
-            raise ValueError(
-                "ReplayBuffer does not support optimize_memory_usage = True "
-                "and handle_timeout_termination = True simultaneously."
-            )
-        self.optimize_memory_usage = optimize_memory_usage
-
         self.policy_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["policy"]).prod()), device=device)
         self.critic_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["critic"]).prod()), device=device)
 
-        if not optimize_memory_usage:
-            # When optimizing memory, `observations` contains also the next observation
-            self.next_policy_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["policy"]).prod()), device=device)
-            self.next_critic_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["critic"]).prod()), device=device)
+        # When optimizing memory, `observations` contains also the next observation
+        self.next_policy_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["policy"]).prod()), device=device)
+        self.next_critic_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["critic"]).prod()), device=device)
 
         self.actions = th.zeros(
             (self.buffer_size, self.n_envs, self.action_dim), dtype=th.float32, device=device
         )
 
         self.rewards = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=device)
-        self.dones = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=device)
+        self.terminations = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=device)
         # Handle timeouts termination properly if needed
         # see https://github.com/DLR-RM/stable-baselines3/issues/284
-        self.handle_timeout_termination = handle_timeout_termination
-        self.timeouts = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=device)
+        self.truncations = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=device)
+        self.n_steps = n_steps
+        self.gamma = gamma
 
     def add(
         self,
@@ -524,7 +513,8 @@ class AsymmetricReplayBuffer(BaseBuffer):
         next_obs: TensorDict,
         action: th.tensor,
         reward: th.tensor,
-        done: th.tensor,
+        termination: th.tensor,
+        truncation: th.tensor,
         infos: list[dict[str, Any]],
     ) -> None:
         # Reshape needed when using multiple envs with discrete observations
@@ -540,20 +530,13 @@ class AsymmetricReplayBuffer(BaseBuffer):
         # Copy to avoid modification by reference
         self.policy_observations[self.pos] = obs["policy"].detach()
         self.critic_observations[self.pos] = obs["critic"].detach()
-
-        if self.optimize_memory_usage:
-            self.policy_observations[(self.pos + 1) % self.buffer_size] = next_obs["policy"].detach()
-            self.critic_observations[(self.pos + 1) % self.buffer_size] = next_obs["critic"].detach()
-        else:
-            self.next_policy_observations[self.pos] = next_obs["policy"].detach()
-            self.next_critic_observations[self.pos] = next_obs["critic"].detach()
+        self.next_policy_observations[self.pos] = next_obs["policy"].detach()
+        self.next_critic_observations[self.pos] = next_obs["critic"].detach()
 
         self.actions[self.pos] = action.detach()
         self.rewards[self.pos] = reward.detach()
-        self.dones[self.pos] = done.detach()
-
-        if self.handle_timeout_termination:
-            self.timeouts[self.pos] = th.tensor([info.get("TimeLimit.truncated", False) for info in infos])
+        self.terminations[self.pos] = termination.detach()
+        self.truncations[self.pos] = truncation.detach()
 
         self.pos += 1
         if self.pos == self.buffer_size:
@@ -570,37 +553,55 @@ class AsymmetricReplayBuffer(BaseBuffer):
         :param batch_size: Number of element to sample
         :return:
         """
-        if not self.optimize_memory_usage:
-            return super().sample(batch_size=batch_size)
-        # Do not sample the element with index `self.pos` as the transitions is invalid
-        # (we use only one array to store `obs` and `next_obs`)
         if self.full:
-            batch_inds = (th.randint(1, self.buffer_size, size=(batch_size,)) + self.pos) % self.buffer_size
+            # FIRST SET self.pos-1 to truncated
+            upper_bound = self.buffer_size
+            current_pos = self.pos % self.buffer_size
+            current_truncations = self.truncations[current_pos - 1, :]
+            self.truncations[current_pos - 1, :] = th.logical_not(self.terminations[current_pos - 1, :])
         else:
-            batch_inds = th.randint(0, self.pos, size=(batch_size,))
-        return self._get_samples(batch_inds)
+            # sample only up to self.pos - self.n_steps + 1
+            upper_bound = self.pos - self.n_steps + 1
+        
+        batch_inds = th.randint(0, upper_bound, (batch_size, ), device=self.device) % self.buffer_size
+        samples = self._get_samples(batch_inds)
+        if self.full:
+            self.truncations[self.pos - 1, :] = current_truncations
+        return samples
 
     def _get_samples(self, batch_inds: th.tensor) -> AsymmetricReplayBufferSamples:
         # Sample randomly the env idx
-        env_indices = th.randint(0, high=self.n_envs, size=(len(batch_inds),))
+        env_indices = th.randint(0, high=self.n_envs, size=(len(batch_inds),), device=self.device)
+        offsets = th.arange(self.n_steps, device=self.device).view(-1, 1)
+        seq_inds = (batch_inds + offsets) % self.buffer_size
 
-        if self.optimize_memory_usage:
-            next_policy_obs = self.policy_observations[(batch_inds + 1) % self.buffer_size, env_indices, :]
-            next_critic_obs = self.critic_observations[(batch_inds + 1) % self.buffer_size, env_indices, :]
-        else:
-            next_policy_obs = self.next_policy_observations[batch_inds, env_indices, :]
-            next_critic_obs = self.next_critic_observations[batch_inds, env_indices, :]
+        n_step_rewards = self.rewards[seq_inds, env_indices]
+        n_step_terminations = self.terminations[seq_inds, env_indices].int().bool()
+        n_step_truncations = self.truncations[seq_inds, env_indices].int().bool()
+        n_step_dones = n_step_terminations | n_step_truncations
+
+        n_step_dones_shifted = th.concat([th.zeros_like(n_step_dones[0].unsqueeze(0)), n_step_dones[:-1, :]])
+        done_mask = th.cumprod(1 - n_step_dones_shifted.int(), dim=0)
+        effective_n_steps = done_mask.sum(dim=0)
+        masked_rewards = done_mask * n_step_rewards
+        discounts = th.pow(self.gamma, th.arange(self.n_steps, device=self.device))
+
+        discounted_rewards = masked_rewards * discounts.view(-1, 1)
+        n_step_rewards = discounted_rewards.sum(dim=0)
+
+        first_done = th.argmax(n_step_dones.int(), dim=0)
+        no_done = n_step_dones.sum(dim=0) == 0
+        first_done = th.where(no_done, self.n_steps - 1, first_done)
 
         data = (
-            self.policy_observations[batch_inds, env_indices, :],
-            self.critic_observations[batch_inds, env_indices, :],
-            self.actions[batch_inds, env_indices, :],
-            next_policy_obs,
-            next_critic_obs,
-            # Only use dones that are not due to timeouts
-            # deactivated by default (timeouts is initialized as an array of False)
-            (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
-            self.rewards[batch_inds, env_indices].reshape(-1, 1),
+            self.policy_observations[batch_inds, env_indices],
+            self.critic_observations[batch_inds, env_indices],
+            self.actions[batch_inds, env_indices],
+            self.next_policy_observations[batch_inds + first_done, env_indices],
+            self.next_critic_observations[batch_inds + first_done, env_indices],
+            self.terminations[batch_inds + first_done, env_indices],
+            n_step_rewards,
+            effective_n_steps
         )
         return AsymmetricReplayBufferSamples(*data)
 
