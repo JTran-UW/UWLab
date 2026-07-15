@@ -33,7 +33,31 @@ parser.add_argument(
     action="store_true",
     help="Use the pre-trained checkpoint from Nucleus.",
 )
+parser.add_argument("--num_steps", type=int, default=None, help="Maximum number of policy steps (safety cap; prefer --num_episodes for unbiased eval).")
+parser.add_argument(
+    "--num_episodes",
+    type=int,
+    default=None,
+    help="Stop after this many episodes have terminated. Unbiased — every counted episode runs to "
+    "its natural success/time_out, so longer (failing) episodes are not under-sampled the way "
+    "they are when truncating on --num_steps.",
+)
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--bc_checkpoint",
+    type=str,
+    default=None,
+    help="Path to a PointNet BC Lightning checkpoint (from "
+    "scripts/imitation_learning/point_cloud/train_point_net.py). When set, the BC PointNet is rolled "
+    "out instead of an RSL-RL policy — the runner is skipped and obs come from --bc_obs_group.",
+)
+parser.add_argument(
+    "--bc_obs_group",
+    type=str,
+    default="data_collect",
+    help="Observation group feeding the BC PointNet: a per-term dict with the point cloud (scene_pc) "
+    "and the proprio terms (concatenated in declaration order, matching training).",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -70,16 +94,78 @@ from isaaclab.envs import (
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
+from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx, export_vision_student_as_jit
+
+# Inject UWLab distillation classes into rsl_rl's distillation_runner module so
+# the runner's eval(class_name) lookup resolves them at checkpoint load time.
+import rsl_rl.runners.distillation_runner as _distillation_runner_module
+
+from uwlab_rl.rsl_rl.distillation_dagger import DistillationDAgger
+from uwlab_rl.rsl_rl.distillation_dagger_weighted import DistillationDAggerWeighted
+from uwlab_rl.rsl_rl.distillation_runner_split import DistillationRunnerSplit
+from uwlab_rl.rsl_rl.student_teacher_history_pointcloud import StudentTeacherHistoryPointCloud
+from uwlab_rl.rsl_rl.student_teacher_mlp import StudentTeacherMLP
+from uwlab_rl.rsl_rl.student_teacher_pointcloud import StudentTeacherPointCloud
+from uwlab_rl.rsl_rl.student_teacher_vision import StudentTeacherVision
+from uwlab_rl.rsl_rl.student_teacher_vision_recurrent import StudentTeacherVisionRecurrent
+
+_distillation_runner_module.StudentTeacherVision = StudentTeacherVision
+_distillation_runner_module.StudentTeacherVisionRecurrent = StudentTeacherVisionRecurrent
+_distillation_runner_module.StudentTeacherMLP = StudentTeacherMLP
+_distillation_runner_module.StudentTeacherPointCloud = StudentTeacherPointCloud
+_distillation_runner_module.StudentTeacherHistoryPointCloud = StudentTeacherHistoryPointCloud
+_distillation_runner_module.DistillationDAgger = DistillationDAgger
+_distillation_runner_module.DistillationDAggerWeighted = DistillationDAggerWeighted
+_distillation_runner_module.DistillationRunnerSplit = DistillationRunnerSplit
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
+
+import rsl_rl.runners.on_policy_runner as _runner_module
+from uwlab_rl.rsl_rl.actor_critic_encoder import ActorCriticWithEncoder
+_runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
+from uwlab_rl.rsl_rl.actor_critic_depth import ActorCriticDepth
+from uwlab_rl.rsl_rl.bc_ppo import BCPPO
+from uwlab_rl.rsl_rl.grpo import GRPO
+from uwlab_rl.rsl_rl.ppo_pbrs import PPOPBRS
+_runner_module.ActorCriticDepth = ActorCriticDepth
+_runner_module.BCPPO = BCPPO
+_runner_module.GRPO = GRPO
+_runner_module.PPOPBRS = PPOPBRS
+from uwlab_rl.rsl_rl.actor_critic_rma import ActorCriticRMA
+from uwlab_rl.rsl_rl.ppo_rma import PPO_RMA
+_runner_module.ActorCriticRMA = ActorCriticRMA
+_runner_module.PPO_RMA = PPO_RMA
+import rsl_rl.algorithms as _rsl_rl_algorithms
+_rsl_rl_algorithms.PPO_RMA = PPO_RMA
+
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config
 
 # PLACEHOLDER: Extension template (do not remove this comment)
+
+
+def _is_jit_checkpoint(path: str) -> bool:
+    """Return True if *path* is a TorchScript (JIT) file, False if it is a runner checkpoint."""
+    try:
+        torch.jit.load(path, map_location="cpu")
+        return True
+    except RuntimeError:
+        return False
+
+
+def _import_bc_utils():
+    """Lazily import the BC PointNet helpers (live in scripts/imitation_learning/point_cloud)."""
+    pc_bc_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "imitation_learning", "point_cloud"
+    )
+    sys.path.insert(0, pc_bc_dir)
+    from bc_utils import bc_actions, bc_reset, load_bc_pointnet  # noqa: E402
+
+    return load_bc_pointnet, bc_actions, bc_reset
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -105,7 +191,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.use_pretrained_checkpoint:
+    bc_mode = args_cli.bc_checkpoint is not None
+    if bc_mode:
+        # BC PointNet eval: the checkpoint is a Lightning .ckpt, not an RSL-RL run.
+        resume_path = os.path.abspath(args_cli.bc_checkpoint)
+    elif args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
         if not resume_path:
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
@@ -143,45 +233,110 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # load previously trained model
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    # BC PointNet eval bypasses the runner / JIT paths entirely.
+    bc = bc_actions = bc_reset = None
+    if bc_mode:
+        load_bc_pointnet, bc_actions, bc_reset = _import_bc_utils()
+        bc = load_bc_pointnet(resume_path, agent_cfg.device)
+    # Auto-detect whether the checkpoint is a TorchScript (JIT) file or a runner checkpoint.
+    is_jit = False if bc_mode else _is_jit_checkpoint(resume_path)
+
+    if bc_mode:
+        print(f"[INFO]: Detected BC PointNet checkpoint — rolling out PointNet on obs group "
+              f"'{args_cli.bc_obs_group}'. hp={bc['hp']}")
+    elif is_jit:
+        print("[INFO]: Detected TorchScript checkpoint — loading with torch.jit.load (skipping runner).")
+        policy_nn = torch.jit.load(resume_path, map_location=agent_cfg.device)
+        policy_nn.eval()
+        # JIT policy forward takes a flat obs tensor; policy() alias used in the loop below.
+        policy = policy_nn
     else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+        # load previously trained model
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunnerSplit":
+            runner = DistillationRunnerSplit(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "BCPPORunner":
+            from uwlab_rl.rsl_rl.bc_ppo_runner import BCPPORunner
+            runner = BCPPORunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "GRPOGroupedRunner":
+            from uwlab_rl.rsl_rl.grpo_grouped_runner import GRPOGroupedRunner
+            runner = GRPOGroupedRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "OnPolicyRunnerRMA":
+            from uwlab_rl.rsl_rl.on_policy_runner_rma import OnPolicyRunnerRMA
+            runner = OnPolicyRunnerRMA(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        try:
+            runner.load(resume_path)
+        except ValueError as _e:
+            if "optimizer" not in str(_e).lower():
+                raise
+            # Optimizer param-group mismatch: checkpoint was saved with a different
+            # policy architecture (e.g. std-head added/removed between train and play).
+            # For inference we only need model weights, so skip the optimizer.
+            print(f"[WARN] Optimizer state mismatch — loading model weights only: {_e}")
+            _ckpt = torch.load(resume_path, map_location=agent_cfg.device)
+            runner.alg.policy.load_state_dict(_ckpt["model_state_dict"])
+        except RuntimeError as _e:
+            if "size mismatch" not in str(_e):
+                raise
+            # Critic obs size mismatch (e.g. checkpoint trained with different critic obs dim).
+            # strict=False still errors on size mismatches, so drop critic keys entirely.
+            print(f"[WARN] State dict size mismatch — dropping critic keys and loading actor only: {_e}")
+            _ckpt = torch.load(resume_path, map_location=agent_cfg.device)
+            _sd = {k: v for k, v in _ckpt["model_state_dict"].items() if not k.startswith("critic")}
+            runner.alg.policy.load_state_dict(_sd, strict=False)
 
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
+        # obtain the trained policy for inference
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
-        policy_nn = runner.alg.actor_critic
+        # extract the neural network module
+        # we do this in a try-except to maintain backwards compatibility.
+        try:
+            # version 2.3 onwards
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            # version 2.2 and below
+            policy_nn = runner.alg.actor_critic
 
-    # extract the normalizer
-    if hasattr(policy_nn, "actor_obs_normalizer"):
-        normalizer = policy_nn.actor_obs_normalizer
-    elif hasattr(policy_nn, "student_obs_normalizer"):
-        normalizer = policy_nn.student_obs_normalizer
-    else:
-        normalizer = None
+        # extract the normalizer
+        if hasattr(policy_nn, "actor_obs_normalizer"):
+            normalizer = policy_nn.actor_obs_normalizer
+        elif hasattr(policy_nn, "student_obs_normalizer"):
+            normalizer = policy_nn.student_obs_normalizer
+        else:
+            normalizer = None
 
-    # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+        # export policy to onnx/jit
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        # StudentTeacherVision needs a custom multi-input exporter (proprio + depth images);
+        # the default actor-MLP exporter would silently drop the encoder. Detect by attr.
+        if isinstance(policy_nn, StudentTeacherVision):
+            export_vision_student_as_jit(policy_nn, path=export_model_dir, filename="depth_policy.pt")
+        elif isinstance(policy_nn, StudentTeacherPointCloud):
+            # PointNet student forward takes (points, proprio) — the flat-actor exporter
+            # would trace garbage (or crash). No PointNet exporter exists yet; skip.
+            print("[INFO]: Skipping JIT/ONNX export for StudentTeacherPointCloud (no exporter).")
+        else:
+            export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+            export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 
     # reset environment
     obs = env.get_observations()
     timestep = 0
+    # Episode-success tracking (matches UWLab-ICL play.py). A done with positive
+    # reward indicates a success-triggered termination; pure time-outs and
+    # abnormal-state terminations land at ~0 reward and are counted as failures.
+    num_episodes = 0
+    num_successes = 0
+    finger_pose_history: list = []
+    # DEBUG: collect actions for env 0
+    action_history: list = []
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -214,6 +369,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # sleep_time = dt - (time.time() - start_time)
         # if args_cli.real_time and sleep_time > 0:
         #     time.sleep(sleep_time)
+
+    print("=" * 50)
+    print(f"Number of episodes: {num_episodes}")
+    print(f"Number of successes: {num_successes}")
+    if num_episodes:
+        print(f"Success rate: {num_successes / num_episodes:.2%}")
+
+    if finger_pose_history:
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        data = np.array(finger_pose_history)  # (T, num_finger_joints)
+        fig, ax = plt.subplots(figsize=(10, 4))
+        for j in range(data.shape[1]):
+            ax.plot(data[:, j], label=f"finger_{j}")
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Joint position (rad)")
+        ax.set_title("Finger joint positions over time (sim)")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+        plot_path = os.path.join(log_dir, "finger_joint_positions.png")
+        npy_path  = os.path.join(log_dir, "finger_joint_positions.npy")
+        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        np.save(npy_path, data)
+        print(f"[INFO] Finger joint position plot saved to: {plot_path}")
+        print(f"[INFO] Finger joint position data saved to: {npy_path}")
+
+    # DEBUG: save action history for env 0
+    if action_history:
+        import numpy as np
+        action_npy_path = os.path.join(log_dir, "debug_actions_env0.npy")
+        np.save(action_npy_path, np.array(action_history))
+        print(f"[DEBUG] Actions for env 0 saved to: {action_npy_path}  shape={np.array(action_history).shape}")
 
     # close the simulator
     file.close()

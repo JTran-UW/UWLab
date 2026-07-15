@@ -1,0 +1,19 @@
+# Variant of base: 3.3x higher learning rate (3e-4 -> 1e-3), same cosine schedule.
+# Question: can we converge faster / to a lower floor, or does it destabilize BC?
+model:
+  encoder_dims: [64, 128, 256]
+  action_dims: [512, 256, 128, 64]
+  predict_std: false
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 50
+  batch_size: 512
+
+data:
+  num_points: null
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

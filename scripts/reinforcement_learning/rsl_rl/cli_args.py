@@ -85,10 +85,12 @@ def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespac
         agent_cfg.run_name = args_cli.run_name
     if args_cli.logger is not None:
         agent_cfg.logger = args_cli.logger
-    # set the project name for wandb and neptune
-    if agent_cfg.logger in {"wandb", "neptune"} and args_cli.log_project_name:
-        agent_cfg.wandb_project = args_cli.log_project_name
-        agent_cfg.neptune_project = args_cli.log_project_name
+    # set the project name for wandb and neptune (default to task name if not specified)
+    if agent_cfg.logger in {"wandb", "neptune"}:
+        project_name = args_cli.log_project_name or getattr(args_cli, "task", None)
+        if project_name:
+            agent_cfg.wandb_project = project_name
+            agent_cfg.neptune_project = project_name
 
     return agent_cfg
 

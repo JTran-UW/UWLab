@@ -63,16 +63,21 @@ class RigidObjectHasher:
                 and p.HasAPI(UsdPhysics.CollisionAPI),
                 traverse_instance_prims=True,
             )
+
+            # 2: Get root transform (needed for scale even if no colliders found)
+            root_xf = xform_cache.GetLocalToWorldTransform(prim_utils.get_prim_at_path(prim_paths[i]))
+            root_tf = Gf.Transform(root_xf)
+            root_prim_scales.append(torch.tensor(root_tf.GetScale()))
+
             if len(coll_prims) == 0:
-                return
+                # No collider prims for this env (e.g. instanced env) — skip collider data
+                root_prim_hashes.append(0)
+                continue
             collider_prims.extend(coll_prims)
             collider_prim_env_ids.extend([i] * len(coll_prims))
 
-            # 2: Get relative transforms of all collider prims
-            root_xf = xform_cache.GetLocalToWorldTransform(prim_utils.get_prim_at_path(prim_paths[i]))
-            root_tf = Gf.Transform(root_xf)
+            # 3: Get relative transforms of all collider prims
             rel_tfs = []
-            root_prim_scales.append(torch.tensor(root_tf.GetScale()))
             for prim in coll_prims:
                 child_xf = xform_cache.GetLocalToWorldTransform(prim)
                 rel_mat_tf = Gf.Transform(child_xf * root_xf.GetInverse())
@@ -126,9 +131,15 @@ class RigidObjectHasher:
         stor["collider_prims"] = collider_prims
         stor["collider_prim_hashes"] = torch.tensor(collider_prim_hashes, dtype=torch.int64, device="cpu")
         stor["collider_prim_env_ids"] = torch.tensor(collider_prim_env_ids, dtype=torch.int64, device="cpu")
-        stor["collider_prim_relative_transforms"] = torch.cat(collider_prim_relative_transforms).view(-1, 10).to("cpu")
+        if collider_prim_relative_transforms:
+            stor["collider_prim_relative_transforms"] = torch.cat(collider_prim_relative_transforms).view(-1, 10).to("cpu")
+        else:
+            stor["collider_prim_relative_transforms"] = torch.zeros(0, 10, device="cpu")
         stor["root_prim_hashes"] = torch.tensor(root_prim_hashes, dtype=torch.int64, device="cpu")
-        stor["root_prim_scales"] = torch.stack(root_prim_scales).to("cpu")
+        if root_prim_scales:
+            stor["root_prim_scales"] = torch.stack(root_prim_scales).to("cpu")
+        else:
+            stor["root_prim_scales"] = torch.ones(num_roots, 3, device="cpu")
 
     @property
     def num_root(self) -> int:

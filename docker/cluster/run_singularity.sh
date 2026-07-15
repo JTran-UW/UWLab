@@ -37,6 +37,53 @@ echo "Parsed Script CLI Args: ${CLI_ARGS[@]}"
 # Helper functions
 #==
 
+exit_with_error() {
+    echo "[ERROR] $1" >&2
+    exit 1
+}
+
+require_runtime_value() {
+    local var_name="$1"
+    local var_value="${!var_name:-}"
+    if [ -z "$var_value" ]; then
+        exit_with_error "Required variable '$var_name' is empty on compute node."
+    fi
+    if [[ "$var_value" == *$'\r'* ]]; then
+        exit_with_error "Variable '$var_name' contains carriage return (CR). Check remote docker/cluster/.env.cluster formatting."
+    fi
+    if [[ "$var_value" == *'${'* ]] || [[ "$var_value" == *'$('* ]] || [[ "$var_value" == *'`'* ]]; then
+        exit_with_error "Variable '$var_name' is unresolved on compute node (value: '$var_value')."
+    fi
+}
+
+require_runtime_absolute_path() {
+    local var_name="$1"
+    require_runtime_value "$var_name"
+    local var_value="${!var_name}"
+    if [[ "$var_value" != /* ]]; then
+        exit_with_error "Variable '$var_name' must be an absolute path, got '$var_value'."
+    fi
+}
+
+validate_runtime_cluster_config() {
+    require_runtime_absolute_path CLUSTER_UWLAB_DIR
+    require_runtime_absolute_path CLUSTER_ISAAC_SIM_CACHE_DIR
+    require_runtime_absolute_path CLUSTER_SIF_PATH
+    require_runtime_absolute_path CLUSTER_MOUNT_DIR
+    require_runtime_value CLUSTER_PYTHON_EXECUTABLE
+    require_runtime_value REMOVE_CODE_COPY_AFTER_JOB
+    require_runtime_value DOCKER_ISAACSIM_ROOT_PATH
+    require_runtime_value DOCKER_USER_HOME
+
+    case "$REMOVE_CODE_COPY_AFTER_JOB" in
+        true|false)
+            ;;
+        *)
+            exit_with_error "REMOVE_CODE_COPY_AFTER_JOB must be 'true' or 'false', got '$REMOVE_CODE_COPY_AFTER_JOB'."
+            ;;
+    esac
+}
+
 setup_directories() {
     # Check and create directories for the persistent cache on GPFS
     # Must include ALL subdirectories Isaac Sim expects, otherwise it crashes with:
@@ -70,8 +117,8 @@ setup_directories() {
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 
 # load variables to set the UW Lab path on the cluster
-source $SCRIPT_DIR/.env.cluster
-source $SCRIPT_DIR/../.env.base
+CLUSTER_ENV_FILE="$SCRIPT_DIR/.env.cluster"
+BASE_ENV_FILE="$SCRIPT_DIR/../.env.base"
 
 # Make sure that all directories exist in the persistent cache directory on GPFS
 setup_directories

@@ -1,0 +1,6 @@
+# Big action head AND a wide (512) pooled feature -- the user's big-head instinct but WITHOUT
+# the narrow 64-d pooled bottleneck in point_net.yaml. Tests whether the head helps once the
+# pooled global feature isn't the limiter.
+model: {architecture: point_net, encoder_dims: [128, 256, 512], action_dims: [1024, 1024, 512, 256], predict_std: false}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 512}
+data:  {num_points: null, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0}

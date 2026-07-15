@@ -1,0 +1,21 @@
+# Pure state-extraction probe: action_weight=0 + aux_weight=1 trains the PointNet encoder ONLY to
+# make object poses linearly decodable from the cloud (+proprio). val/{ins,rec}_{pos_mm,rot_deg,fvu}
+# report how observable each asset is. Strong encoder so the metric reflects observability, not capacity.
+model:
+  architecture: point_net
+  encoder_dims: [256, 1024, 1024]
+  action_dims: [256, 256]   # unused at action_weight=0; kept small
+  predict_std: false
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 30
+  batch_size: 512
+  aux_weight: 1.0
+  action_weight: 0.0
+data:
+  num_points: null
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

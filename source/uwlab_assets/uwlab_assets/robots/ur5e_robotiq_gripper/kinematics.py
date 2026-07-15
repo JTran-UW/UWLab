@@ -22,11 +22,10 @@ base_link frame (180 deg Z rotation from base_link_inertia).
 
 import functools
 import os
-import tempfile
 import torch
 import yaml
 
-from isaaclab.utils.assets import retrieve_file_path
+from uwlab_assets import resolve_cloud_path
 
 # ============================================================================
 # Constants
@@ -59,7 +58,7 @@ def _load_calibration() -> dict[str, torch.Tensor]:
 
     usd_dir = os.path.dirname(UR5E_ARTICULATION.spawn.usd_path)
     meta_path = os.path.join(usd_dir, "metadata.yaml")
-    local = retrieve_file_path(meta_path, download_dir=tempfile.gettempdir())
+    local = resolve_cloud_path(meta_path)
     with open(local) as f:
         metadata = yaml.safe_load(f)
     if metadata is None:

@@ -1,0 +1,29 @@
+# Base PointNet behavior-cloning config.
+#
+# Consumed by train_point_net.py (--config). Sections (model/optim/data) are
+# organizational only -- they get flattened, so keys must stay unique. Any key here
+# can be overridden on the CLI (e.g. --lr 1e-3 --predict_std). Runtime/IO args
+# (--dataset, --devices, --wandb_project, --run_name) are CLI-only.
+
+model:
+  # Per-point set encoder MLP (in=3 -> hidden dims); last dim is the pooled feature size.
+  encoder_dims: [64, 128, 256]
+  # Action head MLP hidden dims (input is pooled_pc + proprio features = 2 * encoder_dims[-1]).
+  action_dims: [512, 256, 128, 64]
+  # false: MSE regression head. true: Gaussian NLL head that also predicts a per-dim std.
+  predict_std: false
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 50
+  batch_size: 512
+
+data:
+  # null = use the full stored cloud (2048 pts). Set an int to randomly subsample per step.
+  num_points: null
+  val_frac: 0.05
+  num_workers: 8
+  # false = train on successful demos only (recommended for BC).
+  no_success_filter: false
+  seed: 0

@@ -1,0 +1,13 @@
+# History-conditioned causal Transformer over (state, action) tokens (history_point_net).
+# Same PointNet set encoder as the feed-forward baselines, but each timestep becomes a state token
+# (pooled PC feature + proprio) interleaved with an action token; a causal Transformer reads the
+# action off the LAST state token. Tests whether conditioning on a short trajectory history beats
+# the memoryless MSE policy (e.g. resolving action multimodality the single-step ceiling can't).
+# clean_scenepc_100k.hdf5 (512pt, point_dim=3).
+#
+# encoder_dims: per-point set encoder (pooled feature = last dim). action_dims: the per-token action
+# head off each state token's hidden state. d_model/n_heads/n_layers: the Transformer geometry.
+# data.history_len: window length (REQUIRED >1 for this architecture; the dataset yields sequences).
+model: {architecture: history_point_net, encoder_dims: [256, 512, 512], action_dims: [512, 256], predict_std: false, d_model: 512, n_heads: 8, n_layers: 4, transformer_dropout: 0.1}
+optim: {lr: 3.0e-4, weight_decay: 1.0e-4, epochs: 50, batch_size: 256}
+data:  {num_points: null, history_len: 8, val_frac: 0.05, num_workers: 8, no_success_filter: false, seed: 0}

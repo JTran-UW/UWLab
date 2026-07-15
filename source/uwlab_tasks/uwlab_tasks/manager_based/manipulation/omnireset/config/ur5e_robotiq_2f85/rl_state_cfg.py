@@ -30,6 +30,7 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.a
 )
 
 from ... import mdp as task_mdp
+from .pc_obs_cfg import ScenePCEECentricObsCfg, ScenePCObsCfg
 
 
 @configclass
@@ -599,7 +600,44 @@ class BaseReachingEventCfg:
 
 @configclass
 class TrainEventCfg(BaseEventCfg):
-    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
+    """Training events: full DR (material + mass + arm sysid + OSC gains) from iter 0 + 4-path resets.
+
+    Single-stage: skips the legacy Stage-1 → Stage-2 curriculum. Uses the ``*_fixed``
+    sysid + OSC-gain variants so ``scale_progress=1`` from iter 0 (no warmup ramp).
+    Arm friction range widened to ``U(0, 1.5×sysid)`` for sim-to-real robustness;
+    armature + delays + OSC gains stay at the calibrated ``U(0.8, 1.2)`` window.
+    """
+
+    # randomize_arm_sysid = EventTerm(
+    #     func=task_mdp.randomize_arm_from_sysid_fixed,
+    #     mode="reset",
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot"),
+    #         "joint_names": [
+    #             "shoulder_pan_joint",
+    #             "shoulder_lift_joint",
+    #             "elbow_joint",
+    #             "wrist_1_joint",
+    #             "wrist_2_joint",
+    #             "wrist_3_joint",
+    #         ],
+    #         "actuator_name": "arm",
+    #         "scale_range": (0.8, 1.2),
+    #         "friction_scale_range": (0.0, 1.5),
+    #         "delay_range": (0, 1),
+    #     },
+    # )
+
+    # randomize_osc_gains = EventTerm(
+    #     func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
+    #     mode="reset",
+    #     params={
+    #         "action_name": "arm",
+    #         "scale_range": (0.8, 1.2),
+    #         "terminal_kp": (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0),
+    #         "terminal_damping_ratio": (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+    #     },
+    # )
 
     reset_from_reset_states = EventTerm(
         func=task_mdp.MultiResetManager,
@@ -897,6 +935,7 @@ class FinetuneEvalEventCfg(BaseEventCfg):
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "group_size": 1,
         },
     )
 
@@ -922,18 +961,26 @@ class FinetuneEventCfg(TrainEventCfg):
             "scale_range": (0.8, 1.2),
             "delay_range": (0, 1),
             "initial_scale_progress": 0.0,
+            # Finetune curriculum start point: at scale_progress=0 reproduce the OLD
+            # (pre-sysid-redo) arm dynamics the checkpoints were trained on, ramping
+            # to the NEW sysid (metadata.yaml) at scale_progress=1.
+            "start_metadata_filename": "metadata_old.yaml",
         },
     )
 
+    # OSC gains are NOT ramped during this finetune: the checkpoints trained at the
+    # terminal (stiff) gains via ``*_fixed`` (scale_progress=1), so we hold them there
+    # (terminal x U(0.8, 1.2)) from iter 0. Only the arm sysid is curriculum-ramped
+    # OLD -> NEW. Ramping gains soft->terminal would start the policy out-of-distribution
+    # and stall the 0.95 warmup gate.
     randomize_osc_gains = EventTerm(
-        func=task_mdp.randomize_rel_cartesian_osc_gains,
+        func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
         mode="reset",
         params={
             "action_name": "arm",
             "scale_range": (0.8, 1.2),
             "terminal_kp": (1000.0, 1000.0, 1000.0, 50.0, 50.0, 50.0),
             "terminal_damping_ratio": (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
-            "initial_scale_progress": 0.0,
         },
     )
 
@@ -1525,34 +1572,26 @@ class TerminationsReachingCfg:
 
 @configclass
 class FinetuneCurriculumsCfg:
-    """Finetune curriculum: ADR sysid + action scale ramp. No actuator swap (explicit from start)."""
+    """Finetune curriculum: ADR ramps the arm sysid OLD -> NEW only.
+
+    OSC gains and action scales are held fixed at the trained-on (terminal) values
+    -- see ``FinetuneEventCfg.randomize_osc_gains`` (``*_fixed``) and the native
+    ``Ur5eRobotiq2f85RelativeOSCAction`` scales (0.02..0.2). Only the arm sysid is
+    curriculum-ramped so the policy starts in-distribution (OLD params it trained on)
+    and is adapted onto the redone (NEW) params.
+    """
 
     adr_sysid = CurrTerm(
         func=task_mdp.adr_sysid_curriculum,
         params={
-            "event_term_names": ["randomize_arm_sysid", "randomize_osc_gains"],
+            "event_term_names": ["randomize_arm_sysid"],
             "reset_event_name": "reset_from_reset_states",
-            "success_threshold_up": 0.95,
-            "success_threshold_down": 0.9,
+            "success_threshold_up": 0.90,
+            "success_threshold_down": 0.80,
             "delta": 0.01,
             "update_every_n_steps": 200,
             "initial_scale_progress": 0.0,
-            "warmup_success_threshold": 0.95,
-        },
-    )
-
-    action_scale = CurrTerm(
-        func=task_mdp.action_scale_curriculum,
-        params={
-            "action_name": "arm",
-            "reset_event_name": "reset_from_reset_states",
-            "initial_scales": [0.02, 0.02, 0.02, 0.02, 0.02, 0.2],
-            "target_scales": [0.01, 0.01, 0.002, 0.02, 0.02, 0.2],
-            "success_threshold_up": 0.95,
-            "success_threshold_down": 0.9,
-            "delta": 0.01,
-            "update_every_n_steps": 200,
-            "initial_progress": 0.0,
+            "warmup_success_threshold": 0.80,
         },
     )
 
@@ -1619,6 +1658,7 @@ variants = {
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd"
         ),
         "peghole": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"),
+        "peghole_fast": make_receptive_object("/home/patrickhaoy/Downloads/PegHole/peg_hole_simplified.usd"),
         "plate": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Plate/plate.usd"),
         "cube": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/ReceptiveCube/receptive_cube.usd"),
         "wall": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Wall/wall.usd"),
@@ -2017,12 +2057,20 @@ class Ur5eRobotiq2f85RlStateReachingCfg(ManagerBasedRLEnvCfg):
         self.sim.render.enable_dl_denoiser = True
 
 
-# Training configuration (Stage 1: no curriculum, implicit actuator, no sysid DR)
+# Training configuration: single-stage, full DR (material + mass + arm sysid + OSC gains)
+# from iter 0, EXPLICIT actuator (required for OSC gain randomization), 0.02 action scales.
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
 
     events: TrainEventCfg = TrainEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Required for ``randomize_rel_cartesian_osc_gains_fixed`` to take effect
+        # (OSC gain knobs live on the explicit actuator).
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingCfg(Ur5eRobotiq2f85RlStateRewardScalingCfg):
@@ -2093,6 +2141,24 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainReachingCfg(Ur5eRobotiq2f85RlStateReach
 
     events: TrainReachingEventCfg = TrainReachingEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+
+# Diversity ablation: identical to the RelCartesianOSC State train cfg above, but reset
+# states are drawn by a deterministic interleaved round-robin over all reset types
+# (``MultiResetManager`` ``sampling_mode='sequential'``) instead of i.i.d. random sampling.
+# Fixing the reset stream to uniform, deterministic coverage isolates the source of
+# behavioral diversity: with the reset states identical across seeds, any remaining
+# multi-modality is attributable to random network initialization rather than reset variety.
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainSequentialCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        p = self.events.reset_from_reset_states.params
+        p["sampling_mode"] = "sequential"
+        # Pure uniform coverage — ensure no GPS curriculum / classifier sampling is active.
+        p["curriculum_target"] = None
+        p["use_classifier"] = False
+
 
 # Finetune configuration (Stage 2: explicit actuator, curriculum ramps sysid + gains + scales)
 @configclass
@@ -2169,10 +2235,11 @@ class Ur5eRobotiq2f85RelCartesianOSCEvalFinetuneDynamicsCfg(Ur5eRobotiq2f85RlSta
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 
-# Evaluation configuration (after Stage 2: explicit actuator, stiff gains, fixed sysid)
+# Evaluation configuration (after Stage 2): explicit actuator, stiff gains, fixed sysid.
+# Action space matches training (0.02 scales) so distillation-time scales match RL-time scales.
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
-    """Eval after Stage 2: explicit actuator, stiff gains, small action scale, fixed sysid + OSC gains."""
+    """Eval after Stage 2: explicit actuator, stiff gains, training (0.02) action scales, fixed sysid + OSC gains."""
 
     events: FinetuneEvalEventCfg = FinetuneEvalEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
@@ -2180,3 +2247,127 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+        self.terminations.success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 10})
+
+@configclass
+class PointCloudTrainEventCfg:
+    """No dynamics randomization -- only scene reset + 4-path reset states."""
+
+    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+        },
+    )
+
+
+@configclass
+class SharedEncoder128PCObservationsCfg:
+    """128-pt wrist-frame PCs with 3 obs groups: proprio (pass-through) + pointcloud (shared encoder) + time_left.
+
+    Groups: proprio (~21d), pointcloud (768d = 128x3x2 objects), time_left (1d, critic-only).
+    Shared encoder compresses concatenated PCs to 32d; main MLP sees 21+32=53d.
+    ``time_left`` is the privileged critic group required by ``ScenePCPPORunnerCfg`` /
+    ``SharedEncoder128PPORunnerCfg`` (their critic obs_groups list ``time_left``).
+    """
+
+    @configclass
+    class ProprioCfg(ObsGroup):
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class PointcloudCfg(ObsGroup):
+        insertive_pc_in_wrist = ObsTerm(
+            func=task_mdp.MeshPointCloud,
+            params={
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "object_cfg": SceneEntityCfg("insertive_object"),
+                "num_points": 128,
+            },
+        )
+        receptive_pc_in_wrist = ObsTerm(
+            func=task_mdp.MeshPointCloud,
+            params={
+                "ref_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "object_cfg": SceneEntityCfg("receptive_object"),
+                "num_points": 128,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class TimeLeftCfg(ObsGroup):
+        """Privileged critic-only group (matches ScenePCObsCfg.TimeLeftCfg)."""
+
+        time_left = ObsTerm(func=task_mdp.time_left)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    proprio: ProprioCfg = ProprioCfg()
+    pointcloud: PointcloudCfg = PointcloudCfg()
+    time_left: TimeLeftCfg = TimeLeftCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPC128SharedEncTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    """128-pt wrist-frame PCs with shared MLP encoder. No DR, no history, symmetric obs."""
+
+    observations: SharedEncoder128PCObservationsCfg = SharedEncoder128PCObservationsCfg()
+    events: PointCloudTrainEventCfg = PointCloudTrainEventCfg()
+
+
+# Point-cloud pre-training WITHOUT the gravity curriculum: the base Stage-1 train cfg
+# (full DR via TrainEventCfg + EXPLICIT actuator + normal gravity, inherited unchanged)
+# with the state observation group swapped for the SAME 512-pt ScenePC obs the gravity
+# envs use. Decouples PC obs from the ZeroG gravity-curriculum recipe that every registered
+# PC env in gravity_cfg.py is bound to, while keeping FULL parity on the PC obs / shared
+# encoder / policy parameterization. Pair with ScenePCPPORunnerCfg (identical to the
+# gravity ScenePC-uniform envs): proprio+pointcloud through the shared encoder, critic
+# also sees time_left.
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    """Base Stage-1 pre-training (full DR, normal gravity, no gravity curriculum) + 512-pt ScenePC obs."""
+
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPCEECentricTrainCfg(Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg):
+    """``Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg`` with EE-centric scene pointcloud obs.
+
+    Identical to the ScenePC pre-training env (``...-RelCartesianOSC-ScenePC-v0``) except
+    the scene pointcloud is expressed in the end-effector (``wrist_3_link``) frame rather
+    than the robot base frame. Scene, events, rewards, and actions are inherited unchanged.
+    """
+
+    observations: ScenePCEECentricObsCfg = ScenePCEECentricObsCfg()

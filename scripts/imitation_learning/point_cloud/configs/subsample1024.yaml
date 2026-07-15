@@ -1,0 +1,20 @@
+# Variant of base: randomly subsample each cloud 2048 -> 1024 points per step.
+# Question: does point dropout act as useful augmentation (and halve encoder compute)
+# without hurting accuracy? Larger batch since each cloud is half the points.
+model:
+  encoder_dims: [64, 128, 256]
+  action_dims: [512, 256, 128, 64]
+  predict_std: false
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 50
+  batch_size: 1024
+
+data:
+  num_points: 1024
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

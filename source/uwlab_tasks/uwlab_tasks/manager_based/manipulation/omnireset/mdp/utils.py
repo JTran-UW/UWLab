@@ -32,11 +32,20 @@ from pytorch3d.structures import Meshes
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 
+from isaaclab.sim.spawners.wrappers.wrappers_cfg import MultiAssetSpawnerCfg
+
 from .rigid_object_hasher import RigidObjectHasher
 
 # ---- module-scope caches ----
 _PRIM_SAMPLE_CACHE: dict[tuple[str, int], np.ndarray] = {}  # (prim_hash, num_points) -> (N,3) in root frame
 _FINAL_SAMPLE_CACHE: dict[str, np.ndarray] = {}  # env_hash -> (num_points,3) in root frame
+
+
+def get_usd_paths_from_spawn_cfg(spawn_cfg) -> list[str]:
+    """Extract USD paths from a single UsdFileCfg or a MultiAssetSpawnerCfg."""
+    if isinstance(spawn_cfg, MultiAssetSpawnerCfg):
+        return [asset_cfg.usd_path for asset_cfg in spawn_cfg.assets_cfg]
+    return [spawn_cfg.usd_path]
 
 
 def clear_pointcloud_caches():
@@ -90,7 +99,7 @@ def sample_object_point_cloud(
         else RigidObjectHasher(num_envs, prim_path_pattern, device=device)
     )
 
-    if hasher.num_root == 0:
+    if hasher.num_root == 0 or len(hasher.collider_prims) == 0:
         return None
 
     replicated_env = torch.all(hasher.root_prim_hashes == hasher.root_prim_hashes[0])
@@ -324,9 +333,13 @@ def get_temp_dir(rank: int | None = None) -> str:
         rank = int(os.getenv("RANK", "0"))
 
     uid = os.getuid()
-    job_id = os.getenv("SLURM_JOB_ID") or os.getenv("PBS_JOBID") or "local"
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
 
-    download_dir = os.path.join("/tmp", "uwlab", str(uid), str(job_id), f"rank_{rank}")
+    base = "/tmp/uwlab"
+    if not os.access(base, os.W_OK) and not os.path.isdir(os.path.join(base, str(uid))):
+        # /tmp/uwlab not writable by this user (e.g. owned by another user); fall back to home cache
+        base = os.path.join(os.path.expanduser("~"), ".cache", "uwlab", "tmp")
+    download_dir = os.path.join(base, str(uid), f"gpu_{local_rank}")
     os.makedirs(download_dir, mode=0o700, exist_ok=True)
 
     return download_dir
@@ -362,19 +375,50 @@ def safe_retrieve_file_path(url: str, download_dir: str | None = None) -> str:
 
 
 @functools.cache
-def read_metadata_from_usd_directory(usd_path: str) -> dict:
-    """Read metadata from metadata.yaml in the same directory as the USD file.
+def read_metadata_from_usd_directory(usd_path: str, filename: str = "metadata.yaml") -> dict:
+    """Read metadata from *filename* in the same directory as the USD file.
 
-    Results are memoised per *usd_path* so each asset's metadata is
+    *filename* defaults to ``metadata.yaml`` but may be any co-located YAML
+    (e.g. ``metadata_old.yaml`` holding a pre-change sysid snapshot used as a
+    finetune curriculum start point).
+
+    Results are memoised per *(usd_path, filename)* so each asset's metadata is
     downloaded and parsed at most once per process.
     """
     usd_dir = os.path.dirname(usd_path)
-    metadata_path = os.path.join(usd_dir, "metadata.yaml")
+    metadata_path = os.path.join(usd_dir, filename)
     local_path = safe_retrieve_file_path(metadata_path, download_dir=get_temp_dir())
     with open(local_path) as f:
         metadata_file = yaml.safe_load(f)
 
     return metadata_file
+
+
+def get_assembled_offsets(metadata: dict) -> list[tuple[list[float], list[float]]]:
+    """Return list of (pos, quat) tuples from a receptive metadata dict.
+
+    The receptive schema uses ``assembled_offsets`` (plural list). The first entry
+    is treated as canonical wherever a single canonical pose is required (e.g.
+    spawning); all entries are valid for success classification.
+
+    Falls back to lifting the legacy singular ``assembled_offset`` (dict) into a
+    1-element list for backward compatibility with stale HF caches that still
+    have pre-migration metadata files.
+    """
+    if "assembled_offsets" in metadata:
+        return [(entry["pos"], entry["quat"]) for entry in metadata["assembled_offsets"]]
+    if "assembled_offset" in metadata:
+        legacy = metadata["assembled_offset"]
+        return [(legacy["pos"], legacy["quat"])]
+    raise KeyError(
+        "metadata has neither 'assembled_offsets' (plural list) nor 'assembled_offset' "
+        "(legacy singular dict). Check that you are passing the receptive metadata."
+    )
+
+
+def get_canonical_assembled_offset(metadata: dict) -> tuple[list[float], list[float]]:
+    """Return the canonical (first) assembled-pose offset as (pos, quat) tuple."""
+    return get_assembled_offsets(metadata)[0]
 
 
 def object_name_from_usd(usd_path: str) -> str:
@@ -504,13 +548,37 @@ def load_asset_paths_from_config(
     return valid_paths
 
 
-def _download_cloud_assets(cloud_urls: list[str], cache_subdir: str = "", num_workers: int = 8) -> list[str]:
+def _download_one_with_retry(url: str, resolve_cloud_path, max_retries: int = 15) -> str:
+    """Download a single cloud URL with exponential backoff on 429 / transient errors."""
+    import random
+    import time
+
+    for attempt in range(max_retries):
+        try:
+            return resolve_cloud_path(url)
+        except Exception as e:
+            is_rate_limit = "429" in str(e) or "Too Many Requests" in str(e)
+            is_transient = is_rate_limit or "LocalEntryNotFoundError" in type(e).__name__
+            if is_transient and attempt < max_retries - 1:
+                # Capped exponential backoff with full random jitter to spread concurrent retries.
+                base_wait = min(2 ** attempt, 60)
+                wait = base_wait + random.uniform(0, base_wait)
+                print(f"\n[WARN] Download failed ({type(e).__name__}), retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries}): {url}", flush=True)
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f"unreachable: {url}")
+
+
+def _download_cloud_assets(cloud_urls: list[str], cache_subdir: str = "", num_workers: int = 3) -> list[str]:
     """Download cloud URLs to local cache, return local paths.
 
     Delegates to :func:`resolve_cloud_path` for each URL so all cloud
     assets share the same persistent cache and atomic-download logic.
     Downloads are parallelized with *num_workers* threads and a live
-    progress line with elapsed time is printed.
+    progress line with elapsed time is printed.  Each URL is retried
+    up to 15 times with capped exponential back-off + full jitter to handle
+    HuggingFace 429 rate-limit errors when multiple processes download simultaneously.
     """
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -525,14 +593,14 @@ def _download_cloud_assets(cloud_urls: list[str], cache_subdir: str = "", num_wo
         return [resolve_cloud_path(url) for url in cloud_urls]
 
     tag = cache_subdir or "cloud"
-    print(f"[INFO] Downloading {needs_download}/{n} {tag} assets ({num_workers} workers) ...")
+    print(f"[INFO] Downloading {needs_download}/{n} {tag} assets ({num_workers} workers, up to 15 retries) ...")
     t0 = time.monotonic()
 
     downloaded = 0
     futures = {}
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
         for url in to_download:
-            futures[pool.submit(resolve_cloud_path, url)] = url
+            futures[pool.submit(_download_one_with_retry, url, resolve_cloud_path)] = url
         for future in as_completed(futures):
             future.result()
             downloaded += 1
@@ -552,10 +620,31 @@ def _download_cloud_assets(cloud_urls: list[str], cache_subdir: str = "", num_wo
 
 
 def _cached_local_path(url: str) -> str:
-    """Return the expected local cache path for a cloud URL without downloading."""
-    from uwlab_assets import _extract_relative_path
+    """Return the expected local cache path for a cloud URL without downloading.
 
-    rel = _extract_relative_path(url)
+    The uwlab_assets package rebased onto HuggingFace Hub and no longer exposes
+    ``_extract_relative_path``. For HF URLs we ask the Hub cache directly via
+    ``try_to_load_from_cache`` (returns the local path if present, ``None`` if
+    not — we return a sentinel that ``os.path.isfile`` treats as missing so the
+    loop falls through to ``resolve_cloud_path``).
+    """
+    from uwlab_assets import _parse_hf_url
+
+    hf_parts = _parse_hf_url(url)
+    if hf_parts is not None:
+        from huggingface_hub import try_to_load_from_cache
+
+        repo_id, repo_type, revision, filename = hf_parts
+        cached = try_to_load_from_cache(
+            repo_id=repo_id, repo_type=repo_type, revision=revision, filename=filename
+        )
+        return cached if isinstance(cached, str) else "/__not_cached__"
+
+    # Non-HF HTTP fallback: predict the urllib download cache path used by
+    # ``_urlretrieve_quiet`` (~/.cache/uwlab/assets/<url-path>).
+    from urllib.parse import urlparse
+
+    rel = urlparse(url).path.lstrip("/")
     return os.path.join(os.path.expanduser("~"), ".cache", "uwlab", "assets", rel)
 
 

@@ -21,6 +21,11 @@ display_warning() {
     echo -e "\033[31mWARNING: $1\033[0m"
 }
 
+exit_with_error() {
+    echo "[ERROR] $1" >&2
+    exit 1
+}
+
 # Helper function to compare version numbers
 version_gte() {
     # Returns 0 if the first version is greater than or equal to the second, otherwise 1
@@ -64,16 +69,94 @@ check_image_exists() {
 
 # Check if the singularity image exists on the remote host, otherwise print warning and exit
 check_singularity_image_exists() {
-    image_name="$1"
-    if ! ssh "$CLUSTER_LOGIN" "[ -f $CLUSTER_SIF_PATH/$image_name.tar ]"; then
+    local image_name="$1"
+    local remote_tar_path="$CLUSTER_SIF_PATH/$image_name.tar"
+    if ! ssh "$CLUSTER_LOGIN" "test -f $(printf '%q' "$remote_tar_path")"; then
         echo "[Error] The '$image_name' image does not exist on the remote host $CLUSTER_LOGIN!" >&2;
         exit 1
     fi
 }
 
-submit_job() {
+validate_env_file() {
+    local env_file="$1"
+    local env_label="$2"
+    if grep -q $'\r' "$env_file"; then
+        exit_with_error "$env_label contains Windows CRLF line endings: $env_file. Convert it with: sed -i 's/\\r\$//' $env_file"
+    fi
+}
 
-    echo "[INFO] Arguments passed to job script ${@}"
+require_resolved_value() {
+    local var_name="$1"
+    local var_value="${!var_name:-}"
+    if [ -z "$var_value" ]; then
+        exit_with_error "Required variable '$var_name' is empty after loading cluster config."
+    fi
+    if [[ "$var_value" == *$'\r'* ]]; then
+        exit_with_error "Variable '$var_name' contains a carriage return (CR). Check line endings in env files."
+    fi
+    if [[ "$var_value" == *'${'* ]] || [[ "$var_value" == *'$('* ]] || [[ "$var_value" == *'`'* ]]; then
+        exit_with_error "Variable '$var_name' is not fully resolved (value: '$var_value'). Check docker/cluster/.env.user and docker/cluster/.env.$CLUSTER_NAME."
+    fi
+}
+
+require_absolute_path() {
+    local var_name="$1"
+    require_resolved_value "$var_name"
+    local var_value="${!var_name}"
+    if [[ "$var_value" != /* ]]; then
+        exit_with_error "Variable '$var_name' must be an absolute path, got '$var_value'."
+    fi
+}
+
+validate_cluster_config() {
+    require_resolved_value CLUSTER_JOB_SCHEDULER
+    require_resolved_value CLUSTER_LOGIN
+    require_absolute_path CLUSTER_UWLAB_DIR
+    require_absolute_path CLUSTER_ISAAC_SIM_CACHE_DIR
+    require_absolute_path CLUSTER_SIF_PATH
+    require_absolute_path CLUSTER_MOUNT_DIR
+    require_resolved_value CLUSTER_PYTHON_EXECUTABLE
+    require_resolved_value REMOVE_CODE_COPY_AFTER_JOB
+
+    case "$CLUSTER_JOB_SCHEDULER" in
+        SLURM|PBS)
+            ;;
+        *)
+            exit_with_error "Unsupported CLUSTER_JOB_SCHEDULER '$CLUSTER_JOB_SCHEDULER'. Expected SLURM or PBS."
+            ;;
+    esac
+
+    case "$REMOVE_CODE_COPY_AFTER_JOB" in
+        true|false)
+            ;;
+        *)
+            exit_with_error "REMOVE_CODE_COPY_AFTER_JOB must be 'true' or 'false', got '$REMOVE_CODE_COPY_AFTER_JOB'."
+            ;;
+    esac
+}
+
+build_cluster_env_payload() {
+    # CLUSTER_UWLAB_DIR must point to the persistent (non-timestamped)
+    # directory so that run_singularity.sh mounts the persistent logs directory.
+    printf 'CLUSTER_JOB_SCHEDULER=%q\n' "$CLUSTER_JOB_SCHEDULER"
+    printf 'CLUSTER_LOGIN=%q\n' "$CLUSTER_LOGIN"
+    printf 'CLUSTER_UWLAB_DIR=%q\n' "$CLUSTER_UWLAB_DIR_PERSISTENT"
+    printf 'CLUSTER_ISAAC_SIM_CACHE_DIR=%q\n' "$CLUSTER_ISAAC_SIM_CACHE_DIR"
+    printf 'CLUSTER_SIF_PATH=%q\n' "$CLUSTER_SIF_PATH"
+    printf 'CLUSTER_MOUNT_DIR=%q\n' "$CLUSTER_MOUNT_DIR"
+    printf 'REMOVE_CODE_COPY_AFTER_JOB=%q\n' "$REMOVE_CODE_COPY_AFTER_JOB"
+    printf 'CLUSTER_PYTHON_EXECUTABLE=%q\n' "$CLUSTER_PYTHON_EXECUTABLE"
+}
+
+submit_job() {
+    local -a job_script_args=("$@")
+    local job_script_file
+    local cluster_env_payload
+    local remote_cluster_env_path
+    local -a wandb_assignments=()
+    local var
+
+    echo "[INFO] Arguments passed to job script ${job_script_args[*]}"
 
     case $CLUSTER_JOB_SCHEDULER in
         "SLURM")
@@ -195,8 +278,8 @@ case $command in
         APPTAINER_NOHTTPS=1 apptainer build --fakeroot uw-lab-$profile.sif docker-daemon://uw-lab-$profile:latest
         # tar image (faster to send single file as opposed to directory with many files)
         tar -cvf /$SCRIPT_DIR/exports/uw-lab-$profile.tar uw-lab-$profile.sif
-        # make sure target directory exists
-        ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_SIF_PATH"
+        # make sure target directories exist
+        ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_SIF_PATH $CLUSTER_UWLAB_DIR $CLUSTER_ISAAC_SIM_CACHE_DIR"
         # send image to cluster
         scp $SCRIPT_DIR/exports/uw-lab-$profile.tar $CLUSTER_LOGIN:$CLUSTER_SIF_PATH/uw-lab-$profile.tar
         ;;
@@ -208,6 +291,22 @@ case $command in
                 shift
             fi
         fi
+
+        # Parse cluster-level overrides (--gpus, --time, --nodes, etc.) and separate from job args
+        remaining_args=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --gpus)     GPUS_PER_NODE="$2"; shift 2 ;;
+                --nodes)    NODES="$2"; shift 2 ;;
+                --time)     TIME="$2"; shift 2 ;;
+                --partition) PARTITION="$2"; shift 2 ;;
+                --account)  ACCOUNT="$2"; shift 2 ;;
+                --qos)      QOS="$2"; shift 2 ;;
+                *)          remaining_args+=("$1"); shift ;;
+            esac
+        done
+        set -- "${remaining_args[@]}"
+
         job_args="$@"
         echo "[INFO] Executing job command"
         [ -n "$profile" ] && echo -e "\tUsing profile: $profile"
@@ -245,8 +344,8 @@ case $command in
         fi
         # Check if singularity image exists on the remote host
         check_singularity_image_exists uw-lab-$profile
-        # make sure target directory exists
-        ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_UWLAB_DIR"
+        # make sure target directories exist
+        ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_UWLAB_DIR $CLUSTER_UWLAB_DIR_PERSISTENT $CLUSTER_ISAAC_SIM_CACHE_DIR $CLUSTER_SIF_PATH"
         # Sync UW Lab code
         echo "[INFO] Syncing UW Lab code to $CLUSTER_UWLAB_DIR ..."
         rsync -rh --exclude="*.git*" --filter=':- .dockerignore' /$SCRIPT_DIR/../.. $CLUSTER_LOGIN:$CLUSTER_UWLAB_DIR

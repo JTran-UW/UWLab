@@ -91,15 +91,32 @@ class CameraAlignSceneCfg(RlStateSceneCfg):
     front_camera = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/rgb_front_camera",
         update_period=0,
-        height=480,
-        width=640,
+        height=960,
+        width=1280,
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(1.0770121, -0.1679045, 0.4486344),
-            rot=(0.70564552, 0.46613815, 0.25072644, 0.47107948),
+            pos=(1.0586113, -0.1757846, 0.4398523),
+            rot=(0.72262758, 0.47281501, 0.23887302, 0.44406649),
             convention="opengl",
         ),
         data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(focal_length=13.20),
+        spawn=sim_utils.PinholeCameraCfg(focal_length=13.00),
+    )
+
+    # Separate real-world front camera (Orbbec). Initial pose/focal/resolution are
+    # placeholders copied from front_camera -- tune pose/focal interactively with
+    # align_cameras.py and set width/height to the Orbbec's native color stream.
+    front_orbbec = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/rgb_front_orbbec_camera",
+        update_period=0,
+        height=960,
+        width=1280,
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(1.1421017, -0.0191422, 0.3554022),
+            rot=(0.66097017, 0.46401624, 0.31409708, 0.49914967),
+            convention="opengl",
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(focal_length=17.05),
     )
 
     side_camera = TiledCameraCfg(
@@ -144,6 +161,15 @@ class CameraAlignObservationsCfg:
             func=task_mdp.process_image,
             params={
                 "sensor_cfg": SceneEntityCfg("front_camera"),
+                "data_type": "rgb",
+                "process_image": False,
+                "output_size": (240, 320),
+            },
+        )
+        front_orbbec_rgb = ObsTerm(
+            func=task_mdp.process_image,
+            params={
+                "sensor_cfg": SceneEntityCfg("front_orbbec"),
                 "data_type": "rgb",
                 "process_image": False,
                 "output_size": (240, 320),

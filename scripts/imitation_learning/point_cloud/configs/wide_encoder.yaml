@@ -1,0 +1,19 @@
+# Variant of base: wider per-point set encoder (64,128,256 -> 128,256,512).
+# Question: is the PC encoder the bottleneck? Doubles the pooled feature width (512d).
+model:
+  encoder_dims: [128, 256, 512]
+  action_dims: [512, 256, 128, 64]
+  predict_std: false
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  epochs: 50
+  batch_size: 512
+
+data:
+  num_points: null
+  val_frac: 0.05
+  num_workers: 8
+  no_success_filter: false
+  seed: 0

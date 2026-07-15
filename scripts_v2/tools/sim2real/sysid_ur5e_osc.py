@@ -38,7 +38,7 @@ parser.add_argument("--max_steps", type=int, default=None)
 parser.add_argument("--armature_min", type=float, default=0.0)
 parser.add_argument("--armature_max", type=float, default=10.0)
 parser.add_argument("--friction_min", type=float, default=0.0)
-parser.add_argument("--friction_max", type=float, default=20.0)
+parser.add_argument("--friction_max", type=float, default=30.0)
 parser.add_argument("--viscous_friction_min", type=float, default=0.0)
 parser.add_argument("--viscous_friction_max", type=float, default=20.0)
 parser.add_argument(

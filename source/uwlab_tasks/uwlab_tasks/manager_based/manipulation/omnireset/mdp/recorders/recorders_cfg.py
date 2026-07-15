@@ -86,3 +86,38 @@ class ActionStateRecorderManagerCfg(RecorderManagerBaseCfg):
     record_post_step_states = PostStepStatesRecorderCfg()
     record_pre_step_actions = PreStepActionsRecorderCfg()
     record_pre_step_data_collection_observations = PreStepDataCollectionObservationsRecorderCfg()
+
+
+@configclass
+class PreStepExpertMaskRecorderCfg(RecorderTermCfg):
+    """Configuration for the expert / learner action-source mask recorder term."""
+
+    class_type: type[RecorderTerm] = recorders.PreStepExpertMaskRecorder
+
+
+@configclass
+class PreStepBAMDPRescueActionRecorderCfg(RecorderTermCfg):
+    """Configuration for the BAMDP rescue-action recorder term.
+
+    Overrides the default action recorder to log the rescue expert's
+    counterfactual action as the supervision target.
+    """
+
+    class_type: type[RecorderTerm] = recorders.PreStepBAMDPRescueActionRecorder
+
+
+@configclass
+class ActionStateRecorderManagerTransformedActionCfg(RecorderManagerBaseCfg):
+    """Recorder manager + expert-vs-learner mask (BAMDP / ASTEROID data-collection).
+
+    NOTE: ``record_pre_step_actions`` uses the *rescue-action* recorder, NOT
+    the default ``PreStepActionsRecorderCfg``. The diffusion-policy dataset
+    reads its action label from ``data/actions``; for BAMDP that needs to be
+    the rescue counterfactual, not the executed action.
+    """
+
+    record_initial_state = InitialStateRecorderCfg()
+    record_post_step_states = PostStepStatesRecorderCfg()
+    record_pre_step_actions = PreStepBAMDPRescueActionRecorderCfg()
+    record_pre_step_data_collection_observations = PreStepDataCollectionObservationsRecorderCfg()
+    record_pre_step_expert_mask = PreStepExpertMaskRecorderCfg()

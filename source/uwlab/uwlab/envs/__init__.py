@@ -27,5 +27,7 @@ UW Lab provide Data-Manager-based and Real-Rl environment workflows:
 Based on these workflows, there are the following environment classes for single and multi-agent RL:
 """
 
+from .manager_based_rl_env import UWLabManagerBasedRLEnv
 from .real_rl_env import RealRLEnv
 from .real_rl_env_cfg import RealRLEnvCfg
+from .rsl_rl_wrapper import UWLabRslRlVecEnvWrapper

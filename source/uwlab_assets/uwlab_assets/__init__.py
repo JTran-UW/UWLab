@@ -21,27 +21,47 @@ UWLAB_ASSETS_DATA_DIR = os.path.join(UWLAB_ASSETS_EXT_DIR, "data")
 UWLAB_ASSETS_METADATA = toml.load(os.path.join(UWLAB_ASSETS_EXT_DIR, "config", "extension.toml"))
 """Extension metadata dictionary parsed from the extension.toml file."""
 
-UWLAB_CLOUD_ASSETS_DIR = "https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main"
+UWLAB_CLOUD_ASSETS_DIR = "https://huggingface.co/datasets/yandabao/uwlab-assets/resolve/main"
 
 
-def _extract_relative_path(url: str) -> str:
-    """Strip the HuggingFace resolve-URL prefix, returning the repo-relative path.
+def _parse_hf_url(url: str) -> tuple[str, str, str, str] | None:
+    """Parse a HuggingFace resolve URL into (repo_id, repo_type, revision, filename).
 
-    Example:
-        ``https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Props/Custom/Peg/peg.usd``
-        -> ``Props/Custom/Peg/peg.usd``
+    Examples:
+        ``https://huggingface.co/datasets/patrickhaoy/uwlab-assets/resolve/main/Props/X/y.usd``
+            -> ("patrickhaoy/uwlab-assets", "dataset", "main", "Props/X/y.usd")
+        ``https://huggingface.co/patrickhaoy/some-model/resolve/v2.0/file.bin``
+            -> ("patrickhaoy/some-model", "model", "v2.0", "file.bin")
+
+    Returns None if the URL doesn't look like a HuggingFace resolve URL.
     """
     parsed = urlparse(url)
+    if "huggingface.co" not in parsed.netloc:
+        return None
     parts = parsed.path.strip("/").split("/")
     try:
-        idx = parts.index("resolve")
-        return "/".join(parts[idx + 2 :])
+        resolve_idx = parts.index("resolve")
     except ValueError:
-        return parsed.path.strip("/")
+        return None
+    if resolve_idx + 2 > len(parts) - 1:
+        return None
+    if parts[0] == "datasets":
+        repo_type = "dataset"
+        repo_parts = parts[1:resolve_idx]
+    elif parts[0] == "spaces":
+        repo_type = "space"
+        repo_parts = parts[1:resolve_idx]
+    else:
+        repo_type = "model"
+        repo_parts = parts[:resolve_idx]
+    repo_id = "/".join(repo_parts)
+    revision = parts[resolve_idx + 1]
+    filename = "/".join(parts[resolve_idx + 2 :])
+    return repo_id, repo_type, revision, filename
 
 
 def _urlretrieve_quiet(url: str, dest: str) -> None:
-    """Download *url* to *dest* silently."""
+    """Download *url* to *dest* silently. Used as a fallback for non-HF HTTP URLs."""
     req = urllib.request.urlopen(url)
     chunk_size = 1 << 16  # 64 KiB
     with open(dest, "wb") as f:
@@ -57,20 +77,35 @@ def resolve_cloud_path(path: str) -> str:
     """Resolve a cloud asset path to a local file, downloading if needed.
 
     * Local paths (including already-cached files) are returned immediately.
-    * HTTPS URLs are downloaded once to ``~/.cache/uwlab/assets/<relative>``
-      and the local cached path is returned on subsequent calls.
-    * Downloads are atomic (write to a temp file, then ``os.rename``).
+    * HuggingFace HTTPS URLs are routed through ``hf_hub_download``, which uses
+      the standard HF Hub cache (~/.cache/huggingface/hub/) with ETag-based
+      revision tracking. When the remote file changes, the cache is invalidated
+      automatically — no manual cache cleanup needed across hosts.
+    * Other HTTPS URLs fall back to a simple urllib download into
+      ``~/.cache/uwlab/assets/<relative>`` (one-shot, no staleness check).
     """
     if not path.startswith(("http://", "https://")):
         return path
 
-    rel = _extract_relative_path(path)
+    hf_parts = _parse_hf_url(path)
+    if hf_parts is not None:
+        from huggingface_hub import hf_hub_download
+
+        repo_id, repo_type, revision, filename = hf_parts
+        return hf_hub_download(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            revision=revision,
+            filename=filename,
+        )
+
+    # Non-HF fallback: simple urllib download to legacy uwlab cache
+    parsed = urlparse(path)
+    rel = parsed.path.strip("/")
     cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "uwlab", "assets")
     local = os.path.join(cache_dir, rel)
-
     if os.path.isfile(local):
         return local
-
     os.makedirs(os.path.dirname(local), exist_ok=True)
     tmp = f"{local}.tmp.{os.getpid()}"
     try:
@@ -81,7 +116,6 @@ def resolve_cloud_path(path: str) -> str:
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
-
     return local
 
 

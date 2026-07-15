@@ -25,6 +25,7 @@
 # Docker/Singularity
 **/*.sif
 docker/cluster/exports/
+docker/cluster/.env.user
 docker/.container.cfg
 
 # IDE
@@ -42,6 +43,7 @@ docker/.container.cfg
 **/.neptune/*
 docker/artifacts/
 *.tmp
+depth_render_smoke/*
 
 # Doc Outputs
 **/docs/_build/*
@@ -71,3 +73,20 @@ tests/
 
 # Docker history
 .uw-lab-docker-history
+
+tmp/
+
+# Local agent sessions + large analysis/checkpoint artifacts (not for VCS)
+/.claude/
+# Ignore analysis/ contents (data dumps, npz, figures) but allow-list specific
+# "timeless" analysis scripts worth versioning. Add a `!` line per script to keep.
+/analysis/*
+!/analysis/action_multimodality.py
+!/analysis/scenepc_select_checkpoints.py
+/teachers/
+*.hdf5
+*.tsv
+
+*.pt
+*.png
+*.mp4
