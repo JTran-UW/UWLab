@@ -52,6 +52,8 @@ class Args:
     """total iterations of the experiments"""
     num_envs: int = 1
     """the number of parallel game environments"""
+    num_steps: int = 1
+    """n-step returns"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
     gamma: float = 0.99
@@ -364,7 +366,7 @@ if __name__ == "__main__":
         envs.single_action_space,
         device,
         n_envs=args.num_envs,
-        handle_timeout_termination=False,
+        n_steps=args.num_steps,
     )
     start_time = time.time()
 
@@ -409,7 +411,8 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
         real_next_obs[truncations.bool()] = infos["final_obs"]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        rb.add(obs, real_next_obs, actions, rewards, terminations, truncations, infos)
+        # import pdb; pdb.set_trace()
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -434,21 +437,21 @@ if __name__ == "__main__":
 
                 with torch.no_grad():
                     next_state_actions, next_state_log_probs, _ = actor.get_action(next_policy_obs)
-                    discount = args.gamma
+                    discount = args.gamma ** data.effective_n_steps
 
                     qf1_target_dist = qf1_target.projection(
                         next_critic_obs,
                         next_state_actions,
-                        data.rewards.squeeze(-1) - discount * torch.ones(args.batch_size, device="cuda") * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1),
+                        data.rewards.squeeze(-1) - discount * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1),
                         bootstrap.squeeze(-1),
-                        discount * torch.ones(args.batch_size, device="cuda"),
+                        discount
                     )
                     qf2_target_dist = qf2_target.projection(
                         next_critic_obs,
                         next_state_actions,
-                        data.rewards.squeeze(-1) - discount * torch.ones(args.batch_size, device="cuda") * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1),
+                        data.rewards.squeeze(-1) - discount * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1),
                         bootstrap.squeeze(-1),
-                        discount * torch.ones(args.batch_size, device="cuda"),
+                        discount,
                     )
                     qf1_target_values = qf1_target.get_value(qf1_target_dist)
                     qf2_target_values = qf2_target.get_value(qf2_target_dist)
