@@ -2066,11 +2066,11 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 
-    def __post_init__(self):
-        super().__post_init__()
-        # Required for ``randomize_rel_cartesian_osc_gains_fixed`` to take effect
-        # (OSC gain knobs live on the explicit actuator).
-        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    # def __post_init__(self):
+    #     super().__post_init__()
+    #     # Required for ``randomize_rel_cartesian_osc_gains_fixed`` to take effect
+    #     # (OSC gain knobs live on the explicit actuator).
+    #     self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingCfg(Ur5eRobotiq2f85RlStateRewardScalingCfg):
@@ -2356,6 +2356,18 @@ class Ur5eRobotiq2f85RelCartesianOSCPC128SharedEncTrainCfg(Ur5eRobotiq2f85RelCar
 # also sees time_left.
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    """Base Stage-1 pre-training (full DR, normal gravity, no gravity curriculum) + 512-pt ScenePC obs."""
+
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPCEvalCfg(Ur5eRobotiq2f85RelCartesianOSCEvalRewardScalingCfg):
+    """Base Stage-1 pre-training (full DR, normal gravity, no gravity curriculum) + 512-pt ScenePC obs."""
+
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPCTrainRewardScalingSuccessTerminationCfg(Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationCfg):
     """Base Stage-1 pre-training (full DR, normal gravity, no gravity curriculum) + 512-pt ScenePC obs."""
 
     observations: ScenePCObsCfg = ScenePCObsCfg()

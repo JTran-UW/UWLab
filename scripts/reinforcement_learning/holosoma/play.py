@@ -128,6 +128,7 @@ import tqdm
 from tensordict import TensorDict
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from rsl_rl.runners import on_policy_runner as _runner_module
 from holosoma.agents.fast_sac.fast_sac_agent import FastSACAgent
 from holosoma.agents.fast_sac.fast_sac_utils import SimpleReplayBuffer
 
@@ -143,6 +144,8 @@ from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+from uwlab_rl.rsl_rl.actor_critic_encoder import ActorCriticWithEncoder
+_runner_module.ActorCriticWithEncoder = ActorCriticWithEncoder
 from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
 from vecenv_wrapper import HolosomaVecEnvWrapper
 
@@ -209,7 +212,7 @@ def record_transitions_to_replay_buffer(
         n_critic_obs=n_critic_obs,
         n_steps=n_steps,
         gamma=gamma,
-        device=device,
+        device="cpu",
     )
 
     pbar = tqdm.tqdm(total=num_steps, desc="Recording transitions")

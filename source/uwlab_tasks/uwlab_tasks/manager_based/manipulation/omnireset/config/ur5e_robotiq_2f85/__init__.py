@@ -358,6 +358,36 @@ gym.register(
     },
 )
 
+# Point-cloud pre-training WITHOUT gravity curriculum: base Stage-1 train cfg
+# (full DR + EXPLICIT actuator + normal gravity) with state obs replaced by 128-pt
+# wrist-frame PCs (shared encoder). Decouples PC obs from the ZeroG recipe that all
+# registered PC envs in gravity_cfg.py are bound to.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-OffPolicy-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPCTrainRewardScalingSuccessTerminationCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePC_FastSACRunnerCfg",
+    },
+)
+
+
+# Point-cloud pre-training WITHOUT gravity curriculum: base Stage-1 train cfg
+# (full DR + EXPLICIT actuator + normal gravity) with state obs replaced by 128-pt
+# wrist-frame PCs (shared encoder). Decouples PC obs from the ZeroG recipe that all
+# registered PC envs in gravity_cfg.py are bound to.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-ScenePC-Eval-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCPCEvalCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:ScenePCPPORunnerCfg",
+    },
+)
+
+
 # Same as ScenePC-v0 but the scene pointcloud is expressed in the end-effector
 # (wrist_3_link) frame instead of the robot base frame.
 gym.register(
