@@ -126,3 +126,34 @@ class ScenePCPPORunnerCfg(Base_PPORunnerCfg):
         },
     )
 
+
+
+@configclass
+class RslRlActorCriticWithEncoderCfg(RslRlFancyActorCriticCfg):
+    class_name: str = "ActorCriticWithEncoder"
+    encoder_groups: dict = dict()
+
+
+def my_experts_observation_func(env):
+    obs = env.unwrapped.obs_buf["expert_obs"]
+    return obs
+
+@configclass
+class ScenePC_FastSACRunnerCfg(RslRlOffPolicyRunnerCfg):
+    save_interval = 1000
+    resume = False
+    experiment_name = "ur5e_robotiq_2f85_omnireset_agent"
+    wandb_project = "omnireset_fastsac"
+    policy = RslRlFastSACActorCriticCfg(
+    )
+    algorithm = RslRlFastSACAlgorithmCfg(
+    )
+    obs_groups = {
+        "policy": ["proprio", "pointcloud"],
+        "critic": ["proprio", "pointcloud", "time_left"],
+    }
+    actor_obs_keys = ["proprio", "pointcloud"]
+    critic_obs_keys = ["proprio", "pointcloud", "time_left"]
+    encoder_obs_key: str = "pointcloud"
+    encoder_obs_shape: tuple = (512 * 3, )  # NUM POINTS * 3
+
