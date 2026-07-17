@@ -30,6 +30,7 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.a
 )
 
 from ... import mdp as task_mdp
+from .pc_obs_cfg import ScenePCObsCfg
 
 
 @configclass
@@ -2180,3 +2181,17 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+# POINT CLOUDS
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPCTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationCfg):
+    """Base Stage-1 pre-training (full DR, normal gravity, no gravity curriculum) + 512-pt ScenePC obs."""
+
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCPCEvalCfg(Ur5eRobotiq2f85RelCartesianOSCEvalRewardScalingCfg):
+    """Base Stage-1 pre-training (full DR, normal gravity, no gravity curriculum) + 512-pt ScenePC obs."""
+
+    observations: ScenePCObsCfg = ScenePCObsCfg()
+

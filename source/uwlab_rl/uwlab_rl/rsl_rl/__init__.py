@@ -4,3 +4,4 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from .rl_cfg import BehaviorCloningCfg, OffPolicyAlgorithmCfg, RslRlFancyPpoAlgorithmCfg
+from .actor_critic_encoder import ActorCriticWithEncoder
