@@ -14,13 +14,6 @@ from uwlab_rl.rsl_rl.rl_cfg import (
 )
 
 
-@configclass
-class RslRlActorCriticWithEncoderCfg(RslRlFancyActorCriticCfg):
-    class_name: str = "ActorCriticWithEncoder"
-    encoder_groups: dict = dict()
-
-
-
 def my_experts_observation_func(env):
     obs = env.unwrapped.obs_buf["expert_obs"]
     return obs
@@ -98,62 +91,3 @@ class Base_DAggerRunnerCfg(Base_PPORunnerCfg):
             )
         ),
     )
-
-
-@configclass
-class ScenePCPPORunnerCfg(Base_PPORunnerCfg):
-    """Plain PPO with shared MLP encoder for ScenePC obs (no V_success aux head).
-
-    Symmetric AC: both actor and critic see ``proprio + pointcloud`` through
-    the same shared PC encoder. Critic additionally gets ``time_left``.
-    """
-
-    obs_groups = {
-        "policy": ["proprio", "pointcloud"],
-        "critic": ["proprio", "pointcloud", "time_left"],
-    }
-    policy = RslRlActorCriticWithEncoderCfg(
-        init_noise_std=1.0,
-        actor_obs_normalization=True,
-        critic_obs_normalization=True,
-        actor_hidden_dims=[512, 256, 128, 64],
-        critic_hidden_dims=[512, 256, 128, 64],
-        activation="elu",
-        noise_std_type="gsde",
-        state_dependent_std=False,
-        encoder_groups={
-            "pointcloud": {"hidden_dims": [256, 128], "output_dim": 32},
-        },
-    )
-
-
-
-@configclass
-class RslRlActorCriticWithEncoderCfg(RslRlFancyActorCriticCfg):
-    class_name: str = "ActorCriticWithEncoder"
-    encoder_groups: dict = dict()
-
-
-def my_experts_observation_func(env):
-    obs = env.unwrapped.obs_buf["expert_obs"]
-    return obs
-
-@configclass
-class ScenePC_FastSACRunnerCfg(RslRlOffPolicyRunnerCfg):
-    save_interval = 1000
-    resume = False
-    experiment_name = "ur5e_robotiq_2f85_omnireset_agent"
-    wandb_project = "omnireset_fastsac"
-    policy = RslRlFastSACActorCriticCfg(
-    )
-    algorithm = RslRlFastSACAlgorithmCfg(
-    )
-    obs_groups = {
-        "policy": ["proprio", "pointcloud"],
-        "critic": ["proprio", "pointcloud", "time_left"],
-    }
-    actor_obs_keys = ["proprio", "pointcloud"]
-    critic_obs_keys = ["proprio", "pointcloud", "time_left"]
-    encoder_obs_key: str = "pointcloud"
-    encoder_obs_shape: tuple = (512 * 3, )  # NUM POINTS * 3
-
