@@ -311,7 +311,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             expert_critic=None, # expert_critic,
             lambda_bc_policy=1.0,
             lambda_bc_critic=1.0,
-            use_cpu_rb=True
+            # use_cpu_rb=True
         )
         runner.setup()
         runner.expert_ratio = args_cli.expert_ratio

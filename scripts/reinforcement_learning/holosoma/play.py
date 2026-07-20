@@ -513,33 +513,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     obs = env.get_observations()
 
     # --eval: run for a fixed number of episodes, report success rate, then exit.
-    # Success isn't a termination (only timeout / abnormal_robot are), so we replicate
-    # ProgressContext's check from the newest `insertive_asset_in_receptive_asset_frame`
-    # frame: pos_norm < pos_thresh AND |aa_x|+|aa_y| < orient_thresh (approximates the
-    # exact Euler-XY L1 used by the reward; matches it well near success). An episode
-    # counts as success if any of its steps satisfied the check.
+    # Success isn't a termination (only timeout / abnormal_robot are), so we read
+    # ProgressContext's own alignment flags (`orientation_aligned` & `position_aligned`)
+    # off the `progress_context` reward term each step (see the eval loop below). An
+    # episode counts as success if any of its steps satisfied the check. This works for
+    # both state and point-cloud tasks — it does not depend on any particular obs group
+    # or term layout (the ScenePC obs config has no `policy` group).
     if args_cli.eval is not None:
-        obs_mgr = env.unwrapped.observation_manager
-        term_names = list(obs_mgr.active_terms["policy"])
-        term_dims = list(obs_mgr.group_obs_term_dim["policy"])
-        offsets = {}
-        cursor = 0
-        for name, shape in zip(term_names, term_dims):
-            dim = shape[0] if isinstance(shape, tuple) else int(shape)
-            offsets[name] = (cursor, cursor + dim)
-            cursor += dim
-        if "insertive_asset_in_receptive_asset_frame" not in offsets:
-            raise RuntimeError(
-                "Task has no `insertive_asset_in_receptive_asset_frame` obs term; "
-                "cannot compute success from obs for this task."
-            )
-        ins_block_start, ins_block_end = offsets["insertive_asset_in_receptive_asset_frame"]
-        ins_newest_start = ins_block_end - 6  # last 6 dims of the block = newest frame
-        POS_THRESH = 0.03
-        ORIENT_THRESH = 0.2
-        print(f"[eval] success check: pos_norm < {POS_THRESH}  AND  |aa_x|+|aa_y| < {ORIENT_THRESH}")
-        print(f"[eval] ins_in_rec newest slice: [{ins_newest_start}:{ins_block_end}]")
-
         target_episodes = args_cli.eval
         total_episodes = 0
         successful_episodes = 0
@@ -569,7 +549,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # Accumulate success at the pre-step state (obs at iter start).
                 obs, _, dones, _ = env.step(actions)
 
-                context_term = env.env.env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
+                context_term = env.unwrapped.reward_manager.get_term_cfg("progress_context").func  # type: ignore
                 orientation_aligned = getattr(context_term, "orientation_aligned")
                 position_aligned = getattr(context_term, "position_aligned")
                 before_es = ever_success.clone()
@@ -611,8 +591,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             successes_np = torch.tensor(episode_successes).numpy()
             fig = plt.figure(figsize=(8, 7))
             ax = fig.add_subplot(111, projection="3d")
-            # ax.scatter(xyzs[successes_np, 0], xyzs[successes_np, 1], xyzs[successes_np, 2],
-            #            c="green", s=18, alpha=0.7, label=f"success ({int(successes_np.sum())})")
+            ax.scatter(xyzs[successes_np, 0], xyzs[successes_np, 1], xyzs[successes_np, 2],
+                       c="green", s=18, alpha=0.7, label=f"success ({int(successes_np.sum())})")
             ax.scatter(xyzs[~successes_np, 0], xyzs[~successes_np, 1], xyzs[~successes_np, 2],
                        c="red", s=18, alpha=0.7, label=f"failure ({int((~successes_np).sum())})")
             ax.scatter(peghole_xyz_env0[0], peghole_xyz_env0[1], peghole_xyz_env0[2],

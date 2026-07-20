@@ -120,6 +120,16 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 CLUSTER_ENV_FILE="$SCRIPT_DIR/.env.cluster"
 BASE_ENV_FILE="$SCRIPT_DIR/../.env.base"
 
+if [ ! -f "$CLUSTER_ENV_FILE" ]; then
+    exit_with_error "Cluster env file not found: $CLUSTER_ENV_FILE"
+fi
+if [ ! -f "$BASE_ENV_FILE" ]; then
+    exit_with_error "Base env file not found: $BASE_ENV_FILE"
+fi
+source "$CLUSTER_ENV_FILE"
+source "$BASE_ENV_FILE"
+validate_runtime_cluster_config
+
 # Make sure that all directories exist in the persistent cache directory on GPFS
 setup_directories
 
@@ -164,9 +174,9 @@ touch "$CLUSTER_UWLAB_DIR/logs/.keep"
 # Exclude bulky persistent dirs (logs/, rbs/, expert_rb/, tmp/) — under `_latest` snapshot mode
 # these accumulate across jobs and can balloon to hundreds of GB. logs/ and tmp/ (torch.compile's
 # inductor/triton cache) are provided to the container via persistent bind-mounts below regardless,
-# and expert_rb/ is reachable through the blanket $CLUSTER_MOUNT_DIR bind (both map to the same
-# /mmfs1 absolute path), so excluding them here only affects the per-job /tmp copy, not what the
-# container sees.
+# and expert_rb/ is reachable through the $CLUSTER_UWLAB_DIR bind below (same absolute path
+# inside and outside the container), so excluding them here only affects the per-job /tmp copy,
+# not what the container sees.
 rsync -a --exclude="logs/" --exclude="rbs/" --exclude="expert_rb/" --exclude="tmp/" "$UWLAB_DIR_ARG" "$JOB_TMPDIR/"
 # Get the directory name
 dir_name=$(basename "$UWLAB_DIR_ARG")
@@ -253,7 +263,9 @@ singularity exec \
     -B "$JOB_TMPDIR/docker-isaac-sim/documents":${DOCKER_USER_HOME}/Documents:rw \
     -B "$JOB_TMPDIR/$dir_name":/workspace/uwlab:rw \
     -B $CLUSTER_UWLAB_DIR/logs:/workspace/uwlab/logs:rw \
-    -B $CLUSTER_MOUNT_DIR:$CLUSTER_MOUNT_DIR:rw \
+    -B $CLUSTER_UWLAB_DIR:$CLUSTER_UWLAB_DIR:rw \
+    -B /mmfs1/home/$USER:/mmfs1/home/$USER:rw \
+    `# home bind is REQUIRED: omni.client caches USD downloads to $HOME/.cache; without it --containall gives a ~16MB tmpfs home and downloads die with "Could not download local file"` \
     -B /etc/resolv.conf:/etc/resolv.conf:ro \
     -B /etc/pki:/etc/pki:ro \
     -B /etc/ssl:/etc/ssl:ro \
