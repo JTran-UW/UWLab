@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
@@ -18,6 +19,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import TiledCameraCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
  
@@ -30,6 +32,46 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.a
 )
 
 from ... import mdp as task_mdp
+
+
+def _look_at_quat(
+    pos: tuple[float, float, float],
+    target: tuple[float, float, float],
+    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
+) -> tuple[float, float, float, float]:
+    """Quaternion (w, x, y, z) for an OpenGL-convention camera (forward=-Z, up=+Y) at `pos`
+    looking at `target`."""
+    zx, zy, zz = pos[0] - target[0], pos[1] - target[1], pos[2] - target[2]
+    zlen = math.sqrt(zx * zx + zy * zy + zz * zz)
+    zx, zy, zz = zx / zlen, zy / zlen, zz / zlen
+
+    ux, uy, uz = world_up
+    xx, xy, xz = uy * zz - uz * zy, uz * zx - ux * zz, ux * zy - uy * zx
+    xlen = math.sqrt(xx * xx + xy * xy + xz * xz)
+    xx, xy, xz = xx / xlen, xy / xlen, xz / xlen
+
+    yx, yy, yz = zy * xz - zz * xy, zz * xx - zx * xz, zx * xy - zy * xx
+
+    # rotation matrix columns are the camera's local x/y/z axes expressed in world coords
+    m00, m01, m02 = xx, yx, zx
+    m10, m11, m12 = xy, yy, zy
+    m20, m21, m22 = xz, yz, zz
+
+    trace = m00 + m11 + m22
+    if trace > 0:
+        s = 0.5 / math.sqrt(trace + 1.0)
+        w, x, y, z = 0.25 / s, (m21 - m12) * s, (m02 - m20) * s, (m10 - m01) * s
+    elif m00 > m11 and m00 > m22:
+        s = 2.0 * math.sqrt(1.0 + m00 - m11 - m22)
+        w, x, y, z = (m21 - m12) / s, 0.25 * s, (m01 + m10) / s, (m02 + m20) / s
+    elif m11 > m22:
+        s = 2.0 * math.sqrt(1.0 + m11 - m00 - m22)
+        w, x, y, z = (m02 - m20) / s, (m01 + m10) / s, 0.25 * s, (m12 + m21) / s
+    else:
+        s = 2.0 * math.sqrt(1.0 + m22 - m00 - m11)
+        w, x, y, z = (m10 - m01) / s, (m02 + m20) / s, (m12 + m21) / s, 0.25 * s
+
+    return (w, x, y, z)
 
 
 @configclass
@@ -155,6 +197,34 @@ class RlStateReachingSceneCfg(InteractiveSceneCfg):
             intensity=1000.0,
             texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
         ),
+    )
+
+    # front_camera = TiledCameraCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/depth_front_camera",
+    #     update_period=0,
+    #     height=240,
+    #     width=320,
+    #     offset=TiledCameraCfg.OffsetCfg(
+    #         pos=(1.0770121, -0.1679045, 0.4486344),
+    #         rot=(0.70564552, 0.46613815, 0.25072644, 0.47107948),
+    #         convention="opengl",
+    #     ),
+    #     data_types=["distance_to_camera"],
+    #     spawn=sim_utils.PinholeCameraCfg(focal_length=13.20, clipping_range=(0.1, 1.25)),
+    # )
+
+    front_camera = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/depth_front_camera",
+        update_period=0,
+        height=240,
+        width=320,
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(1.5, 0, 0.75),
+            rot=_look_at_quat(pos=(1.5, 0, 0.75), target=(0, 0, 0)),
+            convention="opengl",
+        ),
+        data_types=["distance_to_camera"],
+        spawn=sim_utils.PinholeCameraCfg(focal_length=13.20, clipping_range=(0.1, 2.0)),
     )
 
 
@@ -1315,6 +1385,54 @@ class ObservationsReachingCfg:
 
 
 @configclass
+class ObservationsReachingDepthCfg:
+    """Observation specifications for the MDP."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Observations for policy group."""
+
+        depth_image = ObsTerm(
+            func=task_mdp.process_image,
+            params={
+                "sensor_cfg": SceneEntityCfg("front_camera"),
+                "data_type": "distance_to_camera",
+                "output_size": (84, 84),
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+            self.history_length = 3
+            self.flatten_history_dim = False
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Critic observations for policy group."""
+
+
+        depth_image = ObsTerm(
+            func=task_mdp.process_image,
+            params={
+                "sensor_cfg": SceneEntityCfg("front_camera"),
+                "data_type": "distance_to_camera",
+                "output_size": (84, 84),
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+            self.history_length = 3
+            self.flatten_history_dim = False
+
+    # observation groups
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
 class RewardsCfg:
 
     # safety rewards
@@ -2016,6 +2134,43 @@ class Ur5eRobotiq2f85RlStateReachingCfg(ManagerBasedRLEnvCfg):
         self.sim.render.enable_reflections = True
         self.sim.render.enable_dl_denoiser = True
 
+@configclass
+class Ur5eRobotiq2f85RlStateReachingDepthCfg(ManagerBasedRLEnvCfg):
+    scene: RlStateReachingSceneCfg = RlStateReachingSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: ObservationsReachingDepthCfg = ObservationsReachingDepthCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    rewards: RewardsReachingCfg = RewardsReachingCfg()
+    terminations: TerminationsReachingCfg = TerminationsReachingCfg()
+    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
+    events: BaseReachingEventCfg = MISSING
+    commands: CommandsReachingCfg = CommandsReachingCfg()
+    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
+
+    def __post_init__(self):
+        self.decimation = 12
+        self.episode_length_s = 4.0
+        # simulation settings
+        self.sim.dt = 1 / 120.0
+
+        # Contact and solver settings
+        self.sim.physx.solver_type = 1
+        self.sim.physx.max_position_iteration_count = 192
+        self.sim.physx.max_velocity_iteration_count = 1
+        self.sim.physx.bounce_threshold_velocity = 0.02
+        self.sim.physx.friction_offset_threshold = 0.01
+        self.sim.physx.friction_correlation_distance = 0.0005
+
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
+        self.sim.physx.gpu_max_rigid_contact_count = 2**23
+        self.sim.physx.gpu_max_rigid_patch_count = 2**23
+        self.sim.physx.gpu_collision_stack_size = 2**31
+
+        # Render settings
+        self.sim.render.enable_dlssg = True
+        self.sim.render.enable_ambient_occlusion = True
+        self.sim.render.enable_reflections = True
+        self.sim.render.enable_dl_denoiser = True
 
 # Training configuration (Stage 1: no curriculum, implicit actuator, no sysid DR)
 @configclass
@@ -2090,6 +2245,13 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainEasyNoDRCfg(Ur5eRobotiq2f85RlStateEasyC
 
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainReachingCfg(Ur5eRobotiq2f85RlStateReachingCfg):
+
+    events: TrainReachingEventCfg = TrainReachingEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainReachingDepthCfg(Ur5eRobotiq2f85RlStateReachingDepthCfg):
 
     events: TrainReachingEventCfg = TrainReachingEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()

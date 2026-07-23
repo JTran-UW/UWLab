@@ -478,8 +478,10 @@ class AsymmetricReplayBuffer(BaseBuffer):
         n_envs: int = 1,
         n_steps: int = 1,
         gamma: float = 0.99,
+        sample_device: th.device | str | None = None,
     ):
         super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+        self.sample_device = get_device(sample_device) if sample_device is not None else self.device
 
         # Adjust buffer size
         self.buffer_size = max(buffer_size // n_envs, 1)
@@ -527,16 +529,17 @@ class AsymmetricReplayBuffer(BaseBuffer):
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
         action = action.reshape((self.n_envs, self.action_dim))
 
-        # Copy to avoid modification by reference
-        self.policy_observations[self.pos] = obs["policy"].detach()
-        self.critic_observations[self.pos] = obs["critic"].detach()
-        self.next_policy_observations[self.pos] = next_obs["policy"].detach()
-        self.next_critic_observations[self.pos] = next_obs["critic"].detach()
+        # Copy to avoid modification by reference; flatten to match storage shape and move to
+        # the buffer's storage device (may differ from the device incoming tensors live on).
+        self.policy_observations[self.pos] = obs["policy"].detach().reshape(self.n_envs, -1).to(self.device)
+        self.critic_observations[self.pos] = obs["critic"].detach().reshape(self.n_envs, -1).to(self.device)
+        self.next_policy_observations[self.pos] = next_obs["policy"].detach().reshape(self.n_envs, -1).to(self.device)
+        self.next_critic_observations[self.pos] = next_obs["critic"].detach().reshape(self.n_envs, -1).to(self.device)
 
-        self.actions[self.pos] = action.detach()
-        self.rewards[self.pos] = reward.detach()
-        self.terminations[self.pos] = termination.detach()
-        self.truncations[self.pos] = truncation.detach()
+        self.actions[self.pos] = action.detach().to(self.device)
+        self.rewards[self.pos] = reward.detach().to(self.device)
+        self.terminations[self.pos] = termination.detach().to(self.device)
+        self.truncations[self.pos] = truncation.detach().to(self.device)
 
         self.pos += 1
         if self.pos == self.buffer_size:
@@ -593,16 +596,19 @@ class AsymmetricReplayBuffer(BaseBuffer):
         no_done = n_step_dones.sum(dim=0) == 0
         first_done = th.where(no_done, self.n_steps - 1, first_done)
 
+        next_inds = (batch_inds + first_done) % self.buffer_size
         data = (
             self.policy_observations[batch_inds, env_indices],
             self.critic_observations[batch_inds, env_indices],
             self.actions[batch_inds, env_indices],
-            self.next_policy_observations[batch_inds + first_done, env_indices],
-            self.next_critic_observations[batch_inds + first_done, env_indices],
-            self.terminations[batch_inds + first_done, env_indices],
+            self.next_policy_observations[next_inds, env_indices],
+            self.next_critic_observations[next_inds, env_indices],
+            self.terminations[next_inds, env_indices],
             n_step_rewards,
             effective_n_steps
         )
+        if self.sample_device != self.device:
+            data = tuple(t.to(self.sample_device) for t in data)
         return AsymmetricReplayBufferSamples(*data)
 
 

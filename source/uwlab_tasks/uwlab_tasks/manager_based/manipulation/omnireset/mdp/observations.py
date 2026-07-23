@@ -227,7 +227,8 @@ def process_image(
     Returns:
         The images produced at the last time-step
     """
-    assert data_type == "rgb", "Only RGB images are supported for now."
+    is_depth = "distance_to" in data_type or "depth" in data_type
+    assert data_type == "rgb" or is_depth, f"Unsupported data_type: {data_type}"
     # extract the used quantities (to enable type-hinting)
     sensor: TiledCamera | Camera | RayCasterCamera = env.scene.sensors[sensor_cfg.name]
 
@@ -240,15 +241,19 @@ def process_image(
 
     # Convert to float32 and normalize in-place
     images = images.to(dtype=torch.float32)  # Avoid redundant .float() and .type() calls
-    images.div_(255.0).clamp_(0.0, 1.0)  # Normalize and clip in-place
+    if is_depth:
+        images[images == float("inf")] = 0.0
+    else:
+        images.div_(255.0).clamp_(0.0, 1.0)  # Normalize and clip in-place
     images = images.permute(start_dims + [s + 3, s + 1, s + 2])
 
     if current_size != output_size:
         # Perform resize operation
         images = F.interpolate(images, size=output_size, mode="bilinear", antialias=True)
 
-    # rgb/depth image normalization
+    # rgb image normalization
     if not process_image:
+        assert not is_depth, "process_image=False (uint8 packing) is only supported for rgb, not depth."
         # Reverse the permutation
         reverse_dims = torch.argsort(torch.tensor(start_dims + [s + 3, s + 1, s + 2]))
         images = images.permute(reverse_dims.tolist())
@@ -271,6 +276,25 @@ def process_image(
     # plt.savefig('saved_image_3.png', dpi=300, bbox_inches='tight')
 
     return images
+
+
+def process_multi_camera_image(
+    env: ManagerBasedEnv,
+    sensor_cfgs: list[SceneEntityCfg],
+    data_type: str = "distance_to_camera",
+    output_size: tuple = (64, 64),
+) -> torch.Tensor:
+    """Images from multiple camera sensors, concatenated along the channel dimension.
+
+    Each camera is processed via :func:`process_image` independently (resize, depth
+    inf-handling, etc.), then stacked as extra input channels: shape (N, len(sensor_cfgs) *
+    channels_per_camera, *output_size).
+    """
+    images = [
+        process_image(env, sensor_cfg=cfg, data_type=data_type, process_image=True, output_size=output_size)
+        for cfg in sensor_cfgs
+    ]
+    return torch.cat(images, dim=1)
 
 
 def binary_force_contact(

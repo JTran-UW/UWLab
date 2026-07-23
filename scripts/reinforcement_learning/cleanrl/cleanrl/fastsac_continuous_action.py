@@ -96,6 +96,12 @@ class Args:
     """the weight decay of the optimizer"""
     logging_interval: int = 100
     """the interval to log the metrics"""
+    hessian_interval: int = 100 # 0
+    """interval (in global_step) at which to estimate the qf1 critic loss Hessian's top/bottom
+    eigenvalues and condition number, per arxiv.org/abs/2509.25174. Expensive (double-backward
+    power/Lanczos iterations), so this runs far less often than logging_interval."""
+    hessian_lanczos_iters: int = 20
+    """number of Lanczos iterations used to estimate the extremal Hessian eigenvalues"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -298,6 +304,70 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 
+def _make_hvp_fn(loss: torch.Tensor, params: list[torch.Tensor]):
+    """Build a Hessian-vector-product closure for `loss`'s Hessian w.r.t. `params`.
+
+    Computes the first-order gradient graph once (with create_graph=True); each call to the
+    returned closure does one additional (cheap, retained-graph) backward pass to get H @ vec,
+    rather than rebuilding the forward/first-backward graph per Hessian-vector product.
+    """
+    flat_grad = torch.cat([g.reshape(-1) for g in torch.autograd.grad(loss, params, create_graph=True)])
+
+    def hvp(vec: torch.Tensor) -> torch.Tensor:
+        grad_dot_v = torch.dot(flat_grad, vec)
+        hvp_grads = torch.autograd.grad(grad_dot_v, params, retain_graph=True)
+        return torch.cat([h.reshape(-1) for h in hvp_grads]).detach()
+
+    return hvp
+
+
+def lanczos_extreme_eigenvalues(loss: torch.Tensor, params: list[torch.Tensor], num_iters: int, device) -> tuple[float, float]:
+    """Estimate the largest and smallest eigenvalues of the Hessian of `loss` w.r.t. `params`.
+
+    Uses the Lanczos algorithm (Golub & Welsch 1969), the same core primitive as the stochastic
+    Lanczos quadrature method in arxiv.org/abs/2509.25174, restricted here to just the extremal
+    Ritz values (top/bottom eigenvalues of the small resulting tridiagonal matrix) rather than
+    the full spectral density. Uses only Hessian-vector products (no explicit Hessian matrix).
+    Full reorthogonalization against all prior Lanczos vectors, cheap since num_iters is small.
+    """
+    hvp = _make_hvp_fn(loss, params)
+    n_params = sum(p.numel() for p in params)
+
+    v = torch.randn(n_params, device=device)
+    v = v / v.norm()
+    vs = [v]
+    alphas: list[float] = []
+    betas: list[float] = []
+    v_prev = torch.zeros_like(v)
+    beta_prev = 0.0
+
+    for i in range(num_iters):
+        w = hvp(vs[-1])
+        alpha = torch.dot(w, vs[-1])
+        w = w - alpha * vs[-1] - beta_prev * v_prev
+        for vj in vs:  # full reorthogonalization
+            w = w - torch.dot(w, vj) * vj
+        beta = w.norm()
+        alphas.append(alpha.item())
+        if beta.item() < 1e-8 or i == num_iters - 1:
+            betas.append(0.0)
+            break
+        betas.append(beta.item())
+        v_prev = vs[-1]
+        beta_prev = beta
+        vs.append(w / beta)
+
+    m = len(alphas)
+    T = torch.zeros(m, m, device=device)
+    for i in range(m):
+        T[i, i] = alphas[i]
+        if i < m - 1 and betas[i] != 0.0:
+            T[i, i + 1] = betas[i]
+            T[i + 1, i] = betas[i]
+    ritz = torch.linalg.eigvalsh(T)
+    return ritz[-1].item(), ritz[0].item()
+
+
 if __name__ == "__main__":
 
     args, launcher_args = tyro.cli(Args, return_unknown_args=True)
@@ -380,6 +450,11 @@ if __name__ == "__main__":
     total_episodes = 0
     num_success_episodes_log = 0
     num_episodes_log = 0
+    # Rolling moving average, per termination term (e.g. success/time_out/off_table), of the
+    # fraction of envs whose most recent completed episode ended via that term. Term names are
+    # discovered dynamically from IsaacLab's TerminationManager ("Episode_Termination/<name>" in
+    # infos["log"], refreshed whenever any env resets), so this works for any task's termination cfg.
+    termination_buffers: dict[str, deque] = {}
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
@@ -407,6 +482,11 @@ if __name__ == "__main__":
         num_episodes_log += dones.int().sum()
         total_episodes += dones.int().sum()
         num_success_episodes_log += infos["ep_success"].sum()
+        if dones.any():
+            for key, val in infos.get("log", {}).items():
+                if key.startswith("Episode_Termination/"):
+                    term_name = key[len("Episode_Termination/"):]
+                    termination_buffers.setdefault(term_name, deque(maxlen=1000)).append(val)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
@@ -419,6 +499,17 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
+            # Snapshot the policy on a reference batch before this epoch's updates, to
+            # measure how far the policy moves (KL) over the course of the num_updates
+            # gradient steps below.
+            with torch.no_grad():
+                kl_ref_obs = rb.sample(args.batch_size).policy_observations
+                if args.obs_normalization:
+                    kl_ref_obs = normalize_obs(kl_ref_obs, update=False)
+                old_mean, old_log_std = actor(kl_ref_obs)
+                old_mean = old_mean.detach()
+                old_log_std = old_log_std.detach()
+
             for upd_i in range(args.num_updates):
                 data = rb.sample(args.batch_size)
 
@@ -474,6 +565,8 @@ if __name__ == "__main__":
                 if args.num_updates > 1:
                     if upd_i % args.policy_frequency == 1:
                         pi, log_pi, _ = actor.get_action(policy_obs)
+                        with torch.no_grad():
+                            policy_entropy = -log_pi.mean()
                         qf1_pi = qf1(critic_obs, pi)
                         qf2_pi = qf2(critic_obs, pi)
                         qf1_probs = F.softmax(qf1_pi)
@@ -506,6 +599,64 @@ if __name__ == "__main__":
                     for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                         target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
+            # KL(new policy || old policy) on the reference batch, measured over this epoch's
+            # num_updates gradient steps. Closed-form KL between diagonal Gaussians, computed in
+            # pre-tanh space (valid regardless of use_tanh, since KL is invariant under a shared
+            # deterministic bijection).
+            with torch.no_grad():
+                new_mean, new_log_std = actor(kl_ref_obs)
+                old_std = old_log_std.exp()
+                new_std = new_log_std.exp()
+                kl_old_policy = (
+                    old_log_std - new_log_std
+                    + (new_std.pow(2) + (new_mean - old_mean).pow(2)) / (2.0 * old_std.pow(2))
+                    - 0.5
+                ).sum(dim=-1).mean()
+
+            # qf1 critic-loss Hessian top/bottom eigenvalues + condition number (arxiv.org/abs/2509.25174).
+            # Expensive (double-backward Lanczos), so this runs on its own coarse interval, on a
+            # fresh replay-buffer batch, and is NOT part of the actual training update.
+            if global_step % args.hessian_interval == 0:
+                h_data = rb.sample(args.batch_size)
+                h_policy_obs = h_data.policy_observations
+                h_next_policy_obs = h_data.next_policy_observations
+                h_critic_obs = h_data.critic_observations
+                h_next_critic_obs = h_data.next_critic_observations
+                if args.obs_normalization:
+                    h_policy_obs = normalize_obs(h_policy_obs, update=False)
+                    h_next_policy_obs = normalize_obs(h_next_policy_obs, update=False)
+                    h_critic_obs = normalize_critic_obs(h_critic_obs, update=False)
+                    h_next_critic_obs = normalize_critic_obs(h_next_critic_obs, update=False)
+
+                h_bootstrap = (~h_data.dones.bool()).float()
+                with torch.no_grad():
+                    h_next_actions, h_next_log_probs, _ = actor.get_action(h_next_policy_obs)
+                    h_discount = args.gamma ** h_data.effective_n_steps
+                    qf1_target_dist_h = qf1_target.projection(
+                        h_next_critic_obs,
+                        h_next_actions,
+                        h_data.rewards.squeeze(-1) - h_discount * h_bootstrap.squeeze(-1) * log_alpha.exp() * h_next_log_probs.squeeze(-1),
+                        h_bootstrap.squeeze(-1),
+                        h_discount,
+                    )
+
+                qf1_outputs_h = qf1(h_critic_obs, h_data.actions)
+                qf1_log_probs_h = F.log_softmax(qf1_outputs_h, dim=-1)
+                qf1_loss_h = (-torch.sum(qf1_target_dist_h * qf1_log_probs_h, dim=-1)).mean()
+
+                qf1_params = list(qf1.parameters())
+                hess_lambda_max, hess_lambda_min = lanczos_extreme_eigenvalues(
+                    qf1_loss_h, qf1_params, num_iters=args.hessian_lanczos_iters, device=device
+                )
+                hess_cond_number = abs(hess_lambda_max) / max(abs(hess_lambda_min), 1e-12)
+
+                # log10 versions for log-scale plotting: these metrics (per arxiv.org/abs/2509.25174)
+                # commonly span several orders of magnitude, so a linear-axis chart of the raw value
+                # is hard to read. top_eig can in principle be <= 0 (non-convex loss), so we take
+                # log10 of its magnitude and clamp both away from 0 to avoid log(0).
+                writer.add_scalar("metrics/critic_hessian_top_eig_log10", math.log10(max(abs(hess_lambda_max), 1e-12)), global_step)
+                writer.add_scalar("metrics/critic_hessian_cond_number_log10", math.log10(max(hess_cond_number, 1e-12)), global_step)
+
             if global_step % args.logging_interval == 0:
                 writer.add_scalar("losses/qf1_values", qf1_target_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf2_values", qf2_target_values.mean().item(), global_step)
@@ -514,6 +665,8 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
+                writer.add_scalar("metrics/kl_divergence", kl_old_policy.item(), global_step)
+                writer.add_scalar("metrics/policy_entropy", policy_entropy.item(), global_step)
                 sps = int(global_step / (time.time() - start_time))
                 writer.add_scalar("charts/SPS", sps, global_step)
                 samples_per_sec = sps * args.num_envs * args.num_updates * args.batch_size
@@ -528,6 +681,10 @@ if __name__ == "__main__":
                 num_episodes_log = 0
 
                 writer.add_scalar("charts/num_episodes", total_episodes, global_step)
+
+                for term_name, buf in termination_buffers.items():
+                    if len(buf) > 0:
+                        writer.add_scalar(f"charts/termination_{term_name}", statistics.mean(buf), global_step)
 
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
@@ -554,6 +711,8 @@ if __name__ == "__main__":
                     f"{'qf_loss:':>{pad}} {(qf_loss.item() / 2.0):>10.4f}",
                     f"{'actor_loss:':>{pad}} {actor_loss.item():>10.4f}",
                     f"{'log_pi (mean):':>{pad}} {log_pi.mean().item():>10.3f}",
+                    f"{'kl_divergence:':>{pad}} {kl_old_policy.item():>10.5f}",
+                    f"{'policy_entropy:':>{pad}} {policy_entropy.item():>10.4f}",
                     f"{'alpha:':>{pad}} {alpha:>10.4f}"
                     + (f"   alpha_loss={alpha_loss.item():.4f}" if args.autotune else ""),
                     bar,
