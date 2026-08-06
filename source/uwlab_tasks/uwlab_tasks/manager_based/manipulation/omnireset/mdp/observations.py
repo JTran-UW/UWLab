@@ -209,6 +209,7 @@ def process_image(
     data_type: str = "rgb",
     process_image: bool = True,
     output_size: tuple = (224, 224),
+    grayscale: bool = False,
 ) -> torch.Tensor:
     """Images of a specific datatype from the camera sensor.
 
@@ -223,12 +224,15 @@ def process_image(
         sensor_cfg: The desired sensor to read from. Defaults to SceneEntityCfg("tiled_camera").
         data_type: The data type to pull from the desired camera. Defaults to "rgb".
         process_image: Whether to normalize the image. Defaults to True.
+        grayscale: If True, collapse an rgb image to a single luma channel (ITU-R BT.601:
+            0.299 R + 0.587 G + 0.114 B), giving (..., 1, H, W). Only valid for rgb data types.
 
     Returns:
         The images produced at the last time-step
     """
     is_depth = "distance_to" in data_type or "depth" in data_type
     assert data_type == "rgb" or is_depth, f"Unsupported data_type: {data_type}"
+    assert not (grayscale and is_depth), "grayscale=True is only valid for rgb, not depth."
     # extract the used quantities (to enable type-hinting)
     sensor: TiledCamera | Camera | RayCasterCamera = env.scene.sensors[sensor_cfg.name]
 
@@ -246,6 +250,13 @@ def process_image(
     else:
         images.div_(255.0).clamp_(0.0, 1.0)  # Normalize and clip in-place
     images = images.permute(start_dims + [s + 3, s + 1, s + 2])
+
+    if grayscale:
+        # Collapse rgb(a) to one luma channel before the resize: both the weighted channel sum and
+        # bilinear interpolation are linear, so they commute -- doing it here resizes 1 channel
+        # instead of 3. Slicing to :3 tolerates an rgba source.
+        luma = torch.tensor([0.299, 0.587, 0.114], device=images.device, dtype=images.dtype)
+        images = (images[..., :3, :, :] * luma.view(-1, 1, 1)).sum(dim=-3, keepdim=True)
 
     if current_size != output_size:
         # Perform resize operation
@@ -283,15 +294,24 @@ def process_multi_camera_image(
     sensor_cfgs: list[SceneEntityCfg],
     data_type: str = "distance_to_camera",
     output_size: tuple = (64, 64),
+    grayscale: bool = False,
 ) -> torch.Tensor:
     """Images from multiple camera sensors, concatenated along the channel dimension.
 
     Each camera is processed via :func:`process_image` independently (resize, depth
-    inf-handling, etc.), then stacked as extra input channels: shape (N, len(sensor_cfgs) *
-    channels_per_camera, *output_size).
+    inf-handling, optional rgb->grayscale, etc.), then stacked as extra input channels: shape
+    (N, len(sensor_cfgs) * channels_per_camera, *output_size). With ``grayscale=True`` each camera
+    contributes exactly one channel, so the result is (N, len(sensor_cfgs), *output_size).
     """
     images = [
-        process_image(env, sensor_cfg=cfg, data_type=data_type, process_image=True, output_size=output_size)
+        process_image(
+            env,
+            sensor_cfg=cfg,
+            data_type=data_type,
+            process_image=True,
+            output_size=output_size,
+            grayscale=grayscale,
+        )
         for cfg in sensor_cfgs
     ]
     return torch.cat(images, dim=1)

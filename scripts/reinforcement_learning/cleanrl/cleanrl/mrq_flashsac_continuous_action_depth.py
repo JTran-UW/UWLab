@@ -1,4 +1,12 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
+# FlashSAC (depth) + MR.Q model-based auxiliary loss (arxiv.org/abs/2501.16142).
+#
+# The raw-obs image encoder is replaced by MR.Q's decoupled encoders: a state encoder f (s -> zs)
+# and a state-action encoder g ((zs, a) -> zsa), plus a linear MDP predictor that forecasts the
+# next latent state, reward, and done. The encoders are trained end-to-end ONLY by this model-based
+# auxiliary loss. The FlashSAC C51 critic reads zsa and the actor reads zs, both with gradients
+# detached from the encoder (decoupled RL). A single shared f is applied to both the policy and the
+# critic obs streams (identical shape for this task); the dynamics model is learned on the critic
+# stream. Base file: flashsac_continuous_action_depth.py (DrQ augmentation dropped for this variant).
 from collections import deque
 import math
 import os
@@ -55,7 +63,7 @@ class Args:
     """the number of parallel game environments"""
     num_steps: int = 3
     """n-step returns"""
-    action_repeat: int = 2
+    action_repeat: int = 1
     """number of env sim-steps each sampled action is repeated for"""
     buffer_size: int = int(1e5)
     """the replay memory buffer size"""
@@ -89,11 +97,28 @@ class Args:
     """checkpoint save interval, in global_step units (transitions)"""
     use_tanh: bool = False
     """use tanh layer after policy"""
-    share_encoder: bool = True
-    """tie actor/qf1/qf2 depth-encoder weights into one shared encoder (DrQ-v2 style); actor
-    gradients are detached from it so only the critic updates the shared encoder"""
     obs_normalization: bool = True
     """use obs normalization"""
+    # ── MR.Q model-based auxiliary loss (arxiv.org/abs/2501.16142) ──
+    zs_dim: int = 512
+    """MR.Q state-embedding (zs) dimension"""
+    za_dim: int = 256
+    """MR.Q action-embedding (za) dimension inside the state-action encoder"""
+    zsa_dim: int = 512
+    """MR.Q state-action-embedding (zsa) dimension; the FlashSAC C51 critic operates on this"""
+    encoder_hidden_dim: int = 512
+    """hidden width of the MR.Q encoder MLPs (state MLP is unused for image obs; g-network MLP)"""
+    encoder_lr: float = 3e-4
+    """learning rate for the MR.Q encoder (state + state-action + MDP-predictor), trained only by
+    the model-based auxiliary loss"""
+    encoder_num_channels: int = 32
+    """channels per conv layer in the MR.Q image state encoder"""
+    model_reward_coef: float = 1.0
+    """weight on the reward-prediction term of the MR.Q auxiliary loss"""
+    model_done_coef: float = 1.0
+    """weight on the done-prediction term of the MR.Q auxiliary loss"""
+    model_dynamics_coef: float = 1.0
+    """weight on the next-latent-state prediction term of the MR.Q auxiliary loss"""
     num_updates: float = 0.5
     """Update-to-data ratio: gradient updates per env step. Values below 1 (e.g. 0.5) run an
     update only once every 1/num_updates env steps, via a fractional accumulator."""
@@ -197,30 +222,73 @@ class UnitRMSNorm(nn.Module):
         self.norm.weight.copy_(scale * norm_factor)
 
 
-class DepthCNNEncoder(nn.Module):
-    """DrQ-v2-style encoder: num_layers conv layers (first stride 2, rest stride 1) then a linear
-    bottleneck to feature_dim, followed by LayerNorm + Tanh (matches FlashSAC paper Table 11)."""
+class MRQEncoder(nn.Module):
+    """MR.Q encoder (arxiv.org/abs/2501.16142): a state encoder f, a state-action encoder g, and a
+    linear MDP predictor, trained end-to-end as one network by the model-based auxiliary loss only.
 
-    def __init__(self, in_channels, input_hw, feature_dim=50, num_layers=3, num_channels=32):
+      zs  = f(s)            state embedding      (used by the policy, gradients detached)
+      zsa = g(zs, a)        state-action embed   (used by the value net, gradients detached)
+      (next_zs_hat, r_hat, d_hat) = model(zsa)   one linear head predicting the next latent state,
+                                                 reward, and terminal signal (the auxiliary targets)
+
+    The image state encoder matches the paper: four 3x3 convs, 32 channels, strides (2, 2, 2, 1),
+    ELU, then a linear -> LayerNorm -> ELU bottleneck to zs_dim. The flatten dim is computed from a
+    dummy pass (84x84 gives 1568 as in the paper). We skip the paper's `state/255 - 0.5` rescale
+    since depth obs are in meters and already go through EmpiricalNormalization upstream.
+    """
+
+    def __init__(self, obs_shape, action_dim, zs_dim=512, za_dim=256, zsa_dim=512, hidden_dim=512, num_channels=32):
         super().__init__()
-        conv_layers = []
-        c_in = in_channels
-        for i in range(num_layers):
-            stride = 2 if i == 0 else 1
-            conv_layers += [nn.Conv2d(c_in, num_channels, kernel_size=3, stride=stride), nn.ReLU()]
-            c_in = num_channels
-        self.convnet = nn.Sequential(*conv_layers)
+        in_channels = obs_shape[0] * obs_shape[1]  # history * C, folded into conv channels
+        self.obs_hw = obs_shape[2:]
+        self.zs_dim = zs_dim
 
+        # State encoder f (image)
+        self.zs_cnn = nn.Sequential(
+            nn.Conv2d(in_channels, num_channels, kernel_size=3, stride=2), nn.ELU(),
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, stride=2), nn.ELU(),
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, stride=2), nn.ELU(),
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, stride=1), nn.ELU(),
+        )
         with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, *input_hw)
-            flatten_dim = self.convnet(dummy).flatten(1).shape[1]
+            dummy = torch.zeros(1, in_channels, *self.obs_hw)
+            flatten_dim = self.zs_cnn(dummy).flatten(1).shape[1]
+        self.zs_lin = nn.Linear(flatten_dim, zs_dim)
 
-        self.trunk = nn.Sequential(nn.Linear(flatten_dim, feature_dim), nn.LayerNorm(feature_dim), nn.Tanh())
+        # State-action encoder g
+        self.za = nn.Linear(action_dim, za_dim)
+        self.zsa1 = nn.Linear(zs_dim + za_dim, hidden_dim)
+        self.zsa2 = nn.Linear(hidden_dim, hidden_dim)
+        self.zsa3 = nn.Linear(hidden_dim, zsa_dim)
 
-    def forward(self, x):
-        h = self.convnet(x)
-        h = h.flatten(1)
-        return self.trunk(h)
+        # MDP predictor: next latent state (zs_dim) + reward (1) + done (1)
+        self.model = nn.Linear(zsa_dim, zs_dim + 1 + 1)
+
+    @staticmethod
+    def _ln_elu(x):
+        return F.elu(F.layer_norm(x, (x.shape[-1],)))
+
+    def zs(self, obs_flat):
+        """State embedding f(s). `obs_flat` is (B, prod(obs_shape)); reshaped to (B, hist*C, H, W)."""
+        x = obs_flat.reshape(obs_flat.shape[0], -1, *self.obs_hw)
+        h = self.zs_cnn(x).flatten(1)
+        return self._ln_elu(self.zs_lin(h))  # LayerNorm + ELU on the final linear (paper's ln_activ)
+
+    def zsa(self, zs, action):
+        """State-action embedding g(zs, a). Returned raw (no final activation), as in the paper."""
+        za = F.elu(self.za(action))
+        x = torch.cat([zs, za], dim=1)
+        x = self._ln_elu(self.zsa1(x))
+        x = self._ln_elu(self.zsa2(x))
+        return self.zsa3(x)
+
+    def predict(self, zsa):
+        """MDP predictor head: (next_zs_hat, reward_hat, done_logit) from the state-action embed."""
+        out = self.model(zsa)
+        next_zs_hat = out[:, : self.zs_dim]
+        reward_hat = out[:, self.zs_dim : self.zs_dim + 1]
+        done_logit = out[:, self.zs_dim + 1 : self.zs_dim + 2]
+        return next_zs_hat, reward_hat, done_logit
 
 
 class FlashSACBlock(nn.Module):
@@ -246,28 +314,26 @@ class FlashSACBlock(nn.Module):
 
 # ALGO LOGIC: initialize agent here:
 class FlashSACQNetwork(nn.Module):
+    """FlashSAC distributional (C51) critic operating on the MR.Q state-action embedding zsa.
+
+    Unlike the base depth critic, this has no image encoder and no action input -- the action is
+    already folded into zsa by the MR.Q state-action encoder g. It receives zsa (gradients detached
+    from the encoder) and outputs a categorical value distribution.
+    """
+
     def __init__(
         self,
-        env,
+        zsa_dim,
         hidden_dim=256,
         num_atoms=101,
         v_min=-20.0,
         v_max=20.0,
         num_blocks=2,
-        encoder=None,
     ):
         super().__init__()
 
-        obs_shape = env.single_observation_space["critic"].shape  # (history, C, H, W)
-        img_channels = obs_shape[0] * obs_shape[1]
-        self.obs_hw = obs_shape[2:]
-        action_dim = np.prod(env.single_action_space.shape)
-
-        self.encoder = encoder if encoder is not None else DepthCNNEncoder(
-            in_channels=img_channels, input_hw=obs_shape[2:], feature_dim=50
-        )
-        self.norm1 = UnitBatchNorm(50 + action_dim)
-        self.linear1 = UnitLinear(50 + action_dim, hidden_dim)
+        self.norm1 = UnitBatchNorm(zsa_dim)
+        self.linear1 = UnitLinear(zsa_dim, hidden_dim)
         self.blocks = nn.ModuleList([FlashSACBlock(hidden_dim) for _ in range(num_blocks)])
         self.norm2 = UnitRMSNorm(hidden_dim)
         self.linear2 = UnitLinear(hidden_dim, num_atoms, bias=True)
@@ -277,11 +343,8 @@ class FlashSACQNetwork(nn.Module):
         self.num_atoms = num_atoms
         self.q_support = torch.linspace(v_min, v_max, num_atoms, device="cuda")
 
-    def forward(self, x, a, training: bool):
-        x = x.reshape(x.shape[0], -1, *self.obs_hw)
-        x = self.encoder(x)
-        x = torch.cat([x, a], 1)
-        x = self.linear1(self.norm1(x, training=training))
+    def forward(self, zsa, training: bool):
+        x = self.linear1(self.norm1(zsa, training=training))
         for block in self.blocks:
             x = block(x, training=training) + x
         x = self.linear2(self.norm2(x))
@@ -289,8 +352,7 @@ class FlashSACQNetwork(nn.Module):
 
     def projection(
         self,
-        obs,
-        actions,
+        zsa,
         rewards,
         bootstrap,
         discount,
@@ -315,7 +377,7 @@ class FlashSACQNetwork(nn.Module):
         upper = torch.where(upper_mask, upper + 1, upper)
 
         if next_dist is None:
-            next_dist = F.softmax(self(obs, actions, training=training), dim=1)
+            next_dist = F.softmax(self(zsa, training=training), dim=1)
         proj_dist = torch.zeros_like(next_dist)
         offset = (
             torch.linspace(0, (batch_size - 1) * self.num_atoms, batch_size, device=device)
@@ -355,28 +417,25 @@ LOG_STD_MIN = -5
 
 
 class FlashSACActor(nn.Module):
+    """FlashSAC actor operating on the MR.Q state embedding zs (gradients detached from the encoder).
+
+    Callers pass zs = f(s).detach(); this network never touches the raw obs or the encoder.
+    """
+
     def __init__(self,
         env,
+        zs_dim,
         action_scale=None,
         action_bias=None,
         hidden_dim=128,
         num_blocks=2,
         use_tanh=False,
-        encoder=None,
-        detach_encoder=False,
     ):
         super().__init__()
-        obs_shape = env.single_observation_space["policy"].shape  # (history, C, H, W)
-        img_channels = obs_shape[0] * obs_shape[1]
-        self.obs_hw = obs_shape[2:]
         action_dim = np.prod(env.single_action_space.shape)
 
-        self.encoder = encoder if encoder is not None else DepthCNNEncoder(
-            in_channels=img_channels, input_hw=obs_shape[2:], feature_dim=50
-        )
-        self.detach_encoder = detach_encoder
-        self.norm1 = UnitBatchNorm(50)
-        self.linear1 = UnitLinear(50, hidden_dim)
+        self.norm1 = UnitBatchNorm(zs_dim)
+        self.linear1 = UnitLinear(zs_dim, hidden_dim)
         self.blocks = nn.ModuleList([FlashSACBlock(hidden_dim) for _ in range(num_blocks)])
         self.norm2 = UnitRMSNorm(hidden_dim)
 
@@ -410,12 +469,8 @@ class FlashSACActor(nn.Module):
             ),
         )
 
-    def forward(self, x, training: bool):
-        x = x.reshape(x.shape[0], -1, *self.obs_hw)
-        x = self.encoder(x)
-        if self.detach_encoder:
-            x = x.detach()
-        x = self.linear1(self.norm1(x, training=training))
+    def forward(self, zs, training: bool):
+        x = self.linear1(self.norm1(zs, training=training))
         for block in self.blocks:
             x = block(x, training=training) + x
         x = self.norm2(x)
@@ -624,33 +679,51 @@ if __name__ == "__main__":
     envs = IsaacLabVectorEnv(args.env_id, args.num_envs, launcher_args=launcher_args)
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+    policy_obs_shape = envs.single_observation_space["policy"].shape  # (history, C, H, W)
+    critic_obs_shape = envs.single_observation_space["critic"].shape  # (history, C, H, W)
+    # A single shared MR.Q state encoder f is applied to both the policy and the critic obs streams,
+    # so they must have the same shape (they differ only in observation corruption for this task).
+    assert tuple(policy_obs_shape) == tuple(critic_obs_shape), (
+        f"MR.Q uses one shared state encoder; policy obs {tuple(policy_obs_shape)} and critic obs "
+        f"{tuple(critic_obs_shape)} must have the same shape."
+    )
+    action_dim = int(np.prod(envs.single_action_space.shape))
+
     if args.obs_normalization:
         policy_obs_dim = int(np.prod(envs.single_observation_space["policy"].shape))
         critic_obs_dim = int(np.prod(envs.single_observation_space["critic"].shape))
         actor_obs_normalizer = EmpiricalNormalization(shape=(policy_obs_dim,), device=device)
         critic_obs_normalizer = EmpiricalNormalization(shape=(critic_obs_dim,), device=device)
 
-    qf1 = FlashSACQNetwork(envs).to(device)
-    qf2 = FlashSACQNetwork(envs, encoder=(qf1.encoder if args.share_encoder else None)).to(device)
-    actor = FlashSACActor(
-        envs, use_tanh=args.use_tanh, encoder=(qf1.encoder if args.share_encoder else None), detach_encoder=args.share_encoder
-    ).to(device)
+    # MR.Q encoder (state f + state-action g + MDP predictor), trained only by the auxiliary loss.
+    # A target copy provides the next-state embeddings for both the RL target and the dynamics target.
+    def make_encoder():
+        return MRQEncoder(
+            critic_obs_shape, action_dim,
+            zs_dim=args.zs_dim, za_dim=args.za_dim, zsa_dim=args.zsa_dim,
+            hidden_dim=args.encoder_hidden_dim, num_channels=args.encoder_num_channels,
+        ).to(device)
+
+    encoder = make_encoder()
+    encoder_target = make_encoder()
+    encoder_target.load_state_dict(encoder.state_dict())
+
+    qf1 = FlashSACQNetwork(args.zsa_dim).to(device)
+    qf2 = FlashSACQNetwork(args.zsa_dim).to(device)
+    actor = FlashSACActor(envs, args.zs_dim, use_tanh=args.use_tanh).to(device)
     zeta_cdf = _build_truncated_zeta_cdf(args.noise_repeat_zeta_mu, args.noise_repeat_zeta_max, device)
     noise_repeat_n = torch.ones((), dtype=torch.int32, device=device)
     noise_repeat_count = torch.zeros((), dtype=torch.int32, device=device)
     cached_noise = torch.randn((args.num_envs,) + envs.single_action_space.shape, device=device)
-    qf1_target = FlashSACQNetwork(envs).to(device)
-    qf2_target = FlashSACQNetwork(envs, encoder=(qf1_target.encoder if args.share_encoder else None)).to(device)
+    qf1_target = FlashSACQNetwork(args.zsa_dim).to(device)
+    qf2_target = FlashSACQNetwork(args.zsa_dim).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
+    encoder_optimizer = optim.AdamW(encoder.parameters(), lr=args.encoder_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
     q_optimizer = optim.AdamW(unique_params(qf1, qf2), lr=args.q_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    if args.share_encoder:
-        actor_params = [p for n, p in actor.named_parameters() if not n.startswith("encoder.")]
-    else:
-        actor_params = list(actor.parameters())
-    actor_optimizer = optim.AdamW(actor_params, lr=args.policy_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    actor_optimizer = optim.AdamW(actor.parameters(), lr=args.policy_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
 
-    # Normalize after init
+    # Normalize after init (FlashSAC unit-norm heads only; the MR.Q encoder uses plain params)
     actor.normalize_parameters()
     qf1.normalize_parameters()
     qf2.normalize_parameters()
@@ -707,8 +780,9 @@ if __name__ == "__main__":
                 policy_obs = normalize_obs(policy_obs, update=False)
 
         with torch.no_grad():
+            policy_zs = encoder.zs(policy_obs)
             actions, cached_noise, noise_repeat_count, noise_repeat_n = _sample_rollout_action(
-                actor, policy_obs, cached_noise, noise_repeat_count, noise_repeat_n, zeta_cdf, training=False
+                actor, policy_zs, cached_noise, noise_repeat_count, noise_repeat_n, zeta_cdf, training=False
             )
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -764,7 +838,7 @@ if __name__ == "__main__":
                 kl_ref_obs = rb.sample(args.batch_size).policy_observations
                 if args.obs_normalization:
                     kl_ref_obs = normalize_obs(kl_ref_obs, update=False)
-                old_mean, old_log_std = actor(kl_ref_obs, training=False)
+                old_mean, old_log_std = actor(encoder.zs(kl_ref_obs), training=False)
                 old_mean = old_mean.detach()
                 old_log_std = old_log_std.detach()
 
@@ -785,47 +859,59 @@ if __name__ == "__main__":
                 bootstrap = (~data.dones.bool()).float()
 
                 with torch.no_grad():
-                    next_state_actions, next_state_log_probs, _ = actor.get_action(next_policy_obs, training=False)
                     discount = args.gamma ** data.effective_n_steps
 
-                critic_obs_all = torch.cat([critic_obs, next_critic_obs], dim=0)
-                actions_all = torch.cat([data.actions, next_state_actions], dim=0)
+                # ── MR.Q encoders (online) + model-based auxiliary loss ──
+                # f/g/model are trained here only; value and policy read detached embeddings below.
+                zs_c = encoder.zs(critic_obs)                              # state embedding of s (critic view)
+                zsa = encoder.zsa(zs_c, data.actions)                     # state-action embedding of (s, a)
+                next_zs_hat, reward_hat, done_logit = encoder.predict(zsa)  # MDP predictions from zsa
 
                 with torch.no_grad():
-                    qf1_target_outputs_all = qf1_target(critic_obs_all, actions_all, training=True)
-                    qf2_target_outputs_all = qf2_target(critic_obs_all, actions_all, training=True)
-                    qf1_target_next_dist = F.softmax(qf1_target_outputs_all, dim=-1).chunk(2, dim=0)[1]
-                    qf2_target_next_dist = F.softmax(qf2_target_outputs_all, dim=-1).chunk(2, dim=0)[1]
+                    # Target embedding of the (n-step) next state, shared by the dynamics target here
+                    # and the RL target below. Target encoder is used for stability.
+                    next_zs_c_target = encoder_target.zs(next_critic_obs)
 
+                # data.rewards / data.dones are (B,) 1-D; reshape to (B, 1) to match the predictions
+                # (otherwise MSE/BCE would broadcast (B,1) vs (B,) into a (B, B) matrix).
+                dyn_loss = F.mse_loss(next_zs_hat, next_zs_c_target)
+                reward_loss = F.mse_loss(reward_hat, data.rewards.reshape(-1, 1))
+                done_loss = F.binary_cross_entropy_with_logits(done_logit, data.dones.reshape(-1, 1).float())
+                model_loss = (
+                    args.model_dynamics_coef * dyn_loss
+                    + args.model_reward_coef * reward_loss
+                    + args.model_done_coef * done_loss
+                )
+                encoder_optimizer.zero_grad()
+                model_loss.backward()
+                encoder_optimizer.step()
+
+                # ── FlashSAC C51 target on zsa (decoupled RL: value reads detached zsa) ──
+                with torch.no_grad():
+                    # Target action comes from the policy stream (policy always sees the policy-obs view).
+                    next_zs_pi = encoder_target.zs(next_policy_obs)
+                    next_state_actions, next_state_log_probs, _ = actor.get_action(next_zs_pi, training=False)
+                    next_zsa = encoder_target.zsa(next_zs_c_target, next_state_actions)
+                    qf1_target_next_dist = F.softmax(qf1_target(next_zsa, training=True), dim=-1)
+                    qf2_target_next_dist = F.softmax(qf2_target(next_zsa, training=True), dim=-1)
+                    reward_term = (
+                        data.rewards.squeeze(-1)
+                        - discount * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1)
+                    )
                     qf1_target_dist = qf1_target.projection(
-                        next_critic_obs,
-                        next_state_actions,
-                        data.rewards.squeeze(-1) - discount * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1),
-                        bootstrap.squeeze(-1),
-                        discount,
-                        training=True,
-                        next_dist=qf1_target_next_dist,
+                        next_zsa, reward_term, bootstrap.squeeze(-1), discount, training=True, next_dist=qf1_target_next_dist,
                     )
                     qf2_target_dist = qf2_target.projection(
-                        next_critic_obs,
-                        next_state_actions,
-                        data.rewards.squeeze(-1) - discount * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1),
-                        bootstrap.squeeze(-1),
-                        discount,
-                        training=True,
-                        next_dist=qf2_target_next_dist,
+                        next_zsa, reward_term, bootstrap.squeeze(-1), discount, training=True, next_dist=qf2_target_next_dist,
                     )
                     qf1_target_values = qf1_target.get_value(qf1_target_dist)
                     qf2_target_values = qf2_target.get_value(qf2_target_dist)
                     use_qf1 = (qf1_target_values <= qf2_target_values).unsqueeze(-1)
                     qf_target_dist = torch.where(use_qf1, qf1_target_dist, qf2_target_dist)
 
-                qf1_outputs_all = qf1(critic_obs_all, actions_all, training=True)
-                qf2_outputs_all = qf2(critic_obs_all, actions_all, training=True)
-                qf1_outputs = qf1_outputs_all.chunk(2, dim=0)[0]
-                qf2_outputs = qf2_outputs_all.chunk(2, dim=0)[0]
-                qf1_log_probs = F.log_softmax(qf1_outputs, dim=-1)
-                qf2_log_probs = F.log_softmax(qf2_outputs, dim=-1)
+                # Critic loss on the online zsa, detached from the encoder (value trains its own params only).
+                qf1_log_probs = F.log_softmax(qf1(zsa.detach(), training=True), dim=-1)
+                qf2_log_probs = F.log_softmax(qf2(zsa.detach(), training=True), dim=-1)
                 qf1_loss = -torch.sum(qf_target_dist * qf1_log_probs, dim=-1)
                 qf2_loss = -torch.sum(qf_target_dist * qf2_log_probs, dim=-1)
                 qf_loss = torch.stack([qf1_loss, qf2_loss]).mean(dim=1).sum(dim=0)
@@ -836,11 +922,17 @@ if __name__ == "__main__":
                 q_optimizer.step()
 
                 if update_step % args.policy_frequency == 0:
-                    pi, log_pi, _ = actor.get_action(policy_obs, training=True)
+                    # Decoupled policy update: the actor consumes the state embedding zs (detached from
+                    # the encoder). The proposed action is re-encoded through g so the critic can score
+                    # it; g's params are not in the actor optimizer, so only the actor is updated here.
+                    zs_pi = encoder.zs(policy_obs).detach()   # policy stream
+                    zs_c_detached = zs_c.detach()             # critic stream (reuse the online forward)
+                    pi, log_pi, _ = actor.get_action(zs_pi, training=True)
                     with torch.no_grad():
                         policy_entropy = -log_pi.mean()
-                    qf1_pi = qf1(critic_obs, pi, training=False)
-                    qf2_pi = qf2(critic_obs, pi, training=False)
+                    zsa_pi = encoder.zsa(zs_c_detached, pi)
+                    qf1_pi = qf1(zsa_pi, training=False)
+                    qf2_pi = qf2(zsa_pi, training=False)
                     qf1_probs = F.softmax(qf1_pi, dim=-1)
                     qf2_probs = F.softmax(qf2_pi, dim=-1)
                     qf1_value = qf1.get_value(qf1_probs)
@@ -854,7 +946,7 @@ if __name__ == "__main__":
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(policy_obs, training=False)
+                            _, log_pi, _ = actor.get_action(zs_pi, training=False)
                         alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
                         a_optimizer.zero_grad()
@@ -869,9 +961,11 @@ if __name__ == "__main__":
                 qf1.normalize_parameters()
                 qf2.normalize_parameters()
 
-                # update the target networks
+                # update the target networks (critics + MR.Q encoder)
                 if global_step % args.target_network_frequency == 0:
                     for param, target_param in unique_param_pairs((qf1, qf1_target), (qf2, qf2_target)):
+                        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                    for param, target_param in zip(encoder.parameters(), encoder_target.parameters()):
                         target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
             
         
@@ -880,7 +974,7 @@ if __name__ == "__main__":
             # pre-tanh space (valid regardless of use_tanh, since KL is invariant under a shared
             # deterministic bijection).
             with torch.no_grad():
-                new_mean, new_log_std = actor(kl_ref_obs, training=False)
+                new_mean, new_log_std = actor(encoder.zs(kl_ref_obs), training=False)
                 old_std = old_log_std.exp()
                 new_std = new_log_std.exp()
                 kl_old_policy = (
@@ -906,18 +1000,20 @@ if __name__ == "__main__":
 
                 h_bootstrap = (~h_data.dones.bool()).float()
                 with torch.no_grad():
-                    h_next_actions, h_next_log_probs, _ = actor.get_action(h_next_policy_obs, training=False)
+                    h_next_zs_pi = encoder_target.zs(h_next_policy_obs)
+                    h_next_actions, h_next_log_probs, _ = actor.get_action(h_next_zs_pi, training=False)
+                    h_next_zsa = encoder_target.zsa(encoder_target.zs(h_next_critic_obs), h_next_actions)
                     h_discount = args.gamma ** h_data.effective_n_steps
                     qf1_target_dist_h = qf1_target.projection(
-                        h_next_critic_obs,
-                        h_next_actions,
+                        h_next_zsa,
                         h_data.rewards.squeeze(-1) - h_discount * h_bootstrap.squeeze(-1) * log_alpha.exp() * h_next_log_probs.squeeze(-1),
                         h_bootstrap.squeeze(-1),
                         h_discount,
                         training=True,
                     )
+                    h_zsa = encoder.zsa(encoder.zs(h_critic_obs), h_data.actions)
 
-                qf1_outputs_h = qf1(h_critic_obs, h_data.actions, training=False)
+                qf1_outputs_h = qf1(h_zsa, training=False)
                 qf1_log_probs_h = F.log_softmax(qf1_outputs_h, dim=-1)
                 qf1_loss_h = (-torch.sum(qf1_target_dist_h * qf1_log_probs_h, dim=-1)).mean()
 
@@ -941,6 +1037,10 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf2_loss", qf2_loss.mean().item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                writer.add_scalar("losses/model_loss", model_loss.item(), global_step)
+                writer.add_scalar("losses/model_dynamics_loss", dyn_loss.item(), global_step)
+                writer.add_scalar("losses/model_reward_loss", reward_loss.item(), global_step)
+                writer.add_scalar("losses/model_done_loss", done_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 writer.add_scalar("metrics/kl_divergence", kl_old_policy.item(), global_step)
                 writer.add_scalar("metrics/policy_entropy", policy_entropy.item(), global_step)
@@ -1006,12 +1106,15 @@ if __name__ == "__main__":
                 ckpt_path = f"{ckpt_dir}/model_{global_step:010d}.pt"
                 ckpt = {
                     "actor": actor.state_dict(),
+                    "encoder": encoder.state_dict(),
+                    "encoder_target": encoder_target.state_dict(),
                     "qf1": qf1.state_dict(),
                     "qf2": qf2.state_dict(),
                     "qf1_target": qf1_target.state_dict(),
                     "qf2_target": qf2_target.state_dict(),
                     "actor_obs_normalizer": actor_obs_normalizer.state_dict() if args.obs_normalization else None,
                     "critic_obs_normalizer": critic_obs_normalizer.state_dict() if args.obs_normalization else None,
+                    "encoder_optimizer": encoder_optimizer.state_dict(),
                     "q_optimizer": q_optimizer.state_dict(),
                     "actor_optimizer": actor_optimizer.state_dict(),
                     "global_step": global_step,
@@ -1034,10 +1137,15 @@ if __name__ == "__main__":
         ckpt_path = f"{ckpt_dir}/model_final.pt"
         ckpt = {
             "actor": actor.state_dict(),
+            "encoder": encoder.state_dict(),
+            "encoder_target": encoder_target.state_dict(),
             "qf1": qf1.state_dict(),
             "qf2": qf2.state_dict(),
             "qf1_target": qf1_target.state_dict(),
             "qf2_target": qf2_target.state_dict(),
+            "actor_obs_normalizer": actor_obs_normalizer.state_dict() if args.obs_normalization else None,
+            "critic_obs_normalizer": critic_obs_normalizer.state_dict() if args.obs_normalization else None,
+            "encoder_optimizer": encoder_optimizer.state_dict(),
             "q_optimizer": q_optimizer.state_dict(),
             "actor_optimizer": actor_optimizer.state_dict(),
             "global_step": global_step,

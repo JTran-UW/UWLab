@@ -71,6 +71,10 @@ class AsymmetricReplayBufferSamples(NamedTuple):
     dones: th.Tensor
     rewards: th.Tensor
     effective_n_steps: th.Tensor
+    # Optional proprioception stream, present only when the task defines a "proprio" obs group
+    # (e.g. the grayscale/depth reaching tasks). Stays None for state-only tasks.
+    proprio_observations: th.Tensor | None = None
+    next_proprio_observations: th.Tensor | None = None
 
 def get_action_dim(action_space: spaces.Space) -> int:
     """
@@ -479,7 +483,26 @@ class AsymmetricReplayBuffer(BaseBuffer):
         n_steps: int = 1,
         gamma: float = 0.99,
         sample_device: th.device | str | None = None,
+        share_policy_critic_obs: bool = False,
+        store_next_obs: bool = True,
+        truncation_capacity_ratio: float = 0.05,
+        pin_memory: bool = True,
     ):
+        """
+        :param share_policy_critic_obs: store ONE image stream instead of separate policy/critic
+            copies. Only valid when the two groups are bitwise identical every step (true when they
+            wrap the same obs terms and no noise/corruption actually differs between them). Verified
+            on the first add(), which raises if they diverge. Halves image storage.
+        :param store_next_obs: if False, do not materialize next_* streams; recover them at sample
+            time as observations[t+1]. Halves image storage again. See the note below on why a small
+            terminal-observation side store is still required for exactness.
+        :param truncation_capacity_ratio: size of that side store, as a fraction of the buffer's
+            transition capacity. Only used when store_next_obs=False.
+        :param pin_memory: stage CPU->GPU sample transfers through reusable page-locked buffers,
+            avoiding the driver's bounce-buffer copy. Costs only batch_size worth of pinned memory,
+            not the whole buffer -- pinning the buffer would be pointless, since indexing it yields a
+            fresh pageable tensor anyway.
+        """
         super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
         self.sample_device = get_device(sample_device) if sample_device is not None else self.device
 
@@ -490,16 +513,73 @@ class AsymmetricReplayBuffer(BaseBuffer):
         if psutil is not None:
             mem_available = psutil.virtual_memory().available
 
-        self.policy_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["policy"]).prod()), device=device)
-        self.critic_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["critic"]).prod()), device=device)
+        policy_dim = int(np.array(self.obs_shape["policy"]).prod())
+        critic_dim = int(np.array(self.obs_shape["critic"]).prod())
+        self.share_policy_critic_obs = share_policy_critic_obs
+        self.store_next_obs = store_next_obs
+        self._shared_obs_verified = not share_policy_critic_obs
+        self.pin_memory = pin_memory
+        self._pinned_staging: dict[int, th.Tensor] = {}
 
-        # When optimizing memory, `observations` contains also the next observation
-        self.next_policy_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["policy"]).prod()), device=device)
-        self.next_critic_observations = th.zeros((self.buffer_size, self.n_envs, np.array(self.obs_shape["critic"]).prod()), device=device)
+        if share_policy_critic_obs and policy_dim != critic_dim:
+            raise ValueError(
+                f"share_policy_critic_obs=True needs matching policy/critic obs dims, got "
+                f"{policy_dim} vs {critic_dim}."
+            )
+
+        self.policy_observations = th.zeros((self.buffer_size, self.n_envs, policy_dim), device=device)
+        # Alias, not a copy: both names point at one allocation.
+        self.critic_observations = (
+            self.policy_observations
+            if share_policy_critic_obs
+            else th.zeros((self.buffer_size, self.n_envs, critic_dim), device=device)
+        )
+
+        if store_next_obs:
+            self.next_policy_observations = th.zeros((self.buffer_size, self.n_envs, policy_dim), device=device)
+            self.next_critic_observations = (
+                self.next_policy_observations
+                if share_policy_critic_obs
+                else th.zeros((self.buffer_size, self.n_envs, critic_dim), device=device)
+            )
+        else:
+            # next_obs[t] == observations[t+1] EXCEPT at truncations. The caller substitutes the true
+            # terminal observation into next_obs on truncated steps, while observations[t+1] holds the
+            # post-reset observation -- and truncations are NOT masked out of bootstrapping here
+            # (`dones` returns terminations only), so those targets would be silently wrong if we just
+            # indexed t+1. Terminations need no such care: the env auto-resets so next_obs is already
+            # observations[t+1], and bootstrap is zero for them anyway.
+            #
+            # Hence a compact side store holding terminal observations for truncated steps only --
+            # roughly one entry per episode per env, i.e. a few percent of a full next_* stream.
+            capacity = max(1, int(self.buffer_size * self.n_envs * truncation_capacity_ratio))
+            self.trunc_capacity = capacity
+            self.trunc_obs_policy = th.zeros((capacity, policy_dim), device=device)
+            self.trunc_obs_critic = (
+                self.trunc_obs_policy if share_policy_critic_obs else th.zeros((capacity, critic_dim), device=device)
+            )
+            # slot index per (step, env), -1 when that step was not a truncation
+            self.trunc_slot = th.full((self.buffer_size, self.n_envs), -1, dtype=th.long, device=device)
+            # which (step, env) each slot was written for, so a slot recycled by the ring can be
+            # detected as stale instead of silently returning another transition's observation
+            self.trunc_owner = th.full((capacity,), -1, dtype=th.long, device=device)
+            self.trunc_ptr = 0
+            self.trunc_live = 0          # truncations currently referenced by the main ring
+            self.trunc_stale_reads = 0   # backstop counter; should stay 0 now that the store grows
+            self.next_policy_observations = None
+            self.next_critic_observations = None
 
         self.actions = th.zeros(
             (self.buffer_size, self.n_envs, self.action_dim), dtype=th.float32, device=device
         )
+
+        # Optional proprioception stream: allocated only if the observation space declares a
+        # "proprio" group, so state-only tasks are unaffected and cost no extra memory.
+        self.has_proprio = isinstance(self.obs_shape, dict) and "proprio" in self.obs_shape
+        if self.has_proprio:
+            proprio_dim = np.array(self.obs_shape["proprio"]).prod()
+            self.proprio_observations = th.zeros((self.buffer_size, self.n_envs, proprio_dim), device=device)
+            self.next_proprio_observations = th.zeros((self.buffer_size, self.n_envs, proprio_dim), device=device)
 
         self.rewards = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=device)
         self.terminations = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=device)
@@ -508,6 +588,49 @@ class AsymmetricReplayBuffer(BaseBuffer):
         self.truncations = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=device)
         self.n_steps = n_steps
         self.gamma = gamma
+
+    def _grow_truncation_store(self, needed: int) -> None:
+        """Enlarge the terminal-observation store in place, preserving existing slot indices.
+
+        Capacity cannot be derived at construction time -- it depends on episode length, which the
+        buffer never sees -- so rather than make the user guess a ratio (and silently lose exactness
+        when they guess low), the store doubles on demand. Existing indices stay valid because this
+        only appends.
+        """
+        new_cap = max(int(needed), self.trunc_capacity * 2)
+        shared = self.share_policy_critic_obs
+        dev = self.trunc_slot.device
+
+        # Compact, don't merely extend. Extending leaves live entries scattered while trunc_ptr
+        # wraps modulo capacity, so the allocator can circle back onto occupied slots even though
+        # free ones exist elsewhere. The owner check then rejects the recycled slot and falls back
+        # to observations[t+1] -- wrong for exactly the truncated transitions this store exists to
+        # get right. Re-packing live entries into [0, L) restores the single contiguous free region
+        # the ring allocator assumes.
+        live_mask = self.trunc_slot >= 0
+        pos_env = live_mask.nonzero(as_tuple=False)  # (L, 2): rows of (step, env)
+        old_slots = self.trunc_slot[live_mask]
+        n_live = int(old_slots.numel())
+
+        def _repacked(src: th.Tensor) -> th.Tensor:
+            out = th.zeros((new_cap, src.shape[1]), dtype=src.dtype, device=src.device)
+            if n_live:
+                out[:n_live] = src[old_slots]
+            return out
+
+        self.trunc_obs_policy = _repacked(self.trunc_obs_policy)
+        self.trunc_obs_critic = self.trunc_obs_policy if shared else _repacked(self.trunc_obs_critic)
+
+        owner = th.full((new_cap,), -1, dtype=th.long, device=dev)
+        if n_live:
+            new_slots = th.arange(n_live, device=dev)
+            owner[new_slots] = pos_env[:, 0] * self.n_envs + pos_env[:, 1]
+            self.trunc_slot[live_mask] = new_slots
+        self.trunc_owner = owner
+
+        self.trunc_capacity = new_cap
+        self.trunc_ptr = n_live
+        self.trunc_live = n_live
 
     def add(
         self,
@@ -531,10 +654,70 @@ class AsymmetricReplayBuffer(BaseBuffer):
 
         # Copy to avoid modification by reference; flatten to match storage shape and move to
         # the buffer's storage device (may differ from the device incoming tensors live on).
-        self.policy_observations[self.pos] = obs["policy"].detach().reshape(self.n_envs, -1).to(self.device)
-        self.critic_observations[self.pos] = obs["critic"].detach().reshape(self.n_envs, -1).to(self.device)
-        self.next_policy_observations[self.pos] = next_obs["policy"].detach().reshape(self.n_envs, -1).to(self.device)
-        self.next_critic_observations[self.pos] = next_obs["critic"].detach().reshape(self.n_envs, -1).to(self.device)
+        # Every stream below is a device->host copy when the buffer lives on CPU, and for image
+        # observations that copy dominates add(). So fetch only what is actually stored: with
+        # share_policy_critic_obs + store_next_obs=False that is one stream instead of four, plus a
+        # handful of rows for truncations.
+        def _to_buf(t: th.Tensor) -> th.Tensor:
+            return t.detach().reshape(self.n_envs, -1).to(self.device)
+
+        pol = _to_buf(obs["policy"])
+
+        if not self._shared_obs_verified:
+            # One-time check: sharing the allocation is only sound if the two groups really are
+            # identical. Fail loudly here rather than train on silently-wrong critic observations.
+            # Costs one extra full transfer, once.
+            if not (
+                th.equal(pol, _to_buf(obs["critic"]))
+                and th.equal(_to_buf(next_obs["policy"]), _to_buf(next_obs["critic"]))
+            ):
+                raise ValueError(
+                    "share_policy_critic_obs=True but the policy and critic observation groups "
+                    "differ. They must be bitwise identical (same terms, no differing corruption)."
+                )
+            self._shared_obs_verified = True
+
+        self.policy_observations[self.pos] = pol
+        if not self.share_policy_critic_obs:
+            self.critic_observations[self.pos] = _to_buf(obs["critic"])
+
+        if self.store_next_obs:
+            self.next_policy_observations[self.pos] = _to_buf(next_obs["policy"])
+            if not self.share_policy_critic_obs:
+                self.next_critic_observations[self.pos] = _to_buf(next_obs["critic"])
+        else:
+            # This ring position is being overwritten, so any terminal obs recorded for it is dead
+            # and its slots are free again.
+            self.trunc_live -= int((self.trunc_slot[self.pos] >= 0).sum())
+            self.trunc_slot[self.pos] = -1
+            trunc_src = th.nonzero(truncation.detach().reshape(-1).bool(), as_tuple=False).flatten()
+            if trunc_src.numel() > 0:
+                n = int(trunc_src.numel())
+                # Slice on the source device first: only the truncated rows cross the bus, rather
+                # than a full next_obs stream every step for the sake of a handful of episodes.
+                sel_pol = next_obs["policy"].detach().reshape(self.n_envs, -1)[trunc_src].to(self.device)
+                sel_cri = (
+                    None
+                    if self.share_policy_critic_obs
+                    else next_obs["critic"].detach().reshape(self.n_envs, -1)[trunc_src].to(self.device)
+                )
+                trunc_envs = trunc_src.to(self.device)
+                if self.trunc_live + n > self.trunc_capacity:
+                    self._grow_truncation_store(self.trunc_live + n)
+                slots = (th.arange(n, device=self.device) + self.trunc_ptr) % self.trunc_capacity
+                self.trunc_obs_policy[slots] = sel_pol
+                if not self.share_policy_critic_obs:
+                    self.trunc_obs_critic[slots] = sel_cri
+                self.trunc_slot[self.pos, trunc_envs] = slots
+                self.trunc_owner[slots] = self.pos * self.n_envs + trunc_envs
+                self.trunc_ptr = (self.trunc_ptr + n) % self.trunc_capacity
+                self.trunc_live += n
+
+        if self.has_proprio:
+            self.proprio_observations[self.pos] = obs["proprio"].detach().reshape(self.n_envs, -1).to(self.device)
+            self.next_proprio_observations[self.pos] = (
+                next_obs["proprio"].detach().reshape(self.n_envs, -1).to(self.device)
+            )
 
         self.actions[self.pos] = action.detach().to(self.device)
         self.rewards[self.pos] = reward.detach().to(self.device)
@@ -565,8 +748,22 @@ class AsymmetricReplayBuffer(BaseBuffer):
         else:
             # sample only up to self.pos - self.n_steps + 1
             upper_bound = self.pos - self.n_steps + 1
-        
-        batch_inds = th.randint(0, upper_bound, (batch_size, ), device=self.device) % self.buffer_size
+
+        if self.store_next_obs:
+            batch_inds = th.randint(0, upper_bound, (batch_size, ), device=self.device) % self.buffer_size
+        else:
+            # Reconstructing next_obs as observations[t+1] means index self.pos is poison: when full
+            # it holds the oldest entry (a lap behind, not t+1); before that it is uninitialized. The
+            # n-step window can reach batch_inds + n_steps, so keep that whole span clear of it.
+            if self.full:
+                span = max(self.buffer_size - self.n_steps - 1, 1)
+                batch_inds = (
+                    self.pos + 1 + th.randint(0, span, (batch_size,), device=self.device)
+                ) % self.buffer_size
+            else:
+                batch_inds = th.randint(
+                    0, max(upper_bound - 1, 1), (batch_size,), device=self.device
+                ) % self.buffer_size
         samples = self._get_samples(batch_inds)
         if self.full:
             self.truncations[self.pos - 1, :] = current_truncations
@@ -597,19 +794,101 @@ class AsymmetricReplayBuffer(BaseBuffer):
         first_done = th.where(no_done, self.n_steps - 1, first_done)
 
         next_inds = (batch_inds + first_done) % self.buffer_size
+
+        if self.store_next_obs:
+            next_pol = self.next_policy_observations[next_inds, env_indices]
+            next_cri = self.next_critic_observations[next_inds, env_indices]
+        else:
+            # next_obs[t] = observations[t+1], with truncated steps patched from the side store.
+            plus1 = (next_inds + 1) % self.buffer_size
+            next_pol = self.policy_observations[plus1, env_indices]
+            next_cri = next_pol if self.share_policy_critic_obs else self.critic_observations[plus1, env_indices]
+
+            slot = self.trunc_slot[next_inds, env_indices]
+            safe = slot.clamp(min=0)
+            # A slot is usable only if it still belongs to this exact (step, env): the ring may have
+            # recycled it for a newer truncation, in which case fall back to observations[t+1].
+            valid = (slot >= 0) & (self.trunc_owner[safe] == next_inds * self.n_envs + env_indices)
+            if bool(valid.any()):
+                mask = valid.unsqueeze(-1)
+                next_pol = th.where(mask, self.trunc_obs_policy[safe], next_pol)
+                # Re-alias rather than running an identical where(): th.where allocates, which would
+                # otherwise split the shared stream back into two tensors and cost a second transfer.
+                next_cri = (
+                    next_pol
+                    if self.share_policy_critic_obs
+                    else th.where(mask, self.trunc_obs_critic[safe], next_cri)
+                )
+            stale = int((slot >= 0).sum()) - int(valid.sum())
+            if stale:
+                self.trunc_stale_reads += stale
+
+        # When the two streams are aliased, gather once and hand back the same tensor for both:
+        # otherwise the identical rows are gathered twice and cross the bus twice.
+        pol_batch = self.policy_observations[batch_inds, env_indices]
+        cri_batch = pol_batch if self.share_policy_critic_obs else self.critic_observations[batch_inds, env_indices]
+
         data = (
-            self.policy_observations[batch_inds, env_indices],
-            self.critic_observations[batch_inds, env_indices],
+            pol_batch,
+            cri_batch,
             self.actions[batch_inds, env_indices],
-            self.next_policy_observations[next_inds, env_indices],
-            self.next_critic_observations[next_inds, env_indices],
+            next_pol,
+            next_cri,
             self.terminations[next_inds, env_indices],
             n_step_rewards,
             effective_n_steps
         )
+        if self.has_proprio:
+            # Appended last so the positional AsymmetricReplayBufferSamples(*data) construction keeps
+            # working unchanged for tasks without a proprio group (fields default to None).
+            data = data + (
+                self.proprio_observations[batch_inds, env_indices],
+                self.next_proprio_observations[next_inds, env_indices],
+            )
         if self.sample_device != self.device:
-            data = tuple(t.to(self.sample_device) for t in data)
+            data = self._to_sample_device(data)
         return AsymmetricReplayBufferSamples(*data)
+
+    def _to_sample_device(self, tensors: tuple) -> tuple:
+        """Move a gathered batch to the sample device, staging through pinned host memory.
+
+        Pinning the buffer storage itself would achieve nothing: advanced indexing allocates a fresh
+        pageable tensor, so it is the *gather output* that crosses the bus. A pageable copy makes the
+        driver stage through an internal bounce buffer; copying into our own reusable page-locked
+        staging tensor first lets the DMA read host memory directly.
+
+        Transfers are issued blocking on purpose. Reusing one staging tensor per stream is only safe
+        if the previous DMA has finished before the next copy_ overwrites it, and a host-side write
+        is not ordered against an async copy already queued on the stream.
+        """
+        seen: dict[int, th.Tensor] = {}
+        out = []
+        for t in tensors:
+            if t is None:
+                out.append(None)
+                continue
+            if id(t) in seen:  # aliased streams (shared policy/critic) move once
+                out.append(seen[id(t)])
+                continue
+            moved = self._move_to_sample_device(t, len(out))
+            seen[id(t)] = moved
+            out.append(moved)
+        return tuple(out)
+
+    def _move_to_sample_device(self, t: th.Tensor, key: int) -> th.Tensor:
+        if not self.pin_memory or t.device.type != "cpu" or self.sample_device.type != "cuda":
+            return t.to(self.sample_device)
+        staging = self._pinned_staging.get(key)
+        if staging is None or staging.shape != t.shape or staging.dtype != t.dtype:
+            try:
+                staging = th.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            except RuntimeError:
+                # No CUDA host allocator available -- fall back permanently rather than retry.
+                self.pin_memory = False
+                return t.to(self.sample_device)
+            self._pinned_staging[key] = staging
+        staging.copy_(t)
+        return staging.to(self.sample_device)
 
 
 class RolloutBuffer(BaseBuffer):
@@ -790,3 +1069,88 @@ class RolloutBuffer(BaseBuffer):
             self.returns[batch_inds].flatten(),
         )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+
+
+def load_expert_replay_buffer(
+    path: str,
+    device: th.device | str = "cpu",
+    sample_device: th.device | str | None = None,
+    n_steps: int | None = None,
+    gamma: float | None = None,
+) -> "AsymmetricReplayBuffer":
+    """Rebuild an AsymmetricReplayBuffer from a payload written by collect_expert_replay_buffer.py.
+
+    Restores whichever layout it was saved in (shared policy/critic, dense vs reconstructed next_*,
+    proprio present or not) and, for the compact layout, rebuilds the truncation side store at the
+    capacity it grew to during collection -- saved slot indices would otherwise point past the end of
+    a default-sized store. ``n_steps``/``gamma`` override the recorded values so an expert buffer can
+    be replayed at the consumer's n-step horizon rather than the collector's.
+    """
+    # Always land the payload on the HOST, never on `device`. Loading straight to the GPU means the
+    # th.load payload and the buffer it is copied into are both resident at once -- a 9.7 GiB file
+    # peaks near 19 GiB of VRAM, which is what put both-buffers-on-GPU out of reach on a 44 GiB
+    # l40s despite a steady-state footprint that fits comfortably. Staged through host memory the
+    # peak is just the buffer itself; the copies below go straight from CPU into the device tensors.
+    payload = th.load(path, map_location="cpu", weights_only=False)
+    meta, tensors = payload["metadata"], payload["buffer_tensors"]
+
+    obs_space = spaces.Dict(
+        {
+            "policy": spaces.Box(low=-np.inf, high=np.inf, shape=(meta["n_obs"],)),
+            "critic": spaces.Box(low=-np.inf, high=np.inf, shape=(meta["n_critic_obs"],)),
+        }
+    )
+    if meta.get("n_proprio"):
+        obs_space.spaces["proprio"] = spaces.Box(low=-np.inf, high=np.inf, shape=(meta["n_proprio"],))
+    action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(meta["n_act"],))
+
+    share = meta.get("share_policy_critic_obs", False)
+    store_next = meta.get("store_next_obs", True)
+    rb = AsymmetricReplayBuffer(
+        meta["buffer_size"] * meta["n_envs"],
+        obs_space,
+        action_space,
+        device,
+        n_envs=meta["n_envs"],
+        n_steps=meta["n_steps"] if n_steps is None else n_steps,
+        gamma=meta["gamma"] if gamma is None else gamma,
+        sample_device=sample_device,
+        share_policy_critic_obs=share,
+        store_next_obs=store_next,
+    )
+
+    names = ["policy_observations", "actions", "rewards", "terminations", "truncations"]
+    if not share:
+        names.append("critic_observations")
+    if meta.get("n_proprio"):
+        names += ["proprio_observations", "next_proprio_observations"]
+    if store_next:
+        names.append("next_policy_observations")
+        if not share:
+            names.append("next_critic_observations")
+    for name in names:
+        getattr(rb, name).copy_(tensors[name])          # CPU -> device, no GPU temporary
+
+    if not store_next:
+        cap = int(tensors["trunc_capacity"])
+        if cap != rb.trunc_capacity:
+            rb._grow_truncation_store(cap)
+        rb.trunc_obs_policy[:cap].copy_(tensors["trunc_obs_policy"])
+        if not share:
+            rb.trunc_obs_critic[:cap].copy_(tensors["trunc_obs_critic"])
+        rb.trunc_slot.copy_(tensors["trunc_slot"])
+        rb.trunc_owner[:cap].copy_(tensors["trunc_owner"])
+        rb.trunc_ptr = int(tensors["trunc_ptr"])
+        rb.trunc_live = int(tensors["trunc_live"])
+
+    rb.pos = tensors["pos"]
+    rb.full = tensors["full"]
+    rb._shared_obs_verified = True  # restored buffers never call add()
+    return rb
+
+
+def cat_samples(a: AsymmetricReplayBufferSamples, b: AsymmetricReplayBufferSamples):
+    """Concatenate two sample batches field-wise, preserving None for absent optional streams."""
+    return AsymmetricReplayBufferSamples(
+        *[None if x is None or y is None else th.cat([x, y], dim=0) for x, y in zip(a, b)]
+    )

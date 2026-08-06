@@ -77,6 +77,28 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--record_actor_obs_keys",
+    type=str,
+    nargs="+",
+    default=None,
+    help=(
+        "Env observation group(s) to store as the recorded actor observations. Defaults to the "
+        "groups the loaded policy acts from. Set this to record data for a task whose policy "
+        "obs differ from the expert's (e.g. expert acts on state, record depth/grayscale)."
+    ),
+)
+parser.add_argument(
+    "--record_critic_obs_keys",
+    type=str,
+    nargs="+",
+    default=None,
+    help=(
+        "Env observation group(s) to store as the recorded critic observations. Defaults to the "
+        "loaded policy's critic groups. Keep the env's `critic` group matching the checkpoint so "
+        "it loads, and point this at an extra group (e.g. `critic_no_priv`) to record something else."
+    ),
+)
+parser.add_argument(
     "--single_env_rb",
     action="store_true",
     default=False,
@@ -89,10 +111,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
-    "--eval",
+    "--eval_episodes_per_env",
     type=int,
     default=None,
-    help="If set, run evaluation for this many episodes (across all envs) and report success rate, then exit.",
+    help=(
+        "If set, run evaluation until EVERY env has completed this many episodes, then report the "
+        "success rate and exit. Counted per env rather than as a global total: success is a "
+        "termination, so successful episodes are shorter and recur more often within a fixed "
+        "stepping window -- a global target fills up with them and inflates the success rate."
+    ),
 )
 parser.add_argument(
     "--plot_ee",
@@ -154,6 +181,56 @@ from uwlab_tasks.utils.hydra import hydra_task_config
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
+def _flatten_obs_groups(obs_td, keys: list[str]) -> torch.Tensor:
+    """Concatenate observation groups into the flat (n_env, D) layout the FastSAC agent expects.
+
+    Vector groups are already (n_env, D) and pass through untouched. Image groups arrive with rank
+    > 2 -- the grayscale rig gives (n_env, history, cameras, H, W) -- and a plain ``cat(..., dim=-1)``
+    would concatenate along W and then read ``shape[-1]`` as the width, sizing the buffer wrong.
+
+    Flattening each group and concatenating in ``keys`` order reproduces exactly the layout
+    ``FastSACAgent.setup`` assumes when it builds ``actor_obs_indices``: groups laid out
+    contiguously in ``actor_obs_keys`` order, each of size ``obs_dim * history_length``. ``CNNActor``
+    then slices its ``encoder_obs_key`` range back out and ``.view(N, *encoder_obs_shape)`` it, so
+    the flatten here and the view there are inverses as long as the key order matches.
+    """
+    return torch.cat([obs_td[k].reshape(obs_td[k].shape[0], -1) for k in keys], dim=-1)
+
+
+def resolve_record_obs_keys(
+    env, policy_actor_keys: list[str], policy_critic_keys: list[str]
+) -> tuple[list[str], list[str]]:
+    """Pick which env observation groups get *recorded*, independent of which the policy *acts* from.
+
+    Defaults to the policy's own groups (unchanged behaviour). ``--record_actor_obs_keys`` /
+    ``--record_critic_obs_keys`` override them, which is what lets one expert generate data for a
+    different task: the expert keeps consuming the groups it was trained on while the buffer stores
+    the target task's groups. Requires a single env exposing both sets of groups.
+    """
+    actor_keys = args_cli.record_actor_obs_keys or policy_actor_keys
+    critic_keys = args_cli.record_critic_obs_keys or policy_critic_keys
+
+    # Validate against manager metadata, not get_observations(): ObservationManager.compute()
+    # appends to each term's history CircularBuffer, so an extra call here would push a duplicate
+    # frame into history_length>1 groups and skew the first recorded transitions.
+    obs_manager = getattr(env.unwrapped, "observation_manager", None)
+    if obs_manager is not None:
+        available = list(obs_manager.active_terms.keys())
+        missing = [k for k in (*actor_keys, *critic_keys) if k not in available]
+        if missing:
+            raise ValueError(
+                f"Requested observation group(s) {missing} are not produced by task '{args_cli.task}'. "
+                f"Available groups: {available}. Add them to the task's ObservationsCfg (see the "
+                f"data-collection configs) or pick from the available groups."
+            )
+    if actor_keys != policy_actor_keys or critic_keys != policy_critic_keys:
+        print(
+            f"[INFO] Recording obs groups actor={actor_keys}, critic={critic_keys} "
+            f"(policy acts from actor={policy_actor_keys}, critic={policy_critic_keys})"
+        )
+    return list(actor_keys), list(critic_keys)
+
+
 def record_transitions_to_replay_buffer(
     env,
     policy,
@@ -196,8 +273,8 @@ def record_transitions_to_replay_buffer(
 
     # Initial obs
     obs_td = env.get_observations().to(device)
-    actor_obs = torch.cat([obs_td[g] for g in actor_obs_keys], dim=-1)
-    critic_obs = torch.cat([obs_td[g] for g in critic_obs_keys], dim=-1)
+    actor_obs = _flatten_obs_groups(obs_td, actor_obs_keys)
+    critic_obs = _flatten_obs_groups(obs_td, critic_obs_keys)
     n_obs = actor_obs.shape[-1]
     n_critic_obs = critic_obs.shape[-1]
 
@@ -231,8 +308,8 @@ def record_transitions_to_replay_buffer(
             )
             truncations = truncations.to(device).long()
 
-            next_actor_obs = torch.cat([next_obs_td[g] for g in actor_obs_keys], dim=-1)
-            next_critic_obs = torch.cat([next_obs_td[g] for g in critic_obs_keys], dim=-1)
+            next_actor_obs = _flatten_obs_groups(next_obs_td, actor_obs_keys)
+            next_critic_obs = _flatten_obs_groups(next_obs_td, critic_obs_keys)
 
             transition = TensorDict(
                 {
@@ -421,12 +498,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 a_obs = torch.cat([obs_td[k] for k in actor_obs_keys], dim=-1)
                 return policy({"actor_obs": a_obs})
 
+            rec_actor_keys, rec_critic_keys = resolve_record_obs_keys(env, actor_obs_keys, critic_obs_keys)
             output_path = args_cli.transitions_output or os.path.join(log_dir, "play_transitions.pt")
             record_transitions_to_replay_buffer(
                 env=env,
                 policy=fastsac_sample_policy,
-                actor_obs_keys=actor_obs_keys,
-                critic_obs_keys=critic_obs_keys,
+                actor_obs_keys=rec_actor_keys,
+                critic_obs_keys=rec_critic_keys,
                 num_steps=args_cli.record_transitions,
                 output_path=output_path,
                 task_name=args_cli.task,
@@ -449,12 +527,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Optional: record transitions into a replay buffer and exit
         if args_cli.record_transitions is not None and args_cli.record_transitions > 0:
             # policy = runner.get_inference_policy_sample(device=env.unwrapped.device)
+            rec_actor_keys, rec_critic_keys = resolve_record_obs_keys(env, ppo_actor_keys, ppo_critic_keys)
             output_path = args_cli.transitions_output or os.path.join(log_dir, "play_transitions.pt")
             record_transitions_to_replay_buffer(
                 env=env,
                 policy=policy,
-                actor_obs_keys=ppo_actor_keys,
-                critic_obs_keys=ppo_critic_keys,
+                actor_obs_keys=rec_actor_keys,
+                critic_obs_keys=rec_critic_keys,
                 num_steps=args_cli.record_transitions,
                 output_path=output_path,
                 task_name=args_cli.task,
@@ -515,7 +594,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # frame: pos_norm < pos_thresh AND |aa_x|+|aa_y| < orient_thresh (approximates the
     # exact Euler-XY L1 used by the reward; matches it well near success). An episode
     # counts as success if any of its steps satisfied the check.
-    if args_cli.eval is not None:
+    if args_cli.eval_episodes_per_env is not None:
         obs_mgr = env.unwrapped.observation_manager
         term_names = list(obs_mgr.active_terms["policy"])
         term_dims = list(obs_mgr.group_obs_term_dim["policy"])
@@ -537,11 +616,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[eval] success check: pos_norm < {POS_THRESH}  AND  |aa_x|+|aa_y| < {ORIENT_THRESH}")
         print(f"[eval] ins_in_rec newest slice: [{ins_newest_start}:{ins_block_end}]")
 
-        target_episodes = args_cli.eval
-        total_episodes = 0
-        successful_episodes = 0
+        # Episode outcome codes, shared by the printed breakdown and the scatter plot.
+        OUTCOME_SUCCESS, OUTCOME_TIMEOUT, OUTCOME_ABNORMAL, OUTCOME_OTHER = 0, 1, 2, 3
+        OUTCOME_STYLE = {
+            OUTCOME_SUCCESS: ("green", "success"),
+            OUTCOME_TIMEOUT: ("red", "timeout"),
+            OUTCOME_ABNORMAL: ("orange", "abnormal_robot"),
+            OUTCOME_OTHER: ("gray", "other"),
+        }
+
+        episodes_per_env = args_cli.eval_episodes_per_env
         device = env.unwrapped.device
         ever_success = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+        # Per-env tallies, not global sums. Envs that finish early keep stepping, but their surplus
+        # episodes are discarded, so every env contributes exactly `episodes_per_env` to the rate.
+        ep_count = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+        succ_count = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+        # Failure breakdown. Which termination actually fired is read per-term off the
+        # TerminationManager rather than inferred, so an episode that ended for some third reason
+        # (e.g. `first_episode_termination` left enabled) shows up as "other" instead of being
+        # silently lumped into timeouts.
+        timeout_count = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+        abnormal_count = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+        other_count = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+        term_mgr = env.unwrapped.termination_manager
+        term_names = list(term_mgr.active_terms)
+        has_timeout = "time_out" in term_names
+        has_abnormal = "abnormal_robot" in term_names
+        print(f"[eval] termination terms: {term_names}")
+        if not has_timeout or not has_abnormal:
+            print(
+                "[eval] WARNING: expected 'time_out' and 'abnormal_robot' terms; missing ones will "
+                "be reported under 'other'."
+            )
+        zeros_b = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
 
         # Per-episode initial peg (insertive_object) xyz in env-local frame.
         # Captured at episode start; refreshed after each done.
@@ -550,12 +658,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_origins = env.unwrapped.scene.env_origins  # [num_envs, 3]
         init_peg_xyz = (insertive.data.root_pos_w - env_origins)[:, :3].clone()
         peghole_xyz_env0 = (receptive.data.root_pos_w[0] - env_origins[0])[:3].cpu().numpy()
-        # Collected per completed episode: (x, y, z, success_bool)
+        # Collected per completed episode: (x, y, z) and an outcome code from OUTCOME_*.
         episode_init_xyzs: list[torch.Tensor] = []
-        episode_successes: list[bool] = []
+        episode_outcomes: list[int] = []
 
-        pbar = tqdm.tqdm(total=target_episodes, desc="Eval episodes", unit="ep")
-        while total_episodes < target_episodes:
+        pbar = tqdm.tqdm(total=episodes_per_env * env.num_envs, desc="Eval episodes", unit="ep")
+        while bool((ep_count < episodes_per_env).any()):
             with torch.inference_mode():
                 if is_fastsac:
                     actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=1)
@@ -576,42 +684,92 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     print(f"new success at: {torch.argwhere(~before_es & ever_success)}")
                 
             done_mask = dones.bool()
-            successes = ever_success & done_mask
-            n_done = int(done_mask.sum().item())
-            n_success = int(successes.sum().item())
-            total_episodes += n_done
-            successful_episodes += n_success
-            pbar.update(n_done)
+            # Only an env's first `episodes_per_env` episodes count. Dropping the surplus is what
+            # removes the length bias: without this gate, envs whose episodes end early (i.e.
+            # succeed) recycle faster and contribute more samples than envs that run to timeout.
+            counting = done_mask & (ep_count < episodes_per_env)
+            successes = ever_success & counting
+            ep_count += counting.long()
+            succ_count += successes.long()
+            n_counted = int(counting.sum().item())
+            pbar.update(n_counted)
 
-            # Record (init_xy, success) for each env that just finished an episode,
-            # then refresh init_peg_xy for those envs from the new post-reset peg pose.
-            if n_done > 0:
-                done_idx = torch.nonzero(done_mask, as_tuple=False).flatten()
-                xyz_cpu = init_peg_xyz[done_idx].cpu()
-                succ_cpu = successes[done_idx].cpu()
-                for k in range(done_idx.numel()):
+            # Classify each counted episode into exactly one bucket. Read the per-term flags now:
+            # they describe the step that just ended, before the next compute() overwrites them.
+            # Success wins over any termination flag, and abnormal_robot wins over time_out so a
+            # robot that blows up on the very last step is not filed as a clean timeout.
+            failed = counting & ~successes
+            timed_out = term_mgr.get_term("time_out").bool() if has_timeout else zeros_b
+            abnormal = term_mgr.get_term("abnormal_robot").bool() if has_abnormal else zeros_b
+            abnormal_f = failed & abnormal
+            timeout_f = failed & timed_out & ~abnormal
+            abnormal_count += abnormal_f.long()
+            timeout_count += timeout_f.long()
+            other_count += (failed & ~abnormal_f & ~timeout_f).long()
+
+            # Record (init_xyz, outcome) for each episode that counted. Outcome uses the same
+            # buckets as the printed breakdown, so plot and report can never disagree.
+            if n_counted > 0:
+                outcome = torch.full_like(ep_count, OUTCOME_OTHER)
+                outcome[successes] = OUTCOME_SUCCESS
+                outcome[timeout_f] = OUTCOME_TIMEOUT
+                outcome[abnormal_f] = OUTCOME_ABNORMAL
+                counted_idx = torch.nonzero(counting, as_tuple=False).flatten()
+                xyz_cpu = init_peg_xyz[counted_idx].cpu()
+                out_cpu = outcome[counted_idx].cpu()
+                for k in range(counted_idx.numel()):
                     episode_init_xyzs.append(xyz_cpu[k])
-                    episode_successes.append(bool(succ_cpu[k]))
+                    episode_outcomes.append(int(out_cpu[k]))
+            # Refresh on EVERY done, not just counted ones: the env resets regardless, so a stale
+            # init pose would otherwise be attributed to a later episode that does count.
+            if bool(done_mask.any()):
                 new_xyz = (insertive.data.root_pos_w - env_origins)[:, :3]
                 init_peg_xyz[done_mask] = new_xyz[done_mask]
             # Reset success flag for envs that just finished an episode.
             ever_success[done_mask] = False
-        
+
         pbar.close()
+        total_episodes = int(ep_count.sum().item())
+        successful_episodes = int(succ_count.sum().item())
+        n_timeout = int(timeout_count.sum().item())
+        n_abnormal = int(abnormal_count.sum().item())
+        n_other = int(other_count.sum().item())
         success_rate = successful_episodes / total_episodes if total_episodes > 0 else 0.0
+        pct = lambda n: (n / total_episodes if total_episodes > 0 else 0.0)
         print(f"\n[EVAL] Episodes: {total_episodes}  |  Successes: {successful_episodes}  |  Success rate: {success_rate:.2%}")
+        print(f"[EVAL] Failure breakdown ({total_episodes - successful_episodes} failures):")
+        print(f"[EVAL]   timeout        : {n_timeout:6d}  ({pct(n_timeout):.2%} of episodes)")
+        print(f"[EVAL]   abnormal_robot : {n_abnormal:6d}  ({pct(n_abnormal):.2%} of episodes)")
+        print(f"[EVAL]   other          : {n_other:6d}  ({pct(n_other):.2%} of episodes)")
+        if n_other:
+            print(
+                "[EVAL]   NOTE: 'other' means an episode ended on neither time_out nor "
+                "abnormal_robot -- most often first_episode_termination left enabled. Disable it "
+                "with env.terminations.first_episode_termination=null."
+            )
+        # Buckets partition the counted episodes; a mismatch means an episode was double-counted or
+        # missed, which would silently corrupt every rate above.
+        assert successful_episodes + n_timeout + n_abnormal + n_other == total_episodes, (
+            f"bucket mismatch: {successful_episodes}+{n_timeout}+{n_abnormal}+{n_other} "
+            f"!= {total_episodes}"
+        )
 
         # Plot 3D initial peg positions colored by episode outcome.
         if len(episode_init_xyzs) > 0:
             import matplotlib.pyplot as plt
             xyzs = torch.stack(episode_init_xyzs).numpy()
-            successes_np = torch.tensor(episode_successes).numpy()
+            outcomes_np = torch.tensor(episode_outcomes).numpy()
             fig = plt.figure(figsize=(8, 7))
             ax = fig.add_subplot(111, projection="3d")
-            # ax.scatter(xyzs[successes_np, 0], xyzs[successes_np, 1], xyzs[successes_np, 2],
-            #            c="green", s=18, alpha=0.7, label=f"success ({int(successes_np.sum())})")
-            ax.scatter(xyzs[~successes_np, 0], xyzs[~successes_np, 1], xyzs[~successes_np, 2],
-                       c="red", s=18, alpha=0.7, label=f"failure ({int((~successes_np).sum())})")
+            # One scatter per outcome. Abnormal is drawn last so the rare orange points land on top
+            # of the dense success/timeout clouds instead of being hidden inside them.
+            for code in (OUTCOME_SUCCESS, OUTCOME_TIMEOUT, OUTCOME_OTHER, OUTCOME_ABNORMAL):
+                sel = outcomes_np == code
+                if not sel.any():
+                    continue
+                color, label = OUTCOME_STYLE[code]
+                ax.scatter(xyzs[sel, 0], xyzs[sel, 1], xyzs[sel, 2],
+                           c=color, s=18, alpha=0.7, label=f"{label} ({int(sel.sum())})")
             ax.scatter(peghole_xyz_env0[0], peghole_xyz_env0[1], peghole_xyz_env0[2],
                        c="blue", s=200, marker="*", label="peghole (env 0)", zorder=10)
             ax.set_xlabel("x (m, env-local)")
