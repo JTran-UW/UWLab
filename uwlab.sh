@@ -582,15 +582,47 @@ while [[ $# -gt 0 ]]; do
             export -f extract_pip_command
             export -f extract_pip_uninstall_command
             export -f install_uwlab_extension
-            # --- NEW: install upstream isaaclab (GitHub main, editable) ---
-            echo "[INFO] Installing upstream IsaacLab packages from GitHub (main) in editable mode into ${UWLAB_PATH}/_isaaclab ..."
+            # --- install upstream isaaclab (PINNED commit, editable) ---
+            #
+            # Pinned deliberately; do not switch this back to tracking main.
+            # IsaacLab bumped its rsl-rl-lib requirement 3.1.2 -> 5.0.1 between
+            # 2026-02-15 and 2026-03-10, and added an `optimizer` field to
+            # RslRlPpoAlgorithmCfg. UWLab targets the 3.1.2 API (see
+            # source/uwlab_rl/setup.py), so tracking IsaacLab main breaks every
+            # fresh install with one of:
+            #
+            #   TypeError: PPO.__init__() got an unexpected keyword argument 'optimizer'
+            #       (rsl-rl 3.1.2 with a newer IsaacLab passing `optimizer`)
+            #   KeyError: 'class_name' in PPO.construct_algorithm
+            #       (rsl-rl 5.0.1, which wants a cfg["actor"] schema UWLab does
+            #        not emit)
+            #
+            # Neither failure names IsaacLab, so this is expensive to diagnose:
+            # it cost a full night of downtime on 2026-08-15.
+            #
+            # To upgrade: bump this commit AND the rsl-rl-lib pin in
+            # source/uwlab_rl/setup.py together, then verify training runs.
+            ISAACLAB_COMMIT="${UWLAB_ISAACLAB_COMMIT:-2f91d7dd2994246505602526b32ac67ff758d472}"
+            echo "[INFO] Installing upstream IsaacLab (pinned ${ISAACLAB_COMMIT:0:9}) in editable mode into ${UWLAB_PATH}/_isaaclab ..."
             repo_root="${UWLAB_PATH}/_isaaclab/IsaacLab"
             mkdir -p "${UWLAB_PATH}/_isaaclab"
             if [ ! -d "${repo_root}/.git" ]; then
-                echo "[INFO] Cloning IsaacLab repository (branch: main) into ${repo_root} ..."
-                git clone --depth 1 --branch main https://github.com/isaac-sim/IsaacLab.git "${repo_root}"
+                echo "[INFO] Initializing IsaacLab repository at ${repo_root} ..."
+                git init -q "${repo_root}"
+                git -C "${repo_root}" remote add origin https://github.com/isaac-sim/IsaacLab.git
             else
-                echo "[INFO] Found existing IsaacLab clone at ${repo_root}; using it."
+                echo "[INFO] Found existing IsaacLab clone at ${repo_root}; checking out the pin."
+            fi
+            git -C "${repo_root}" fetch -q --depth 1 origin "${ISAACLAB_COMMIT}"
+            git -C "${repo_root}" checkout -q --detach FETCH_HEAD
+
+            # Fail loudly rather than 40 minutes later with an unrelated error.
+            if grep -q '^    optimizer' \
+                "${repo_root}/source/isaaclab_rl/isaaclab_rl/rsl_rl/rl_cfg.py" 2>/dev/null; then
+                echo "[ERROR] Pinned IsaacLab (${ISAACLAB_COMMIT:0:9}) has an 'optimizer' field in"
+                echo "[ERROR] RslRlPpoAlgorithmCfg, which requires rsl-rl-lib >= 5.0.1, but UWLab"
+                echo "[ERROR] targets the 3.1.2 API. Bump both pins together or revert this one."
+                exit 1
             fi
             ${pip_command} -e "${repo_root}/source/isaaclab" --extra-index-url https://pypi.nvidia.com
             ${pip_command} -e "${repo_root}/source/isaaclab_assets" --extra-index-url https://pypi.nvidia.com
