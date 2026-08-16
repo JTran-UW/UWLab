@@ -172,7 +172,12 @@ class ProgressContext(ManagerTermBase):
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         super().reset(env_ids)
-        self.continuous_success_counter[:] = 0
+        # Only the envs that actually reset: a blanket [:] wipes every env's progress whenever any
+        # one env ends, which starves consecutive_success_state (terminations run before rewards).
+        if env_ids is None:
+            self.continuous_success_counter[:] = 0
+        else:
+            self.continuous_success_counter[env_ids] = 0
 
     def __call__(
         self,
@@ -250,7 +255,10 @@ class ProgressContextReaching(ManagerTermBase):
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         super().reset(env_ids)
-        self.continuous_success_counter[:] = 0
+        if env_ids is None:
+            self.continuous_success_counter[:] = 0
+        else:
+            self.continuous_success_counter[env_ids] = 0
 
     def __call__(
         self,

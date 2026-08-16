@@ -904,17 +904,16 @@ class TrainEventCfg(BaseEventCfg):
 
 
 @configclass
-class TrainEventPegMassGapCfg(TrainEventCfg):
-    """``TrainEventCfg`` with the peg pinned to 400 g -- a pure dynamics gap over insertive mass.
+class TrainEventPegMassGapFullResetCfg(TrainEventCfg):
+    """``TrainEventCfg`` with the peg pinned to 500 g, keeping the full 4-path reset mixture.
 
-    Redeclaring ``randomize_insertive_object_mass`` REPLACES the inherited term rather than adding
-    to it, so both the value and the mode change: the base samples 0.02-0.2 kg fresh on every reset,
-    this pins 0.4 kg once at startup. That is 2x the heaviest peg seen in training and 20x the
-    lightest, held fixed for the whole run.
+    ``randomize_insertive_object_mass`` REPLACES the inherited term, so both value and mode change:
+    the base samples 0.02-0.2 kg fresh on every reset, this pins 0.5 kg once at startup. That is
+    2.5x the heaviest peg seen in training and 25x the lightest, held fixed for the whole run.
 
-    Everything else -- the 4-path reset distribution, materials, the remaining mass events -- is
-    inherited untouched, so peg mass is the only difference from the base task. Mirrors
-    ``TrainEvalEventAnywhereOnlyPegMassGapCfg`` on the eval side.
+    Everything else -- resets, materials, the other mass events -- is inherited untouched, so peg
+    mass is the ONLY difference from the base task. Use this when the dynamics gap has to be
+    isolated from any change of initial-state distribution.
     """
 
     randomize_insertive_object_mass = EventTerm(
@@ -922,10 +921,35 @@ class TrainEventPegMassGapCfg(TrainEventCfg):
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("insertive_object"),
-            "mass_distribution_params": (0.4, 0.4),
+            "mass_distribution_params": (0.5, 0.5),
             "operation": "abs",
             "distribution": "uniform",
             "recompute_inertia": True,
+        },
+    )
+
+
+@configclass
+class TrainEventPegMassGapCfg(TrainEventPegMassGapFullResetCfg):
+    """The peg-mass gap PLUS resets restricted to ``ObjectAnywhereEEAnywhere``.
+
+    Inherits the mass override from its parent rather than restating it, so the two gap variants
+    cannot drift apart if the pinned mass is retuned. Only the reset distribution is added here:
+    every episode starts from the hardest path (object loose, gripper empty and anywhere) instead
+    of a quarter of them starting already grasped or partly assembled.
+
+    Matches ``TrainEvalEventAnywhereOnlyPegMassGapCfg`` term for term, so this finetune and its
+    eval env see the same initial-state distribution.
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": ["ObjectAnywhereEEAnywhere"],
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
         },
     )
 
@@ -1137,7 +1161,7 @@ class TrainEvalEventAnywhereOnlyCfg(TrainEventCfg):
 
 @configclass
 class TrainEvalEventAnywhereOnlyPegMassGapCfg(TrainEvalEventAnywhereOnlyCfg):
-    """``TrainEvalEventAnywhereOnlyCfg`` with the peg pinned to 400 g.
+    """``TrainEvalEventAnywhereOnlyCfg`` with the peg pinned to 500 g.
 
     Same single-path resets as its parent, so this and ``TrainEvalEventAnywhereOnlyCfg`` differ only
     in peg mass -- the eval-side counterpart of ``TrainEventPegMassGapCfg``.
@@ -1172,7 +1196,7 @@ class TrainEvalEventAnywhereOnlyPegMassGapCfg(TrainEvalEventAnywhereOnlyCfg):
         params={
             "asset_cfg": SceneEntityCfg("insertive_object"),
             # we assume insertive object is somewhere between 20g and 200g
-            "mass_distribution_params": (0.4, 0.4), # (0.02, 0.2),
+            "mass_distribution_params": (0.5, 0.5), # (0.02, 0.2),
             "operation": "abs",
             "distribution": "uniform",
             "recompute_inertia": True,
@@ -1366,6 +1390,37 @@ class FinetuneEvalEventCfg(BaseEventCfg):
             "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+        },
+    )
+
+
+@configclass
+class FinetuneFullResetEventCfg(FinetuneEvalEventCfg):
+    """Stage-2 fixed sysid + OSC gains, but resetting from all four distributions.
+
+    Sits between the two existing finetune event configs: it keeps ``FinetuneEvalEventCfg``'s
+    ``*_fixed`` randomizers -- fully ramped (scale_progress=1) gains that never change over training,
+    so no curriculum is required to drive them -- while restoring ``TrainEventCfg``'s uniform 4-way
+    reset distribution instead of the eval config's ObjectAnywhereEEAnywhere-only resets.
+
+    Use for training runs that want the hardest, final dynamics from step 0 across the full reset
+    distribution. ``FinetuneEventCfg`` is the alternative when you do want the gains ramped, but that
+    one requires ``FinetuneCurriculumsCfg`` to advance ``scale_progress``.
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.MultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
         },
     )
@@ -3464,6 +3519,21 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNo
 
 
 @configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsCfg(
+    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
+):
+    """Its parent minus the ``success`` termination: episodes end only on time-out, abnormal
+    robot state, or ``first_episode_termination``.
+
+    Observations, rewards, actions and the reset distribution are inherited unchanged, so a
+    policy transfers between this and the parent and any difference is attributable to the
+    termination alone.
+    """
+
+    terminations: TerminationsCfg = TerminationsCfg()
+
+
+@configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapCfg(
     Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
 ):
@@ -3475,6 +3545,34 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNo
     """
 
     events: TrainEventPegMassGapCfg = TrainEventPegMassGapCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapFullResetCfg(
+    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
+):
+    """Dynamics-gap twin of the base task with the 4-path reset mixture left intact.
+
+    Differs from the base task in peg mass alone, so a comparison against it isolates the gap.
+    The sibling ``...PegMassGapCfg`` additionally narrows resets to one path, which confounds the
+    gap with a change of initial-state distribution -- use this one when that matters.
+    """
+
+    events: TrainEventPegMassGapFullResetCfg = TrainEventPegMassGapFullResetCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsPegMassGapFullResetCfg(
+    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapFullResetCfg
+):
+    """Its parent minus the ``success`` termination: episodes end only on time-out, abnormal
+    robot state, or ``first_episode_termination``, so a solved episode runs to the horizon.
+
+    Observations, rewards, actions and the 4-path reset mixture are inherited unchanged, as is the
+    peg-mass gap, so any difference against the parent is attributable to the termination alone.
+    """
+
+    terminations: TerminationsCfg = TerminationsCfg()
 
 
 @configclass
@@ -3639,6 +3737,36 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSpars
     events: FinetuneEventCfg = FinetuneEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
     curriculum: FinetuneCurriculumsCfg = FinetuneCurriculumsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+# Finetune TRAINING configuration: no curriculum, fixed/maximal gains, full reset distribution
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsFullResetCfg(
+    Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
+):
+    """Off-policy finetune, trained on the final dynamics from step 0 over all four reset paths.
+
+    Differs from the sibling
+    ``Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg``
+    in that nothing ramps: that one pairs ``FinetuneEventCfg`` with ``FinetuneCurriculumsCfg`` to
+    walk sysid / OSC gains up over training, whereas this one takes the ``*_fixed`` randomizers at
+    scale_progress=1 and inherits the base's ``NoCurriculumsCfg``.
+
+    Differs from the ...EvalCfg variant only in the reset distribution -- same events family, action
+    and explicit actuator, but resets are drawn uniformly from all four paths
+    (ObjectAnywhereEEAnywhere / ObjectRestingEEGrasped / ObjectAnywhereEEGrasped /
+    ObjectPartiallyAssembledEEGrasped) rather than ObjectAnywhereEEAnywhere alone.
+
+    Terminations come from the base's ``TerminationsSuccessTerminationCfg``, which keeps
+    ``first_episode_termination`` -- correct for training, unlike the eval/data-collection variants.
+    """
+
+    events: FinetuneFullResetEventCfg = FinetuneFullResetEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
 
     def __post_init__(self):
         super().__post_init__()
@@ -4093,6 +4221,36 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionRewardScalingSparseNoPrivilege
     events: TrainEvalEventCfg = TrainEvalEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
+
+# Data-collection configuration for the Stage-2 FINETUNE task: PPO expert acts from its own obs and
+# records `critic_no_priv`, but under finetune dynamics rather than Stage-1 ones.
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg(
+    Ur5eRobotiq2f85RlStateDataCollectionRewardScalingSparseNoPrivilegedObsCfg
+):
+    """Records expert transitions for
+    ``Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsEvalCfg``.
+
+    Same Stage-2 setup as that config -- explicit actuator, ``FinetuneEvalEventCfg`` and the Eval
+    action -- so the recorded transitions come from the dynamics the finetune task actually trains
+    under. ``FinetuneEvalEventCfg`` uses the ``*_fixed`` sysid / OSC-gain randomizers, i.e. the fully
+    ramped (scale_progress=1) gains, and the base pins ``curriculum = NoCurriculumsCfg``, so nothing
+    here ramps over time -- every recorded episode sees the same, maximally sys-IDed dynamics.
+
+    Terminations come from the base's ``TerminationsEvalCfg`` rather than the consumer's
+    ``TerminationsSuccessTerminationCfg``. The two are identical except that the latter also carries
+    ``first_episode_termination``, which truncates the first episode after a reset -- wanted while
+    training, not while recording, since it would throw away expert transitions.
+    """
+
+    events: FinetuneFullResetEventCfg = FinetuneFullResetEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCEvalNoDRCfg(Ur5eRobotiq2f85RlStateEvalCfg):
@@ -4141,6 +4299,21 @@ class Ur5eRobotiq2f85RelCartesianOSCEvalFinetuneDynamicsCfg(Ur5eRobotiq2f85RlSta
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
     """Eval after Stage 2: explicit actuator, stiff gains, small action scale, fixed sysid + OSC gains."""
+
+    events: FinetuneEvalEventCfg = FinetuneEvalEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+# Finetune configuration with scaled sparse rewards, success termination and a non-privileged critic
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsEvalCfg(
+    Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
+):
+    """Off-policy finetune: Stage 2 events/curriculum on top of the scaled-sparse, no-privileged-obs base."""
 
     events: FinetuneEvalEventCfg = FinetuneEvalEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()

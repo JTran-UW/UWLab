@@ -341,6 +341,42 @@ gym.register(
     },
 )
 
+
+# As above but nothing ramps: fixed/maximal sysid + OSC gains, no curriculum, and resets drawn
+# uniformly from all four distributions instead of the curriculum-ramped schedule.
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Reward-Scaling-"
+        "Success-Termination-Sparse-No-Privileged-Obs-Full-Reset-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsFullResetCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Reward-Scaling-Success-Termination-Sparse-No-Privileged-Obs-Play-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsEvalCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -385,6 +421,18 @@ gym.register(
 )
 
 gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Reward-Scaling-Sparse-No-Privileged-Obs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+gym.register(
     id=(
         "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Reward-Scaling-Success-Termination-Sparse-No-Privileged-Obs-Dynamics-Gap-v0"
     ),
@@ -394,6 +442,38 @@ gym.register(
         "env_cfg_entry_point": (
             f"{__name__}.rl_state_cfg:"
             "Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Reward-Scaling-Success-Termination-"
+        "Sparse-No-Privileged-Obs-Dynamics-Gap-Full-Reset-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapFullResetCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Reward-Scaling-"
+        "Sparse-No-Privileged-Obs-Dynamics-Gap-Full-Reset-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsPegMassGapFullResetCfg"
         ),
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
     },
@@ -439,6 +519,26 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": (
             f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCDataCollectionRewardScalingSparseNoPrivilegedObsCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+
+# Stage-2 counterpart of the above: same recorded groups, but finetune dynamics (explicit actuator,
+# fixed/maximal sysid + OSC gains, no curriculum) so the buffer matches what the finetune task trains
+# under. Feeds the ...-Finetune-Reward-Scaling-Success-Termination-Sparse-No-Privileged-Obs task.
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-DataCollection-Finetune-Reward-Scaling-"
+        "Success-Termination-Sparse-No-Privileged-Obs-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg"
         ),
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
@@ -855,6 +955,31 @@ gym.register(
 )
 
 # OOD (out-of-distribution) RGB environments
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DataCollection-FastSAC-Finetune-State-Expert-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.data_collection_rgb_cfg:Ur5eRobotiq2f85DataCollectionRGBFastSACFinetuneStateExpertCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DataCollection-FastSAC-State-Expert-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.data_collection_rgb_cfg:Ur5eRobotiq2f85DataCollectionRGBFastSACStateExpertCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-OOD-DataCollection-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

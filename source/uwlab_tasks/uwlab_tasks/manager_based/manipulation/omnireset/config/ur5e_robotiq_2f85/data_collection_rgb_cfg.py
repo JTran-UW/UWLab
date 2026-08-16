@@ -19,10 +19,16 @@ from isaaclab.sensors import TiledCameraCfg
 from isaaclab.utils import configclass
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85
 
 from ... import mdp as task_mdp
-from .actions import Ur5eRobotiq2f85RelativeOSCEvalAction
-from .rl_state_cfg import FinetuneEvalEventCfg, RlStateSceneCfg, Ur5eRobotiq2f85RlStateCfg
+from .actions import Ur5eRobotiq2f85RelativeOSCAction, Ur5eRobotiq2f85RelativeOSCEvalAction
+from .rl_state_cfg import (
+    FinetuneEvalEventCfg,
+    ObservationsNoPrivilegedObsCfg,
+    RlStateSceneCfg,
+    Ur5eRobotiq2f85RlStateCfg,
+)
 
 
 @configclass
@@ -638,6 +644,72 @@ class Ur5eRobotiq2f85RGBRelCartesianOSCEvalCfg(Ur5eRobotiq2f85RlStateCfg):
 @configclass
 class Ur5eRobotiq2f85DataCollectionRGBRelCartesianOSCCfg(Ur5eRobotiq2f85RGBRelCartesianOSCEvalCfg):
     events: DataCollectionRGBEventCfg = DataCollectionRGBEventCfg()
+
+
+@configclass
+class FastSACStateExpertRGBObservationsCfg:
+    """State groups for a FastSAC expert alongside the RGB group the recorder writes.
+
+    Two consumers, one env:
+
+    - ``policy`` / ``critic`` are the 215-d non-privileged state groups the state FastSAC experts
+      were trained on. ``HolosomaOffPolicyRunnerCfg`` defaults ``actor_obs_keys=["policy"]`` and
+      ``critic_obs_keys=["critic"]``, so the checkpoint loads without an obs-key override.
+    - ``data_collection`` is the *same class object* the RGB collection env uses, so recorded rows
+      cannot drift from what that pipeline already produces. ``PreStepDataCollectionObservations
+      Recorder`` dumps this group verbatim, which is where the images come from.
+    """
+
+    policy: ObservationsNoPrivilegedObsCfg.PolicyCfg = ObservationsNoPrivilegedObsCfg.PolicyCfg()
+    critic: ObservationsNoPrivilegedObsCfg.CriticCfg = ObservationsNoPrivilegedObsCfg.CriticCfg()
+    data_collection: RGBObservationsCfg.RGBDataCollectionCfg = RGBObservationsCfg.RGBDataCollectionCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionRGBFastSACStateExpertCfg(Ur5eRobotiq2f85DataCollectionRGBRelCartesianOSCCfg):
+    """RGB collection env driven by a state FastSAC expert.
+
+    Inherits the RGB scene (cameras), collection events, terminations and recorder settings from its
+    parent; swaps the observation set so the expert sees state and the recorder still sees RGB.
+
+    ``actions`` is reset to the non-eval ``Ur5eRobotiq2f85RelativeOSCAction`` because that is the
+    term the state experts were trained under -- the parent's Eval action term uses different gains
+    and scales, which would put the policy in a different control regime than it learned.
+    """
+
+    observations: FastSACStateExpertRGBObservationsCfg = FastSACStateExpertRGBObservationsCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+
+@configclass
+class Ur5eRobotiq2f85DataCollectionRGBFastSACFinetuneStateExpertCfg(
+    Ur5eRobotiq2f85DataCollectionRGBRelCartesianOSCCfg
+):
+    """RGB collection driven by a Stage-2 FINETUNE state expert.
+
+    Same idea as ``Ur5eRobotiq2f85DataCollectionRGBFastSACStateExpertCfg`` -- expert sees state, the
+    recorder sees RGB -- but matched to the control regime a finetune expert actually trained in,
+    e.g. one from ``...-Finetune-Reward-Scaling-Success-Termination-Sparse-No-Privileged-Obs-Full-Reset-v0``.
+
+    Two things differ from that sibling, and both matter enough to freeze the arm if they are wrong:
+
+    * ``actions`` is deliberately NOT overridden, so it keeps the RGB base's
+      ``Ur5eRobotiq2f85RelativeOSCEvalAction``. The sibling reverts to the non-eval term because the
+      older state experts trained under it; a finetune expert did not. The gap is not subtle --
+      rotational motion stiffness is 3.0 there against 50.0 here, and the Z action scale differs 10x
+      -- so running a finetune policy under the non-eval term produces a limp arm that barely tracks.
+    * the robot is the EXPLICIT actuator, matching the finetune configs. The RGB scene otherwise
+      inherits ``RlStateSceneCfg``'s IMPLICIT robot, which is a different actuation model again.
+
+    Events (fixed sysid + OSC gains, 4-way resets) already come from the parent, so nothing there
+    needs changing.
+    """
+
+    observations: FastSACStateExpertRGBObservationsCfg = FastSACStateExpertRGBObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 
 @configclass

@@ -265,7 +265,8 @@ class HolosomaVecEnvWrapper(VecEnv):
                 "episode": episode_log,
                 "episode_all": {},
                 "to_log": {},
-                "ep_success": extras["ep_success"]
+                "ep_success": extras["ep_success"],
+                "ep_counted": extras.get("ep_counted", 0),
             }
             return plain_obs, rew, dones, info_dict
 

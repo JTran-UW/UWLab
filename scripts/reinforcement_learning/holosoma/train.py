@@ -44,6 +44,44 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--sgft",
+    action="store_true",
+    default=False,
+    help=(
+        "Shaped-guidance finetuning. Freezes the resumed checkpoint's actor and critic into a "
+        "source value function V(s) = mean_i Q_i(s, mu(s)) and stores potential-shaped rewards "
+        "r_hat = r + gamma*V(s') - V(s) instead of r. V is never updated. Requires --resume_path "
+        "(there is nothing to freeze otherwise). Potential-based, so the optimal policy is "
+        "unchanged; only credit assignment moves."
+    ),
+)
+parser.add_argument(
+    "--h_step_backup",
+    action="store_true",
+    default=False,
+    help=(
+        "Bootstrap the n-step critic target off the frozen source value function instead of the "
+        "learned target critic: target = sum_k gamma^k r_k + gamma^n * V_source(s_n). V_source is "
+        "distributional, so its atom distribution is pushed through the same categorical Bellman "
+        "projection. Freezes the resumed checkpoint, so it requires --resume_path. Can be used "
+        "with or without --sgft, but enabling both double-counts V_source (warned at startup)."
+    ),
+)
+parser.add_argument(
+    "--cpu_replay_buffer",
+    action="store_true",
+    default=False,
+    help=(
+        "Hold the online AND expert replay buffers in host RAM instead of on the compute device. "
+        "Off by default: GPU residency removes a host->device copy per update. Turn it on when the "
+        "buffers do not fit -- note the expert buffer is loaded straight to the buffer's device, so "
+        "a 7 GB expert file costs 7 GB of VRAM on top of the online buffer and of PhysX's fixed GPU "
+        "arenas (which are sized by config, not by --num_envs, and so cost the same at 1 env as at "
+        "4096). Sampled batches are moved to the compute device before every update, so results are "
+        "unchanged; only the per-update transfer cost differs."
+    ),
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
 parser.add_argument(
@@ -311,7 +349,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             expert_critic=None, # expert_critic,
             lambda_bc_policy=1.0,
             lambda_bc_critic=1.0,
+            use_cpu_rb=args_cli.cpu_replay_buffer,
         )
+        if args_cli.cpu_replay_buffer:
+            print("[INFO] Replay buffers (online + expert) held on CPU; batches move to device per update.")
         runner.setup()
         runner.expert_ratio = args_cli.expert_ratio
         runner.expert_ratio_anneal_steps = args_cli.expert_ratio_anneal_steps
@@ -329,6 +370,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+
+    # SGFT: snapshot the just-loaded weights as the frozen source V. Must run after runner.load()
+    # -- before it, the networks are still randomly initialised -- and after the expert buffer is
+    # loaded, so enable_sgft() can reshape those stored rewards too.
+    if args_cli.sgft or args_cli.h_step_backup:
+        _which = " / ".join(f for f, on in (("--sgft", args_cli.sgft),
+                                            ("--h_step_backup", args_cli.h_step_backup)) if on)
+        if not (agent_cfg.resume or args_cli.resume_path is not None):
+            raise ValueError(f"{_which} needs a source policy to freeze; pass --resume_path <checkpoint>.")
+        if not hasattr(runner, "enable_sgft"):
+            raise ValueError(f"{_which} is only supported by FastSACAgent, got {type(runner).__name__}.")
+        runner.enable_sgft(shape_rewards=args_cli.sgft, h_step_backup=args_cli.h_step_backup)
 
     # Optional: load online replay buffer from a saved snapshot (FastSAC only).
     if args_cli.replay_buffer_path is not None and hasattr(runner, "load_replay_buffer"):

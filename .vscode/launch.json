@@ -393,6 +393,29 @@
             ]
         },
         {
+            "name": "Train CleanRL MR.Q FlashSAC Depth (Reaching)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/jtran/miniconda3/envs/env_uwlab/bin/python",
+            "program": "${workspaceFolder}/scripts/reinforcement_learning/cleanrl/cleanrl/mrq_flashsac_continuous_action_depth.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PATH": "/home/jtran/miniconda3/envs/env_uwlab/bin:${env:PATH}",
+                "CONDA_DEFAULT_ENV": "env_uwlab"
+            },
+            "args": [
+                "--seed", "2",
+                "--env-id", "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Depth-Reaching-OffPolicy-v0",
+                // "--headless",
+                "--track",
+                "--wandb_project_name", "omnireset_fastsac",
+                "--run_name", "MRQ-FlashSAC-Depth-Reaching",
+                "--enable_cameras"
+            ]
+        },
+        {
             "name": "Visualize All Resets Single Image (env_uwlab)",
             "type": "debugpy",
             "request": "launch",

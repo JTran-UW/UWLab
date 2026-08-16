@@ -323,26 +323,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         nco = critic_obs_normalizer(co, update=False) if obs_normalization else co
         return qnet.get_value(torch.softmax(qnet(nco, actions), dim=-1)).mean(dim=0)
 
+    term_mgr = env.unwrapped.termination_manager
+    _term_names = list(term_mgr.active_terms)
+    _has_success_term = "success" in _term_names
+    _has_abnormal_term = "abnormal_robot" in _term_names
+    print(f"[eval_critic] termination terms: {_term_names}")
+    if not _has_success_term:
+        print("[eval_critic] WARNING: no 'success' termination term; nothing will be counted as a success.")
+
     def classify_terminations(term_type, dones, extras, was_active):
-        # Bucket envs terminating for the first time this step: 0=abnormal robot (hard done, no
-        # timeout), 1=timeout without success, 2=timeout with success. Success at termination is
-        # captured by the env as extras["ep_success"] = progress_context.success[reset_env_ids].
+        """Bucket envs terminating for the first time this step.
+
+        0 = abnormal robot, 1 = failure (timeout / anything else), 2 = success.
+
+        Per-term flags come off the TerminationManager rather than being inferred from
+        ``time_outs``. ``success`` is itself a termination term here, so a successful episode ends
+        with time_out=False -- the previous ``~time_out -> abnormal`` rule filed every success as an
+        abnormal robot, and only counted a success if it coincided with a timeout. Truncations are
+        always failures in this task: running out of time is never a success.
+        """
         newly = was_active & dones.bool()
         if not bool(newly.any()):
             return
-        time_out = extras.get("time_outs", torch.zeros(n_env, dtype=torch.bool, device=device)).to(device).bool()
-        success = torch.zeros(n_env, dtype=torch.bool, device=device)
-        ep = extras.get("ep_success", None)
-        if ep is not None:
-            ep = ep.to(device).reshape(-1).bool()
-            done_ids = dones.bool().nonzero(as_tuple=False).squeeze(-1)
-            if ep.numel() == done_ids.numel():
-                success[done_ids] = ep
-            elif ep.numel() == n_env:
-                success = ep
-        term_type[newly & ~time_out] = 0            # abnormal robot
-        term_type[newly & time_out & ~success] = 1  # timeout, no success
-        term_type[newly & time_out & success] = 2   # timeout, success
+        zeros = torch.zeros(n_env, dtype=torch.bool, device=device)
+        succ = term_mgr.get_term("success").to(device).bool() if _has_success_term else zeros
+        abnormal = term_mgr.get_term("abnormal_robot").to(device).bool() if _has_abnormal_term else zeros
+        # Default any new termination to failure, then let the specific causes override. Success is
+        # applied last so it wins if it coincides with a timeout or an abnormal flag.
+        term_type[newly] = 1
+        term_type[newly & abnormal] = 0
+        term_type[newly & succ] = 2
 
     base_seed = args_cli.seed if args_cli.seed is not None else 42
 
@@ -591,7 +601,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ax_ent.set_xlabel("Discounted −α·logπ return")
         ax_ent.set_ylabel("Count")
 
-        term_labels = ["abnormal", "timeout\n(no success)", "timeout\n(success)"]
+        term_labels = ["abnormal", "failure\n(timeout)", "success"]
         ax_term.bar(term_labels, term_counts, color=["tab:red", "tab:gray", "tab:green"])
         for i, c in enumerate(term_counts):
             ax_term.text(i, c, str(c), ha="center", va="bottom", fontsize=8)
@@ -608,18 +618,48 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Subsample envs for legibility if there are many.
         max_lines = 256
         env_ids_plot = np.arange(n_env) if n_env <= max_lines else np.linspace(0, n_env - 1, max_lines).astype(int)
+        # Colour each trajectory by its outcome (term_type 2 == timeout with success), and mark
+        # where it ended. Successes are drawn last so the (usually rarer) green lines sit on top.
+        term_np = term_type.detach().cpu().numpy()
+        succ_ids = [e for e in env_ids_plot if term_np[e] == 2]
+        fail_ids = [e for e in env_ids_plot if term_np[e] != 2]
+        for ids, colour in ((fail_ids, "tab:red"), (succ_ids, "tab:green")):
+            for e in ids:
+                ax2.plot(peg_traj[:, e, 0], peg_traj[:, e, 1], color=colour, lw=0.5, alpha=0.35)
+        # Legend proxies: one entry per outcome rather than one per line.
+        ax2.plot([], [], color="tab:green", lw=1.5, label=f"success ({len(succ_ids)})")
+        ax2.plot([], [], color="tab:red", lw=1.5, label=f"failure ({len(fail_ids)})")
+
+        # Final peg position per env: last non-NaN sample, since each env's line stops at its own
+        # termination step rather than at T.
+        end_xy = []
         for e in env_ids_plot:
-            ax2.plot(peg_traj[:, e, 0], peg_traj[:, e, 1], color="tab:blue", lw=0.5, alpha=0.25)
-        # Shared start (all envs broadcast to the same s0) and peghole target.
-        ax2.scatter(peghole_xy[0], peghole_xy[1], marker="*", color="tab:red", s=250, zorder=6, label="peghole")
-        ax2.scatter(peg_traj[0, 0, 0], peg_traj[0, 0, 1], color="tab:green", s=40, zorder=7, label="start (s0)")
+            valid = np.flatnonzero(~np.isnan(peg_traj[:, e, 0]))
+            if valid.size:
+                end_xy.append(peg_traj[valid[-1], e])
+        if end_xy:
+            end_xy = np.asarray(end_xy)
+            ax2.scatter(end_xy[:, 0], end_xy[:, 1], color="gold", s=18, zorder=6,
+                        edgecolors="black", linewidths=0.3, label="end")
+        # Shared start (all envs broadcast to the same s0) and peghole target. The peghole marker is
+        # black rather than red now that red means a failed trajectory.
+        ax2.scatter(peghole_xy[0], peghole_xy[1], marker="*", color="black", s=250, zorder=8, label="peghole")
+        ax2.scatter(peg_traj[0, 0, 0], peg_traj[0, 0, 1], color="tab:blue", s=60, zorder=9,
+                    edgecolors="white", linewidths=0.5, label="start (s0)")
         # Fixed bounds so every plot shares the same scale (tune via --peg_xlim / --peg_ylim).
         ax2.set_xlim(args_cli.peg_xlim)
         ax2.set_ylim(args_cli.peg_ylim)
         ax2.set_aspect("equal")
         ax2.set_xlabel("x (env-local, m)")
         ax2.set_ylabel("y (env-local, m)")
-        ax2.set_title(f"Peg x-y trajectories — iter {iteration}  ({len(env_ids_plot)}/{n_env} envs, T={peg_traj.shape[0]})")
+        # Success rate is over ALL n_env, not just the plotted subset: env_ids_plot is subsampled
+        # above when n_env > max_lines, so counting green lines would understate it.
+        ax2.set_title(
+            f"{ckpt_name}\n"
+            f"success {term_counts[2]}/{n_env} = {term_counts[2] / n_env:.1%}"
+            f"  —  iter {iteration}  ({len(env_ids_plot)}/{n_env} envs plotted, T={peg_traj.shape[0]})",
+            fontsize=10,
+        )
         ax2.legend(loc="upper right", fontsize=8)
         fig2.tight_layout()
         fig2.savefig(peg_xy_path, dpi=100)

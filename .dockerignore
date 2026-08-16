@@ -58,3 +58,13 @@ docker/exports/
 # Root-level odds and ends
 /env.bin
 /Untitled
+
+# Local training artifacts, same rationale as rbs/ above: these are outputs, not source, and
+# bulk-syncing them pushes ~10 GB per submission onto a filesystem that sits above 90% full.
+# Upload explicitly to /mmfs1/.../<dir>/<file> when a job actually needs one.
+/checkpoints/
+/data_archive/
+/Datasets/
+/PegInsertive/
+/Miniconda3-latest-Linux-x86_64.sh
+*.png

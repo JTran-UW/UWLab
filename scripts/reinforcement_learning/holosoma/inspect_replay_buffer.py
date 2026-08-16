@@ -14,6 +14,7 @@ Supported formats:
 """
 
 import argparse
+import os
 import torch
 from tensordict import TensorDict
 
@@ -302,6 +303,69 @@ def _plot_newest_frame(obs: torch.Tensor, title: str,
     plt.show()
 
 
+def plot_episode_end_breakdown(dones: torch.Tensor, truncations: torch.Tensor | None,
+                               out_path: str | None = None, title_extra: str = "") -> None:
+    """Bar chart: what fraction of stored transitions are episode ends, split by cause.
+
+    The `dones` convention differs by writer. FastSAC stores the vec-env's dones, which are
+    terminated|truncated, so a true termination is `dones & ~truncations`. Other collectors store
+    dones already excluding truncations. Detect which by testing whether every truncation is also
+    flagged done -- getting this backwards would swap the two bars.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[WARN] matplotlib not available; skipping episode-end plot.")
+        return
+
+    d = dones.reshape(-1).bool()
+    total = d.numel()
+    if truncations is None:
+        term = d
+        trunc = torch.zeros_like(d)
+        convention = "no truncation field; all dones counted as terminations"
+    else:
+        t = truncations.reshape(-1).bool()
+        if t.numel() != total:
+            print(f"[WARN] dones ({total}) and truncations ({t.numel()}) differ in size; skipping.")
+            return
+        union = bool((t & ~d).sum() == 0)  # truncations imply dones -> dones is the union
+        if union:
+            term, trunc = d & ~t, t
+            convention = "dones = terminated|truncated"
+        else:
+            term, trunc = d, t
+            convention = "dones excludes truncations"
+
+    n_term, n_trunc = int(term.sum()), int(trunc.sum())
+    n_ends = n_term + n_trunc
+    n_ongoing = total - n_ends
+    pct = lambda n: 100.0 * n / total if total else 0.0
+
+    print(f"\n  episode-end breakdown ({convention})")
+    print(f"    termination : {n_term:>10}  ({pct(n_term):.3f}% of samples)")
+    print(f"    truncation  : {n_trunc:>10}  ({pct(n_trunc):.3f}%)")
+    print(f"    any end     : {n_ends:>10}  ({pct(n_ends):.3f}%)")
+    print(f"    mean episode length ~ {total / n_ends:.1f} steps" if n_ends else "    no episode ends recorded")
+
+    labels = ["termination", "truncation", "non-terminal"]
+    counts = [n_term, n_trunc, n_ongoing]
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars = ax.bar(labels, [pct(c) for c in counts], color=["tab:green", "tab:orange", "tab:gray"])
+    for b, c in zip(bars, counts):
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height(),
+                f"{c}\n{pct(c):.2f}%", ha="center", va="bottom", fontsize=9)
+    ax.set_ylabel("% of stored transitions")
+    ax.set_title(f"Episode ends in replay buffer{title_extra}\n"
+                 f"{total} transitions — {convention}", fontsize=10)
+    ax.set_ylim(0, max(pct(c) for c in counts) * 1.25 or 1)
+    fig.tight_layout()
+    if out_path:
+        fig.savefig(out_path, dpi=150)
+        print(f"    saved plot -> {out_path}")
+    plt.show()
+
+
 def plot_ee_pose_histograms(obs: torch.Tensor, task: str | None,
                             block_override: tuple[int, int] | None = None) -> None:
     if block_override is not None:
@@ -343,6 +407,9 @@ def main():
                         help="Max per-env steps to inspect (default: all filled entries).")
     parser.add_argument("--no_per_dim", action="store_true",
                         help="Skip per-dimension stats.")
+    parser.add_argument("--plot_episode_ends", action="store_true",
+                        help="Bar chart of what %% of stored transitions are terminations vs "
+                             "truncations vs non-terminal. Saved next to the buffer file.")
     parser.add_argument("--plot_ee_pose", action="store_true",
                         help="Plot per-dimension histograms of the EE pose from actor obs.")
     parser.add_argument("--plot_joint_pos", action="store_true",
@@ -424,6 +491,18 @@ def main():
     print_norm_stats("actor obs ", obs)
     print_norm_stats("critic obs", cobs)
     print_norm_stats("actions   ", acts)
+
+    # Episode-end breakdown
+    if args.plot_episode_ends:
+        if parsed["dones"] is None:
+            print("[WARN] buffer has no `dones` field; skipping --plot_episode_ends.")
+        else:
+            d = parsed["dones"][:, :parsed["limit"]] if parsed["dones"].dim() > 1 else parsed["dones"]
+            t = parsed["truncations"]
+            if t is not None and t.dim() > 1:
+                t = t[:, :parsed["limit"]]
+            out = os.path.splitext(args.buffer)[0] + "_episode_ends.png"
+            plot_episode_end_breakdown(d, t, out_path=out, title_extra=f"  ({os.path.basename(args.buffer)})")
 
     # EE pose histograms
     if args.plot_ee_pose:

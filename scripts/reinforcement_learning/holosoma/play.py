@@ -111,6 +111,17 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--stochastic",
+    action="store_true",
+    default=False,
+    help=(
+        "Sample actions from the policy distribution instead of taking its mean. This is what the "
+        "TRAINING rollout does (fast_sac_agent sets policy = actor.explore), whereas play.py "
+        "otherwise evaluates the deterministic mean -- so a policy whose mean is fine but whose "
+        "log_std has blown up looks healthy here and destabilises during training. FastSAC only."
+    ),
+)
+parser.add_argument(
     "--eval_episodes_per_env",
     type=int,
     default=None,
@@ -491,6 +502,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         actor_obs_keys = agent_cfg.actor_obs_keys
         critic_obs_keys = agent_cfg.critic_obs_keys
 
+        if args_cli.stochastic:
+            # Mirror get_inference_policy but sample instead of taking the mean, so eval matches the
+            # training rollout (fast_sac_agent.py: self.policy = self.actor.explore). Same frozen
+            # normalizer -- update=False -- so the only difference is mean vs sample.
+            _dev = env.unwrapped.device
+            _actor = runner.actor.to(_dev)
+            _actor.eval()
+            _obs_norm = runner.obs_normalizer.to(_dev)
+            _obs_norm.eval()
+
+            def _stochastic_policy(obs: dict) -> torch.Tensor:
+                x = obs["actor_obs"]
+                nx = _obs_norm(x, update=False) if runner.obs_normalization else x
+                return _actor.explore(nx, deterministic=False)
+
+            policy = _stochastic_policy
+            print("[INFO] --stochastic: sampling actions from the policy distribution (matches training rollout).")
+
         # Optional: record transitions into a replay buffer and exit
         if args_cli.record_transitions is not None and args_cli.record_transitions > 0:
             # FastSAC policy expects {"actor_obs": tensor}; wrap for compatibility
@@ -550,6 +579,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         policy = runner.get_inference_policy(device=env.unwrapped.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+
+    if args_cli.stochastic and not is_fastsac:
+        print("[WARN] --stochastic is only wired for FastSAC; evaluating the deterministic policy instead.")
 
     # --checkpoint_dir sweep: record one video per checkpoint, reusing this Isaac Sim instance.
     if args_cli.checkpoint_dir:
@@ -632,6 +664,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # episodes are discarded, so every env contributes exactly `episodes_per_env` to the rate.
         ep_count = torch.zeros(env.num_envs, dtype=torch.long, device=device)
         succ_count = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+        # Episode length, counted here rather than read from env.episode_length_buf: the env
+        # auto-resets on done and zeroes that buffer before we get to look at it.
+        ep_steps = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+        episode_durations: list[int] = []
+        step_dt = float(getattr(env.unwrapped, "step_dt", 0.0))
         # Failure breakdown. Which termination actually fired is read per-term off the
         # TerminationManager rather than inferred, so an episode that ended for some third reason
         # (e.g. `first_episode_termination` left enabled) shows up as "other" instead of being
@@ -683,6 +720,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if len(new_success) > 0:
                     print(f"new success at: {torch.argwhere(~before_es & ever_success)}")
                 
+            ep_steps += 1
             done_mask = dones.bool()
             # Only an env's first `episodes_per_env` episodes count. Dropping the surplus is what
             # removes the length bias: without this gate, envs whose episodes end early (i.e.
@@ -717,16 +755,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 counted_idx = torch.nonzero(counting, as_tuple=False).flatten()
                 xyz_cpu = init_peg_xyz[counted_idx].cpu()
                 out_cpu = outcome[counted_idx].cpu()
+                dur_cpu = ep_steps[counted_idx].cpu()
                 for k in range(counted_idx.numel()):
                     episode_init_xyzs.append(xyz_cpu[k])
                     episode_outcomes.append(int(out_cpu[k]))
+                    episode_durations.append(int(dur_cpu[k]))
             # Refresh on EVERY done, not just counted ones: the env resets regardless, so a stale
             # init pose would otherwise be attributed to a later episode that does count.
             if bool(done_mask.any()):
                 new_xyz = (insertive.data.root_pos_w - env_origins)[:, :3]
                 init_peg_xyz[done_mask] = new_xyz[done_mask]
-            # Reset success flag for envs that just finished an episode.
+            # Reset success flag and step counter for envs that just finished an episode.
             ever_success[done_mask] = False
+            ep_steps[done_mask] = 0
 
         pbar.close()
         total_episodes = int(ep_count.sum().item())
@@ -747,6 +788,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "abnormal_robot -- most often first_episode_termination left enabled. Disable it "
                 "with env.terminations.first_episode_termination=null."
             )
+
+        # Episode duration, overall and split by outcome. Reported per outcome because the pooled
+        # mean is a mixture: successes end early, timeouts sit at the episode cap, so the average
+        # over all episodes mostly tracks the success rate rather than any property of the policy.
+        def _dur_stats(sel_codes):
+            vals = [d for d, o in zip(episode_durations, episode_outcomes) if o in sel_codes]
+            if not vals:
+                return None
+            m = sum(vals) / len(vals)
+            return m, min(vals), max(vals), len(vals)
+
+        _fmt = lambda s: f"{s:.1f} steps" + (f" ({s * step_dt:.2f} s)" if step_dt > 0 else "")
+        allstats = _dur_stats({OUTCOME_SUCCESS, OUTCOME_TIMEOUT, OUTCOME_ABNORMAL, OUTCOME_OTHER})
+        if allstats:
+            print(f"[EVAL] Mean episode duration: {_fmt(allstats[0])}  "
+                  f"[min {allstats[1]}, max {allstats[2]} steps over {allstats[3]} episodes]")
+            for code in (OUTCOME_SUCCESS, OUTCOME_TIMEOUT, OUTCOME_ABNORMAL, OUTCOME_OTHER):
+                st = _dur_stats({code})
+                if st:
+                    print(f"[EVAL]   {OUTCOME_STYLE[code][1]:<15}: mean {_fmt(st[0])}  (n={st[3]})")
         # Buckets partition the counted episodes; a mismatch means an episode was double-counted or
         # missed, which would silently corrupt every rate above.
         assert successful_episodes + n_timeout + n_abnormal + n_other == total_episodes, (
@@ -802,6 +863,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             plt.tight_layout()
             plt.savefig(out_path, dpi=150)
             print(f"[EVAL] Saved initial-pose scatter plot to: {out_path}")
+
+            # Episode-duration histogram, stacked by outcome. Kept as its own figure rather than a
+            # subplot so the 3D scatter above keeps its layout and rotation animation.
+            fig2, ax2 = plt.subplots(figsize=(8, 4.5))
+            durs = np.asarray(episode_durations, dtype=float)
+            codes = np.asarray(episode_outcomes)
+            present = [c for c in (OUTCOME_SUCCESS, OUTCOME_TIMEOUT, OUTCOME_ABNORMAL, OUTCOME_OTHER)
+                       if (codes == c).any()]
+            bins = np.histogram_bin_edges(durs, bins=min(40, max(10, len(set(episode_durations)))))
+            ax2.hist([durs[codes == c] for c in present], bins=bins, stacked=True,
+                     color=[OUTCOME_STYLE[c][0] for c in present],
+                     label=[f"{OUTCOME_STYLE[c][1]} (n={int((codes == c).sum())}, "
+                            f"mean {durs[codes == c].mean():.0f})" for c in present])
+            mean_all = durs.mean()
+            ax2.axvline(mean_all, color="black", ls="--", lw=1.5,
+                        label=f"overall mean {mean_all:.1f} steps"
+                              + (f" = {mean_all * step_dt:.2f} s" if step_dt > 0 else ""))
+            ax2.set_xlabel("episode duration (steps)" + (f"   [1 step = {step_dt:.3f} s]" if step_dt > 0 else ""))
+            ax2.set_ylabel("episodes")
+            ax2.set_title(f"Episode duration by outcome  (mean {mean_all:.1f} steps, "
+                          f"success {success_rate:.1%})")
+            ax2.legend(loc="best", fontsize=8)
+            dur_path = os.path.join(plots_dir, "eval_episode_duration.png")
+            fig2.tight_layout()
+            fig2.savefig(dur_path, dpi=150)
+            print(f"[EVAL] Saved episode-duration histogram to: {dur_path}")
             plt.show()
 
         env.close()

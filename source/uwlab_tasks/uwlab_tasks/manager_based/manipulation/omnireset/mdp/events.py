@@ -1222,21 +1222,15 @@ class MultiResetManager(ManagerTermBase):
             success_mask = torch.where(eval(success)[env_ids], 1.0, 0.0)
             self.success_monitor.success_update(self.task_id[env_ids], success_mask)
 
-            # Log metrics for each task
+            # Per-reset-type success rate: one entry per slot of `reset_types`, over the
+            # SuccessMonitor's rolling 100-episode window. Lowercase `metrics/` is the prefix the
+            # agent forwards to the writer; sampling probabilities and episode length are
+            # deliberately not logged here.
             success_rates = self.success_monitor.get_success_rate()
             if "log" not in self._env.extras:
                 self._env.extras["log"] = {}
             for task_idx in range(self.num_tasks):
-                self._env.extras["log"].update({
-                    f"Metrics/task_{task_idx}_success_rate": success_rates[task_idx].item(),
-                    f"Metrics/task_{task_idx}_prob": self.probs[task_idx].item(),
-                    f"Metrics/task_{task_idx}_normalized_prob": self.probs[task_idx].item(),
-                })
-
-            # Log episode length at reset
-            ep_lengths = self._env.episode_length_buf[env_ids].float()
-            self._env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
-
+                self._env.extras["log"][f"metrics/task_{task_idx}_success_rate"] = success_rates[task_idx].item()
         # Sample which dataset to use for each environment
         dataset_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
         self.task_id[env_ids] = dataset_indices
