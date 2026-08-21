@@ -16,6 +16,44 @@ from uwlab_tasks.manager_based.manipulation.omnireset.assembly_keypoints import 
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
 
 
+def asset_pose_in_gc_goal_frame(
+    env: ManagerBasedEnv,
+    target: str = "insertive_object",
+    ee_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="wrist_3_link"),
+    event_term_name: str = "reset_from_reset_states",
+    rotation_repr: str = "axis_angle",
+):
+    """Current pose of an asset expressed in the frame of its GCMRM-sampled goal pose.
+
+    ``target`` selects the asset: a rigid object name (its root pose vs the goal root pose), or
+    ``"ee"`` (the ``ee_asset_cfg`` body vs the FK-derived goal EE pose). Goal poses are env-relative
+    in ``goal_state``; env origins are added before the frame subtraction.
+    """
+    goal_state = env.event_manager.get_term_cfg(event_term_name).func.goal_state
+
+    if target == "ee":
+        goal_pose = goal_state["articulation"]["robot"]["ee_pose"]
+        ee_asset: Articulation = env.scene[ee_asset_cfg.name]
+        body_idx = 0 if isinstance(ee_asset_cfg.body_ids, slice) else ee_asset_cfg.body_ids
+        current_pos = ee_asset.data.body_link_pos_w[:, body_idx].view(-1, 3)
+        current_quat = ee_asset.data.body_link_quat_w[:, body_idx].view(-1, 4)
+    else:
+        goal_pose = goal_state["rigid_object"][target]["root_pose"]
+        asset: RigidObject = env.scene[target]
+        current_pos = asset.data.root_pos_w
+        current_quat = asset.data.root_quat_w
+
+    goal_pos_w = goal_pose[:, :3] + env.scene.env_origins
+    pos_b, quat_b = math_utils.subtract_frame_transforms(goal_pos_w, goal_pose[:, 3:7], current_pos, current_quat)
+
+    if rotation_repr == "axis_angle":
+        return torch.cat([pos_b, math_utils.axis_angle_from_quat(quat_b)], dim=1)
+    elif rotation_repr == "quat":
+        return torch.cat([pos_b, quat_b], dim=1)
+    else:
+        raise ValueError(f"Invalid rotation_repr: {rotation_repr}. Must be one of: 'quat', 'axis_angle'")
+
+
 def target_asset_pose_in_root_asset_frame(
     env: ManagerBasedEnv,
     target_asset_cfg: SceneEntityCfg,
@@ -49,6 +87,57 @@ def target_asset_pose_in_root_asset_frame(
         return torch.cat([target_pos_b, target_quat_b], dim=1)
     else:
         raise ValueError(f"Invalid rotation_repr: {rotation_repr}. Must be one of: 'quat', 'axis_angle'")
+
+
+def target_asset_pose_in_root_asset_frame_with_gap(
+    env: ManagerBasedEnv,
+    target_asset_cfg: SceneEntityCfg,
+    root_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_asset_offset=None,
+    root_asset_offset=None,
+    rotation_repr: str = "quat",
+    pos_noise_std: float | None = None,
+    rot_noise_std: float | None = None,
+    pos_bias=None,
+    rot_bias=None,
+) -> torch.Tensor:
+    """``target_asset_pose_in_root_asset_frame`` with optional observation-gap corruption.
+
+    Two kinds of corruption, each on the position (m) and rotation (axis-angle, rad) parts:
+
+    * ``pos_noise_std`` / ``rot_noise_std``: zero-mean additive gaussian noise, resampled every
+      step. None or <= 0 disables.
+    * ``pos_bias`` / ``rot_bias``: a fixed constant additive offset -- a scalar (added to every
+      component) or a 3-sequence (per-component). None or all-zero adds nothing.
+
+    Defaults (None here; 0.0 / [0,0,0] in the task cfgs so scalar and list CLI overrides pass
+    ``update_class_from_dict``'s type check) are a clean passthrough, so swapping this in for the
+    plain function leaves the task unchanged, and the knobs are hydra-overridable, e.g.::
+
+        env.observations.policy.insertive_asset_pose.params.pos_noise_std=0.005
+        env.observations.policy.insertive_asset_pose.params.pos_bias=[0.01,0,0]
+
+    Any rotation knob requires ``rotation_repr='axis_angle'`` (additive corruption of a
+    quaternion is not well-defined).
+    """
+    rot_gap_active = (rot_noise_std is not None and rot_noise_std > 0.0) or (
+        rot_bias is not None and torch.as_tensor(rot_bias).abs().sum() > 0
+    )
+    if rot_gap_active and rotation_repr != "axis_angle":
+        raise ValueError("Rotation noise/bias requires rotation_repr='axis_angle'.")
+
+    obs = target_asset_pose_in_root_asset_frame(
+        env, target_asset_cfg, root_asset_cfg, target_asset_offset, root_asset_offset, rotation_repr
+    )
+    if pos_noise_std is not None and pos_noise_std > 0.0:
+        obs[:, :3] += torch.randn_like(obs[:, :3]) * pos_noise_std
+    if rot_noise_std is not None and rot_noise_std > 0.0:
+        obs[:, 3:6] += torch.randn_like(obs[:, 3:6]) * rot_noise_std
+    if pos_bias is not None:
+        obs[:, :3] += torch.as_tensor(pos_bias, dtype=obs.dtype, device=obs.device)
+    if rot_bias is not None:
+        obs[:, 3:6] += torch.as_tensor(rot_bias, dtype=obs.dtype, device=obs.device)
+    return obs
 
 
 class target_asset_pose_in_root_asset_frame_with_metadata(ManagerTermBase):

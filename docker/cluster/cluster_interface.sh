@@ -102,6 +102,10 @@ submit_job() {
         PARTITION=${PARTITION} ACCOUNT=${ACCOUNT} TIME=${TIME} \
         CPUS_PER_TASK=${CPUS_PER_TASK} MEM_PER_GPU=${MEM_PER_GPU} CONSTRAINT='${CONSTRAINT}' \
         CLUSTER_PYTHON_EXECUTABLE=${CLUSTER_PYTHON_EXECUTABLE} \
+        RANK_ISOLATE_DISABLE=${RANK_ISOLATE_DISABLE:-} \
+        NCCL_DEBUG=${NCCL_DEBUG:-} NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-} \
+        NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-} NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE:-} \
+        NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-} NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-} \
         bash $CLUSTER_UWLAB_DIR/docker/cluster/$job_script_file \"$CLUSTER_UWLAB_DIR\" \"uw-lab-$profile\" ${@}"
 }
 
@@ -249,12 +253,12 @@ case $command in
         ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_UWLAB_DIR"
         # Sync UW Lab code
         echo "[INFO] Syncing UW Lab code to $CLUSTER_UWLAB_DIR ..."
-        rsync -rh --exclude="*.git*" --filter=':- .dockerignore' /$SCRIPT_DIR/../.. $CLUSTER_LOGIN:$CLUSTER_UWLAB_DIR
+        rsync -ah --exclude="*.git*" --filter=':- .dockerignore' /$SCRIPT_DIR/../.. $CLUSTER_LOGIN:$CLUSTER_UWLAB_DIR
         # Sync rsl_rl if configured
         if [ -n "$LOCAL_RSL_RL_DIR" ] && [ -n "$CLUSTER_RSL_RL_DIR" ]; then
             echo "[INFO] Syncing rsl_rl code to $CLUSTER_RSL_RL_DIR ..."
             ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_RSL_RL_DIR"
-            rsync -rh --exclude="*.git*" --exclude="__pycache__" --exclude="*.pyc" \
+            rsync -ah --exclude="*.git*" --exclude="__pycache__" --exclude="*.pyc" \
                 --exclude="logs/" \
                 "$LOCAL_RSL_RL_DIR/" "$CLUSTER_LOGIN:$CLUSTER_RSL_RL_DIR/"
         fi
@@ -262,7 +266,7 @@ case $command in
         if [ -n "$LOCAL_HOLOSOMA_DIR" ] && [ -n "$CLUSTER_HOLOSOMA_DIR" ]; then
             echo "[INFO] Syncing holosoma code to $CLUSTER_HOLOSOMA_DIR ..."
             ssh $CLUSTER_LOGIN "mkdir -p $CLUSTER_HOLOSOMA_DIR"
-            rsync -rh --exclude="*.git*" --exclude="__pycache__" --exclude="*.pyc" \
+            rsync -ah --exclude="*.git*" --exclude="__pycache__" --exclude="*.pyc" \
                 --exclude=".wandb" --exclude="logs/" \
                 --exclude="src/holosoma_retargeting/" \
                 --exclude="src/holosoma/holosoma/data/" \

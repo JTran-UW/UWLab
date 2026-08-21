@@ -24,7 +24,7 @@ from isaaclab.controllers import DifferentialIKControllerCfg
 from isaaclab.envs import ManagerBasedEnv
 from isaaclab.envs.mdp.actions.task_space_actions import DifferentialInverseKinematicsAction
 from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
-from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from pxr import Gf, UsdGeom, UsdLux
 
@@ -1204,6 +1204,9 @@ class MultiResetManager(ManagerTermBase):
             self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
 
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
+        # Index (within self.datasets[task_id]) of the state each env was last reset from.
+        # Subclasses use it to relate an env's start state to candidate goals.
+        self.state_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
     def __call__(
         self,
@@ -1245,6 +1248,7 @@ class MultiResetManager(ManagerTermBase):
             state_indices = torch.randint(
                 0, self.num_states[dataset_idx], (len(current_env_ids),), device=self._env.device
             )
+            self.state_id[current_env_ids] = state_indices
             states_to_reset_from = sample_from_nested_dict(self.datasets[dataset_idx], state_indices)
             self._reset_to(states_to_reset_from["initial_state"], env_ids=current_env_ids, is_relative=True)
 
@@ -1322,6 +1326,386 @@ class MultiResetManager(ManagerTermBase):
         self._env.scene.write_data_to_sim()
 
 
+def make_gc_goal_marker(
+    prim_path: str, sphere_color: tuple[float, float, float]
+) -> tuple[VisualizationMarkers, VisualizationMarkers]:
+    """Coordinate frame marker plus a small color-coded sphere at its origin.
+
+    Two separate single-prototype instancers: Fabric renders point instancers with
+    heterogeneous prototypes incorrectly (mismatched-prototypes warning, garbled shapes).
+    """
+    frame_cfg = FRAME_MARKER_CFG.copy()
+    frame_cfg.markers["frame"].scale = (0.05, 0.05, 0.05)
+    frame_cfg.prim_path = f"{prim_path}/frame"
+    sphere_cfg = VisualizationMarkersCfg(
+        prim_path=f"{prim_path}/sphere",
+        markers={
+            "sphere": sim_utils.SphereCfg(
+                radius=0.008,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=sphere_color),
+            )
+        },
+    )
+    return VisualizationMarkers(frame_cfg), VisualizationMarkers(sphere_cfg)
+
+
+def visualize_gc_goal(
+    markers: tuple[VisualizationMarkers, VisualizationMarkers], pos: torch.Tensor, quat: torch.Tensor
+) -> None:
+    """Draw the frame and sphere of a gc goal marker at the given poses."""
+    frame_marker, sphere_marker = markers
+    frame_marker.visualize(pos, quat)
+    sphere_marker.visualize(pos, quat)
+
+
+class GoalConditionedMultiResetManager(MultiResetManager):
+    """MultiResetManager that additionally samples a per-env goal state on each reset event.
+
+    The goal is drawn uniformly from the same reset dataset as the env's initial state
+    (independently of the initial-state index) and stored in :attr:`goal_state` as a nested
+    dict of tensors with leading dim ``num_envs``. Poses are env-relative, matching the
+    dataset convention.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        # Precompute the EE (wrist_3_link) pose for every dataset state via analytical FK, stored
+        # env-relative alongside root_pose so sampled goals carry it.
+        from uwlab_assets.robots.ur5e_robotiq_gripper.kinematics import ARM_JOINT_NAMES, compute_ee_pose_analytical
+
+        robot: Articulation = env.scene["robot"]
+        arm_joint_indices = [robot.joint_names.index(name) for name in ARM_JOINT_NAMES]
+        for dataset in self.datasets:
+            robot_state = dataset["initial_state"]["articulation"]["robot"]
+            ee_pose_b = compute_ee_pose_analytical(
+                robot_state["joint_position"][:, arm_joint_indices], device=str(env.device)
+            )
+            root_pose = robot_state["root_pose"]
+            ee_pos, ee_quat = math_utils.combine_frame_transforms(
+                root_pose[:, :3], root_pose[:, 3:7], ee_pose_b[:, :3], ee_pose_b[:, 3:7]
+            )
+            robot_state["ee_pose"] = torch.cat([ee_pos, ee_quat], dim=1)
+
+        # ---- keypoint k-NN index: for each dataset state, its nearest states ordered by MEAN
+        # KEYPOINT DISTANCE (the same quantity success is scored on).
+        #
+        # Why an index instead of the earlier reject-sampling: measured on Peg__PegHole, only 1.2%
+        # of random state pairs lie within 5 cm of each other in keypoint space, so drawing K
+        # uniform candidates and keeping the close ones reaches ~5 cm at best -- while every state
+        # has a neighbour at ~1.8 cm (anywhere-grasped) or ~1.3 mm (resting-grasped). The close
+        # goals exist; uniform sampling just cannot find them. Ranking gives exact access to them
+        # and makes the difficulty knob independent of dataset density.
+        self.knn_k = int(cfg.params.get("knn_k", 256))
+        self.neighbor_idx: list[torch.Tensor] = []
+        if bool(cfg.params.get("goal_curriculum", False)) and cfg.params.get("curriculum_mode") == "knn":
+            from .rewards import axis_keypoints_local, transform_keypoints
+
+            extent = float(cfg.params.get("keypoint_extent", -1.0))
+            if extent <= 0:
+                try:
+                    meta = utils.read_metadata_from_usd_directory(env.scene["insertive_object"].cfg.spawn.usd_path)
+                    extent = abs(float(meta["bottom_offset"]["pos"][2]))
+                except Exception:
+                    extent = 0.03
+            kp_local = axis_keypoints_local(extent, int(cfg.params.get("num_keypoints", 4)), self.device)
+            for di, dataset in enumerate(self.datasets):
+                poses = dataset["initial_state"]["rigid_object"]["insertive_object"]["root_pose"]
+                idx = self._build_keypoint_knn(poses, kp_local, min(self.knn_k, poses.shape[0] - 1), transform_keypoints)
+                self.neighbor_idx.append(idx)
+                carb.log_info(f"[GCMRM] keypoint k-NN built for dataset {di}: {tuple(idx.shape)}")
+
+        # allocate per-env goal buffers with the dataset's structure
+        init_indices = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.goal_state = sample_from_nested_dict(self.datasets[0]["initial_state"], init_indices)
+
+        # non-physical coordinate frame marker at the sampled goal
+        self.debug_vis = bool(cfg.params.get("debug_vis", False))
+        if self.debug_vis:
+            # magenta sphere = insertive object goal. There is deliberately NO EE goal marker:
+            # success is scored on the insertive object alone (GCProgressContext include_ee=False),
+            # so drawing an EE goal would advertise a target the policy is not judged against.
+            # Non-fatal: the frame prototype USD lives on the Omniverse CDN, which cluster
+            # compute nodes cannot always reach — markers are a nicety, training is not.
+            try:
+                self.insertive_goal_marker = make_gc_goal_marker("/Visuals/GCGoals/insertive_object", (1.0, 0.0, 1.0))
+            except Exception as e:
+                carb.log_warn(f"GC goal marker creation failed ({e}); disabling debug_vis.")
+                self.debug_vis = False
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        dataset_dir: str,
+        reset_types: list[str],
+        probs: list[float],
+        success: str | None = None,
+        debug_vis: bool = False,
+        goal_curriculum: bool = False,
+        curriculum_pos_start: float = 0.05,
+        curriculum_pos_end: float = 100.0,
+        curriculum_rot_start: float = 0.3,
+        curriculum_rot_end: float = 100.0,
+        curriculum_steps: int = 100000,
+        curriculum_candidates: int = 64,
+        curriculum_mode: str = "success",
+        curriculum_promote_at: float = 0.7,
+        curriculum_demote_at: float = 0.3,
+        curriculum_expand_factor: float = 1.3,
+        curriculum_cooldown: int = 50,
+        curriculum_rank_start: int = 8,
+        curriculum_rank_max: int = 0,
+        knn_k: int = 256,
+        keypoint_extent: float = -1.0,
+        num_keypoints: int = 4,
+    ) -> None:
+        super().__call__(env, env_ids, dataset_dir, reset_types, probs, success)
+
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self._env.device)
+
+        # sample goals from the same dataset each env was reset from
+        for dataset_idx in range(self.num_tasks):
+            mask = self.task_id[env_ids] == dataset_idx
+            if not mask.any():
+                continue
+
+            current_env_ids = env_ids[mask]
+            if goal_curriculum and curriculum_mode == "knn":
+                rank_limit = self._advance_rank_curriculum(
+                    env,
+                    dataset_idx,
+                    rank_start=curriculum_rank_start,
+                    rank_max=(curriculum_rank_max if curriculum_rank_max > 0 else self.knn_k),
+                    promote_at=curriculum_promote_at,
+                    demote_at=curriculum_demote_at,
+                    factor=curriculum_expand_factor,
+                    cooldown=curriculum_cooldown,
+                )
+                goal_indices = self._sample_knn_goals(dataset_idx, self.state_id[current_env_ids], rank_limit)
+            elif goal_curriculum:
+                if curriculum_mode == "success":
+                    pos_radius, rot_radius = self._advance_curriculum_on_success(
+                        env,
+                        pos_start=curriculum_pos_start,
+                        pos_end=curriculum_pos_end,
+                        rot_start=curriculum_rot_start,
+                        rot_end=curriculum_rot_end,
+                        promote_at=curriculum_promote_at,
+                        demote_at=curriculum_demote_at,
+                        factor=curriculum_expand_factor,
+                        cooldown=curriculum_cooldown,
+                    )
+                else:
+                    pos_radius = self._curriculum_value(env, curriculum_pos_start, curriculum_pos_end, curriculum_steps)
+                    rot_radius = self._curriculum_value(env, curriculum_rot_start, curriculum_rot_end, curriculum_steps)
+                goal_indices = self._sample_curriculum_goals(
+                    env,
+                    dataset_idx,
+                    current_env_ids,
+                    pos_radius=pos_radius,
+                    rot_radius=rot_radius,
+                    num_candidates=curriculum_candidates,
+                )
+            else:
+                goal_indices = torch.randint(
+                    0, self.num_states[dataset_idx], (len(current_env_ids),), device=self._env.device
+                )
+            sampled_goals = sample_from_nested_dict(self.datasets[dataset_idx]["initial_state"], goal_indices)
+            write_into_nested_dict(self.goal_state, sampled_goals, current_env_ids)
+
+        if self.debug_vis:
+            env_origins = self._env.scene.env_origins
+            insertive_goal = self.goal_state["rigid_object"]["insertive_object"]["root_pose"]
+            visualize_gc_goal(self.insertive_goal_marker, insertive_goal[:, :3] + env_origins, insertive_goal[:, 3:7])
+
+
+    def _build_keypoint_knn(self, poses: torch.Tensor, kp_local: torch.Tensor, k: int, transform_fn) -> torch.Tensor:
+        """Per-state indices of the k nearest states by MEAN keypoint distance. Chunked over rows.
+
+        Mean keypoint distance is ``(1/K) * sum_k ||a_k - b_k||`` -- NOT the Euclidean distance
+        between flattened keypoint vectors, so it is computed explicitly rather than via cdist.
+        """
+        n = poses.shape[0]
+        world = transform_fn(poses[:, :3], poses[:, 3:7], kp_local)  # [N, K, 3]
+        out = torch.empty(n, k, dtype=torch.long, device=poses.device)
+        chunk = max(1, int(2**24 // max(1, n * kp_local.shape[0])))  # cap peak memory
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            d = (world[start:end, None, :, :] - world[None, :, :, :]).norm(dim=-1).mean(dim=-1)  # [b, N]
+            rows = torch.arange(end - start, device=poses.device)
+            d[rows, torch.arange(start, end, device=poses.device)] = float("inf")  # exclude self
+            out[start:end] = torch.topk(d, k, dim=1, largest=False).indices
+        return out
+
+    def _sample_knn_goals(self, dataset_idx: int, start_ids: torch.Tensor, rank_limit: int) -> torch.Tensor:
+        """Goal indices drawn uniformly from each start state's ``rank_limit`` nearest neighbours.
+
+        ``rank_limit >= knn_k`` means "no restriction" and falls back to a uniform draw over the
+        whole dataset, so the end of the curriculum is exactly the unrestricted distribution.
+        """
+        nbr = self.neighbor_idx[dataset_idx]
+        n = len(start_ids)
+        if rank_limit >= nbr.shape[1]:
+            return torch.randint(0, int(self.num_states[dataset_idx]), (n,), device=self.device)
+        ranks = torch.randint(0, max(1, rank_limit), (n,), device=self.device)
+        return nbr[start_ids, ranks]
+
+    def _advance_rank_curriculum(
+        self,
+        env: ManagerBasedEnv,
+        dataset_idx: int,
+        rank_start: int,
+        rank_max: int,
+        promote_at: float,
+        demote_at: float,
+        factor: float,
+        cooldown: int,
+    ) -> int:
+        """Per-dataset neighbour-rank limit, gated on THAT dataset's own success rate.
+
+        Deliberately per-dataset rather than on the pooled mean. With one global level gated on the
+        probability-weighted mean, a strong path buys promotions the weak path then pays for (seen
+        2026-08-20: `resting` fell 0.51 -> 0.33 while `anywhere` at 0.90 carried the mean over the
+        threshold), and later the weak path freezes the strong one below its own ceiling. Each path
+        advancing on its own competence removes both failure modes.
+        """
+        if not hasattr(self, "_rank_limit"):
+            self._rank_limit = [int(rank_start)] * self.num_tasks
+            self._rank_cooldown = [-(10**9)] * self.num_tasks
+
+        rate = float("nan")
+        if getattr(self, "success_monitor", None) is not None:
+            rates = self.success_monitor.get_success_rate()
+            if dataset_idx < len(rates):
+                rate = float(rates[dataset_idx].item())
+
+        step = int(getattr(env, "common_step_counter", 0))
+        if step - self._rank_cooldown[dataset_idx] >= max(1, cooldown) and rate == rate:
+            self._rank_cooldown[dataset_idx] = step
+            if rate >= promote_at:
+                self._rank_limit[dataset_idx] = min(rank_max, max(1, int(self._rank_limit[dataset_idx] * factor)) + 1)
+            elif rate <= demote_at:
+                self._rank_limit[dataset_idx] = max(rank_start, int(self._rank_limit[dataset_idx] / factor))
+
+        if "log" not in env.extras:
+            env.extras["log"] = {}
+        env.extras["log"][f"curriculum/rank_limit_task_{dataset_idx}"] = float(self._rank_limit[dataset_idx])
+        env.extras["log"][f"curriculum/rate_task_{dataset_idx}"] = rate
+        return self._rank_limit[dataset_idx]
+
+    def _advance_curriculum_on_success(
+        self,
+        env: ManagerBasedEnv,
+        pos_start: float,
+        pos_end: float,
+        rot_start: float,
+        rot_end: float,
+        promote_at: float,
+        demote_at: float,
+        factor: float,
+        cooldown: int,
+    ) -> tuple[float, float]:
+        """Widen the goal radii when the policy is actually succeeding; shrink when it is not.
+
+        Keyed to `SuccessMonitor.get_success_rate()` (rolling 100-episode window) rather than to a
+        step count. An open-loop schedule has to guess the data's scale in advance: a linear ramp
+        from 0.05 m to a large end value crosses the dataset's own spread within a few hundred
+        steps and is a no-op for the rest of the run, which is exactly what happened on 2026-08-20.
+        Keying on competence removes that guess -- the radius only grows when the current radius
+        has been mastered.
+
+        `cooldown` is load-bearing: the success window needs ~100 episodes to reflect a change, so
+        adjusting on every reset event would ratchet the radius far faster than the signal driving
+        it can respond -- reintroducing the same runaway in success-triggered clothing.
+        """
+        if not hasattr(self, "_cur_pos_radius"):
+            self._cur_pos_radius = float(pos_start)
+            self._cur_rot_radius = float(rot_start)
+            self._curriculum_cooldown = -10**9  # allow the first adjustment immediately
+
+        rate = float("nan")
+        if getattr(self, "success_monitor", None) is not None:
+            rates = self.success_monitor.get_success_rate()
+            # Weight by the sampling probabilities so a rarely-drawn reset type cannot dominate.
+            rate = float((rates * self.probs).sum().item())
+
+        # Gate on the ENV STEP, not on call count: this method runs once per reset TYPE per reset
+        # event, so a call counter would tick N times faster with N reset distributions and
+        # silently shrink the intended pacing.
+        step = int(getattr(env, "common_step_counter", 0))
+        if step - self._curriculum_cooldown >= max(1, cooldown) and rate == rate:  # rate==rate filters NaN
+            self._curriculum_cooldown = step
+            if rate >= promote_at:
+                self._cur_pos_radius = min(pos_end, self._cur_pos_radius * factor)
+                self._cur_rot_radius = min(rot_end, self._cur_rot_radius * factor)
+            elif rate <= demote_at:
+                self._cur_pos_radius = max(pos_start, self._cur_pos_radius / factor)
+                self._cur_rot_radius = max(rot_start, self._cur_rot_radius / factor)
+
+        if "log" not in env.extras:
+            env.extras["log"] = {}
+        env.extras["log"]["curriculum/driving_success_rate"] = rate
+        return self._cur_pos_radius, self._cur_rot_radius
+
+    @staticmethod
+    def _curriculum_value(env: ManagerBasedEnv, start: float, end: float, steps: int) -> float:
+        """Linearly interpolate start -> end over the first ``steps`` env steps, then hold at end."""
+        if steps <= 0:
+            return end
+        progress = min(1.0, float(env.common_step_counter) / float(steps))
+        return start + progress * (end - start)
+
+    def _sample_curriculum_goals(
+        self,
+        env: ManagerBasedEnv,
+        dataset_idx: int,
+        env_ids: torch.Tensor,
+        pos_radius: float,
+        rot_radius: float,
+        num_candidates: int,
+    ) -> torch.Tensor:
+        """Pick goal indices near each env's START state, widening as the curriculum advances.
+
+        Draw ``num_candidates`` iid uniform goal candidates per env, keep those within
+        ``pos_radius`` metres and ``rot_radius`` radians of that env's initial insertive-object
+        pose, and choose uniformly among the survivors. If an env has no candidate in range the
+        CLOSEST candidate is used, so the curriculum degrades to "as near as available" rather
+        than failing or silently reverting to the full distribution.
+
+        Once both radii exceed the dataset's own spread every candidate qualifies, and choosing
+        uniformly among iid uniform draws is itself an exact uniform draw -- so the schedule ends
+        at precisely the original unrestricted distribution, not an approximation of it.
+        """
+        n = len(env_ids)
+        poses = self.datasets[dataset_idx]["initial_state"]["rigid_object"]["insertive_object"]["root_pose"]
+
+        start_pose = poses[self.state_id[env_ids]]
+        cand = torch.randint(0, int(self.num_states[dataset_idx]), (n, num_candidates), device=self.device)
+        cand_pose = poses[cand.reshape(-1)].reshape(n, num_candidates, 7)
+
+        pos_d = torch.norm(cand_pose[..., :3] - start_pose[:, None, :3], dim=-1)
+        rot_d = math_utils.quat_error_magnitude(
+            start_pose[:, None, 3:7].expand(-1, num_candidates, -1).reshape(-1, 4),
+            cand_pose[..., 3:7].reshape(-1, 4),
+        ).reshape(n, num_candidates)
+
+        in_range = (pos_d <= pos_radius) & (rot_d <= rot_radius)
+        # In-range candidates get a random key in [0,1) so the pick among them is uniform;
+        # out-of-range ones get 1 + normalised distance, so they only win when nothing is in
+        # range, and then the nearest wins.
+        far = pos_d / max(pos_radius, 1e-6) + rot_d / max(rot_radius, 1e-6)
+        key = torch.where(in_range, torch.rand_like(pos_d), 1.0 + far)
+        chosen = cand.gather(1, key.argmin(dim=1, keepdim=True)).squeeze(1)
+
+        if "log" in env.extras:
+            env.extras["log"]["curriculum/goal_pos_radius"] = pos_radius
+            env.extras["log"]["curriculum/goal_rot_radius"] = rot_radius
+            env.extras["log"]["curriculum/goal_in_range_frac"] = in_range.any(dim=1).float().mean().item()
+        return chosen
+
+
 def sample_state_data_set(episode_data: dict, idx: torch.Tensor, device: torch.device) -> dict:
     """Sample state from episode data and move tensors to device in one pass."""
     result = {}
@@ -1346,6 +1730,17 @@ def sample_from_nested_dict(nested_dict: dict, idx) -> dict:
         else:
             raise TypeError(f"Unsupported type in nested dictionary: {type(value)}")
     return sampled_dict
+
+
+def write_into_nested_dict(dst: dict, src: dict, idx) -> None:
+    """Write ``src`` tensors into ``dst`` buffers at the given indices, recursing through dicts."""
+    for key, value in src.items():
+        if isinstance(value, dict):
+            write_into_nested_dict(dst[key], value, idx)
+        elif isinstance(value, torch.Tensor):
+            dst[key][idx] = value
+        else:
+            raise TypeError(f"Unsupported type in nested dictionary: {type(value)}")
 
 
 class reset_root_states_uniform(ManagerTermBase):
@@ -2542,3 +2937,114 @@ class implicit_to_explicit_swap(ManagerTermBase):
             return {"actuator_swapped": False, "scale_progress": self._sysid_term.scale_progress}
 
         return self._do_swap(env)
+
+
+class apply_dynamics_gap(ManagerTermBase):
+    """Pin selected dynamics parameters to fixed values, overriding the training DR.
+
+    Every knob defaults to ``-1.0``; any negative value (or ``None``) means "leave the training
+    distribution untouched", so with no overrides this term is a no-op and the task is unchanged.
+    (A float sentinel rather than ``None`` because ``update_class_from_dict`` rejects a float
+    override of a ``None`` default; pass decimals from the CLI -- ints are rejected too.)
+    Declare it AFTER the DR terms in the events cfg: it runs last within the reset mode and
+    re-pins the value each reset, so it wins regardless of what the DR terms sampled. All knobs
+    are plain scalars in ``params`` and therefore hydra-overridable, e.g.::
+
+        env.events.dynamics_gap.params.peg_mass=0.5
+        env.events.dynamics_gap.params.peg_friction=0.3
+
+    Knobs:
+        peg_mass / socket_mass / table_mass_scale / robot_mass_scale: absolute kg for the two
+            objects, scale-of-default for table and robot.
+        peg_friction / socket_friction / table_friction / robot_friction: static AND dynamic
+            friction pinned to the same value (restitution 0).
+        gripper_stiffness_scale / gripper_damping_scale: scale-of-default on ``finger_joint``.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        from isaaclab.envs.mdp.events import (
+            randomize_actuator_gains,
+            randomize_rigid_body_mass,
+            randomize_rigid_body_material,
+        )
+
+        p = {k: (None if isinstance(v, float) and v < 0 else v) for k, v in cfg.params.items()}
+        self._sub_terms: list[tuple[ManagerTermBase, dict]] = []
+
+        def add(term_cls, params: dict):
+            sub_cfg = EventTermCfg(func=term_cls, mode=cfg.mode, params=params)
+            self._sub_terms.append((term_cls(sub_cfg, env), params))
+
+        mass_specs = [
+            ("peg_mass", "insertive_object", "abs"),
+            ("socket_mass", "receptive_object", "abs"),
+            ("table_mass_scale", "table", "scale"),
+            ("robot_mass_scale", "robot", "scale"),
+        ]
+        for knob, asset, operation in mass_specs:
+            value = p.get(knob)
+            if value is not None:
+                add(
+                    randomize_rigid_body_mass,
+                    {
+                        "asset_cfg": SceneEntityCfg(asset),
+                        "mass_distribution_params": (value, value),
+                        "operation": operation,
+                        "distribution": "uniform",
+                        "recompute_inertia": True,
+                    },
+                )
+
+        friction_specs = [
+            ("peg_friction", "insertive_object"),
+            ("socket_friction", "receptive_object"),
+            ("table_friction", "table"),
+            ("robot_friction", "robot"),
+        ]
+        for knob, asset in friction_specs:
+            value = p.get(knob)
+            if value is not None:
+                add(
+                    randomize_rigid_body_material,
+                    {
+                        "asset_cfg": SceneEntityCfg(asset),
+                        "static_friction_range": (value, value),
+                        "dynamic_friction_range": (value, value),
+                        "restitution_range": (0.0, 0.0),
+                        "num_buckets": 1,
+                        "make_consistent": True,
+                    },
+                )
+
+        stiffness = p.get("gripper_stiffness_scale")
+        damping = p.get("gripper_damping_scale")
+        if stiffness is not None or damping is not None:
+            add(
+                randomize_actuator_gains,
+                {
+                    "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_joint"]),
+                    "stiffness_distribution_params": (stiffness, stiffness) if stiffness is not None else None,
+                    "damping_distribution_params": (damping, damping) if damping is not None else None,
+                    "operation": "scale",
+                    "distribution": "uniform",
+                },
+            )
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor | None,
+        peg_mass: float | None = None,
+        socket_mass: float | None = None,
+        table_mass_scale: float | None = None,
+        robot_mass_scale: float | None = None,
+        peg_friction: float | None = None,
+        socket_friction: float | None = None,
+        table_friction: float | None = None,
+        robot_friction: float | None = None,
+        gripper_stiffness_scale: float | None = None,
+        gripper_damping_scale: float | None = None,
+    ):
+        for term, params in self._sub_terms:
+            term(env, env_ids, **params)

@@ -707,6 +707,27 @@ class BaseEventCfg:
     # mode: reset
     reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
 
+    # Declared last so it runs after every DR term within the reset mode; negative = disabled
+    # (float sentinel, not None -- update_class_from_dict rejects a float override of None).
+    # Override scalars from the CLI to turn any task into a dynamics-gap benchmark, e.g.
+    #   env.events.dynamics_gap.params.peg_mass=0.5
+    dynamics_gap = EventTerm(
+        func=task_mdp.apply_dynamics_gap,
+        mode="reset",
+        params={
+            "peg_mass": -1.0,
+            "socket_mass": -1.0,
+            "table_mass_scale": -1.0,
+            "robot_mass_scale": -1.0,
+            "peg_friction": -1.0,
+            "socket_friction": -1.0,
+            "table_friction": -1.0,
+            "robot_friction": -1.0,
+            "gripper_stiffness_scale": -1.0,
+            "gripper_damping_scale": -1.0,
+        },
+    )
+
 @configclass
 class BaseEventNoDRCfg:
     """Shared events: material/mass randomization, gripper gains, scene reset.
@@ -1508,12 +1529,19 @@ class ObservationsCfg:
             },
         )
 
+        # Peg-pose terms use the gap-capable wrapper; all knobs None = identical to the plain
+        # function. Override scalars from the CLI for an observation-gap benchmark, e.g.
+        #   env.observations.policy.insertive_asset_pose.params.pos_noise_std=0.005
         insertive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
             },
         )
 
@@ -1527,11 +1555,15 @@ class ObservationsCfg:
         )
 
         insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("receptive_object"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
             },
         )
 
@@ -1666,12 +1698,19 @@ class ObservationsNoPrivilegedObsCfg:
             },
         )
 
+        # Peg-pose terms use the gap-capable wrapper; all knobs None = identical to the plain
+        # function. Override scalars from the CLI for an observation-gap benchmark, e.g.
+        #   env.observations.policy.insertive_asset_pose.params.pos_noise_std=0.005
         insertive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
             },
         )
 
@@ -1685,11 +1724,15 @@ class ObservationsNoPrivilegedObsCfg:
         )
 
         insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("receptive_object"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
             },
         )
 
@@ -3489,6 +3532,419 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
     events: TrainEventCfg = TrainEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
+
+@configclass
+class GCObservationsCfg(ObservationsCfg):
+    """ObservationsCfg with goal-conditioned relative-pose terms.
+
+    Replaces ``insertive_asset_in_receptive_asset_frame`` with the insertive object's pose in its
+    goal-pose frame, and adds the EE pose in its goal-EE-pose frame. Applied to both groups.
+    """
+
+    @configclass
+    class PolicyCfg(ObservationsCfg.PolicyCfg):
+        insertive_asset_in_receptive_asset_frame: ObsTerm | None = None
+
+        insertive_asset_in_goal_frame = ObsTerm(
+            func=task_mdp.asset_pose_in_gc_goal_frame,
+            params={"target": "insertive_object", "rotation_repr": "axis_angle"},
+        )
+
+        end_effector_in_goal_ee_frame = ObsTerm(
+            func=task_mdp.asset_pose_in_gc_goal_frame,
+            params={
+                "target": "ee",
+                "ee_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+    @configclass
+    class CriticCfg(ObservationsCfg.CriticCfg):
+        insertive_asset_in_receptive_asset_frame: ObsTerm | None = None
+
+        insertive_asset_in_goal_frame = ObsTerm(
+            func=task_mdp.asset_pose_in_gc_goal_frame,
+            params={"target": "insertive_object", "rotation_repr": "axis_angle"},
+        )
+
+        end_effector_in_goal_ee_frame = ObsTerm(
+            func=task_mdp.asset_pose_in_gc_goal_frame,
+            params={
+                "target": "ee",
+                "ee_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class GCRewardsCfg:
+    """Goal-conditioned reward weights, simplified for learnability.
+
+    Success and the dense shaping term depend on the INSERTIVE OBJECT's pose only; the EE may end
+    anywhere. Requiring the EE to hit its own goal too made success a conjunction of two 6-DoF
+    constraints, a much sparser target. Both terms take ``include_ee`` (see GCProgressContext),
+    so the stricter criterion is one config flip away.
+
+    There are deliberately no per-asset intermediate rewards here -- see GCRewardIntermediateCfg.
+    """
+
+    # safety rewards
+
+    action_magnitude = RewTerm(func=task_mdp.action_l2_clamped, weight=-1e-4)
+
+    action_rate = RewTerm(func=task_mdp.action_rate_l2_clamped, weight=-1e-3)
+
+    joint_vel = RewTerm(
+        func=task_mdp.joint_vel_l2_clamped,
+        weight=-1e-2,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
+    )
+
+    abnormal_robot = RewTerm(func=task_mdp.abnormal_robot_state, weight=-100.0)
+
+    # task rewards
+
+    progress_context = RewTerm(
+        func=task_mdp.GCProgressContext,  # type: ignore
+        weight=0.1,
+        params={
+            "insertive_asset_cfg": SceneEntityCfg("insertive_object"),
+            "ee_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "include_ee": False,
+            # Difficulty levers, all Hydra-overridable. require_orientation=False drops the
+            # orientation conjunct; the *_threshold sentinels (-1.0 = use the object's USD
+            # metadata value, any value > 0 overrides it) loosen the success ball.
+            "require_orientation": True,
+            "position_threshold": -1.0,
+            "orientation_threshold": -1.0,
+            # Keypoint objective: success when ALL axis keypoints are within keypoint_threshold
+            # metres of their goal counterparts. Spin about the peg axis is free by construction,
+            # matching the base task's euler-XY criterion ("yaw could be different").
+            "success_mode": "pose",
+            "num_keypoints": 4,
+            "keypoint_extent": -1.0,
+            "keypoint_threshold": 0.01,
+        },
+    )
+
+    dense_success_reward = RewTerm(
+        func=task_mdp.gc_dense_success_reward,
+        weight=0.1,
+        # std sets the length-scale of the shaping. At std=1.0 the position term only spans
+        # ~0.15 over the whole 0-0.2 m working range, i.e. almost no gradient; drop it toward
+        # 0.1 to sharpen. include_orientation=False pairs with require_orientation=False.
+        params={
+            "std": 1.0,
+            "include_ee": False,
+            "include_orientation": True,
+            "rot_std": -1.0,
+            # use_keypoints=True switches shaping to mean keypoint distance (one unit, one std);
+            # pair it with progress_context success_mode="keypoint".
+            "use_keypoints": False,
+        },
+    )
+
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
+
+
+@configclass
+class GCRewardIntermediateCfg(GCRewardsCfg):
+    """GCRewardsCfg plus intermediate per-asset success rewards: 0.1 when the insertive object
+    alone is aligned with its goal, and 0.1 when the EE alone is aligned with its goal.
+
+    NOTE: ``ee_success_reward`` rewards EE alignment that the parent's success criterion ignores
+    (``include_ee=False``), so this variant re-introduces an objective the task no longer scores.
+    Kept for comparison; the plain GCRewardsCfg is the simplified default.
+    """
+
+    insertive_success_reward = RewTerm(func=task_mdp.gc_insertive_success_reward, weight=0.1)
+
+    ee_success_reward = RewTerm(func=task_mdp.gc_ee_success_reward, weight=0.1)
+
+
+@configclass
+class GCTrainEventCfg(BaseEventCfg):
+    """Training events with goal-conditioned 4-path resets and a goal-distance curriculum.
+
+    The goal is sampled near each env's own start state at first (``curriculum_pos_start`` metres,
+    ``curriculum_rot_start`` radians) and the radii widen linearly over ``curriculum_steps`` env
+    steps until every dataset state qualifies -- at which point the distribution is exactly the
+    original uniform one. Early goals are therefore reachable in a few steps, so the sparse
+    success term fires often enough to learn from before long-horizon goals appear.
+
+    Progress is logged as ``curriculum/goal_pos_radius``, ``curriculum/goal_rot_radius`` and
+    ``curriculum/goal_in_range_frac`` (the fraction of envs that found an in-radius goal;
+    persistently < 1 means the start radius is tighter than the dataset can supply).
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.GoalConditionedMultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "debug_vis": True,
+            "goal_curriculum": True,
+            "curriculum_pos_start": 0.05,
+            "curriculum_pos_end": 100.0,
+            "curriculum_rot_start": 0.3,
+            "curriculum_rot_end": 100.0,
+            "curriculum_steps": 100000,
+            # Candidates drawn per env per reset. The radius is only honoured if some candidate
+            # lands inside it; with too few, the term degrades to "nearest of K" and the
+            # effective radius is set by candidate density, not by the schedule. Watch
+            # curriculum/goal_in_range_frac and raise this if it sits well below 1.
+            "curriculum_candidates": 256,
+            # Schedule mode. "success" widens the radii only when the rolling success rate clears
+            # `curriculum_promote_at`, and shrinks below `curriculum_demote_at`. "steps" is the old
+            # open-loop linear ramp, kept for comparison -- note it has to guess the data's scale
+            # in advance, and a too-large `*_end` makes it a no-op within a few hundred steps.
+            "curriculum_mode": "success",
+            "curriculum_promote_at": 0.7,
+            "curriculum_demote_at": 0.3,
+            "curriculum_expand_factor": 1.3,
+            # Reset events between adjustments. The success window is ~100 episodes, so adjusting
+            # every reset would move the radius faster than the signal driving it can respond.
+            "curriculum_cooldown": 50,
+            # k-NN rank curriculum ("knn" mode): difficulty is the neighbour RANK limit rather
+            # than a metric radius, so it is independent of dataset density. Neighbours are ranked
+            # by mean KEYPOINT distance -- the same quantity success is scored on. rank_limit >=
+            # knn_k falls back to a uniform draw, i.e. the unrestricted distribution.
+            "curriculum_rank_start": 8,
+            "curriculum_rank_max": 0,
+            "knn_k": 256,
+            "keypoint_extent": -1.0,
+            "num_keypoints": 4,
+        },
+    )
+
+
+@configclass
+class GCGraspedTrainEventCfg(GCTrainEventCfg):
+    """GCTrainEventCfg with resets restricted to ``ObjectAnywhereEEGrasped`` (prob 1.0).
+
+    The object starts already grasped, so the policy never has to solve approach-and-grasp --
+    the task collapses to "carry the held object to a goal pose", i.e. reaching. This is the
+    simplest rung of the ladder: if success does not move here, the problem is not the reset
+    distribution.
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.GoalConditionedMultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": ["ObjectAnywhereEEGrasped"],
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "debug_vis": True,
+            "goal_curriculum": True,
+            "curriculum_pos_start": 0.05,
+            "curriculum_pos_end": 100.0,
+            "curriculum_rot_start": 0.3,
+            "curriculum_rot_end": 100.0,
+            "curriculum_steps": 100000,
+            "curriculum_candidates": 256,
+            # Schedule mode. "success" widens the radii only when the rolling success rate clears
+            # `curriculum_promote_at`, and shrinks below `curriculum_demote_at`. "steps" is the old
+            # open-loop linear ramp, kept for comparison -- note it has to guess the data's scale
+            # in advance, and a too-large `*_end` makes it a no-op within a few hundred steps.
+            "curriculum_mode": "success",
+            "curriculum_promote_at": 0.7,
+            "curriculum_demote_at": 0.3,
+            "curriculum_expand_factor": 1.3,
+            # Reset events between adjustments. The success window is ~100 episodes, so adjusting
+            # every reset would move the radius faster than the signal driving it can respond.
+            "curriculum_cooldown": 50,
+            # k-NN rank curriculum ("knn" mode): difficulty is the neighbour RANK limit rather
+            # than a metric radius, so it is independent of dataset density. Neighbours are ranked
+            # by mean KEYPOINT distance -- the same quantity success is scored on. rank_limit >=
+            # knn_k falls back to a uniform draw, i.e. the unrestricted distribution.
+            "curriculum_rank_start": 8,
+            "curriculum_rank_max": 0,
+            "knn_k": 256,
+            "keypoint_extent": -1.0,
+            "num_keypoints": 4,
+        },
+    )
+
+
+@configclass
+class GCGraspedRestingTrainEventCfg(GCGraspedTrainEventCfg):
+    """Two grasped reset paths: ``ObjectAnywhereEEGrasped`` + ``ObjectRestingEEGrasped``, 50/50.
+
+    A step up from grasped-only without yet requiring approach-and-grasp: the object still starts
+    held, but half the episodes begin with it resting on a surface rather than free in the air, so
+    the policy must also lift/extract before transporting. Per-path success is logged separately as
+    ``metrics/task_0_success_rate`` (anywhere) and ``metrics/task_1_success_rate`` (resting).
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.GoalConditionedMultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": ["ObjectAnywhereEEGrasped", "ObjectRestingEEGrasped"],
+            "probs": [0.5, 0.5],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "debug_vis": True,
+            "goal_curriculum": True,
+            "curriculum_pos_start": 0.05,
+            "curriculum_pos_end": 1.0,
+            "curriculum_rot_start": 0.3,
+            "curriculum_rot_end": 3.2,
+            "curriculum_steps": 100000,
+            "curriculum_candidates": 512,
+            "curriculum_mode": "success",
+            "curriculum_promote_at": 0.7,
+            "curriculum_demote_at": 0.3,
+            "curriculum_expand_factor": 1.3,
+            "curriculum_cooldown": 400,
+            # k-NN rank curriculum ("knn" mode): difficulty is the neighbour RANK limit rather
+            # than a metric radius, so it is independent of dataset density. Neighbours are ranked
+            # by mean KEYPOINT distance -- the same quantity success is scored on. rank_limit >=
+            # knn_k falls back to a uniform draw, i.e. the unrestricted distribution.
+            "curriculum_rank_start": 8,
+            "curriculum_rank_max": 0,
+            "knn_k": 256,
+            "keypoint_extent": -1.0,
+            "num_keypoints": 4,
+        },
+    )
+
+
+@configclass
+class GCGraspedPlayEventCfg(GCGraspedTrainEventCfg):
+    """``GCGraspedTrainEventCfg`` with the goal curriculum OFF.
+
+    Goals are drawn uniformly from the reset dataset rather than near each env's start pose, so an
+    evaluation measures the policy against the FULL goal distribution. With the curriculum on, an
+    early-training policy is scored against goals deliberately sampled close to its start state,
+    which flatters the number; this variant removes that.
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.GoalConditionedMultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": ["ObjectAnywhereEEGrasped"],
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "debug_vis": True,
+            "goal_curriculum": False,
+        },
+    )
+
+
+@configclass
+class GCMRMVisualizationEventCfg(BaseEventNoDRCfg):
+    """Goal-conditioned resets only, no domain randomization: for visual inspection."""
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.GoalConditionedMultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+        },
+    )
+
+
+@configclass
+class VisualizationTerminationsCfg:
+    """Time-out only, so the env resets on a fixed cadence."""
+
+    time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+
+
+@configclass
+class Ur5eRobotiq2f85GCMRMVisualizationCfg(Ur5eRobotiq2f85RlStateCfg):
+    """Peg-insertion scene with GoalConditionedMultiResetManager resets and 2 s episodes.
+
+    No success termination and no DR: every episode runs exactly 2 s, then all envs reset to a
+    fresh (initial state, goal state) pair. Intended for visual inspection with no policy.
+    """
+
+    events: GCMRMVisualizationEventCfg = GCMRMVisualizationEventCfg()
+    terminations: VisualizationTerminationsCfg = VisualizationTerminationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = 2.0
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
+    """Goal-conditioned training env: GCMRM resets, goal-frame observations, goal-reaching rewards.
+
+    Terminations are the inherited TerminationsCfg (time_out, abnormal_robot,
+    first_episode_termination) -- no success termination.
+    """
+
+    observations: GCObservationsCfg = GCObservationsCfg()
+    rewards: GCRewardsCfg = GCRewardsCfg()
+    events: GCTrainEventCfg = GCTrainEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGCGraspedRestingTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGCTrainCfg):
+    """Grasped GC task widened to two reset paths (anywhere-grasped + resting-grasped).
+
+    Observations, rewards, terminations and actions are inherited from the grasped task, so a
+    checkpoint trained there loads here unchanged; only the reset distribution differs.
+    """
+
+    events: GCGraspedRestingTrainEventCfg = GCGraspedRestingTrainEventCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGCGraspedPlayCfg(Ur5eRobotiq2f85RelCartesianOSCGCTrainCfg):
+    """Play/eval twin of the grasped GC task: uniform goal sampling, no curriculum.
+
+    Observations, rewards, terminations and actions are inherited, so a checkpoint trained on
+    ``...-GC-Grasped-v0`` loads here unchanged and is scored on the unrestricted goal distribution.
+    """
+
+    events: GCGraspedPlayEventCfg = GCGraspedPlayEventCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGCGraspedTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGCTrainCfg):
+    """Its parent with resets restricted to ``ObjectAnywhereEEGrasped``: a reaching-style task.
+
+    Observations, rewards and terminations are inherited unchanged, so the reset distribution is
+    the only difference and a policy transfers between the two.
+    """
+
+    events: GCGraspedTrainEventCfg = GCGraspedTrainEventCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGCIntermediateTrainCfg(Ur5eRobotiq2f85RelCartesianOSCGCTrainCfg):
+    """GC training env with intermediate per-asset success rewards."""
+
+    rewards: GCRewardIntermediateCfg = GCRewardIntermediateCfg()
+
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingCfg(Ur5eRobotiq2f85RlStateRewardScalingCfg):
 
@@ -3573,6 +4029,20 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsPegMa
     """
 
     terminations: TerminationsCfg = TerminationsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsPegMassGapCfg(
+    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsPegMassGapFullResetCfg
+):
+    """Its parent with resets narrowed to ``ObjectAnywhereEEAnywhere`` (prob 1.0).
+
+    Observations, rewards, terminations (no ``success``) and the peg-mass gap are inherited, so the
+    initial-state distribution is the only difference from the parent. Matches
+    ``TrainEvalEventAnywhereOnlyPegMassGapCfg`` term for term, so an eval env sees the same states.
+    """
+
+    events: TrainEventPegMassGapCfg = TrainEventPegMassGapCfg()
 
 
 @configclass

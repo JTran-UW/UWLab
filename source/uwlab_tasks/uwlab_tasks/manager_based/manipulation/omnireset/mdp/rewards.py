@@ -224,6 +224,186 @@ class ProgressContext(ManagerTermBase):
         return torch.zeros(env.num_envs, device=env.device)
 
 
+def axis_keypoints_local(extent: float, num: int, device) -> torch.Tensor:
+    """``num`` points evenly spaced along the object's local +z axis over ``[-extent, +extent]``.
+
+    Deliberately ON THE AXIS rather than at bounding-box corners. A peg is a solid of revolution:
+    spin about its own long axis does not change whether it can be inserted. Corner keypoints would
+    penalise that spin and make the learned task strictly harder than the real one. Axis keypoints
+    are spin-invariant by construction while still capturing position AND tilt -- the two DoF that
+    actually matter -- because a tilt moves the end points apart even when the centre coincides.
+    """
+    kp = torch.zeros(num, 3, device=device)
+    kp[:, 2] = torch.linspace(-extent, extent, num, device=device)
+    return kp
+
+
+def transform_keypoints(pos: torch.Tensor, quat: torch.Tensor, kp_local: torch.Tensor) -> torch.Tensor:
+    """Rigidly place ``kp_local`` [K,3] under each pose (``pos`` [N,3], ``quat`` [N,4]) -> [N,K,3]."""
+    n, k = pos.shape[0], kp_local.shape[0]
+    q = quat[:, None, :].expand(n, k, 4).reshape(-1, 4)
+    p = kp_local[None, :, :].expand(n, k, 3).reshape(-1, 3)
+    return math_utils.quat_apply(q, p).reshape(n, k, 3) + pos[:, None, :]
+
+
+class GCProgressContext(ManagerTermBase):
+    """Goal-conditioned analogue of ProgressContext.
+
+    Tracks pose error of the insertive object and the EE (wrist_3_link) against the
+    GCMRM-sampled goal state. Exposes the same success/aligned/counter attributes as
+    ProgressContext so success_reward and the GCMRM success hook work unchanged.
+
+    ``include_ee`` selects what counts as success. With ``include_ee=False`` (the default)
+    ONLY the insertive object's pose matters -- the EE may be anywhere. Requiring the EE to
+    also hit its goal makes success a conjunction of two independent 6-DoF constraints, which
+    is a far sparser target to learn from. EE distances are still computed and exposed, so
+    turning ``include_ee=True`` restores the stricter criterion without any other change.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.insertive_asset: RigidObject = env.scene[cfg.params.get("insertive_asset_cfg").name]  # type: ignore
+        self.ee_asset_cfg: SceneEntityCfg = cfg.params.get("ee_asset_cfg")
+        self.ee_asset: Articulation = env.scene[self.ee_asset_cfg.name]
+        self.ee_body_idx = 0 if isinstance(self.ee_asset_cfg.body_ids, slice) else self.ee_asset_cfg.body_ids[0]
+
+        self.insertive_xyz_distance = torch.zeros((env.num_envs), device=env.device)
+        self.insertive_angle_distance = torch.zeros((env.num_envs), device=env.device)
+        self.ee_xyz_distance = torch.zeros((env.num_envs), device=env.device)
+        self.ee_angle_distance = torch.zeros((env.num_envs), device=env.device)
+        self.insertive_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
+        self.ee_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
+        self.orientation_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
+        self.position_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
+        self.success = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
+        self.continuous_success_counter = torch.zeros((env.num_envs), dtype=torch.int32, device=env.device)
+
+        # Keypoint objective. One quantity in METRES couples position and tilt, so there is a single
+        # threshold and a single shaping length-scale -- no metres-vs-radians pairing to keep in sync.
+        num_kp = int(cfg.params.get("num_keypoints", 4))
+        extent = float(cfg.params.get("keypoint_extent", -1.0))
+        if extent <= 0:
+            # No bounding box in metadata; `bottom_offset` gives the origin->tip distance along z.
+            try:
+                meta = utils.read_metadata_from_usd_directory(self.insertive_asset.cfg.spawn.usd_path)
+                extent = abs(float(meta["bottom_offset"]["pos"][2]))
+            except Exception:
+                extent = 0.03
+        self.keypoint_extent = extent
+        self.keypoints_local = axis_keypoints_local(extent, num_kp, env.device)
+        self.keypoint_max_distance = torch.zeros((env.num_envs), device=env.device)
+        self.keypoint_mean_distance = torch.zeros((env.num_envs), device=env.device)
+
+        success_monitor_cfg = SuccessMonitorCfg(monitored_history_len=100, num_monitored_data=1, device=env.device)
+        self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        super().reset(env_ids)
+        if env_ids is None:
+            self.continuous_success_counter[:] = 0
+        else:
+            self.continuous_success_counter[env_ids] = 0
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        insertive_asset_cfg: SceneEntityCfg,
+        ee_asset_cfg: SceneEntityCfg,
+        event_term_name: str = "reset_from_reset_states",
+        command_context: str = "task_command",
+        include_ee: bool = False,
+        require_orientation: bool = True,
+        position_threshold: float = -1.0,
+        orientation_threshold: float = -1.0,
+        success_mode: str = "pose",
+        num_keypoints: int = 4,
+        keypoint_extent: float = -1.0,
+        keypoint_threshold: float = 0.01,
+    ) -> torch.Tensor:
+        task_command: TaskCommand = env.command_manager.get_term(command_context)
+        # The command's thresholds come from the receptive object's USD metadata, so they are not
+        # reachable by a Hydra override. These sentinels (any value > 0 wins) make them tunable
+        # per-run for curriculum/difficulty sweeps. -1.0 rather than None deliberately: the config
+        # type-checker compares against the DEFAULT's type and rejects float-over-None.
+        success_position_threshold = (
+            position_threshold if position_threshold > 0 else task_command.success_position_threshold
+        )
+        success_orientation_threshold = (
+            orientation_threshold if orientation_threshold > 0 else task_command.success_orientation_threshold
+        )
+
+        goal_state = env.event_manager.get_term_cfg(event_term_name).func.goal_state
+        env_origins = env.scene.env_origins
+
+        insertive_goal_pose = goal_state["rigid_object"][insertive_asset_cfg.name]["root_pose"]
+        self.insertive_xyz_distance[:] = torch.norm(
+            self.insertive_asset.data.root_pos_w - (insertive_goal_pose[:, :3] + env_origins), dim=1
+        )
+        self.insertive_angle_distance[:] = math_utils.quat_error_magnitude(
+            self.insertive_asset.data.root_quat_w, insertive_goal_pose[:, 3:7]
+        )
+
+        ee_goal_pose = goal_state["articulation"]["robot"]["ee_pose"]
+        self.ee_xyz_distance[:] = torch.norm(
+            self.ee_asset.data.body_link_pos_w[:, self.ee_body_idx] - (ee_goal_pose[:, :3] + env_origins), dim=1
+        )
+        self.ee_angle_distance[:] = math_utils.quat_error_magnitude(
+            self.ee_asset.data.body_link_quat_w[:, self.ee_body_idx], ee_goal_pose[:, 3:7]
+        )
+
+        self.insertive_aligned[:] = (self.insertive_xyz_distance < success_position_threshold) & (
+            self.insertive_angle_distance < success_orientation_threshold
+        )
+        self.ee_aligned[:] = (self.ee_xyz_distance < success_position_threshold) & (
+            self.ee_angle_distance < success_orientation_threshold
+        )
+        # Success is insertive-object-only unless include_ee is set; see the class docstring.
+        if include_ee:
+            self.position_aligned[:] = (self.insertive_xyz_distance < success_position_threshold) & (
+                self.ee_xyz_distance < success_position_threshold
+            )
+            self.orientation_aligned[:] = (self.insertive_angle_distance < success_orientation_threshold) & (
+                self.ee_angle_distance < success_orientation_threshold
+            )
+        else:
+            self.position_aligned[:] = self.insertive_xyz_distance < success_position_threshold
+            self.orientation_aligned[:] = self.insertive_angle_distance < success_orientation_threshold
+
+        # Position-only success: drop the orientation conjunct entirely. Hitting an arbitrary
+        # dataset goal within BOTH 3cm and 0.2rad is a very small target; this is the next rung
+        # down the simplification ladder when nothing is learning.
+        if not require_orientation:
+            self.orientation_aligned[:] = True
+
+        # Keypoint distances are always computed (cheap, and useful to log even in pose mode).
+        cur_kp = transform_keypoints(
+            self.insertive_asset.data.root_pos_w, self.insertive_asset.data.root_quat_w, self.keypoints_local
+        )
+        goal_kp = transform_keypoints(
+            insertive_goal_pose[:, :3] + env_origins, insertive_goal_pose[:, 3:7], self.keypoints_local
+        )
+        kp_d = torch.norm(cur_kp - goal_kp, dim=-1)
+        self.keypoint_max_distance[:] = kp_d.max(dim=1).values
+        self.keypoint_mean_distance[:] = kp_d.mean(dim=1)
+
+        if success_mode == "keypoint":
+            # ALL keypoints must be within threshold -- the max is the honest criterion.
+            aligned = self.keypoint_max_distance < keypoint_threshold
+            self.position_aligned[:] = aligned
+            self.orientation_aligned[:] = True
+        self.success[:] = self.orientation_aligned & self.position_aligned
+
+        self.continuous_success_counter[:] = torch.where(
+            self.success, self.continuous_success_counter + 1, torch.zeros_like(self.continuous_success_counter)
+        )
+
+        self.success_monitor.success_update(
+            torch.zeros(env.num_envs, dtype=torch.int32, device=env.device), self.success
+        )
+
+        return torch.zeros(env.num_envs, device=env.device)
+
+
 class ProgressContextReaching(ManagerTermBase):
     """Reaching-task analogue of ProgressContext. Tracks EE-link → target-marker pose error.
 
@@ -303,6 +483,79 @@ def dense_success_reward(env: ManagerBasedRLEnv, std: float, context: str = "pro
     xyz_distance = torch.exp(-xyz_distance / std)
     stacked = torch.stack([angle_diff, xyz_distance], dim=0)
     return torch.mean(stacked, dim=0)
+
+
+def gc_insertive_success_reward(env: ManagerBasedRLEnv, context: str = "progress_context") -> torch.Tensor:
+    """1.0 when the insertive object is within the goal position and orientation thresholds."""
+    context_term: ManagerTermBase = env.reward_manager.get_term_cfg(context).func  # type: ignore
+    return context_term.insertive_aligned.float()
+
+
+def gc_ee_success_reward(env: ManagerBasedRLEnv, context: str = "progress_context") -> torch.Tensor:
+    """1.0 when the EE is within the goal position and orientation thresholds."""
+    context_term: ManagerTermBase = env.reward_manager.get_term_cfg(context).func  # type: ignore
+    return context_term.ee_aligned.float()
+
+
+def gc_keypoint_dense_reward(
+    env: ManagerBasedRLEnv, std: float, context: str = "progress_context"
+) -> torch.Tensor:
+    """Dense shaping from mean keypoint distance: ``exp(-mean_kp_dist / std)``, in [0, 1].
+
+    The counterpart to ``success_mode="keypoint"``. Because keypoint distance is a single quantity
+    in metres, this needs ONE ``std`` -- there is no position/orientation pair to keep consistent,
+    which is the failure mode `gc_dense_success_reward` had to grow a `rot_std` to work around.
+    Mean (not max) is used for shaping so every keypoint contributes gradient; success still uses
+    the max, so shaping is smoother than the criterion but points the same way.
+    """
+    context_term: ManagerTermBase = env.reward_manager.get_term_cfg(context).func  # type: ignore
+    return torch.exp(-context_term.keypoint_mean_distance / std)
+
+
+def gc_dense_success_reward(
+    env: ManagerBasedRLEnv,
+    std: float,
+    context: str = "progress_context",
+    include_ee: bool = False,
+    include_orientation: bool = True,
+    rot_std: float = -1.0,
+    use_keypoints: bool = False,
+) -> torch.Tensor:
+    """Dense goal-reaching reward from angle and xyz distance to the goal, in [0, 1].
+
+    With ``include_ee=False`` (the default) only the insertive object contributes, matching the
+    insertive-only success criterion -- a dense term that rewards EE proximity while success
+    ignores the EE would pull the policy toward states that never score. Set ``include_ee=True``
+    to average the EE terms back in.
+    """
+    context_term: ManagerTermBase = env.reward_manager.get_term_cfg(context).func  # type: ignore
+    if use_keypoints:
+        # Single quantity in metres: position and tilt are already coupled, so one `std` suffices
+        # and `rot_std`/`include_orientation` are irrelevant here. Pairs with success_mode="keypoint".
+        return torch.exp(-context_term.keypoint_mean_distance / std)
+    # Position is in METRES and orientation in RADIANS, whose useful ranges differ by ~10x. A single
+    # shared `std` therefore cannot serve both: sharpening position to 0.1 makes the angle term
+    # exp(-1.2/0.1) ~ 0 (dead), while a std large enough for angle leaves position nearly flat.
+    # rot_std defaults to <=0 meaning "use std", so existing configs are unchanged.
+    pos_std = std
+    ang_std = rot_std if rot_std > 0 else std
+    # When success is position-only (`require_orientation=False` on the context), keeping the
+    # angle term here rewards alignment that success does not score -- the same incoherence as
+    # shaping toward the EE while ignoring it. include_orientation=False drops it.
+    if not include_orientation:
+        insertive_pos = torch.exp(-context_term.insertive_xyz_distance / pos_std)
+        if not include_ee:
+            return insertive_pos
+        return (insertive_pos + torch.exp(-context_term.ee_xyz_distance / pos_std)) / 2.0
+    insertive = torch.exp(-context_term.insertive_angle_distance / ang_std) + torch.exp(
+        -context_term.insertive_xyz_distance / pos_std
+    )
+    if not include_ee:
+        return insertive / 2.0
+    ee = torch.exp(-context_term.ee_angle_distance / ang_std) + torch.exp(
+        -context_term.ee_xyz_distance / pos_std
+    )
+    return (insertive + ee) / 4.0
 
 
 def dense_success_reward_no_angle(env: ManagerBasedRLEnv, std: float, context: str = "progress_context") -> torch.Tensor:

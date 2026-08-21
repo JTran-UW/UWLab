@@ -112,6 +112,51 @@ def rpy_to_matrix_torch(rpy: torch.Tensor) -> torch.Tensor:
 
 
 # ============================================================================
+# Analytical FK
+# ============================================================================
+
+
+def compute_ee_pose_analytical(joint_angles: torch.Tensor, device: str = "cuda") -> torch.Tensor:
+    """Compute wrist_3_link pose from arm joint angles using calibrated kinematics (batched).
+
+    Same joint-frame composition as :func:`compute_jacobian_analytical`, output in the
+    REP-103 base_link frame (180 deg Z rotation from base_link_inertia).
+
+    Args:
+        joint_angles: (N, 6) joint angles in radians, ordered as ``ARM_JOINT_NAMES``.
+    Returns:
+        (N, 7) pose as position + quaternion (w, x, y, z).
+    """
+    from isaaclab.utils.math import quat_from_matrix
+
+    N = joint_angles.shape[0]
+    cal = _load_calibration()
+    xyz_all = cal["joints_xyz"].to(device)
+    rpy_all = cal["joints_rpy"].to(device)
+
+    T = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).repeat(N, 1, 1)
+    for i in range(6):
+        R_fixed = rpy_to_matrix_torch(rpy_all[i])
+        T_fixed = torch.eye(4, device=device, dtype=torch.float32)
+        T_fixed[:3, :3] = R_fixed
+        T_fixed[:3, 3] = xyz_all[i]
+        T_fixed = T_fixed.unsqueeze(0).repeat(N, 1, 1)
+        theta = joint_angles[:, i]
+        ct, st = torch.cos(theta), torch.sin(theta)
+        T_joint = torch.eye(4, device=device, dtype=torch.float32).unsqueeze(0).repeat(N, 1, 1)
+        T_joint[:, 0, 0] = ct
+        T_joint[:, 0, 1] = -st
+        T_joint[:, 1, 0] = st
+        T_joint[:, 1, 1] = ct
+        T = torch.bmm(torch.bmm(T, T_fixed), T_joint)
+
+    R_180Z_batch = R_180Z.to(device).unsqueeze(0).repeat(N, 1, 1)
+    pos = torch.bmm(R_180Z_batch, T[:, :3, 3].unsqueeze(-1)).squeeze(-1)
+    quat = quat_from_matrix(torch.bmm(R_180Z_batch, T[:, :3, :3]))
+    return torch.cat([pos, quat], dim=1)
+
+
+# ============================================================================
 # Analytical Jacobian
 # ============================================================================
 

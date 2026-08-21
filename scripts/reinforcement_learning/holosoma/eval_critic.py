@@ -328,25 +328,54 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _has_success_term = "success" in _term_names
     _has_abnormal_term = "abnormal_robot" in _term_names
     print(f"[eval_critic] termination terms: {_term_names}")
-    if not _has_success_term:
-        print("[eval_critic] WARNING: no 'success' termination term; nothing will be counted as a success.")
 
-    def classify_terminations(term_type, dones, extras, was_active):
+    # Tasks without a `success` termination (the *-Sparse-*-v0 family) never end an episode on
+    # success, so every episode times out and a termination-only rule files them all as failures.
+    # play.py handles this by reading ProgressContext's instantaneous success flag each step and
+    # counting an episode as a success if ANY step satisfied it. Do the same here.
+    # ProgressContext.success is defined as `orientation_aligned & position_aligned`, which is the
+    # exact expression play.py accumulates -- and is weaker than the `success` TERMINATION term,
+    # which additionally requires the continuous-success counter to reach its threshold.
+    try:
+        _progress_ctx = env.unwrapped.reward_manager.get_term_cfg("progress_context").func
+    except Exception as exc:  # noqa: BLE001 - task simply may not define the term
+        _progress_ctx = None
+        print(f"[eval_critic] no `progress_context` reward term ({exc}); ever-success unavailable.")
+    _has_ever_success = _progress_ctx is not None and hasattr(_progress_ctx, "success")
+    if _has_ever_success:
+        print("[eval_critic] success = ProgressContext.success ever true during the episode "
+              "(matches play.py); timeouts are NOT automatically failures.")
+    if not _has_success_term and not _has_ever_success:
+        print("[eval_critic] WARNING: no 'success' termination term and no ProgressContext; "
+              "nothing will be counted as a success.")
+
+    def accumulate_success(ever_success):
+        """OR this step's instantaneous ProgressContext success flag into the per-env episode flag.
+
+        Must be called after EVERY ``env.step`` -- including for envs that terminate on this step,
+        whose success would otherwise be lost when the env auto-resets.
+        """
+        if not _has_ever_success:
+            return
+        ever_success |= _progress_ctx.success.to(device).bool()
+
+    def classify_terminations(term_type, dones, extras, was_active, ever_success):
         """Bucket envs terminating for the first time this step.
 
-        0 = abnormal robot, 1 = failure (timeout / anything else), 2 = success.
+        0 = abnormal robot, 1 = failure, 2 = success.
 
         Per-term flags come off the TerminationManager rather than being inferred from
-        ``time_outs``. ``success`` is itself a termination term here, so a successful episode ends
-        with time_out=False -- the previous ``~time_out -> abnormal`` rule filed every success as an
-        abnormal robot, and only counted a success if it coincided with a timeout. Truncations are
-        always failures in this task: running out of time is never a success.
+        ``time_outs``. An episode counts as a success if EITHER the `success` termination fired
+        (tasks that terminate on success) OR the ProgressContext success condition was met at any
+        point during the episode (tasks that do not). Without the second clause a task with no
+        success termination scores 0% by construction, since every episode necessarily times out.
         """
         newly = was_active & dones.bool()
         if not bool(newly.any()):
             return
         zeros = torch.zeros(n_env, dtype=torch.bool, device=device)
         succ = term_mgr.get_term("success").to(device).bool() if _has_success_term else zeros
+        succ = succ | ever_success
         abnormal = term_mgr.get_term("abnormal_robot").to(device).bool() if _has_abnormal_term else zeros
         # Default any new termination to failure, then let the specific causes override. Success is
         # applied last so it wins if it coincides with a timeout or an abnormal flag.
@@ -448,14 +477,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             q_dists = torch.softmax(q_logits, dim=-1).mean(dim=1).cpu().numpy()    # [num_critics, num_atoms]
             q0_scalar = qnet.get_value(torch.softmax(q_logits, dim=-1)).mean(dim=0)  # [n_env] Q(s0,a0)
 
-        # Termination bucket per env: -1 not-yet, 0 abnormal, 1 timeout-no-success, 2 timeout-success.
+        # Termination bucket per env: -1 not-yet, 0 abnormal, 1 failure, 2 success.
         term_type = torch.full((n_env,), -1, device=device, dtype=torch.long)
         all_active = torch.ones(n_env, dtype=torch.bool, device=device)
+        # Sticky per-episode success flag. Each iteration is exactly one episode per env (all envs
+        # are reset above and rolled out until every one terminates), so this is cleared per
+        # iteration rather than per done.
+        ever_success = torch.zeros(n_env, dtype=torch.bool, device=device)
 
         # ---- 3a. First rollout step (contributes r_0 at γ^0=1; NO entropy bonus on a_0,
         #         matching the soft target which only bonuses future actions a_{t>=1}) ----
         q_traj.append(q0_scalar)                                                # Q(s_0, a_0)
         new_obs, rew, dones, extras = env.step(actions_0)
+        accumulate_success(ever_success)
 
         # ---- Bootstrapped Bellman target y = r_0 + γ(1-d)[Qtarget(s1,a1) − α·logπ(a1|s1)],
         #      matching FastSACAgent._update_main exactly (fast_sac_agent.py) — NOT the target
@@ -476,7 +510,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
             qt_dists = target_dist.mean(dim=1).cpu().numpy()  # [num_critics, num_atoms]
 
-        classify_terminations(term_type, dones, extras, all_active)
+        classify_terminations(term_type, dones, extras, all_active, ever_success)
         active_mask = ~dones.bool()                                             # envs not yet terminated
         reward_returns = rew.clone()                                           # Σ γ^t r_t, seeded with r_0
         entropy_returns = torch.zeros(n_env, device=device, dtype=rew.dtype)   # Σ_{t>=1} γ^t (−α logπ(a_t|s_t))
@@ -514,7 +548,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     q_ppo_traj.append(per_env_q(obs, a_star_t))
             was_active = active_mask.clone()
             new_obs, rew, dones, extras = env.step(actions)
-            classify_terminations(term_type, dones, extras, was_active)
+            accumulate_success(ever_success)
+            classify_terminations(term_type, dones, extras, was_active, ever_success)
             # Accumulate reward and entropy bonus separately, both discounted by γ^t and gated to
             # envs still active going into this step. Entropy bonus is −α·logπ(a_t|s_t).
             print(f"Average reward: {torch.mean(rew[active_mask])}")
@@ -601,7 +636,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ax_ent.set_xlabel("Discounted −α·logπ return")
         ax_ent.set_ylabel("Count")
 
-        term_labels = ["abnormal", "failure\n(timeout)", "success"]
+        term_labels = ["abnormal", "failure", "success"]
         ax_term.bar(term_labels, term_counts, color=["tab:red", "tab:gray", "tab:green"])
         for i, c in enumerate(term_counts):
             ax_term.text(i, c, str(c), ha="center", va="bottom", fontsize=8)
@@ -618,7 +653,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Subsample envs for legibility if there are many.
         max_lines = 256
         env_ids_plot = np.arange(n_env) if n_env <= max_lines else np.linspace(0, n_env - 1, max_lines).astype(int)
-        # Colour each trajectory by its outcome (term_type 2 == timeout with success), and mark
+        # Colour each trajectory by its outcome (term_type 2 == success), and mark
         # where it ended. Successes are drawn last so the (usually rarer) green lines sit on top.
         term_np = term_type.detach().cpu().numpy()
         succ_ids = [e for e in env_ids_plot if term_np[e] == 2]
@@ -841,7 +876,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(
             f"[iter {iteration:04d}] soft MC mean={soft_mc.mean():.4f}  reward mean={reward_mc.mean():.4f}  "
             f"entropy mean={entropy_mc.mean():.4f}  E[Q online mean]={q_exp_online:.4f}  "
-            f"term[abnormal/to-nosucc/to-succ]={term_counts}  → {output_path}, {peg_xy_path}, "
+            f"term[abnormal/fail/success]={term_counts}  → {output_path}, {peg_xy_path}, "
             f"{video_summary}"
         )
         iteration += 1

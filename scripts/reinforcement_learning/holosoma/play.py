@@ -668,6 +668,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # auto-resets on done and zeroes that buffer before we get to look at it.
         ep_steps = torch.zeros(env.num_envs, dtype=torch.long, device=device)
         episode_durations: list[int] = []
+        # Local timestep (1-indexed within the episode) at which each env FIRST met the success
+        # condition; -1 while it has not. Success is not a termination here, so the episode keeps
+        # running afterwards -- this is time-to-success, not episode duration.
+        first_success_step = torch.full((env.num_envs,), -1, dtype=torch.long, device=device)
+        episode_success_steps: list[int] = []
         step_dt = float(getattr(env.unwrapped, "step_dt", 0.0))
         # Failure breakdown. Which termination actually fired is read per-term off the
         # TerminationManager rather than inferred, so an episode that ended for some third reason
@@ -716,10 +721,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 position_aligned = getattr(context_term, "position_aligned")
                 before_es = ever_success.clone()
                 ever_success |= torch.where(orientation_aligned & position_aligned, True, False)
-                new_success = torch.argwhere(~before_es & ever_success)
+                newly_succeeded = ~before_es & ever_success
+                # ep_steps is still the pre-step count, so the step just taken is ep_steps + 1.
+                # Same 1-indexed convention as episode_durations below.
+                first_success_step[newly_succeeded] = ep_steps[newly_succeeded] + 1
+                new_success = torch.argwhere(newly_succeeded)
                 if len(new_success) > 0:
-                    print(f"new success at: {torch.argwhere(~before_es & ever_success)}")
-                
+                    print(f"new success at: envs {new_success.flatten().tolist()} "
+                          f"step {first_success_step[newly_succeeded].tolist()}")
+
             ep_steps += 1
             done_mask = dones.bool()
             # Only an env's first `episodes_per_env` episodes count. Dropping the surplus is what
@@ -756,10 +766,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 xyz_cpu = init_peg_xyz[counted_idx].cpu()
                 out_cpu = outcome[counted_idx].cpu()
                 dur_cpu = ep_steps[counted_idx].cpu()
+                fss_cpu = first_success_step[counted_idx].cpu()
                 for k in range(counted_idx.numel()):
                     episode_init_xyzs.append(xyz_cpu[k])
                     episode_outcomes.append(int(out_cpu[k]))
                     episode_durations.append(int(dur_cpu[k]))
+                    episode_success_steps.append(int(fss_cpu[k]))
             # Refresh on EVERY done, not just counted ones: the env resets regardless, so a stale
             # init pose would otherwise be attributed to a later episode that does count.
             if bool(done_mask.any()):
@@ -768,6 +780,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Reset success flag and step counter for envs that just finished an episode.
             ever_success[done_mask] = False
             ep_steps[done_mask] = 0
+            first_success_step[done_mask] = -1
 
         pbar.close()
         total_episodes = int(ep_count.sum().item())
@@ -808,6 +821,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 st = _dur_stats({code})
                 if st:
                     print(f"[EVAL]   {OUTCOME_STYLE[code][1]:<15}: mean {_fmt(st[0])}  (n={st[3]})")
+        # Time to success: mean over SUCCESSFUL episodes only of the local step at which the
+        # success condition was first met. Distinct from the success-episode duration above --
+        # success is not a termination, so the episode runs on to timeout after reaching it.
+        succ_steps = [s for s, o in zip(episode_success_steps, episode_outcomes)
+                      if o == OUTCOME_SUCCESS and s > 0]
+        assert len(succ_steps) == successful_episodes, (
+            f"time-to-success mismatch: {len(succ_steps)} recorded vs {successful_episodes} successes"
+        )
+        if succ_steps:
+            mean_tts = sum(succ_steps) / len(succ_steps)
+            print(f"[EVAL] Mean time to success: {_fmt(mean_tts)}  "
+                  f"[min {min(succ_steps)}, max {max(succ_steps)} steps over {len(succ_steps)} successes]")
+        else:
+            print("[EVAL] Mean time to success: n/a (no successful episodes)")
+
         # Buckets partition the counted episodes; a mismatch means an episode was double-counted or
         # missed, which would silently corrupt every rate above.
         assert successful_episodes + n_timeout + n_abnormal + n_other == total_episodes, (
