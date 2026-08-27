@@ -21,8 +21,14 @@ Inside the Singularity container, `/mmfs1` is bind-mounted at `/mmfs1`, so GPFS 
 
 ### Basic pattern
 ```bash
-NODES=1 GPUS_PER_NODE=4 ACCOUNT=weirdlab-ckpt bash docker/cluster/cluster_interface.sh job -- <train.py args>
+NODES=1 GPUS_PER_NODE=4 ACCOUNT=weirdlab-ckpt bash docker/cluster/cluster_interface.sh job <train.py args>
 ```
+
+**Do NOT put a `--` separator before the train.py args** (confirmed 2026-08-26, jobs
+38916169/38916182/38918384): `job_args` is forwarded verbatim into the container, and a leading
+`--` makes train.py's argparse treat everything after it as positionals — `--task` silently
+becomes None and the job dies at hydra registration with
+`AttributeError: 'NoneType' object has no attribute 'split'` right after Kit startup.
 
 ### Common job configs
 

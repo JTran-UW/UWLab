@@ -262,13 +262,15 @@ class check_reset_state_success(ManagerTermBase):
 
             insertive_meta = utils.read_metadata_from_usd_directory(self.insertive_asset.cfg.spawn.usd_path)
             receptive_meta = utils.read_metadata_from_usd_directory(self.receptive_asset.cfg.spawn.usd_path)
+            insertive_offset = utils.get_assembled_offset(insertive_meta)
+            receptive_offset = utils.get_assembled_offset(receptive_meta)
             self.insertive_asset_offset = Offset(
-                pos=tuple(insertive_meta.get("assembled_offset").get("pos")),
-                quat=tuple(insertive_meta.get("assembled_offset").get("quat")),
+                pos=tuple(insertive_offset.get("pos")),
+                quat=tuple(insertive_offset.get("quat")),
             )
             self.receptive_asset_offset = Offset(
-                pos=tuple(receptive_meta.get("assembled_offset").get("pos")),
-                quat=tuple(receptive_meta.get("assembled_offset").get("quat")),
+                pos=tuple(receptive_offset.get("pos")),
+                quat=tuple(receptive_offset.get("quat")),
             )
             assembly_threshold_scale = cfg.params.get("assembly_threshold_scale", 1.0)
             self.assembly_pos_threshold: float = (

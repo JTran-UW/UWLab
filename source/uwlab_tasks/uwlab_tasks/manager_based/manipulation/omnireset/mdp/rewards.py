@@ -151,13 +151,15 @@ class ProgressContext(ManagerTermBase):
 
         insertive_meta = utils.read_metadata_from_usd_directory(self.insertive_asset.cfg.spawn.usd_path)
         receptive_meta = utils.read_metadata_from_usd_directory(self.receptive_asset.cfg.spawn.usd_path)
+        insertive_offset = utils.get_assembled_offset(insertive_meta)
+        receptive_offset = utils.get_assembled_offset(receptive_meta)
         self.insertive_asset_offset = Offset(
-            pos=tuple(insertive_meta.get("assembled_offset").get("pos")),
-            quat=tuple(insertive_meta.get("assembled_offset").get("quat")),
+            pos=tuple(insertive_offset.get("pos")),
+            quat=tuple(insertive_offset.get("quat")),
         )
         self.receptive_asset_offset = Offset(
-            pos=tuple(receptive_meta.get("assembled_offset").get("pos")),
-            quat=tuple(receptive_meta.get("assembled_offset").get("quat")),
+            pos=tuple(receptive_offset.get("pos")),
+            quat=tuple(receptive_offset.get("quat")),
         )
 
         self.orientation_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
@@ -297,6 +299,33 @@ class GCProgressContext(ManagerTermBase):
         success_monitor_cfg = SuccessMonitorCfg(monitored_history_len=100, num_monitored_data=1, device=env.device)
         self.success_monitor = success_monitor_cfg.class_type(success_monitor_cfg)
 
+        # keypoint debug markers, created lazily on first use (sim must be up)
+        self._kp_markers = None
+
+    def _get_kp_markers(self):
+        if self._kp_markers is None:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+            def sphere(path, color):
+                return VisualizationMarkers(
+                    VisualizationMarkersCfg(
+                        prim_path=path,
+                        markers={
+                            "p": sim_utils.SphereCfg(
+                                radius=0.006, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color)
+                            )
+                        },
+                    )
+                )
+
+            # ORANGE = current peg keypoints, BLUE = goal keypoints
+            self._kp_markers = (
+                sphere("/Visuals/GCKeypoints/current", (1.0, 0.45, 0.0)),
+                sphere("/Visuals/GCKeypoints/goal", (0.0, 0.45, 1.0)),
+            )
+        return self._kp_markers
+
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         super().reset(env_ids)
         if env_ids is None:
@@ -319,6 +348,13 @@ class GCProgressContext(ManagerTermBase):
         num_keypoints: int = 4,
         keypoint_extent: float = -1.0,
         keypoint_threshold: float = 0.01,
+        keypoint_threshold_start: float = -1.0,
+        keypoint_threshold_min: float = 0.01,
+        debug_vis: bool = False,
+        threshold_promote_at: float = 0.7,
+        threshold_demote_at: float = 0.55,
+        threshold_factor: float = 0.9,
+        threshold_cooldown: int = 12800,
     ) -> torch.Tensor:
         task_command: TaskCommand = env.command_manager.get_term(command_context)
         # The command's thresholds come from the receptive object's USD metadata, so they are not
@@ -386,9 +422,25 @@ class GCProgressContext(ManagerTermBase):
         self.keypoint_max_distance[:] = kp_d.max(dim=1).values
         self.keypoint_mean_distance[:] = kp_d.mean(dim=1)
 
+        if debug_vis:
+            cur_m, goal_m = self._get_kp_markers()
+            cur_m.visualize(translations=cur_kp.reshape(-1, 3))
+            goal_m.visualize(translations=goal_kp.reshape(-1, 3))
+
         if success_mode == "keypoint":
+            active_threshold = self._advance_threshold_curriculum(
+                env,
+                event_term_name=event_term_name,
+                static_threshold=keypoint_threshold,
+                start=keypoint_threshold_start,
+                minimum=keypoint_threshold_min,
+                promote_at=threshold_promote_at,
+                demote_at=threshold_demote_at,
+                factor=threshold_factor,
+                cooldown=threshold_cooldown,
+            )
             # ALL keypoints must be within threshold -- the max is the honest criterion.
-            aligned = self.keypoint_max_distance < keypoint_threshold
+            aligned = self.keypoint_max_distance < active_threshold
             self.position_aligned[:] = aligned
             self.orientation_aligned[:] = True
         self.success[:] = self.orientation_aligned & self.position_aligned
@@ -402,6 +454,64 @@ class GCProgressContext(ManagerTermBase):
         )
 
         return torch.zeros(env.num_envs, device=env.device)
+
+
+    def _advance_threshold_curriculum(
+        self,
+        env: ManagerBasedRLEnv,
+        event_term_name: str,
+        static_threshold: float,
+        start: float,
+        minimum: float,
+        promote_at: float,
+        demote_at: float,
+        factor: float,
+        cooldown: int,
+    ) -> float:
+        """Tighten the keypoint success tolerance as the policy earns it; loosen when it stalls.
+
+        A second difficulty axis alongside the reset manager's neighbour-rank curriculum. Both read
+        the SAME per-episode success rate, which makes the pair self-regulating: whichever axis
+        steps first depresses the shared rate below ``promote_at``, so they cannot both run away at
+        once. ``cooldown`` defaults to twice the rank curriculum's so tolerance steps at half the
+        rank cadence rather than compounding with it every window -- the 2026-08-20 collapse came
+        from difficulty stacking faster than the 100-episode success window could report on it.
+
+        ``start <= 0`` disables the curriculum and pins the tolerance at ``static_threshold``.
+        """
+        if start <= 0:
+            return static_threshold
+
+        if not hasattr(self, "_kp_threshold"):
+            self._kp_threshold = float(start)
+            self._kp_threshold_cooldown = -(10**9)  # allow the first adjustment immediately
+
+        # Drive off the reset manager's monitor, not this term's own: this one is refreshed every
+        # STEP with the whole env batch, so its 100-slot ring holds an instantaneous dwell fraction
+        # rather than a per-episode success rate. The event term's monitor is written once per
+        # episode on reset, which is the quantity the rank curriculum already gates on.
+        rate = float("nan")
+        reset_term = env.event_manager.get_term_cfg(event_term_name).func
+        monitor = getattr(reset_term, "success_monitor", None)
+        if monitor is not None:
+            rates = monitor.get_success_rate()
+            probs = getattr(reset_term, "probs", None)
+            # Probability-weighted so a rarely-drawn reset path cannot dominate the tolerance.
+            rate = float((rates * probs).sum().item()) if probs is not None else float(rates.mean().item())
+
+        step = int(getattr(env, "common_step_counter", 0))
+        if step - self._kp_threshold_cooldown >= max(1, cooldown) and rate == rate:  # rate==rate filters NaN
+            self._kp_threshold_cooldown = step
+            if rate >= promote_at:
+                self._kp_threshold = max(minimum, self._kp_threshold * factor)
+            elif rate <= demote_at:
+                self._kp_threshold = min(start, self._kp_threshold / factor)
+
+        if "log" not in env.extras:
+            env.extras["log"] = {}
+        env.extras["log"]["curriculum/keypoint_threshold"] = self._kp_threshold
+        env.extras["log"]["curriculum/threshold_driving_rate"] = rate
+        return self._kp_threshold
 
 
 class ProgressContextReaching(ManagerTermBase):

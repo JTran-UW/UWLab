@@ -361,6 +361,62 @@ gym.register(
 )
 
 
+# As above but the robot USD + sysid metadata.yaml come from yandabao/uwlab-assets.
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Reward-Scaling-"
+        "Success-Termination-Sparse-No-Privileged-Obs-Full-Reset-Yanda-Sysid-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsFullResetYandaSysidCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+
+# As above but without the success termination, matching the
+# ...-No-Success-Termination-Yanda-Sysid data-collection task. No curriculum.
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Reward-Scaling-"
+        "Sparse-No-Privileged-Obs-No-Success-Termination-Full-Reset-Yanda-Sysid-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationFullResetYandaSysidCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+
+# As above but success ends the episode as a time_out-flagged term (bootstrapped truncation
+# online), matching buffers recorded with play.py --success_to_truncation.
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Reward-Scaling-"
+        "Sparse-No-Privileged-Obs-Success-Truncation-Full-Reset-Yanda-Sysid-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsSuccessTruncationFullResetYandaSysidCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+
 gym.register(
     id=(
         "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Reward-Scaling-Success-Termination-Sparse-No-Privileged-Obs-Play-v0"
@@ -466,6 +522,36 @@ gym.register(
 gym.register(
     id=(
         "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Reward-Scaling-"
+        "Sparse-No-Privileged-Obs-Full-Reset-GC-AutoReset-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCGCAutoResetFinetuneNoGapCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Reward-Scaling-"
+        "Sparse-No-Privileged-Obs-Dynamics-Gap-Full-Reset-GC-AutoReset-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCGCAutoResetFinetuneCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Reward-Scaling-"
         "Sparse-No-Privileged-Obs-Dynamics-Gap-Full-Reset-v0"
     ),
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -541,6 +627,22 @@ gym.register(
 )
 
 
+# As above but without the success termination: recorded episodes run past insertion to time-out.
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-DataCollection-Reward-Scaling-Sparse-No-Privileged-Obs-No-Success-Termination-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCDataCollectionRewardScalingSparseNoPrivilegedObsNoSuccessTerminationCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+
 # Stage-2 counterpart of the above: same recorded groups, but finetune dynamics (explicit actuator,
 # fixed/maximal sysid + OSC gains, no curriculum) so the buffer matches what the finetune task trains
 # under. Feeds the ...-Finetune-Reward-Scaling-Success-Termination-Sparse-No-Privileged-Obs task.
@@ -555,6 +657,44 @@ gym.register(
         "env_cfg_entry_point": (
             f"{__name__}.rl_state_cfg:"
             "Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# Yanda-sysid finetune data collection WITH success termination: episodes end at insertion, so the
+# buffer is not dominated by post-success dwell samples. Record with play.py
+# --success_to_truncation so the success done is stored as a truncation (bootstrapped).
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-DataCollection-Finetune-Reward-Scaling-"
+        "Success-Termination-Sparse-No-Privileged-Obs-Yanda-Sysid-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsYandaSysidCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+
+# As above but without the success termination and with the Yanda-sysid robot USD, matching the
+# ...-Full-Reset-Yanda-Sysid finetune training dynamics.
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-DataCollection-Finetune-Reward-Scaling-"
+        "Sparse-No-Privileged-Obs-No-Success-Termination-Yanda-Sysid-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationYandaSysidCfg"
         ),
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },

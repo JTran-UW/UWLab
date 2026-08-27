@@ -377,6 +377,22 @@ def read_metadata_from_usd_directory(usd_path: str) -> dict:
     return metadata_file
 
 
+def get_assembled_offset(metadata: dict) -> dict:
+    """Return the object's assembled offset ({"pos": ..., "quat": ...}).
+
+    Supports both metadata schemas: singular ``assembled_offset`` (UW-Lab assets) and plural
+    ``assembled_offsets`` (yandabao assets, symmetric variants), whose FIRST entry is canonical.
+    """
+    offset = metadata.get("assembled_offset")
+    if offset is None:
+        offsets = metadata.get("assembled_offsets")
+        if offsets:
+            offset = offsets[0]
+    if offset is None:
+        raise KeyError("metadata has neither 'assembled_offset' nor 'assembled_offsets'")
+    return offset
+
+
 def object_name_from_usd(usd_path: str) -> str:
     """Extract the canonical object name from a USD asset path.
 

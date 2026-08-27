@@ -25,17 +25,20 @@ UWLAB_CLOUD_ASSETS_DIR = "https://huggingface.co/datasets/UW-Lab/uwlab-assets/re
 
 
 def _extract_relative_path(url: str) -> str:
-    """Strip the HuggingFace resolve-URL prefix, returning the repo-relative path.
+    """Strip the HuggingFace resolve-URL revision, returning the repo-qualified path.
+
+    The repo owner/name is kept so files at the same repo-relative path in
+    different repos do not collide in the cache.
 
     Example:
         ``https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Props/Custom/Peg/peg.usd``
-        -> ``Props/Custom/Peg/peg.usd``
+        -> ``datasets/UW-Lab/uwlab-assets/Props/Custom/Peg/peg.usd``
     """
     parsed = urlparse(url)
     parts = parsed.path.strip("/").split("/")
     try:
         idx = parts.index("resolve")
-        return "/".join(parts[idx + 2 :])
+        return "/".join(parts[:idx] + parts[idx + 2 :])
     except ValueError:
         return parsed.path.strip("/")
 

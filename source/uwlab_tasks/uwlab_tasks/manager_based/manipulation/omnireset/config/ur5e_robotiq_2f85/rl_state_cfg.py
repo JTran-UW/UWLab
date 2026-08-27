@@ -2677,6 +2677,19 @@ class TerminationsSuccessTerminationCfg:
 
 
 @configclass
+class TerminationsSuccessAsTruncationCfg(TerminationsCfg):
+    """``TerminationsCfg`` plus a ``success`` term flagged ``time_out=True``: episodes end at
+    insertion, but IsaacLab reports the end through ``extras["time_outs"]``, so agents with
+    ``handle_truncations`` bootstrap through it instead of treating success as a zero-value
+    terminal. Online counterpart of play.py's --success_to_truncation recording option.
+    """
+
+    success = DoneTerm(
+        func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1}, time_out=True
+    )
+
+
+@configclass
 class TerminationsEvalCfg:
     """Termination terms for the MDP."""
 
@@ -2699,6 +2712,15 @@ class TerminationsEvalCfg:
 
 
 @configclass
+class TerminationsEvalNoSuccessCfg:
+    """``TerminationsEvalCfg`` minus ``success``: episodes end only on time-out or abnormal robot state."""
+
+    time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+
+    abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
+
+
+@configclass
 class TerminationsReachingCfg:
     """Termination terms for the MDP."""
 
@@ -2711,6 +2733,21 @@ class TerminationsReachingCfg:
     first_episode_termination: DoneTerm | None = DoneTerm(func=task_mdp.terminate_first_episode, time_out=True)
 
     # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 2})
+
+
+@configclass
+class TerminationsGCPlayCfg(TerminationsReachingCfg):
+    """TerminationsReachingCfg plus success termination, for eval/play.
+
+    Training deliberately has no success termination (the policy learns to HOLD the goal for the
+    whole episode); for watching/eval it is nicer for the episode to end once the goal has been
+    held for ~1 s. Reads GCProgressContext's continuous_success_counter.
+    """
+
+    success = DoneTerm(
+        func=task_mdp.consecutive_success_state,
+        params={"num_consecutive_successes": 10},
+    )
 
 
 @configclass
@@ -3629,6 +3666,18 @@ class GCRewardsCfg:
             "num_keypoints": 4,
             "keypoint_extent": -1.0,
             "keypoint_threshold": 0.01,
+            # Tolerance curriculum (second difficulty axis, alongside the reset manager's
+            # neighbour-rank curriculum). keypoint_threshold_start <= 0 disables it and pins the
+            # tolerance at keypoint_threshold. Both axes read the same per-episode success rate,
+            # so a step on either depresses the shared rate and gates the other -- the pair is
+            # self-regulating. The cooldown is deliberately 2x the rank curriculum's so tolerance
+            # steps at half the rank cadence instead of compounding with it every window.
+            "keypoint_threshold_start": -1.0,
+            "keypoint_threshold_min": 0.01,
+            "threshold_promote_at": 0.7,
+            "threshold_demote_at": 0.55,
+            "threshold_factor": 0.9,
+            "threshold_cooldown": 12800,
         },
     )
 
@@ -3646,6 +3695,19 @@ class GCRewardsCfg:
             # use_keypoints=True switches shaping to mean keypoint distance (one unit, one std);
             # pair it with progress_context success_mode="keypoint".
             "use_keypoints": False,
+        },
+    )
+
+    # Straight from the base omnireset reward set: keeps the gripper on the peg. Success ignores
+    # the EE, so nothing else in this config penalises dropping the object mid-transport.
+    ee_asset_distance = RewTerm(
+        func=task_mdp.ee_asset_distance_tanh,
+        weight=0.1,
+        params={
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_offset_metadata_key": "gripper_offset",
+            "std": 1.0,
         },
     )
 
@@ -3713,20 +3775,26 @@ class GCTrainEventCfg(BaseEventCfg):
             # in advance, and a too-large `*_end` makes it a no-op within a few hundred steps.
             "curriculum_mode": "success",
             "curriculum_promote_at": 0.7,
-            "curriculum_demote_at": 0.3,
-            "curriculum_expand_factor": 1.3,
+            "curriculum_demote_at": 0.55,
+            "curriculum_expand_factor": 1.15,
             # Reset events between adjustments. The success window is ~100 episodes, so adjusting
             # every reset would move the radius faster than the signal driving it can respond.
-            "curriculum_cooldown": 50,
+            "curriculum_cooldown": 6400,
             # k-NN rank curriculum ("knn" mode): difficulty is the neighbour RANK limit rather
             # than a metric radius, so it is independent of dataset density. Neighbours are ranked
             # by mean KEYPOINT distance -- the same quantity success is scored on. rank_limit >=
             # knn_k falls back to a uniform draw, i.e. the unrestricted distribution.
             "curriculum_rank_start": 8,
+            # Per-task start ranks for resumes ("1800,114"); empty = rank_start everywhere.
+            "curriculum_rank_starts": "",
+            # Demote floor; 0 = fall back to rank_start.
+            "curriculum_rank_floor": 0,
             "curriculum_rank_max": 0,
             "knn_k": 256,
             "keypoint_extent": -1.0,
             "num_keypoints": 4,
+            # Fraction of envs whose goal IS their own start state (see GCMRM.__call__).
+            "identity_goal_prob": 0.0,
         },
     )
 
@@ -3763,20 +3831,26 @@ class GCGraspedTrainEventCfg(GCTrainEventCfg):
             # in advance, and a too-large `*_end` makes it a no-op within a few hundred steps.
             "curriculum_mode": "success",
             "curriculum_promote_at": 0.7,
-            "curriculum_demote_at": 0.3,
-            "curriculum_expand_factor": 1.3,
+            "curriculum_demote_at": 0.55,
+            "curriculum_expand_factor": 1.15,
             # Reset events between adjustments. The success window is ~100 episodes, so adjusting
             # every reset would move the radius faster than the signal driving it can respond.
-            "curriculum_cooldown": 50,
+            "curriculum_cooldown": 6400,
             # k-NN rank curriculum ("knn" mode): difficulty is the neighbour RANK limit rather
             # than a metric radius, so it is independent of dataset density. Neighbours are ranked
             # by mean KEYPOINT distance -- the same quantity success is scored on. rank_limit >=
             # knn_k falls back to a uniform draw, i.e. the unrestricted distribution.
             "curriculum_rank_start": 8,
+            # Per-task start ranks for resumes ("1800,114"); empty = rank_start everywhere.
+            "curriculum_rank_starts": "",
+            # Demote floor; 0 = fall back to rank_start.
+            "curriculum_rank_floor": 0,
             "curriculum_rank_max": 0,
             "knn_k": 256,
             "keypoint_extent": -1.0,
             "num_keypoints": 4,
+            # Fraction of envs whose goal IS their own start state (see GCMRM.__call__).
+            "identity_goal_prob": 0.0,
         },
     )
 
@@ -3809,18 +3883,24 @@ class GCGraspedRestingTrainEventCfg(GCGraspedTrainEventCfg):
             "curriculum_candidates": 512,
             "curriculum_mode": "success",
             "curriculum_promote_at": 0.7,
-            "curriculum_demote_at": 0.3,
-            "curriculum_expand_factor": 1.3,
-            "curriculum_cooldown": 400,
+            "curriculum_demote_at": 0.55,
+            "curriculum_expand_factor": 1.15,
+            "curriculum_cooldown": 6400,
             # k-NN rank curriculum ("knn" mode): difficulty is the neighbour RANK limit rather
             # than a metric radius, so it is independent of dataset density. Neighbours are ranked
             # by mean KEYPOINT distance -- the same quantity success is scored on. rank_limit >=
             # knn_k falls back to a uniform draw, i.e. the unrestricted distribution.
             "curriculum_rank_start": 8,
+            # Per-task start ranks for resumes ("1800,114"); empty = rank_start everywhere.
+            "curriculum_rank_starts": "",
+            # Demote floor; 0 = fall back to rank_start.
+            "curriculum_rank_floor": 0,
             "curriculum_rank_max": 0,
             "knn_k": 256,
             "keypoint_extent": -1.0,
             "num_keypoints": 4,
+            # Fraction of envs whose goal IS their own start state (see GCMRM.__call__).
+            "identity_goal_prob": 0.0,
         },
     )
 
@@ -3845,6 +3925,8 @@ class GCGraspedPlayEventCfg(GCGraspedTrainEventCfg):
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
             "debug_vis": True,
             "goal_curriculum": False,
+            # Fraction of envs whose goal IS their own start state (see GCMRM.__call__).
+            "identity_goal_prob": 0.0,
         },
     )
 
@@ -3926,6 +4008,12 @@ class Ur5eRobotiq2f85RelCartesianOSCGCGraspedPlayCfg(Ur5eRobotiq2f85RelCartesian
     """
 
     events: GCGraspedPlayEventCfg = GCGraspedPlayEventCfg()
+    terminations: TerminationsGCPlayCfg = TerminationsGCPlayCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # keypoint markers (orange = current peg, blue = goal) -- the quantity success scores on
+        self.rewards.progress_context.params["debug_vis"] = True
 
 
 @configclass
@@ -4015,6 +4103,127 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNo
     """
 
     events: TrainEventPegMassGapFullResetCfg = TrainEventPegMassGapFullResetCfg()
+
+
+@configclass
+class GCAutoResetEventCfg(TrainEventPegMassGapFullResetCfg):
+    """Its parent with the reset term upgraded to ``GoalConditionedMultiResetManager``.
+
+    GCMRM SUBCLASSES MultiResetManager, so the 4-path reset mixture and per-path success
+    accounting are inherited unchanged -- it only additionally samples and exposes ``goal_state``,
+    which the ``gc`` observation group reads. ``goal_curriculum=False`` draws goals uniformly, so
+    a sampled goal is exactly a draw from the task's own reset distribution.
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.GoalConditionedMultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "goal_curriculum": False,
+            # Draws the disassembly policy's target keypoints (blue) and the peg's current ones
+            # (orange). The training loop toggles visibility so they show only while that policy
+            # is driving.
+            "debug_vis": True,
+            "identity_goal_prob": 0.0,
+        },
+    )
+
+
+@configclass
+class GCAutoResetNoGapEventCfg(GCAutoResetEventCfg):
+    """``GCAutoResetEventCfg`` minus the peg-mass gap.
+
+    The gap is exactly one term -- ``randomize_insertive_object_mass``, pinned to 500 g at startup
+    instead of resampled per reset. Restoring it by REFERENCE to ``BaseEventCfg`` rather than
+    restating the distribution means the two variants cannot drift apart if the base range is
+    retuned, which is the same reasoning the PegMassGap configs give for not restating the mass.
+    """
+
+    def __post_init__(self):
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__()
+        self.randomize_insertive_object_mass = BaseEventCfg().randomize_insertive_object_mass
+
+
+@configclass
+class TerminationsGCAutoResetCfg(TerminationsCfg):
+    """``TerminationsCfg`` with ``first_episode_termination`` disabled.
+
+    That term staggers env start times by killing envs still on their first episode, and its guard
+    (``common_step_counter >= max_episode_length``) never trips here because the horizon is huge --
+    so it would keep teleporting roughly one env every ``max_episode_length / num_envs`` steps,
+    forever. Its purpose, desynchronizing episode boundaries, is also the opposite of what this
+    task wants: phases are deliberately synchronized. ``abnormal_robot`` stays the ONLY teleport.
+    """
+
+    first_episode_termination: DoneTerm | None = None
+
+
+@configclass
+class ObservationsGCAutoResetCfg(ObservationsNoPrivilegedObsCfg):
+    """The finetune task's observations plus a ``gc`` group carrying the GC policy's own inputs.
+
+    The group is ``GCObservationsCfg.PolicyCfg`` verbatim, so the PPO goal-conditioned policy sees
+    byte-for-byte the observation it was trained on. FastSAC never reads it: the vec-env wrapper
+    concatenates explicitly named actor/critic groups, so an extra group is inert for it.
+    """
+
+    gc: GCObservationsCfg.PolicyCfg = GCObservationsCfg.PolicyCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGCAutoResetFinetuneCfg(
+    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapFullResetCfg
+):
+    """Finetune task wired for AUTONOMOUS RESETS driven by the goal-conditioned policy.
+
+    Differences from the plain dynamics-gap finetune task:
+
+    * ``time_out`` is effectively disabled (huge ``episode_length_s``). The 160-step collect and
+      160-step GC-reset phases are driven by the training script, because an env auto-reset at the
+      phase boundary would TELEPORT the robot -- exactly the scripted reset this setup exists to
+      avoid. ``abnormal_robot`` still terminates and resets immediately, and is the only teleport.
+    * The reset term is GCMRM so a sampled goal state is available to condition the GC policy on.
+    * A ``gc`` observation group supplies that policy's inputs.
+
+    No observation seen by FastSAC changes, so a checkpoint trained on the plain task loads here
+    unchanged (there is no time-remaining term whose meaning the longer horizon would alter).
+    """
+
+    events: GCAutoResetEventCfg = GCAutoResetEventCfg()
+    observations: ObservationsGCAutoResetCfg = ObservationsGCAutoResetCfg()
+    # Plain TerminationsCfg == time_out + abnormal_robot, i.e. NO success termination. Inheriting
+    # the parent's would end an episode the moment the peg seats and TELEPORT the env -- the
+    # scripted reset this task exists to avoid. Matches the `...Sparse...FullResetCfg` sibling.
+    terminations: TerminationsGCAutoResetCfg = TerminationsGCAutoResetCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # 1e6 s at a 0.1 s control step: time_out never fires within any realistic run.
+        self.episode_length_s = 1.0e6
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGCAutoResetFinetuneNoGapCfg(
+    Ur5eRobotiq2f85RelCartesianOSCGCAutoResetFinetuneCfg
+):
+    """``Ur5eRobotiq2f85RelCartesianOSCGCAutoResetFinetuneCfg`` without the peg-mass gap.
+
+    Peg mass is the ONLY difference, so a comparison against the gap twin isolates the dynamics
+    gap under identical autonomous-reset mechanics: same GC-driven resets, same disabled time_out,
+    same 4-path goal distribution, same terminations.
+    """
+
+    events: GCAutoResetNoGapEventCfg = GCAutoResetNoGapEventCfg()
 
 
 @configclass
@@ -4241,6 +4450,66 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSpars
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+# Robot variant whose USD (and therefore the co-located metadata.yaml the sysid randomizers read)
+# comes from yandabao/uwlab-assets instead of UW-Lab/uwlab-assets. Only the arm sysid nominals
+# (armature / static_friction / dynamic_ratio / viscous_friction) differ between the two.
+YANDA_CLOUD_ASSETS_DIR = "https://huggingface.co/datasets/yandabao/uwlab-assets/resolve/main"
+
+EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID = EXPLICIT_UR5E_ROBOTIQ_2F85.copy()  # type: ignore
+EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.spawn.usd_path = (
+    f"{YANDA_CLOUD_ASSETS_DIR}/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/"
+    "ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd"
+)
+
+
+def _use_yanda_peg_and_hole(scene):
+    """Point the peg/hole at yandabao/uwlab-assets. Same nominal geometry as UW-Lab's, but the
+    hole's collision mesh differs (53 verts vs 2444) and the PegHole metadata.yaml carries 8
+    symmetric assembled offsets at 0.1 rad tolerance instead of one at 0.025 -- both what Yanda's
+    experts trained against. NOTE: a CLI variant token (env.scene.insertive_object=peg) re-applies
+    the UW-Lab asset on top of this.
+    """
+    scene.insertive_object.spawn.usd_path = f"{YANDA_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"
+    scene.receptive_object.spawn.usd_path = f"{YANDA_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsFullResetYandaSysidCfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsFullResetCfg
+):
+    """Its parent with the robot USD (and thus sysid metadata.yaml) and the peg/hole assets sourced
+    from yandabao/uwlab-assets."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        _use_yanda_peg_and_hole(self.scene)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationFullResetYandaSysidCfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsFullResetYandaSysidCfg
+):
+    """Its parent minus the ``success`` termination: episodes run past insertion to time-out, matching
+    the ...NoSuccessTerminationYandaSysid data-collection config. Keeps ``first_episode_termination``
+    for training; curriculum stays ``NoCurriculumsCfg`` from the base (nothing ramps).
+    """
+
+    terminations: TerminationsCfg = TerminationsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsSuccessTruncationFullResetYandaSysidCfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationFullResetYandaSysidCfg
+):
+    """Its parent plus a ``success`` termination flagged ``time_out=True``: online episodes end at
+    insertion (no post-success dwell) but are bootstrapped as truncations, matching a buffer
+    recorded with play.py --success_to_truncation.
+    """
+
+    terminations: TerminationsSuccessAsTruncationCfg = TerminationsSuccessAsTruncationCfg()
 
 
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
@@ -4692,6 +4961,17 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionRewardScalingSparseNoPrivilege
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCDataCollectionRewardScalingSparseNoPrivilegedObsNoSuccessTerminationCfg(
+    Ur5eRobotiq2f85RelCartesianOSCDataCollectionRewardScalingSparseNoPrivilegedObsCfg
+):
+    """Its parent minus the ``success`` termination: episodes end only on time-out or abnormal
+    robot state, so recorded episodes continue past insertion until the time limit.
+    """
+
+    terminations: TerminationsEvalNoSuccessCfg = TerminationsEvalNoSuccessCfg()
+
+
 # Data-collection configuration for the Stage-2 FINETUNE task: PPO expert acts from its own obs and
 # records `critic_no_priv`, but under finetune dynamics rather than Stage-1 ones.
 @configclass
@@ -4719,6 +4999,38 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTe
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationYandaSysidCfg(
+    Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
+):
+    """The finetune data-collection config minus the ``success`` termination, with the robot USD
+    (and thus sysid metadata.yaml) sourced from yandabao/uwlab-assets.
+    """
+
+    terminations: TerminationsEvalNoSuccessCfg = TerminationsEvalNoSuccessCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        _use_yanda_peg_and_hole(self.scene)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsYandaSysidCfg(
+    Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
+):
+    """The finetune data-collection config (success termination kept, so episodes end at insertion
+    instead of dwelling in the success state to time-out) with the robot USD and peg/hole assets
+    sourced from yandabao/uwlab-assets. Pair with play.py --success_to_truncation to record the
+    success-caused done as a truncation (bootstrapped) in the replay buffer.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        _use_yanda_peg_and_hole(self.scene)
 
 
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)

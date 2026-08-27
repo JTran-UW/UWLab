@@ -89,13 +89,15 @@ class TaskCommand(TaskDependentCommand):
         self.receptive_asset: Articulation | RigidObject = env.scene[cfg.receptive_asset_cfg.name]
         insertive_meta = utils.read_metadata_from_usd_directory(self.insertive_asset.cfg.spawn.usd_path)
         receptive_meta = utils.read_metadata_from_usd_directory(self.receptive_asset.cfg.spawn.usd_path)
+        insertive_offset = utils.get_assembled_offset(insertive_meta)
+        receptive_offset = utils.get_assembled_offset(receptive_meta)
         self.insertive_asset_offset = Offset(
-            pos=tuple(insertive_meta.get("assembled_offset").get("pos")),
-            quat=tuple(insertive_meta.get("assembled_offset").get("quat")),
+            pos=tuple(insertive_offset.get("pos")),
+            quat=tuple(insertive_offset.get("quat")),
         )
         self.receptive_asset_offset = Offset(
-            pos=tuple(receptive_meta.get("assembled_offset").get("pos")),
-            quat=tuple(receptive_meta.get("assembled_offset").get("quat")),
+            pos=tuple(receptive_offset.get("pos")),
+            quat=tuple(receptive_offset.get("quat")),
         )
         self.success_position_threshold: float = receptive_meta.get("success_thresholds").get("position")
         self.success_orientation_threshold: float = receptive_meta.get("success_thresholds").get("orientation")

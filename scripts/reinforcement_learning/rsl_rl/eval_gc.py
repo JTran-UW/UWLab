@@ -104,8 +104,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     ever_success = torch.zeros(n, dtype=torch.bool, device=device)
     ep_count = torch.zeros(n, dtype=torch.long, device=device)
     succ_count = torch.zeros(n, dtype=torch.long, device=device)
+    term_count = torch.zeros(n, dtype=torch.long, device=device)
     ep_steps = torch.zeros(n, dtype=torch.long, device=device)
     success_steps: list[int] = []
+
+    # Per-reset-path tallies, under the TERMINAL criterion (success at the episode's last step)
+    # -- the quantity `metrics/task_N_success_rate` is fed from. task_id is re-sampled during the
+    # in-step reset, so the path each episode belongs to is captured at its START.
+    reset_term = env.unwrapped.event_manager.get_term_cfg("reset_from_reset_states").func
+    num_tasks = reset_term.num_tasks
+    task_at_start = reset_term.task_id.clone()
+    task_ep = torch.zeros(num_tasks, dtype=torch.long, device=device)
+    task_term_succ = torch.zeros(num_tasks, dtype=torch.long, device=device)
 
     obs = env.get_observations()  # RslRlVecEnvWrapper returns a TensorDict, not a tuple
     while bool((ep_count < target).any()):
@@ -119,7 +129,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             if bool(done_mask.any()):
                 # only score episodes for envs that still owe us one; surplus is discarded
                 counting = done_mask & (ep_count < target)
+                terminal = ctx.success.to(device).bool()  # success at the episode's final step
                 succ_count += (ever_success & counting).long()
+                term_count += (terminal & counting).long()
+                for t in range(num_tasks):
+                    sel = counting & (task_at_start == t)
+                    task_ep[t] += sel.sum()
+                    task_term_succ[t] += (terminal & sel).sum()
+                task_at_start[done_mask] = reset_term.task_id[done_mask]
                 ep_count += counting.long()
                 for k in torch.nonzero(ever_success & counting).flatten().tolist():
                     success_steps.append(int(ep_steps[k].item()))
@@ -133,7 +150,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     print("\n" + "=" * 62)
     print(f"[eval_gc] episodes scored : {total}  ({n} envs x {target})")
     print(f"[eval_gc] successes       : {succ}")
-    print(f"[eval_gc] SUCCESS RATE    : {rate:.4f}  +/- {stderr:.4f} (1 s.e.)")
+    print(f"[eval_gc] SUCCESS RATE (ever)    : {rate:.4f}  +/- {stderr:.4f} (1 s.e.)")
+    trate = int(term_count.sum().item()) / total if total else 0.0
+    tse = (trate * (1 - trate) / total) ** 0.5 if total else 0.0
+    print(f"[eval_gc] SUCCESS RATE (terminal): {trate:.4f}  +/- {tse:.4f}  <- compare to wandb")
+    for t in range(num_tasks):
+        n_t = int(task_ep[t].item())
+        r_t = int(task_term_succ[t].item()) / n_t if n_t else float("nan")
+        se_t = (r_t * (1 - r_t) / n_t) ** 0.5 if n_t else 0.0
+        print(f"[eval_gc]   task_{t} terminal    : {r_t:.4f}  +/- {se_t:.4f}  ({n_t} eps)")
     if success_steps:
         mean_step = sum(success_steps) / len(success_steps)
         print(f"[eval_gc] mean steps to first success (successful eps): {mean_step:.1f}")

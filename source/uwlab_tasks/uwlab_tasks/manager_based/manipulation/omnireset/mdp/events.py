@@ -942,13 +942,15 @@ class assembly_sampling_event(ManagerTermBase):
         insertive_metadata = utils.read_metadata_from_usd_directory(self.insertive_object.cfg.spawn.usd_path)
         receptive_metadata = utils.read_metadata_from_usd_directory(self.receptive_object.cfg.spawn.usd_path)
 
+        insertive_offset = utils.get_assembled_offset(insertive_metadata)
+        receptive_offset = utils.get_assembled_offset(receptive_metadata)
         self.insertive_assembled_offset = Offset(
-            pos=insertive_metadata.get("assembled_offset").get("pos"),
-            quat=insertive_metadata.get("assembled_offset").get("quat"),
+            pos=insertive_offset.get("pos"),
+            quat=insertive_offset.get("quat"),
         )
         self.receptive_assembled_offset = Offset(
-            pos=receptive_metadata.get("assembled_offset").get("pos"),
-            quat=receptive_metadata.get("assembled_offset").get("quat"),
+            pos=receptive_offset.get("pos"),
+            quat=receptive_offset.get("quat"),
         )
 
     def __call__(
@@ -1419,19 +1421,74 @@ class GoalConditionedMultiResetManager(MultiResetManager):
         init_indices = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.goal_state = sample_from_nested_dict(self.datasets[0]["initial_state"], init_indices)
 
-        # non-physical coordinate frame marker at the sampled goal
+        # Goal visualization: keypoint spheres, not a coordinate frame -- a frame advertises POSE
+        # alignment while success is scored on KEYPOINTS, so the markers should show the quantity
+        # actually being judged. Created HERE, at env construction: VisualizationMarkers made
+        # mid-run (after the sim is playing) do not render.
         self.debug_vis = bool(cfg.params.get("debug_vis", False))
+        self._kp_markers = None
         if self.debug_vis:
-            # magenta sphere = insertive object goal. There is deliberately NO EE goal marker:
-            # success is scored on the insertive object alone (GCProgressContext include_ee=False),
-            # so drawing an EE goal would advertise a target the policy is not judged against.
-            # Non-fatal: the frame prototype USD lives on the Omniverse CDN, which cluster
-            # compute nodes cannot always reach — markers are a nicety, training is not.
             try:
-                self.insertive_goal_marker = make_gc_goal_marker("/Visuals/GCGoals/insertive_object", (1.0, 0.0, 1.0))
-            except Exception as e:
-                carb.log_warn(f"GC goal marker creation failed ({e}); disabling debug_vis.")
+                from .rewards import axis_keypoints_local
+
+                extent = float(cfg.params.get("keypoint_extent", -1.0))
+                if extent <= 0:
+                    try:
+                        insertive = env.scene["insertive_object"]
+                        meta = utils.read_metadata_from_usd_directory(insertive.cfg.spawn.usd_path)
+                        extent = abs(float(meta["bottom_offset"]["pos"][2]))
+                    except Exception:  # noqa: BLE001
+                        extent = 0.03
+                self._kp_local = axis_keypoints_local(extent, int(cfg.params.get("num_keypoints", 4)), env.device)
+
+                def _sphere(path, color, radius):
+                    return VisualizationMarkers(
+                        VisualizationMarkersCfg(
+                            prim_path=path,
+                            markers={
+                                "p": sim_utils.SphereCfg(
+                                    radius=radius,
+                                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+                                )
+                            },
+                        )
+                    )
+
+                # BLUE = goal keypoints (the target), ORANGE = the object's current keypoints.
+                # Sized for video: small enough to read as keypoints rather than blobs, large
+                # enough to survive H.264 4:2:0 chroma subsampling at 720p.
+                self._kp_markers = (
+                    _sphere("/Visuals/GCGoals/goal_kp", (0.0, 0.45, 1.0), 0.010),
+                    _sphere("/Visuals/GCGoals/cur_kp", (1.0, 0.45, 0.0), 0.008),
+                )
+            except Exception as e:  # noqa: BLE001 - markers are a nicety, training is not
+                carb.log_warn(f"GC keypoint marker creation failed ({e}); disabling debug_vis.")
                 self.debug_vis = False
+
+    def visualize_goal_keypoints(self, show: bool = True) -> None:
+        """Draw goal (blue) and current (orange) object keypoints; ``show=False`` hides both."""
+        if not self.debug_vis or self._kp_markers is None:
+            return
+        goal_m, cur_m = self._kp_markers
+        from .rewards import transform_keypoints
+
+        if not show:
+            # Parked far below the floor rather than hidden with set_visibility(): once a marker
+            # PointInstancer has been hidden it does not reliably come back, which silently kept
+            # these off-screen for a whole recording.
+            away = torch.zeros((self.num_envs * self._kp_local.shape[0], 3), device=self.device)
+            away[:, 2] = -50.0
+            goal_m.visualize(translations=away)
+            cur_m.visualize(translations=away)
+            return
+
+        origins = self._env.scene.env_origins
+        goal = self.goal_state["rigid_object"]["insertive_object"]["root_pose"]
+        obj = self._env.scene["insertive_object"]
+        gk = transform_keypoints(goal[:, :3] + origins, goal[:, 3:7], self._kp_local)
+        ck = transform_keypoints(obj.data.root_pos_w, obj.data.root_quat_w, self._kp_local)
+        goal_m.visualize(translations=gk.reshape(-1, 3))
+        cur_m.visualize(translations=ck.reshape(-1, 3))
 
     def __call__(
         self,
@@ -1455,10 +1512,13 @@ class GoalConditionedMultiResetManager(MultiResetManager):
         curriculum_expand_factor: float = 1.3,
         curriculum_cooldown: int = 50,
         curriculum_rank_start: int = 8,
+        curriculum_rank_starts: str = "",
+        curriculum_rank_floor: int = 0,
         curriculum_rank_max: int = 0,
         knn_k: int = 256,
         keypoint_extent: float = -1.0,
         num_keypoints: int = 4,
+        identity_goal_prob: float = 0.0,
     ) -> None:
         super().__call__(env, env_ids, dataset_dir, reset_types, probs, success)
 
@@ -1477,6 +1537,8 @@ class GoalConditionedMultiResetManager(MultiResetManager):
                     env,
                     dataset_idx,
                     rank_start=curriculum_rank_start,
+                    rank_starts=curriculum_rank_starts,
+                    rank_floor=curriculum_rank_floor,
                     rank_max=(curriculum_rank_max if curriculum_rank_max > 0 else self.knn_k),
                     promote_at=curriculum_promote_at,
                     demote_at=curriculum_demote_at,
@@ -1512,14 +1574,46 @@ class GoalConditionedMultiResetManager(MultiResetManager):
                 goal_indices = torch.randint(
                     0, self.num_states[dataset_idx], (len(current_env_ids),), device=self._env.device
                 )
+            # Identity goals: with probability `identity_goal_prob` the goal IS the env's own start
+            # state, so the episode opens already inside the success ball. These episodes are a
+            # standing example of what success looks like at the current tolerance, available from
+            # step 0 rather than only after the policy earns one. They are NOT excluded from the
+            # success monitor, so the reported rate is roughly
+            # `identity_goal_prob + (1 - identity_goal_prob) * true_rate`, and every threshold that
+            # reads it -- both curricula's promote/demote points -- shifts down correspondingly.
+            if identity_goal_prob > 0.0:
+                identity = (
+                    torch.rand(len(current_env_ids), device=self._env.device) < identity_goal_prob
+                )
+                goal_indices = torch.where(identity, self.state_id[current_env_ids], goal_indices)
+
             sampled_goals = sample_from_nested_dict(self.datasets[dataset_idx]["initial_state"], goal_indices)
             write_into_nested_dict(self.goal_state, sampled_goals, current_env_ids)
 
-        if self.debug_vis:
-            env_origins = self._env.scene.env_origins
-            insertive_goal = self.goal_state["rigid_object"]["insertive_object"]["root_pose"]
-            visualize_gc_goal(self.insertive_goal_marker, insertive_goal[:, :3] + env_origins, insertive_goal[:, 3:7])
 
+
+
+    def resample_goals_uniform(self, env_ids: torch.Tensor) -> None:
+        """Draw a fresh goal for ``env_ids`` uniformly from the task's own reset distribution.
+
+        Public entry point for the autonomous-reset loop: at the end of a collection episode the
+        script asks for a new goal, and the GC policy then physically drives the robot there --
+        no teleport. Path is drawn with the configured ``probs``, then a state uniformly within it,
+        which is exactly what a scripted reset would have sampled.
+        """
+        if len(env_ids) == 0:
+            return
+        dataset_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+        for dataset_idx in range(self.num_tasks):
+            mask = dataset_indices == dataset_idx
+            if not mask.any():
+                continue
+            current_env_ids = env_ids[mask]
+            goal_indices = torch.randint(
+                0, int(self.num_states[dataset_idx]), (len(current_env_ids),), device=self.device
+            )
+            sampled_goals = sample_from_nested_dict(self.datasets[dataset_idx]["initial_state"], goal_indices)
+            write_into_nested_dict(self.goal_state, sampled_goals, current_env_ids)
 
     def _build_keypoint_knn(self, poses: torch.Tensor, kp_local: torch.Tensor, k: int, transform_fn) -> torch.Tensor:
         """Per-state indices of the k nearest states by MEAN keypoint distance. Chunked over rows.
@@ -1562,6 +1656,8 @@ class GoalConditionedMultiResetManager(MultiResetManager):
         demote_at: float,
         factor: float,
         cooldown: int,
+        rank_starts: str = "",
+        rank_floor: int = 0,
     ) -> int:
         """Per-dataset neighbour-rank limit, gated on THAT dataset's own success rate.
 
@@ -1572,7 +1668,19 @@ class GoalConditionedMultiResetManager(MultiResetManager):
         advancing on its own competence removes both failure modes.
         """
         if not hasattr(self, "_rank_limit"):
-            self._rank_limit = [int(rank_start)] * self.num_tasks
+            # `rank_starts` ("1800,114"): per-task initial ranks, for resuming a run whose paths
+            # ended at different curriculum levels. Empty -> rank_start for every task.
+            if rank_starts:
+                # ":"-separated ("1919:114"): commas make Hydra treat the value as a list and the
+                # quoting that avoids it does not survive the cluster ssh hop.
+                starts = [int(x) for x in str(rank_starts).replace(",", ":").split(":")]
+                assert len(starts) == self.num_tasks, (rank_starts, self.num_tasks)
+                self._rank_limit = starts
+            else:
+                self._rank_limit = [int(rank_start)] * self.num_tasks
+            # Demote floor, decoupled from the start: without this a run resumed at a high rank
+            # could never back off below where it started, which is how a path strands.
+            self._rank_floor = int(rank_floor) if rank_floor > 0 else int(rank_start)
             self._rank_cooldown = [-(10**9)] * self.num_tasks
 
         rate = float("nan")
@@ -1587,7 +1695,7 @@ class GoalConditionedMultiResetManager(MultiResetManager):
             if rate >= promote_at:
                 self._rank_limit[dataset_idx] = min(rank_max, max(1, int(self._rank_limit[dataset_idx] * factor)) + 1)
             elif rate <= demote_at:
-                self._rank_limit[dataset_idx] = max(rank_start, int(self._rank_limit[dataset_idx] / factor))
+                self._rank_limit[dataset_idx] = max(self._rank_floor, int(self._rank_limit[dataset_idx] / factor))
 
         if "log" not in env.extras:
             env.extras["log"] = {}

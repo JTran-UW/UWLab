@@ -118,7 +118,19 @@ parser.add_argument(
         "Sample actions from the policy distribution instead of taking its mean. This is what the "
         "TRAINING rollout does (fast_sac_agent sets policy = actor.explore), whereas play.py "
         "otherwise evaluates the deterministic mean -- so a policy whose mean is fine but whose "
-        "log_std has blown up looks healthy here and destabilises during training. FastSAC only."
+        "log_std has blown up looks healthy here and destabilises during training. Also essential "
+        "for dither-dependent experts whose mean action jams. FastSAC and OnPolicyRunner (PPO)."
+    ),
+)
+parser.add_argument(
+    "--success_to_truncation",
+    action="store_true",
+    default=False,
+    help=(
+        "When recording transitions, store dones caused by the 'success' termination as truncations "
+        "so the consumer bootstraps through them (FastSAC with handle_truncations bootstraps where "
+        "truncations | ~dones). Use with a Success-Termination task so episodes end at insertion "
+        "without the success step being treated as a zero-value terminal."
     ),
 )
 parser.add_argument(
@@ -254,6 +266,7 @@ def record_transitions_to_replay_buffer(
     gamma: float = 0.99,
     n_steps: int = 1,
     single_env_rb: bool = False,
+    success_to_truncation: bool = False,
 ) -> None:
     """Run a policy for ``num_steps`` and save transitions in SimpleReplayBuffer format.
 
@@ -281,6 +294,15 @@ def record_transitions_to_replay_buffer(
     """
     n_env = env.num_envs
     n_act = env.num_actions
+
+    if success_to_truncation:
+        term_mgr = env.unwrapped.termination_manager
+        if "success" not in list(term_mgr.active_terms):
+            raise ValueError(
+                "--success_to_truncation requires a task with a 'success' termination term; "
+                f"active terms: {list(term_mgr.active_terms)}"
+            )
+        print("[INFO] --success_to_truncation: success-caused dones will be recorded as truncations.")
 
     # Initial obs
     obs_td = env.get_observations().to(device)
@@ -318,6 +340,9 @@ def record_transitions_to_replay_buffer(
                 "time_outs", torch.zeros(n_env, dtype=torch.bool, device=device)
             )
             truncations = truncations.to(device).long()
+            if success_to_truncation:
+                success = term_mgr.get_term("success").to(device).long()
+                truncations = (truncations | success).long()
 
             next_actor_obs = _flatten_obs_groups(next_obs_td, actor_obs_keys)
             next_critic_obs = _flatten_obs_groups(next_obs_td, critic_obs_keys)
@@ -405,6 +430,7 @@ def record_transitions_to_replay_buffer(
             "critic_obs_keys": critic_obs_keys,
             "task": task_name,
             "total_transitions": n_env * num_steps,
+            "success_to_truncation": success_to_truncation,
         },
     }
 
@@ -541,13 +567,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 gamma=getattr(agent_cfg.algorithm, "gamma", 0.99) if hasattr(agent_cfg, "algorithm") else 0.99,
                 n_steps=args_cli.record_n_steps,
                 single_env_rb=args_cli.single_env_rb,
+                success_to_truncation=args_cli.success_to_truncation,
             )
             env.close()
             return
     elif agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        runner.load(resume_path)
-        policy = runner.get_inference_policy(device=env.unwrapped.device)
+        try:
+            runner.load(resume_path)
+        except RuntimeError as e:
+            # Tolerate critic-side size mismatches only (e.g. the env's privileged critic group has a
+            # different dim than the checkpoint's): the critic is unused at play/recording time.
+            loaded_dict = torch.load(resume_path, weights_only=False, map_location=agent_cfg.device)
+            ckpt_sd = loaded_dict["model_state_dict"]
+            model_sd = runner.alg.policy.state_dict()
+            mismatched = [
+                k for k, v in ckpt_sd.items() if k in model_sd and model_sd[k].shape != v.shape
+            ]
+            if any(not k.startswith(("critic.", "critic_obs_normalizer.")) for k in mismatched):
+                raise e
+            filtered = {k: v for k, v in ckpt_sd.items() if k not in mismatched}
+            runner.alg.policy.load_state_dict(filtered, strict=False)
+            print(
+                f"[WARN] Strict checkpoint load failed; skipped critic-side size-mismatched tensors: {mismatched}. "
+                "Critic outputs are untrained/meaningless for this run."
+            )
+        if args_cli.stochastic:
+            policy = runner.get_inference_policy_stochastic(device=env.unwrapped.device)
+            print("[INFO] --stochastic: sampling actions from the policy distribution (matches training rollout).")
+        else:
+            policy = runner.get_inference_policy(device=env.unwrapped.device)
 
         obs_groups = runner.cfg["obs_groups"]
         ppo_actor_keys = list(obs_groups["policy"])
@@ -570,6 +619,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 gamma=float(runner.alg_cfg.get("gamma", 0.99)),
                 n_steps=args_cli.record_n_steps,
                 single_env_rb=args_cli.single_env_rb,
+                success_to_truncation=args_cli.success_to_truncation,
             )
             env.close()
             return
@@ -580,8 +630,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
 
-    if args_cli.stochastic and not is_fastsac:
-        print("[WARN] --stochastic is only wired for FastSAC; evaluating the deterministic policy instead.")
+    if args_cli.stochastic and not is_fastsac and agent_cfg.class_name != "OnPolicyRunner":
+        print("[WARN] --stochastic is only wired for FastSAC and OnPolicyRunner; evaluating the deterministic policy instead.")
 
     # --checkpoint_dir sweep: record one video per checkpoint, reusing this Isaac Sim instance.
     if args_cli.checkpoint_dir:
@@ -594,7 +644,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             name = args_cli.video_name or os.path.splitext(os.path.basename(ckpt))[0]
             print(f"[INFO] Recording {name} from checkpoint: {ckpt}")
             runner.load(ckpt)
-            policy = runner.get_inference_policy(device=env.unwrapped.device)
+            if args_cli.stochastic and agent_cfg.class_name == "OnPolicyRunner":
+                policy = runner.get_inference_policy_stochastic(device=env.unwrapped.device)
+            else:
+                policy = runner.get_inference_policy(device=env.unwrapped.device)
             env.unwrapped.reset()
             obs = env.get_observations()
             frames = []
@@ -999,12 +1052,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=1)
                 actions = policy({"actor_obs": actor_obs})
                 obs, _, dones, _ = env.step(actions)
+                critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=1)
+                print(critic(critic_obs, actions)[0])
             else:
                 actions = policy(obs)
                 obs, _, dones, _ = env.step(actions)
-
-            critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=1)
-            print(critic(critic_obs, actions)[0])
 
         if args_cli.video:
             timestep += 1
