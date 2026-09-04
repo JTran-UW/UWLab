@@ -44,15 +44,28 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
-    "--sgft",
+    "--sgft-pbrs",
+    dest="sgft_pbrs",
     action="store_true",
     default=False,
     help=(
-        "Shaped-guidance finetuning. Freezes the resumed checkpoint's actor and critic into a "
+        "SGFT potential-based reward shaping only (normal bootstrapped critic target). Freezes the resumed checkpoint's actor and critic into a "
         "source value function V(s) = mean_i Q_i(s, mu(s)) and stores potential-shaped rewards "
         "r_hat = r + gamma*V(s') - V(s) instead of r. V is never updated. Requires --resume_path "
         "(there is nothing to freeze otherwise). Potential-based, so the optimal policy is "
         "unchanged; only credit assignment moves."
+    ),
+)
+parser.add_argument(
+    "--sgft",
+    type=int,
+    default=0,
+    metavar="H",
+    help=(
+        "Full SGFT with horizon H: potential-based shaping (as --sgft-pbrs) PLUS an H-step critic "
+        "objective with no Bellman backup -- the target is the H-step sum of shaped rewards only. "
+        "Sets agent.num_steps=H (the replay buffers' n-step window); a conflicting explicit "
+        "agent.num_steps is an error. Mutually exclusive with --h_step_backup. 0 = off."
     ),
 )
 parser.add_argument(
@@ -63,7 +76,7 @@ parser.add_argument(
         "Optional checkpoint to freeze as the SGFT source value function instead of the resumed "
         "weights. Lets the shaping potential come from a different (e.g. earlier or expert) "
         "checkpoint than the one being finetuned. Same format as regular save()/load() "
-        "checkpoints. Only meaningful with --sgft or --h_step_backup; with it set, "
+        "checkpoints. Only meaningful with --sgft-pbrs or --h_step_backup; with it set, "
         "--resume_path is no longer required for those flags."
     ),
 )
@@ -76,7 +89,7 @@ parser.add_argument(
         "learned target critic: target = sum_k gamma^k r_k + gamma^n * V_source(s_n). V_source is "
         "distributional, so its atom distribution is pushed through the same categorical Bellman "
         "projection. Freezes the resumed checkpoint, so it requires --resume_path. Can be used "
-        "with or without --sgft, but enabling both double-counts V_source (warned at startup)."
+        "with or without --sgft-pbrs, but enabling both double-counts V_source (warned at startup)."
     ),
 )
 parser.add_argument(
@@ -115,7 +128,19 @@ parser.add_argument(
     "--expert_ratio_anneal_steps",
     type=int,
     default=0,
-    help="Linearly anneal expert_ratio to 0 over this many global steps. 0 = no annealing (default).",
+    help="Linearly anneal expert_ratio to --expert_ratio_final over this many global steps. 0 = no annealing (default).",
+)
+parser.add_argument(
+    "--expert_ratio_final",
+    type=float,
+    default=0.0,
+    help="Expert ratio reached at the end of the anneal window (default: 0.0).",
+)
+parser.add_argument(
+    "--expert_ratio_anneal_start",
+    type=int,
+    default=None,
+    help="Global step the anneal window starts at. Default: the step training (re)starts at, so a resumed run anneals over its own steps.",
 )
 parser.add_argument(
     "--expert_checkpoint",
@@ -223,6 +248,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # make config compatible with installed rsl-rl version
     agent_cfg = cli_args.sanitize_rsl_rl_cfg(agent_cfg)
+    if args_cli.sgft > 0:
+        # --sgft H: the replay buffers' n-step window must be H. Refuse a conflicting explicit override.
+        explicit = [a for a in hydra_args if a.startswith("agent.num_steps=")]
+        if explicit and int(float(explicit[-1].split("=", 1)[1])) != args_cli.sgft:
+            raise ValueError(f"--sgft {args_cli.sgft} conflicts with {explicit[-1]}; drop one of them.")
+        if not hasattr(agent_cfg, "num_steps"):
+            raise ValueError("--sgft requires an off-policy (FastSAC) agent config with num_steps")
+        agent_cfg.num_steps = args_cli.sgft
+        print(f"[INFO] --sgft {args_cli.sgft}: agent.num_steps set to {args_cli.sgft} (H-step window, no Bellman backup)")
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -270,6 +304,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    try:
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp.utils import describe_assembly_assets
+
+        print(describe_assembly_assets(env_cfg))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[assembly] could not describe peg/hole assets: {exc}")
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -346,6 +387,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "device": agent_cfg.device,
                 "expert_transitions": args_cli.expert_transitions,
                 "expert_ratio": args_cli.expert_ratio,
+                "expert_ratio_final": args_cli.expert_ratio_final,
+                "expert_ratio_anneal_steps": args_cli.expert_ratio_anneal_steps,
+                "expert_ratio_anneal_start": args_cli.expert_ratio_anneal_start,
                 "expert_checkpoint": args_cli.expert_checkpoint,
                 "replay_buffer_path": args_cli.replay_buffer_path,
                 "resume_path": args_cli.resume_path,
@@ -368,6 +412,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.setup()
         runner.expert_ratio = args_cli.expert_ratio
         runner.expert_ratio_anneal_steps = args_cli.expert_ratio_anneal_steps
+        runner.expert_ratio_final = args_cli.expert_ratio_final
+        runner.expert_ratio_anneal_start = args_cli.expert_ratio_anneal_start
         runner.attach_checkpoint_metadata(ExperimentConfig(), log_dir)
         if args_cli.expert_transitions is not None:
             runner.load_expert_replay_buffer(args_cli.expert_transitions)
@@ -387,8 +433,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # just-loaded weights. Must run after runner.load() -- before it, the networks are still
     # randomly initialised -- and after the expert buffer is loaded, so enable_sgft() can reshape
     # those stored rewards too.
-    if args_cli.sgft or args_cli.h_step_backup:
-        _which = " / ".join(f for f, on in (("--sgft", args_cli.sgft),
+    if args_cli.sgft_pbrs or args_cli.h_step_backup or args_cli.sgft > 0:
+        _which = " / ".join(f for f, on in (("--sgft-pbrs", args_cli.sgft_pbrs),
+                                            (f"--sgft {args_cli.sgft}", args_cli.sgft > 0),
                                             ("--h_step_backup", args_cli.h_step_backup)) if on)
         if not (agent_cfg.resume or args_cli.resume_path is not None or args_cli.sgft_source_ckpt is not None):
             raise ValueError(
@@ -398,9 +445,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if not hasattr(runner, "enable_sgft"):
             raise ValueError(f"{_which} is only supported by FastSACAgent, got {type(runner).__name__}.")
         runner.enable_sgft(
-            shape_rewards=args_cli.sgft,
+            shape_rewards=args_cli.sgft_pbrs or args_cli.sgft > 0,
             h_step_backup=args_cli.h_step_backup,
             ckpt_path=args_cli.sgft_source_ckpt,
+            h_step=args_cli.sgft,
         )
 
     # Optional: load online replay buffer from a saved snapshot (FastSAC only).

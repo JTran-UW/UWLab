@@ -393,6 +393,81 @@ def get_assembled_offset(metadata: dict) -> dict:
     return offset
 
 
+def get_assembled_offsets(metadata: dict) -> list[dict]:
+    """All valid assembled offsets as ``{"pos", "quat"}`` dicts; the first is the canonical one.
+
+    yandabao assets list symmetric variants under ``assembled_offsets``; UW-Lab assets carry a
+    single ``assembled_offset``, lifted here to a 1-element list.
+    """
+    offsets = metadata.get("assembled_offsets")
+    if offsets:
+        return list(offsets)
+    offset = metadata.get("assembled_offset")
+    if offset is None:
+        raise KeyError("metadata has neither 'assembled_offset' nor 'assembled_offsets'")
+    return [offset]
+
+
+def assembled_alignment_error(
+    ins_pos_w: torch.Tensor,
+    ins_quat_w: torch.Tensor,
+    rec_root_pos_w: torch.Tensor,
+    rec_root_quat_w: torch.Tensor,
+    rec_offsets_pos: torch.Tensor,
+    rec_offsets_quat: torch.Tensor,
+    ignore_yaw: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Position and orientation error of the insertive alignment frame w.r.t. the CLOSEST receptive
+    assembled offset (symmetry-aware). Orientation error is |roll|+|pitch|, minimised over all
+    offsets (any-of-8 for the yandabao peg hole); yaw is ignored by default because the peg is
+    rotationally symmetric about its insertion axis. ``ignore_yaw=False`` adds the |yaw| term for
+    insertive objects with a discrete yaw symmetry enumerated in ``assembled_offsets``.
+
+    Args:
+        ins_pos_w, ins_quat_w: insertive alignment frame in world, [N,3] / [N,4].
+        rec_root_pos_w, rec_root_quat_w: receptive asset root pose in world, [N,3] / [N,4].
+        rec_offsets_pos, rec_offsets_quat: all assembled offsets of the receptive asset, [K,3] / [K,4].
+    Returns:
+        (xyz_distance [N], euler_distance [N]) taken at the offset with the smallest orientation error.
+    """
+    n = ins_pos_w.shape[0]
+    best_xyz = best_exy = None
+    for k in range(rec_offsets_pos.shape[0]):
+        rec_pos_w, rec_quat_w = math_utils.combine_frame_transforms(
+            rec_root_pos_w, rec_root_quat_w, rec_offsets_pos[k].expand(n, 3), rec_offsets_quat[k].expand(n, 4)
+        )
+        rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
+        e_x, e_y, e_z = math_utils.euler_xyz_from_quat(rel_quat)
+        exy = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
+        if not ignore_yaw:
+            exy = exy + math_utils.wrap_to_pi(e_z).abs()
+        xyz = torch.norm(rel_pos, dim=1)
+        if best_exy is None:
+            best_xyz, best_exy = xyz, exy
+        else:
+            better = exy < best_exy
+            best_xyz = torch.where(better, xyz, best_xyz)
+            best_exy = torch.minimum(exy, best_exy)
+    return best_xyz, best_exy
+
+
+def describe_assembly_assets(env_cfg) -> str:
+    """One-glance summary of which peg/hole assets (and hence success thresholds) a cfg resolves to."""
+    try:
+        ins = env_cfg.scene.insertive_object.spawn.usd_path
+        rec = env_cfg.scene.receptive_object.spawn.usd_path
+    except AttributeError:
+        return ""
+    meta = read_metadata_from_usd_directory(rec)
+    thr = meta.get("success_thresholds", {})
+    n_off = len(get_assembled_offsets(meta))
+    return (
+        f"[assembly] insertive_object: {ins}\n[assembly] receptive_object: {rec}\n"
+        f"[assembly] success thresholds: pos={thr.get('position')} m, ori={thr.get('orientation')} rad;"
+        f" assembled offsets: {n_off}"
+    )
+
+
 def object_name_from_usd(usd_path: str) -> str:
     """Extract the canonical object name from a USD asset path.
 

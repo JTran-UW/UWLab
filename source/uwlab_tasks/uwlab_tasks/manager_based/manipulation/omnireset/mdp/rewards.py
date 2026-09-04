@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 from typing import TYPE_CHECKING
 
@@ -161,6 +162,9 @@ class ProgressContext(ManagerTermBase):
             pos=tuple(receptive_offset.get("pos")),
             quat=tuple(receptive_offset.get("quat")),
         )
+        _offs = utils.get_assembled_offsets(receptive_meta)
+        self.receptive_offsets_pos = torch.tensor([o["pos"] for o in _offs], dtype=torch.float32, device=env.device)
+        self.receptive_offsets_quat = torch.tensor([o["quat"] for o in _offs], dtype=torch.float32, device=env.device)
 
         self.orientation_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
         self.position_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
@@ -176,7 +180,15 @@ class ProgressContext(ManagerTermBase):
         super().reset(env_ids)
         # Only the envs that actually reset: a blanket [:] wipes every env's progress whenever any
         # one env ends, which starves consecutive_success_state (terminations run before rewards).
-        if env_ids is None:
+        if env_ids is not None and os.environ.get("UWLAB_LEGACY_SUCCESS_COUNTER_RESET") == "1" and not getattr(self, "_legacy_wipe_logged", False):
+            self._legacy_wipe_logged = True
+            print("[legacy] UWLAB_LEGACY_SUCCESS_COUNTER_RESET=1 -> blanket success-counter wipe ACTIVE (pre-8d15384 behavior)")
+        if env_ids is None or os.environ.get("UWLAB_LEGACY_SUCCESS_COUNTER_RESET") == "1":
+            # Pre-8d15384 behavior (blanket wipe; starves consecutive_success_state). Env-var gated,
+            # for byte-reproducing pre-fix data collections ONLY -- never set this for training.
+            # DO NOT remove as dead code: this gate is the regression fixture that byte-reproduces
+            # expert_rb/full_resets_peghole_anywhere_w_dr_n_step_3_sparse_no_priv.pt (see
+            # .claude/gap-finetune-handoff.md, "byte-certified").
             self.continuous_success_counter[:] = 0
         else:
             self.continuous_success_counter[env_ids] = 0
@@ -191,24 +203,14 @@ class ProgressContext(ManagerTermBase):
         task_command: TaskCommand = env.command_manager.get_term(command_context)
         success_position_threshold = task_command.success_position_threshold
         success_orientation_threshold = task_command.success_orientation_threshold
-        insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w = self.insertive_asset_offset.apply(
-            self.insertive_asset
+        # symmetry-aware: closest of the receptive asset's assembled offsets; yaw ignored
+        ins_pos_w, ins_quat_w = self.insertive_asset_offset.apply(self.insertive_asset)
+        xyz, exy = utils.assembled_alignment_error(
+            ins_pos_w, ins_quat_w, self.receptive_asset.data.root_pos_w, self.receptive_asset.data.root_quat_w,
+            self.receptive_offsets_pos, self.receptive_offsets_quat,
         )
-        receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self.receptive_asset_offset.apply(
-            self.receptive_asset
-        )
-        insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat = (
-            math_utils.subtract_frame_transforms(
-                receptive_asset_alignment_pos_w,
-                receptive_asset_alignment_quat_w,
-                insertive_asset_alignment_pos_w,
-                insertive_asset_alignment_quat_w,
-            )
-        )
-        # yaw could be different
-        e_x, e_y, _ = math_utils.euler_xyz_from_quat(insertive_asset_in_receptive_asset_frame_quat)
-        self.euler_xy_distance[:] = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
-        self.xyz_distance[:] = torch.norm(insertive_asset_in_receptive_asset_frame_pos, dim=1)
+        self.euler_xy_distance[:] = exy
+        self.xyz_distance[:] = xyz
         self.position_aligned[:] = self.xyz_distance < success_position_threshold
         self.orientation_aligned[:] = self.euler_xy_distance < success_orientation_threshold
         self.success[:] = self.orientation_aligned & self.position_aligned
@@ -545,7 +547,15 @@ class ProgressContextReaching(ManagerTermBase):
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         super().reset(env_ids)
-        if env_ids is None:
+        if env_ids is not None and os.environ.get("UWLAB_LEGACY_SUCCESS_COUNTER_RESET") == "1" and not getattr(self, "_legacy_wipe_logged", False):
+            self._legacy_wipe_logged = True
+            print("[legacy] UWLAB_LEGACY_SUCCESS_COUNTER_RESET=1 -> blanket success-counter wipe ACTIVE (pre-8d15384 behavior)")
+        if env_ids is None or os.environ.get("UWLAB_LEGACY_SUCCESS_COUNTER_RESET") == "1":
+            # Pre-8d15384 behavior (blanket wipe; starves consecutive_success_state). Env-var gated,
+            # for byte-reproducing pre-fix data collections ONLY -- never set this for training.
+            # DO NOT remove as dead code: this gate is the regression fixture that byte-reproduces
+            # expert_rb/full_resets_peghole_anywhere_w_dr_n_step_3_sparse_no_priv.pt (see
+            # .claude/gap-finetune-handoff.md, "byte-certified").
             self.continuous_success_counter[:] = 0
         else:
             self.continuous_success_counter[env_ids] = 0

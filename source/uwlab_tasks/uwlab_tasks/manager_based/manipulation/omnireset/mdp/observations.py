@@ -61,6 +61,9 @@ def target_asset_pose_in_root_asset_frame(
     target_asset_offset=None,
     root_asset_offset=None,
     rotation_repr: str = "quat",
+    target_pos_bias_w=None,
+    target_pos_override_w: torch.Tensor | None = None,
+    root_pos_bias_w=None,
 ):
     target_asset: RigidObject | Articulation = env.scene[target_asset_cfg.name]
     root_asset: RigidObject | Articulation = env.scene[root_asset_cfg.name]
@@ -70,8 +73,14 @@ def target_asset_pose_in_root_asset_frame(
 
     target_pos = target_asset.data.body_link_pos_w[:, target_body_idx].view(-1, 3)
     target_quat = target_asset.data.body_link_quat_w[:, target_body_idx].view(-1, 4)
+    if target_pos_override_w is not None:
+        target_pos = target_pos_override_w
+    if target_pos_bias_w is not None:
+        target_pos = target_pos + torch.as_tensor(target_pos_bias_w, dtype=target_pos.dtype, device=target_pos.device)
     root_pos = root_asset.data.body_link_pos_w[:, root_body_idx].view(-1, 3)
     root_quat = root_asset.data.body_link_quat_w[:, root_body_idx].view(-1, 4)
+    if root_pos_bias_w is not None:
+        root_pos = root_pos + torch.as_tensor(root_pos_bias_w, dtype=root_pos.dtype, device=root_pos.device)
 
     if root_asset_offset is not None:
         root_pos, root_quat = root_asset_offset.combine(root_pos, root_quat)
@@ -100,6 +109,8 @@ def target_asset_pose_in_root_asset_frame_with_gap(
     rot_noise_std: float | None = None,
     pos_bias=None,
     rot_bias=None,
+    world_pos_bias=None,
+    root_world_pos_bias=None,
 ) -> torch.Tensor:
     """``target_asset_pose_in_root_asset_frame`` with optional observation-gap corruption.
 
@@ -108,7 +119,13 @@ def target_asset_pose_in_root_asset_frame_with_gap(
     * ``pos_noise_std`` / ``rot_noise_std``: zero-mean additive gaussian noise, resampled every
       step. None or <= 0 disables.
     * ``pos_bias`` / ``rot_bias``: a fixed constant additive offset -- a scalar (added to every
-      component) or a 3-sequence (per-component). None or all-zero adds nothing.
+      component) or a 3-sequence (per-component). None or all-zero adds nothing. Applied in the
+      OBSERVATION's own frame (the root asset frame).
+    * ``world_pos_bias``: a fixed 3-sequence offset added to the target asset's WORLD position
+      before the frame projection -- one physical miscalibration, consistently rotated into every
+      observation frame that uses this term.
+    * ``root_world_pos_bias``: same, applied to the ROOT (frame-defining) asset's world position --
+      e.g. a miscalibrated peghole pose for the peg-in-peghole-frame term.
 
     Defaults (None here; 0.0 / [0,0,0] in the task cfgs so scalar and list CLI overrides pass
     ``update_class_from_dict``'s type check) are a clean passthrough, so swapping this in for the
@@ -126,8 +143,13 @@ def target_asset_pose_in_root_asset_frame_with_gap(
     if rot_gap_active and rotation_repr != "axis_angle":
         raise ValueError("Rotation noise/bias requires rotation_repr='axis_angle'.")
 
+    if world_pos_bias is not None and not any(float(v) != 0.0 for v in world_pos_bias):
+        world_pos_bias = None
+    if root_world_pos_bias is not None and not any(float(v) != 0.0 for v in root_world_pos_bias):
+        root_world_pos_bias = None
     obs = target_asset_pose_in_root_asset_frame(
-        env, target_asset_cfg, root_asset_cfg, target_asset_offset, root_asset_offset, rotation_repr
+        env, target_asset_cfg, root_asset_cfg, target_asset_offset, root_asset_offset, rotation_repr,
+        target_pos_bias_w=world_pos_bias, root_pos_bias_w=root_world_pos_bias,
     )
     if pos_noise_std is not None and pos_noise_std > 0.0:
         obs[:, :3] += torch.randn_like(obs[:, :3]) * pos_noise_std
@@ -138,6 +160,91 @@ def target_asset_pose_in_root_asset_frame_with_gap(
     if rot_bias is not None:
         obs[:, 3:6] += torch.as_tensor(rot_bias, dtype=obs.dtype, device=obs.device)
     return obs
+
+
+class target_asset_pose_in_root_asset_frame_with_gap_and_hold(ManagerTermBase):
+    """``..._with_gap`` plus a stale-pose "hold" gap: each env step, an env that is not already
+    holding starts a hold with probability ``hold_prob``; for the next ``hold_steps`` env steps the
+    target's observed WORLD position is frozen at its snapshot and re-projected into the observation
+    frame every step (rotation and the root frame stay live) -- a pose estimator republishing a
+    stale estimate. Terms sharing the same ``hold_group`` (default: all peg terms) share one hold
+    state, so a single perception dropout corrupts them consistently. Holds clear on episode reset.
+
+    ``hold_prob=0.0`` / ``hold_steps=0`` (the defaults) make this a bit-identical passthrough of
+    ``target_asset_pose_in_root_asset_frame_with_gap``; all of that function's knobs are accepted
+    and applied on top (the world-bias is applied to the held position too).
+    """
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        group = cfg.params.get("hold_group", "peg_pose_hold")
+        states = env.__dict__.setdefault("_obs_pose_hold_states", {})
+        if group not in states:
+            states[group] = {
+                "held_pos": torch.zeros(env.num_envs, 3, device=env.device),
+                "remaining": torch.zeros(env.num_envs, dtype=torch.long, device=env.device),
+                "last_step": -1,
+            }
+        self._state = states[group]
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = slice(None)
+        self._state["remaining"][env_ids] = 0
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        target_asset_cfg: SceneEntityCfg,
+        root_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        target_asset_offset=None,
+        root_asset_offset=None,
+        rotation_repr: str = "quat",
+        pos_noise_std: float | None = None,
+        rot_noise_std: float | None = None,
+        pos_bias=None,
+        rot_bias=None,
+        world_pos_bias=None,
+        root_world_pos_bias=None,
+        hold_prob: float = 0.0,
+        hold_steps: int = 0,
+        hold_group: str = "peg_pose_hold",
+    ) -> torch.Tensor:
+        target_asset = env.scene[target_asset_cfg.name]
+        tb = 0 if isinstance(target_asset_cfg.body_ids, slice) else target_asset_cfg.body_ids
+        cur_pos = target_asset.data.body_link_pos_w[:, tb].view(-1, 3)
+
+        override = None
+        if hold_prob > 0.0 and hold_steps > 0:
+            st = self._state
+            if env.common_step_counter != st["last_step"]:
+                st["last_step"] = env.common_step_counter
+                active = st["remaining"] > 0
+                st["remaining"][active] -= 1
+                start = ~active & (torch.rand(env.num_envs, device=env.device) < hold_prob)
+                st["remaining"][start] = hold_steps
+                st["held_pos"][start] = cur_pos[start]
+            held = self._state["remaining"] > 0
+            if held.any():
+                override = torch.where(held.unsqueeze(1), self._state["held_pos"], cur_pos)
+
+        if world_pos_bias is not None and not any(float(v) != 0.0 for v in world_pos_bias):
+            world_pos_bias = None
+        if root_world_pos_bias is not None and not any(float(v) != 0.0 for v in root_world_pos_bias):
+            root_world_pos_bias = None
+        obs = target_asset_pose_in_root_asset_frame(
+            env, target_asset_cfg, root_asset_cfg, target_asset_offset, root_asset_offset, rotation_repr,
+            target_pos_bias_w=world_pos_bias, target_pos_override_w=override, root_pos_bias_w=root_world_pos_bias,
+        )
+        if pos_noise_std is not None and pos_noise_std > 0.0:
+            obs[:, :3] += torch.randn_like(obs[:, :3]) * pos_noise_std
+        if rot_noise_std is not None and rot_noise_std > 0.0:
+            obs[:, 3:6] += torch.randn_like(obs[:, 3:6]) * rot_noise_std
+        if pos_bias is not None:
+            obs[:, :3] += torch.as_tensor(pos_bias, dtype=obs.dtype, device=obs.device)
+        if rot_bias is not None:
+            obs[:, 3:6] += torch.as_tensor(rot_bias, dtype=obs.dtype, device=obs.device)
+        return obs
 
 
 class target_asset_pose_in_root_asset_frame_with_metadata(ManagerTermBase):
@@ -249,7 +356,10 @@ def get_mass(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.root_physx_view.get_masses().view(env.num_envs, -1)
+    masses = asset.root_physx_view.get_masses().view(env.num_envs, -1)
+    if not isinstance(asset_cfg.body_ids, slice):
+        masses = masses[:, asset_cfg.body_ids]
+    return masses
 
 
 def get_joint_friction(

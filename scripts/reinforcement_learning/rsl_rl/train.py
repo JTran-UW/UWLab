@@ -257,7 +257,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path)
+        try:
+            runner.load(resume_path)
+        except RuntimeError as e:
+            # Tolerate critic-side size mismatches only (e.g. warm-starting a UW-Lab-robot checkpoint
+            # (204-dim privileged critic) in a Yanda-robot env (205)): the actor must load fully; the
+            # critic's mismatched tensors are skipped and PPO relearns the value function.
+            loaded_dict = torch.load(resume_path, weights_only=False, map_location=agent_cfg.device)
+            ckpt_sd = loaded_dict["model_state_dict"]
+            model_sd = runner.alg.policy.state_dict()
+            mismatched = [k for k, v in ckpt_sd.items() if k in model_sd and model_sd[k].shape != v.shape]
+            if any(not k.startswith(("critic.", "critic_obs_normalizer.")) for k in mismatched):
+                raise e
+            filtered = {k: v for k, v in ckpt_sd.items() if k not in mismatched}
+            runner.alg.policy.load_state_dict(filtered, strict=False)
+            print(
+                f"[WARN] Strict checkpoint load failed; skipped critic-side size-mismatched tensors: {mismatched}. "
+                "The critic (value function) will be relearned from its fresh initialization."
+            )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

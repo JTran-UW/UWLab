@@ -82,11 +82,12 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
-    "--sgft",
+    "--sgft-pbrs",
+    dest="sgft_pbrs",
     action="store_true",
     default=False,
     help=(
-        "Shaped-guidance finetuning. Freezes the resumed checkpoint's actor and critic into a "
+        "SGFT potential-based reward shaping only (normal bootstrapped critic target). Freezes the resumed checkpoint's actor and critic into a "
         "source value function V(s) = mean_i Q_i(s, mu(s)) and stores potential-shaped rewards "
         "r_hat = r + gamma*V(s') - V(s) instead of r. V is never updated. Requires --resume_path "
         "(there is nothing to freeze otherwise). Potential-based, so the optimal policy is "
@@ -101,7 +102,7 @@ parser.add_argument(
         "Optional checkpoint to freeze as the SGFT source value function instead of the resumed "
         "weights. Lets the shaping potential come from a different (e.g. earlier or expert) "
         "checkpoint than the one being finetuned. Same format as regular save()/load() "
-        "checkpoints. Only meaningful with --sgft or --h_step_backup; with it set, "
+        "checkpoints. Only meaningful with --sgft-pbrs or --h_step_backup; with it set, "
         "--resume_path is no longer required for those flags."
     ),
 )
@@ -114,7 +115,7 @@ parser.add_argument(
         "learned target critic: target = sum_k gamma^k r_k + gamma^n * V_source(s_n). V_source is "
         "distributional, so its atom distribution is pushed through the same categorical Bellman "
         "projection. Freezes the resumed checkpoint, so it requires --resume_path. Can be used "
-        "with or without --sgft, but enabling both double-counts V_source (warned at startup)."
+        "with or without --sgft-pbrs, but enabling both double-counts V_source (warned at startup)."
     ),
 )
 parser.add_argument(
@@ -460,8 +461,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # just-loaded weights. Must run after runner.load() -- before it, the networks are still
     # randomly initialised -- and after the expert buffer is loaded, so enable_sgft() can reshape
     # those stored rewards too.
-    if args_cli.sgft or args_cli.h_step_backup:
-        _which = " / ".join(f for f, on in (("--sgft", args_cli.sgft),
+    if args_cli.sgft_pbrs or args_cli.h_step_backup:
+        _which = " / ".join(f for f, on in (("--sgft-pbrs", args_cli.sgft_pbrs),
                                             ("--h_step_backup", args_cli.h_step_backup)) if on)
         if not (agent_cfg.resume or args_cli.resume_path is not None or args_cli.sgft_source_ckpt is not None):
             raise ValueError(
@@ -471,7 +472,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if not hasattr(runner, "enable_sgft"):
             raise ValueError(f"{_which} is only supported by FastSACAgent, got {type(runner).__name__}.")
         runner.enable_sgft(
-            shape_rewards=args_cli.sgft,
+            shape_rewards=args_cli.sgft_pbrs,
             h_step_backup=args_cli.h_step_backup,
             ckpt_path=args_cli.sgft_source_ckpt,
         )

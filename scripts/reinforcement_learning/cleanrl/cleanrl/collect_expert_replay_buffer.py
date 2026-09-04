@@ -35,7 +35,7 @@ Example (FastSAC state peg expert, same task it trained on):
         --num_envs 1024 --checkpoint peg_state_rl_expert_seed42.pt \
         --record_transitions 1000 --num_steps 3 \
         --output expert_rb/peg_state_expert_rb.pt --headless \
-        env.scene.insertive_object=peg env.scene.receptive_object=peghole
+
 """
 
 """Launch Isaac Sim Simulator first."""

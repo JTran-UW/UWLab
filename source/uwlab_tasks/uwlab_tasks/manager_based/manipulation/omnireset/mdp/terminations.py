@@ -272,6 +272,9 @@ class check_reset_state_success(ManagerTermBase):
                 pos=tuple(receptive_offset.get("pos")),
                 quat=tuple(receptive_offset.get("quat")),
             )
+            _offs = utils.get_assembled_offsets(receptive_meta)
+            self.receptive_offsets_pos = torch.tensor([o["pos"] for o in _offs], dtype=torch.float32, device=env.device)
+            self.receptive_offsets_quat = torch.tensor([o["quat"] for o in _offs], dtype=torch.float32, device=env.device)
             assembly_threshold_scale = cfg.params.get("assembly_threshold_scale", 1.0)
             self.assembly_pos_threshold: float = (
                 receptive_meta.get("success_thresholds").get("position") * assembly_threshold_scale
@@ -414,11 +417,10 @@ class check_reset_state_success(ManagerTermBase):
 
         if self.assembly_success_prob is not None:
             ins_pos_w, ins_quat_w = self.insertive_asset_offset.apply(self.insertive_asset)
-            rec_pos_w, rec_quat_w = self.receptive_asset_offset.apply(self.receptive_asset)
-            rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
-            e_x, e_y, _ = math_utils.euler_xyz_from_quat(rel_quat)
-            euler_xy_dist = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
-            xyz_dist = torch.norm(rel_pos, dim=1)
+            xyz_dist, euler_xy_dist = utils.assembled_alignment_error(
+                ins_pos_w, ins_quat_w, self.receptive_asset.data.root_pos_w, self.receptive_asset.data.root_quat_w,
+                self.receptive_offsets_pos, self.receptive_offsets_quat,
+            )
             assembly_success = (xyz_dist < self.assembly_pos_threshold) & (euler_xy_dist < self.assembly_ori_threshold)
             assembly_match = torch.where(self.require_assembly_success, assembly_success, ~assembly_success)
             reset_success = reset_success & assembly_match

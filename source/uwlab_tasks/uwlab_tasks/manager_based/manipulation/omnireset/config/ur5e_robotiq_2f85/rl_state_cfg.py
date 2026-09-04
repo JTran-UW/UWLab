@@ -725,6 +725,10 @@ class BaseEventCfg:
             "robot_friction": -1.0,
             "gripper_stiffness_scale": -1.0,
             "gripper_damping_scale": -1.0,
+            "osc_kp_xyz_scale": -1.0,
+            "osc_kp_rpy_scale": -1.0,
+            "osc_damping_ratio_xyz_scale": -1.0,
+            "osc_damping_ratio_rpy_scale": -1.0,
         },
     )
 
@@ -1533,7 +1537,7 @@ class ObservationsCfg:
         # function. Override scalars from the CLI for an observation-gap benchmark, e.g.
         #   env.observations.policy.insertive_asset_pose.params.pos_noise_std=0.005
         insertive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
@@ -1542,20 +1546,33 @@ class ObservationsCfg:
                 "rot_noise_std": 0.0,
                 "pos_bias": [0.0, 0.0, 0.0],
                 "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
             },
         )
 
+        # Peghole pose: same gap-capable wrapper (own hold group), so a peghole miscalibration can
+        # be injected via world_pos_bias here + root_world_pos_bias on the peg-in-peghole term.
         receptive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("receptive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
+                "hold_group": "peghole_pose_hold",
             },
         )
 
         insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("receptive_object"),
@@ -1564,6 +1581,10 @@ class ObservationsCfg:
                 "rot_noise_std": 0.0,
                 "pos_bias": [0.0, 0.0, 0.0],
                 "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "root_world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
             },
         )
 
@@ -1702,7 +1723,7 @@ class ObservationsNoPrivilegedObsCfg:
         # function. Override scalars from the CLI for an observation-gap benchmark, e.g.
         #   env.observations.policy.insertive_asset_pose.params.pos_noise_std=0.005
         insertive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
@@ -1711,20 +1732,33 @@ class ObservationsNoPrivilegedObsCfg:
                 "rot_noise_std": 0.0,
                 "pos_bias": [0.0, 0.0, 0.0],
                 "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
             },
         )
 
+        # Peghole pose: same gap-capable wrapper (own hold group), so a peghole miscalibration can
+        # be injected via world_pos_bias here + root_world_pos_bias on the peg-in-peghole term.
         receptive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("receptive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
+                "hold_group": "peghole_pose_hold",
             },
         )
 
         insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("receptive_object"),
@@ -1733,6 +1767,10 @@ class ObservationsNoPrivilegedObsCfg:
                 "rot_noise_std": 0.0,
                 "pos_bias": [0.0, 0.0, 0.0],
                 "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "root_world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
             },
         )
 
@@ -4464,15 +4502,22 @@ EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.spawn.usd_path = (
 )
 
 
-def _use_yanda_peg_and_hole(scene):
+def _use_yanda_peg_and_hole(cfg):
     """Point the peg/hole at yandabao/uwlab-assets. Same nominal geometry as UW-Lab's, but the
     hole's collision mesh differs (53 verts vs 2444) and the PegHole metadata.yaml carries 8
     symmetric assembled offsets at 0.1 rad tolerance instead of one at 0.025 -- both what Yanda's
-    experts trained against. NOTE: a CLI variant token (env.scene.insertive_object=peg) re-applies
-    the UW-Lab asset on top of this.
+    experts trained against.
+
+    Also rebinds the ``peg``/``peghole`` CLI variants to these same assets: variant tokens resolve
+    AFTER ``__post_init__``, so without this ``env.scene.insertive_object=peg`` would silently revert
+    the cfg to UW-Lab assets (and their 0.025 rad thresholds). With it, the tokens are no-ops here.
     """
-    scene.insertive_object.spawn.usd_path = f"{YANDA_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"
-    scene.receptive_object.spawn.usd_path = f"{YANDA_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"
+    cfg.scene.insertive_object.spawn.usd_path = f"{YANDA_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"
+    cfg.scene.receptive_object.spawn.usd_path = f"{YANDA_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"
+    yanda_variants = {k: dict(v) for k, v in variants.items()}
+    yanda_variants["scene.insertive_object"]["peg"] = cfg.scene.insertive_object.copy()
+    yanda_variants["scene.receptive_object"]["peghole"] = cfg.scene.receptive_object.copy()
+    cfg.variants = yanda_variants
 
 
 @configclass
@@ -4485,7 +4530,7 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSpars
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        _use_yanda_peg_and_hole(self.scene)
+        _use_yanda_peg_and_hole(self)
 
 
 @configclass
@@ -4501,6 +4546,30 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNo
 
 
 @configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationFullResetYandaSysidRealDynamicsGapCfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationFullResetYandaSysidCfg
+):
+    """Real Dynamics Gap: the Yanda sys-id task with HARDCODED gaps replicating failures observed on
+    the real robot (unlike the CLI-knob sweeps, the gap is part of the task definition).
+
+    Current gap: stale-pose hold on the peg's observed position -- each step, with probability 0.05,
+    the observed WORLD position freezes for 1 step (both policy peg-pose terms share the dropout;
+    rotation and proprioception stay live). Critic observations stay clean.
+    History: 2026-08-29 shipped with a +1 cm x/z world-frame bias (93.4% -> 0.41% on 498k);
+    reverted 2026-08-30 in favor of the hold gap.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        for term in (
+            self.observations.policy.insertive_asset_pose,
+            self.observations.policy.insertive_asset_in_receptive_asset_frame,
+        ):
+            term.params["hold_prob"] = 0.05
+            term.params["hold_steps"] = 1
+
+
+@configclass
 class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsSuccessTruncationFullResetYandaSysidCfg(
     Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationFullResetYandaSysidCfg
 ):
@@ -4510,6 +4579,38 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsSu
     """
 
     terminations: TerminationsSuccessAsTruncationCfg = TerminationsSuccessAsTruncationCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationAnywhereOnlyYandaSysidCfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationFullResetYandaSysidCfg
+):
+    """Its parent with resets drawn from ``ObjectAnywhereEEAnywhere`` only (``FinetuneEvalEventCfg``:
+    same fixed sysid + OSC-gain randomizers, single reset path).
+    """
+
+    events: FinetuneEvalEventCfg = FinetuneEvalEventCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneYandaSysidCfg(Ur5eRobotiq2f85RelCartesianOSCFinetuneCfg):
+    """Curriculum-ramped on-policy finetune (``FinetuneEventCfg`` + ``FinetuneCurriculumsCfg``:
+    adr_sysid and action_scale ramp with success) with the robot USD and peg/hole assets sourced
+    from yandabao/uwlab-assets. On-policy counterpart of the Yanda OffPolicy finetune tasks.
+
+    The privileged critic is pinned to the UW-Lab-robot body set: the yandabao USD carries an extra
+    massless helper frame (``robotiq_fingertip_centered``) that would grow ``robot_mass`` to 205
+    dims and break strict loading of Stage-1 checkpoints (204). Excluding it keeps the checkpoint's
+    exact critic layout so warm-starts load the value function verbatim.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        _use_yanda_peg_and_hole(self)
+        self.observations.critic.robot_mass.params["asset_cfg"] = SceneEntityCfg(
+            "robot", body_names="^(?!robotiq_fingertip_centered$).*"
+        )
 
 
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
@@ -5014,7 +5115,7 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSparseNoP
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        _use_yanda_peg_and_hole(self.scene)
+        _use_yanda_peg_and_hole(self)
 
 
 @configclass
@@ -5030,7 +5131,7 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTe
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        _use_yanda_peg_and_hole(self.scene)
+        _use_yanda_peg_and_hole(self)
 
 
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)

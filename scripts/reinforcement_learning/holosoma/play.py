@@ -150,6 +150,16 @@ parser.add_argument(
     default=None,
     help="If set, run for this many steps collecting EE pose for env 0 (robot base frame), then plot and exit.",
 )
+parser.add_argument(
+    "--save_failure_states",
+    type=str,
+    default=None,
+    help=(
+        "With --eval_episodes_per_env: save the full scene start state (scene.get_state, env-relative) "
+        "of every counted FAILED episode to this .pt, along with its outcome bucket, duration, env id "
+        "and initial peg xyz. Replay them with play_failure_videos.py to record clips of the failures."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -198,6 +208,36 @@ from vecenv_wrapper import HolosomaVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
+
+
+def _state_index(state, idx):
+    """Index every leaf tensor of a nested scene-state dict along dim 0."""
+    if isinstance(state, dict):
+        return {k: _state_index(v, idx) for k, v in state.items()}
+    return state[idx]
+
+
+def _state_scatter(dst, src, idx):
+    """dst[leaf][idx] = src[leaf][idx] for every leaf of two same-shaped nested state dicts."""
+    for k, v in dst.items():
+        if isinstance(v, dict):
+            _state_scatter(v, src[k], idx)
+        else:
+            v[idx] = src[k][idx].to(v.device)
+
+
+def _to_cpu_state(state):
+    if isinstance(state, dict):
+        return {k: _to_cpu_state(v) for k, v in state.items()}
+    return None if state is None else state.detach().cpu()
+
+
+def _state_cat(states):
+    """Concatenate a list of nested state dicts along dim 0 (leaf-wise)."""
+    first = states[0]
+    if isinstance(first, dict):
+        return {k: _state_cat([st[k] for st in states]) for k in first}
+    return torch.cat(states, dim=0)
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config
 
@@ -491,6 +531,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     record_video = args_cli.video or bool(args_cli.checkpoint_dir)
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if record_video else None)
 
+    try:
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp.utils import describe_assembly_assets
+
+        print(describe_assembly_assets(env_cfg))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[assembly] could not describe peg/hole assets: {exc}")
+
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
@@ -698,7 +745,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ins_newest_start = ins_block_end - 6  # last 6 dims of the block = newest frame
         POS_THRESH = 0.03
         ORIENT_THRESH = 0.2
-        print(f"[eval] success check: pos_norm < {POS_THRESH}  AND  |aa_x|+|aa_y| < {ORIENT_THRESH}")
+        print("[eval] success check: env progress_context (metadata thresholds, closest assembled offset)")
         print(f"[eval] ins_in_rec newest slice: [{ins_newest_start}:{ins_block_end}]")
 
         # Episode outcome codes, shared by the printed breakdown and the scatter plot.
@@ -756,6 +803,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Collected per completed episode: (x, y, z) and an outcome code from OUTCOME_*.
         episode_init_xyzs: list[torch.Tensor] = []
         episode_outcomes: list[int] = []
+        # --save_failure_states: per-env scene state at episode start (refreshed on every done,
+        # like init_peg_xyz), from which each counted failure's start state is sliced out.
+        save_failures = args_cli.save_failure_states is not None
+        if save_failures:
+            init_state = env.unwrapped.scene.get_state(is_relative=True)
+            failure_states: list = []
+            failure_meta: dict[str, list] = {"env_id": [], "outcome": [], "duration": [], "init_peg_xyz": []}
 
         pbar = tqdm.tqdm(total=episodes_per_env * env.num_envs, desc="Eval episodes", unit="ep")
         while bool((ep_count < episodes_per_env).any()):
@@ -769,7 +823,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # Accumulate success at the pre-step state (obs at iter start).
                 obs, _, dones, _ = env.step(actions)
 
-                context_term = env.env.env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
+                context_term = env.unwrapped.reward_manager.get_term_cfg("progress_context").func  # type: ignore
                 orientation_aligned = getattr(context_term, "orientation_aligned")
                 position_aligned = getattr(context_term, "position_aligned")
                 before_es = ever_success.clone()
@@ -825,11 +879,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     episode_outcomes.append(int(out_cpu[k]))
                     episode_durations.append(int(dur_cpu[k]))
                     episode_success_steps.append(int(fss_cpu[k]))
+                if save_failures:
+                    failed_idx = torch.nonzero(failed, as_tuple=False).flatten()
+                    if failed_idx.numel() > 0:
+                        failure_states.append(_state_index(init_state, failed_idx))
+                        failure_meta["env_id"].extend(failed_idx.tolist())
+                        failure_meta["outcome"].extend(outcome[failed_idx].tolist())
+                        failure_meta["duration"].extend(ep_steps[failed_idx].tolist())
+                        failure_meta["init_peg_xyz"].append(init_peg_xyz[failed_idx].cpu())
             # Refresh on EVERY done, not just counted ones: the env resets regardless, so a stale
             # init pose would otherwise be attributed to a later episode that does count.
             if bool(done_mask.any()):
                 new_xyz = (insertive.data.root_pos_w - env_origins)[:, :3]
                 init_peg_xyz[done_mask] = new_xyz[done_mask]
+                if save_failures:
+                    done_idx = torch.nonzero(done_mask, as_tuple=False).flatten()
+                    _state_scatter(init_state, env.unwrapped.scene.get_state(is_relative=True), done_idx)
             # Reset success flag and step counter for envs that just finished an episode.
             ever_success[done_mask] = False
             ep_steps[done_mask] = 0
@@ -895,6 +960,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"bucket mismatch: {successful_episodes}+{n_timeout}+{n_abnormal}+{n_other} "
             f"!= {total_episodes}"
         )
+
+        if save_failures:
+            n_fail = len(failure_meta["env_id"])
+            assert n_fail == total_episodes - successful_episodes, (
+                f"failure-state count mismatch: {n_fail} saved vs {total_episodes - successful_episodes} failures"
+            )
+            out = {
+                "task": args_cli.task,
+                "checkpoint": resume_path,
+                "stochastic": bool(args_cli.stochastic),
+                "is_relative": True,
+                "outcome_names": {code: name for code, (_, name) in OUTCOME_STYLE.items()},
+                "num_failures": n_fail,
+                "states": _state_cat(failure_states) if n_fail else None,
+                "env_id": failure_meta["env_id"],
+                "outcome": failure_meta["outcome"],
+                "duration": failure_meta["duration"],
+                "init_peg_xyz": torch.cat(failure_meta["init_peg_xyz"], dim=0) if n_fail else torch.zeros(0, 3),
+            }
+            os.makedirs(os.path.dirname(os.path.abspath(args_cli.save_failure_states)), exist_ok=True)
+            torch.save({k: (_to_cpu_state(v) if k == "states" else v) for k, v in out.items()}, args_cli.save_failure_states)
+            print(f"[EVAL] Saved {n_fail} failure start states to: {args_cli.save_failure_states}")
 
         # Plot 3D initial peg positions colored by episode outcome.
         if len(episode_init_xyzs) > 0:

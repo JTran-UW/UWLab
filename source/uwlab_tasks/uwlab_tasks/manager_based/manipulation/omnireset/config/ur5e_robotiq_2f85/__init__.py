@@ -397,6 +397,53 @@ gym.register(
     },
 )
 
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Reward-Scaling-"
+        "Sparse-No-Privileged-Obs-No-Success-Termination-Full-Reset-Yanda-Sysid-Real-Dynamics-Gap-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationFullResetYandaSysidRealDynamicsGapCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
+
+# On-policy (PPO) curriculum-ramped finetune with Yanda assets: adr_sysid + action_scale ramp
+# with success, robot/peg/hole from yandabao/uwlab-assets.
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Yanda-Sysid-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCFinetuneYandaSysidCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+
+# As above but resets from ObjectAnywhereEEAnywhere only (the reaching path).
+gym.register(
+    id=(
+        "OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Finetune-Reward-Scaling-"
+        "Sparse-No-Privileged-Obs-No-Success-Termination-Anywhere-Only-Full-Reset-Yanda-Sysid-v0"
+    ),
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.rl_state_cfg:"
+            "Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSparseNoPrivilegedObsNoSuccessTerminationAnywhereOnlyYandaSysidCfg"
+        ),
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_FastSACRunnerCfg",
+    },
+)
+
 
 # As above but success ends the episode as a time_out-flagged term (bootstrapped truncation
 # online), matching buffers recorded with play.py --success_to_truncation.

@@ -62,8 +62,6 @@ submit_one() {
         --headless \
         --distributed \
         --run_name "$run_name" \
-        env.scene.insertive_object=peg \
-        env.scene.receptive_object=peghole \
         agent.batch_size="$batch" \
         agent.num_updates="$nu" \
         agent.policy_frequency="$pf" \

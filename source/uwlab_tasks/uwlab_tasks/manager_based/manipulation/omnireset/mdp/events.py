@@ -3069,19 +3069,40 @@ class apply_dynamics_gap(ManagerTermBase):
         gripper_stiffness_scale / gripper_damping_scale: scale-of-default on ``finger_joint``.
     """
 
+    KNOBS = (
+        "peg_mass", "socket_mass", "table_mass_scale", "robot_mass_scale",
+        "peg_friction", "socket_friction", "table_friction", "robot_friction",
+        "gripper_stiffness_scale", "gripper_damping_scale",
+        "osc_kp_xyz_scale", "osc_kp_rpy_scale", "osc_damping_ratio_xyz_scale", "osc_damping_ratio_rpy_scale",
+    )
+
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
+        self._env = env
+        self._built_knobs = None
+        self._build({k: cfg.params.get(k) for k in self.KNOBS})
+
+    @staticmethod
+    def _sanitize(knobs: dict) -> dict:
+        return {k: (None if v is None or (isinstance(v, (int, float)) and v < 0) else float(v)) for k, v in knobs.items()}
+
+    def _build(self, knobs: dict):
+        """(Re)build the pin sub-terms for the given knob values. Called from __init__ and again from
+        __call__ whenever the values passed differ from the ones built — so in-process mutation of
+        ``cfg.params`` (e.g. an eval sweep looping over levels in one process) takes effect."""
         from isaaclab.envs.mdp.events import (
             randomize_actuator_gains,
             randomize_rigid_body_mass,
             randomize_rigid_body_material,
         )
 
-        p = {k: (None if isinstance(v, float) and v < 0 else v) for k, v in cfg.params.items()}
+        env = self._env
+        p = self._sanitize(knobs)
+        self._built_knobs = p
+        self._readback_logged = False
         self._sub_terms: list[tuple[ManagerTermBase, dict]] = []
-
         def add(term_cls, params: dict):
-            sub_cfg = EventTermCfg(func=term_cls, mode=cfg.mode, params=params)
+            sub_cfg = EventTermCfg(func=term_cls, mode=self.cfg.mode, params=params)
             self._sub_terms.append((term_cls(sub_cfg, env), params))
 
         mass_specs = [
@@ -3125,6 +3146,11 @@ class apply_dynamics_gap(ManagerTermBase):
                     },
                 )
 
+        self._osc_knobs = {k: p[k] for k in (
+            "osc_kp_xyz_scale", "osc_kp_rpy_scale", "osc_damping_ratio_xyz_scale", "osc_damping_ratio_rpy_scale",
+        ) if p.get(k) is not None}
+        self._osc_applied = False
+
         stiffness = p.get("gripper_stiffness_scale")
         damping = p.get("gripper_damping_scale")
         if stiffness is not None or damping is not None:
@@ -3138,6 +3164,42 @@ class apply_dynamics_gap(ManagerTermBase):
                     "distribution": "uniform",
                 },
             )
+
+    def _apply_osc_gains(self, env: ManagerBasedEnv, env_ids, action_name: str):
+        """Pin the RelCartesianOSCAction task-space gains by scaling the action term's DEFAULTS.
+
+        Any ``randomize_rel_cartesian_osc_gains*`` DR term re-reads the defaults each reset (and may
+        run AFTER this term), so scaling the defaults makes the knob multiplicative with the task's
+        own OSC randomization and immune to event ordering. For tasks with no OSC randomizer the
+        per-env gains are also written directly here. Curricula that interpolate to explicit
+        ``terminal_kp`` values are anchored, not scaled, by this knob. Applied lazily: the action
+        manager does not exist yet when the event manager is constructed.
+        """
+        knobs = self._osc_knobs
+        term = env.action_manager._terms.get(action_name) if hasattr(env, "action_manager") else None
+        if term is None or not hasattr(term, "_kp_default"):
+            if knobs:
+                raise ValueError(f"OSC gain knobs set but action term '{action_name}' has no OSC gains.")
+            return
+        if not hasattr(term, "_dyn_gap_orig_kp_default"):
+            term._dyn_gap_orig_kp_default = term._kp_default.clone()
+            term._dyn_gap_orig_dr_default = term._damping_ratio_default.clone()
+        if not self._osc_applied:
+            kp = term._dyn_gap_orig_kp_default.clone()
+            dr = term._dyn_gap_orig_dr_default.clone()
+            kp[:3] *= knobs.get("osc_kp_xyz_scale", 1.0)
+            kp[3:] *= knobs.get("osc_kp_rpy_scale", 1.0)
+            dr[:3] *= knobs.get("osc_damping_ratio_xyz_scale", 1.0)
+            dr[3:] *= knobs.get("osc_damping_ratio_rpy_scale", 1.0)
+            term._kp_default[:] = kp
+            term._damping_ratio_default[:] = dr
+            self._osc_applied = True
+            if knobs:
+                print(f"[dynamics_gap] OSC defaults scaled: kp={kp.tolist()} damping_ratio={dr.tolist()}")
+        if knobs:
+            ids = env_ids if env_ids is not None else torch.arange(env.num_envs, device=term._kp.device)
+            term._kp[ids] = term._kp_default
+            term._kd[ids] = 2.0 * torch.sqrt(term._kp[ids]) * term._damping_ratio_default
 
     def __call__(
         self,
@@ -3153,6 +3215,37 @@ class apply_dynamics_gap(ManagerTermBase):
         robot_friction: float | None = None,
         gripper_stiffness_scale: float | None = None,
         gripper_damping_scale: float | None = None,
+        osc_kp_xyz_scale: float | None = None,
+        osc_kp_rpy_scale: float | None = None,
+        osc_damping_ratio_xyz_scale: float | None = None,
+        osc_damping_ratio_rpy_scale: float | None = None,
+        osc_action_name: str = "arm",
     ):
+        knobs = self._sanitize({
+            "peg_mass": peg_mass, "socket_mass": socket_mass, "table_mass_scale": table_mass_scale,
+            "robot_mass_scale": robot_mass_scale, "peg_friction": peg_friction, "socket_friction": socket_friction,
+            "table_friction": table_friction, "robot_friction": robot_friction,
+            "gripper_stiffness_scale": gripper_stiffness_scale, "gripper_damping_scale": gripper_damping_scale,
+            "osc_kp_xyz_scale": osc_kp_xyz_scale, "osc_kp_rpy_scale": osc_kp_rpy_scale,
+            "osc_damping_ratio_xyz_scale": osc_damping_ratio_xyz_scale,
+            "osc_damping_ratio_rpy_scale": osc_damping_ratio_rpy_scale,
+        })
+        if knobs != self._built_knobs:
+            print(f"[dynamics_gap] params changed in-process -> rebuilding pins: { {k: v for k, v in knobs.items() if v is not None} }")
+            self._build(knobs)
+        self._apply_osc_gains(env, env_ids, osc_action_name)
         for term, params in self._sub_terms:
             term(env, env_ids, **params)
+        if self._sub_terms and not getattr(self, "_readback_logged", False):
+            self._readback_logged = True
+            for term, params in self._sub_terms:
+                asset = env.scene[params["asset_cfg"].name]
+                if "mass_distribution_params" in params:
+                    m = asset.root_physx_view.get_masses()
+                    print(f"[dynamics_gap] readback {params['asset_cfg'].name} mass: min {m.min():.4f} max {m.max():.4f} kg")
+                elif "static_friction_range" in params:
+                    mat = asset.root_physx_view.get_material_properties()
+                    print(f"[dynamics_gap] readback {params['asset_cfg'].name} static friction: min {mat[..., 0].min():.3f}"
+                          f" max {mat[..., 0].max():.3f}; dynamic: min {mat[..., 1].min():.3f} max {mat[..., 1].max():.3f}")
+                else:
+                    print(f"[dynamics_gap] readback {params['asset_cfg'].name}: gripper gains pinned (scale)")
