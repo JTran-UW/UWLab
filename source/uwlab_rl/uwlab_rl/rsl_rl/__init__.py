@@ -3,4 +3,5 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from .distributions import LegacyGsdeDistribution
 from .rl_cfg import BehaviorCloningCfg, OffPolicyAlgorithmCfg, RslRlFancyPpoAlgorithmCfg

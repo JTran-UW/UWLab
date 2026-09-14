@@ -65,6 +65,6 @@ class VisualizableJointTargetPosition(ActionTerm):
     def _debug_vis_callback(self, event):
         # update the box marker
         self.vis_articulation.write_joint_state_to_sim(
-            position=self._asset.data.joint_pos_target,
-            velocity=torch.zeros_like(self._asset.data.joint_pos_target, device=self.device),
+            position=self._asset.data.joint_pos_target.torch,
+            velocity=torch.zeros_like(self._asset.data.joint_pos_target.torch, device=self.device),
         )

@@ -20,13 +20,13 @@ def reset_robot_to_default(
 ):
     """Reset the scene to the default state specified in the scene configuration."""
     robot: Articulation = env.scene[robot_cfg.name]
-    default_root_state = robot.data.default_root_state[env_ids].clone()
+    default_root_state = robot.data.default_root_state.torch[env_ids].clone()
     default_root_state[:, 0:3] += env.scene.env_origins[env_ids]
     # set into the physics simulation
     robot.write_root_state_to_sim(default_root_state, env_ids=env_ids)
     # obtain default joint positions
-    default_joint_pos = robot.data.default_joint_pos[env_ids].clone()
-    default_joint_vel = robot.data.default_joint_vel[env_ids].clone()
+    default_joint_pos = robot.data.default_joint_pos.torch[env_ids].clone()
+    default_joint_vel = robot.data.default_joint_vel.torch[env_ids].clone()
     # set into the physics simulation
     robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel, env_ids=env_ids)
 

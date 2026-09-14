@@ -123,8 +123,8 @@ def main():
         ee_pos_w = robot.data.body_link_pos_w[:, ee_idx]  # (N, 3)
         ee_quat_w = robot.data.body_link_quat_w[:, ee_idx]  # (N, 4)
         ee_pos_b, ee_quat_b = math_utils.subtract_frame_transforms(
-            robot.data.root_pos_w,
-            robot.data.root_quat_w,
+            robot.data.root_pos_w.torch,
+            robot.data.root_quat_w.torch,
             ee_pos_w,
             ee_quat_w,
         )

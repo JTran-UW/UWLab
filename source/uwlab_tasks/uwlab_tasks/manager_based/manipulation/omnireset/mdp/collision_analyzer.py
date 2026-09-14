@@ -116,12 +116,12 @@ class CollisionAnalyzer:
 
     def __call__(self, env: ManagerBasedRLEnv, env_ids: torch.Tensor):
         pos_w = (
-            self.asset.data.body_link_pos_w[env_ids][:, self.body_ids]
+            self.asset.data.body_link_pos_w.torch[env_ids][:, self.body_ids]
             .unsqueeze(2)
             .expand(-1, -1, self.cfg.num_points, 3)
         )
         quat_w = (
-            self.asset.data.body_link_quat_w[env_ids][:, self.body_ids]
+            self.asset.data.body_link_quat_w.torch[env_ids][:, self.body_ids]
             .unsqueeze(2)
             .expand(-1, -1, self.cfg.num_points, 4)
         )
@@ -129,14 +129,14 @@ class CollisionAnalyzer:
 
         obstacles_pos_w = torch.cat(
             [
-                obstacle.data.root_pos_w[env_ids].view(-1, 1, 1, 3).expand(-1, -1, self.cfg.num_points, 3)
+                obstacle.data.root_pos_w.torch[env_ids].view(-1, 1, 1, 3).expand(-1, -1, self.cfg.num_points, 3)
                 for obstacle in self.obstacles
             ],
             dim=0,
         )
         obstacles_quat_w = torch.cat(
             [
-                obstacle.data.root_quat_w[env_ids].view(-1, 1, 1, 4).expand(-1, cloud.shape[1], self.cfg.num_points, 4)
+                obstacle.data.root_quat_w.torch[env_ids].view(-1, 1, 1, 4).expand(-1, cloud.shape[1], self.cfg.num_points, 4)
                 for obstacle in self.obstacles
             ],
             dim=0,

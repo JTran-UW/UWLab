@@ -36,7 +36,15 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli, remaining_args = parser.parse_known_args()
 
 # launch omniverse app
-app_launcher = AppLauncher(headless=args_cli.headless)
+#
+# Pass the whole parsed namespace, not just `headless`. `add_app_launcher_args`
+# registers a number of flags (--viz, --device, --enable_cameras, --livestream,
+# ...) and forwarding only one of them makes the rest parse successfully and then
+# get silently dropped. That matters more under Isaac Lab 3.0, where `--headless`
+# is deprecated and the default is now headless *unless* a visualizer is
+# requested with `--viz kit,newton,rerun,viser` -- so with only `headless`
+# forwarded, `--viz` had no effect and no window ever appeared.
+app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 """Rest everything else."""

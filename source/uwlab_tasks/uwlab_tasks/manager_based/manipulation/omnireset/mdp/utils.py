@@ -21,14 +21,12 @@ from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
 import isaaclab.utils.math as math_utils
-import isaacsim.core.utils.torch as torch_utils
 import omni
 import warp as wp
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, NVIDIA_NUCLEUS_DIR, retrieve_file_path
+from isaaclab.utils.seed import configure_seed
 from isaaclab.utils.warp import convert_to_warp_mesh
 from pxr import UsdGeom
-from pytorch3d.ops import sample_farthest_points, sample_points_from_meshes
-from pytorch3d.structures import Meshes
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 
@@ -84,6 +82,23 @@ def sample_object_point_cloud(
     Returns:
         torch.Tensor | None: _description_
     """
+    # Imported lazily: pytorch3d is an optional, hard-to-build dependency (it ships
+    # as a wheel compiled against an exact torch/python/CUDA combination). Only
+    # point-cloud tasks need it -- the state-based omnireset envs do not -- so a
+    # module-level import would make every task in the package unimportable
+    # wherever no matching wheel exists (e.g. Python 3.12 + torch 2.10, which has
+    # no prebuilt pytorch3d 0.7.8 wheel). See uwlab_tasks/setup.py.
+    try:
+        from pytorch3d.ops import sample_farthest_points, sample_points_from_meshes
+        from pytorch3d.structures import Meshes
+    except ImportError as exc:
+        raise ImportError(
+            "sample_object_point_cloud() requires pytorch3d, which is not installed. "
+            "It is optional and only needed for point-cloud based tasks; see the "
+            "wheel table in uwlab_tasks/setup.py for the supported "
+            "python/torch/CUDA combinations."
+        ) from exc
+
     hasher = (
         rigid_object_hasher
         if rigid_object_hasher is not None
@@ -295,7 +310,7 @@ def temporary_seed(seed: int, restore_numpy: bool = True, restore_python: bool =
     try:
         sink = io.StringIO()
         with redirect_stdout(sink), redirect_stderr(sink):
-            torch_utils.set_seed(seed)
+            configure_seed(seed)
         yield
     finally:
         # restore everything
@@ -374,7 +389,24 @@ def read_metadata_from_usd_directory(usd_path: str) -> dict:
     with open(local_path) as f:
         metadata_file = yaml.safe_load(f)
 
+    # metadata.yaml is authored in Isaac Lab 2.x's (w, x, y, z); the math utils
+    # consuming these values now expect (x, y, z, w). Reorder every ``quat`` once
+    # here so no call site has to know.
+    _metadata_quats_to_xyzw(metadata_file)
     return metadata_file
+
+
+def _metadata_quats_to_xyzw(node) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "quat" and isinstance(value, (list, tuple)) and len(value) == 4:
+                w, x, y, z = value
+                node[key] = [x, y, z, w]
+            else:
+                _metadata_quats_to_xyzw(value)
+    elif isinstance(node, list):
+        for value in node:
+            _metadata_quats_to_xyzw(value)
 
 
 def object_name_from_usd(usd_path: str) -> str:
@@ -589,3 +621,31 @@ def settle_robot(
     robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel)
     robot.write_data_to_sim()
     robot.update(sim_dt)
+
+
+def apply_local_object_assets(env_cfg) -> list[str]:
+    """Point scene objects at locally patched USDs under ``UWLAB_ROBOT_ASSETS_DIR`` when present.
+
+    Hydra ``variants`` replace the whole object cfg, so per-field overrides from the CLI are lost;
+    call this after composition. Only objects whose relative path exists under the override
+    directory are redirected (metadata.yaml is read from the same directory).
+    """
+    import os
+
+    from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+
+    root = os.environ.get("UWLAB_ROBOT_ASSETS_DIR")
+    redirected = []
+    if not root or root == UWLAB_CLOUD_ASSETS_DIR:
+        return redirected
+    for name in ("insertive_object", "receptive_object", "table", "ur5_metal_support"):
+        obj = getattr(env_cfg.scene, name, None)
+        spawn = getattr(obj, "spawn", None)
+        path = getattr(spawn, "usd_path", None)
+        if not path or not path.startswith(UWLAB_CLOUD_ASSETS_DIR):
+            continue
+        local = os.path.join(root, path[len(UWLAB_CLOUD_ASSETS_DIR) :].lstrip("/"))
+        if os.path.exists(local):
+            spawn.usd_path = local
+            redirected.append(name)
+    return redirected

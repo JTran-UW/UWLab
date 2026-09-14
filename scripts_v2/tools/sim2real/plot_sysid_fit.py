@@ -111,8 +111,8 @@ def closed_loop_replay(
     action_dim = unwrapped.action_manager.total_action_dim
     W = wp_step_indices.shape[0]
 
-    default_joint_pos = robot.data.default_joint_pos.clone()
-    default_joint_vel = robot.data.default_joint_vel.clone()
+    default_joint_pos = robot.data.default_joint_pos.torch.clone()
+    default_joint_vel = robot.data.default_joint_vel.torch.clone()
     default_joint_pos[:, arm_joint_ids] = initial_joint_pos.unsqueeze(0)
     default_joint_vel[:] = 0.0
     env.reset()
@@ -128,7 +128,7 @@ def closed_loop_replay(
         ee_pos_w = robot.data.body_pos_w[:, ee_frame_idx]
         ee_quat_w = robot.data.body_quat_w[:, ee_frame_idx]
         ee_pos_b, ee_quat_b = subtract_frame_transforms(
-            robot.data.root_pos_w, robot.data.root_quat_w, ee_pos_w, ee_quat_w
+            robot.data.root_pos_w.torch, robot.data.root_quat_w.torch, ee_pos_w, ee_quat_w
         )
         target_pos = wp_target_pos[wp_idx].unsqueeze(0)
         target_quat = wp_target_quat[wp_idx].unsqueeze(0)

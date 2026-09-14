@@ -5,6 +5,7 @@
 
 import torch
 import torch.nn.functional as F
+import warp as wp
 
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
@@ -30,10 +31,10 @@ def target_asset_pose_in_root_asset_frame(
     target_body_idx = 0 if isinstance(target_asset_cfg.body_ids, slice) else target_asset_cfg.body_ids
     root_body_idx = 0 if isinstance(root_asset_cfg.body_ids, slice) else root_asset_cfg.body_ids
 
-    target_pos = target_asset.data.body_link_pos_w[:, target_body_idx].view(-1, 3)
-    target_quat = target_asset.data.body_link_quat_w[:, target_body_idx].view(-1, 4)
-    root_pos = root_asset.data.body_link_pos_w[:, root_body_idx].view(-1, 3)
-    root_quat = root_asset.data.body_link_quat_w[:, root_body_idx].view(-1, 4)
+    target_pos = target_asset.data.body_link_pos_w.torch[:, target_body_idx].view(-1, 3)
+    target_quat = target_asset.data.body_link_quat_w.torch[:, target_body_idx].view(-1, 4)
+    root_pos = root_asset.data.body_link_pos_w.torch[:, root_body_idx].view(-1, 3)
+    root_quat = root_asset.data.body_link_quat_w.torch[:, root_body_idx].view(-1, 4)
 
     if root_asset_offset is not None:
         root_pos, root_quat = root_asset_offset.combine(root_pos, root_quat)
@@ -102,10 +103,10 @@ class target_asset_pose_in_root_asset_frame_with_metadata(ManagerTermBase):
         target_body_idx = 0 if isinstance(self.target_asset_cfg.body_ids, slice) else self.target_asset_cfg.body_ids
         root_body_idx = 0 if isinstance(self.root_asset_cfg.body_ids, slice) else self.root_asset_cfg.body_ids
 
-        target_pos = self.target_asset.data.body_link_pos_w[:, target_body_idx].view(-1, 3)
-        target_quat = self.target_asset.data.body_link_quat_w[:, target_body_idx].view(-1, 4)
-        root_pos = self.root_asset.data.body_link_pos_w[:, root_body_idx].view(-1, 3)
-        root_quat = self.root_asset.data.body_link_quat_w[:, root_body_idx].view(-1, 4)
+        target_pos = self.target_asset.data.body_link_pos_w.torch[:, target_body_idx].view(-1, 3)
+        target_quat = self.target_asset.data.body_link_quat_w.torch[:, target_body_idx].view(-1, 4)
+        root_pos = self.root_asset.data.body_link_pos_w.torch[:, root_body_idx].view(-1, 3)
+        root_quat = self.root_asset.data.body_link_quat_w.torch[:, root_body_idx].view(-1, 4)
 
         if self.root_asset_offset is not None:
             root_pos, root_quat = self.root_asset_offset.combine(root_pos, root_quat)
@@ -133,26 +134,105 @@ def asset_link_velocity_in_root_asset_frame(
 
     target_body_idx = 0 if isinstance(target_asset_cfg.body_ids, slice) else target_asset_cfg.body_ids
 
+    # `.torch` is required, not cosmetic: Isaac Lab 3.0 returns asset data as a
+    # warp-backed ProxyArray. Most torch ops go through its deprecation bridge,
+    # but `subtract_frame_transforms` is torch.jit.script'd and rejects anything
+    # that is not a real Tensor. Both sides are (x, y, z, w) here -- 3.0 data and
+    # 3.0 math utils share the convention -- so no quaternion reordering.
+    # base_link body pose (root pose differs from it on the Newton backend; see task_space_actions)
+    root_pos_w = root_asset.data.body_link_pos_w.torch[:, 0]
+    root_quat_w = root_asset.data.body_link_quat_w.torch[:, 0]
+
     asset_lin_vel_b, _ = math_utils.subtract_frame_transforms(
-        root_asset.data.root_pos_w,
-        root_asset.data.root_quat_w,
-        target_asset.data.body_lin_vel_w[:, target_body_idx].view(-1, 3),
+        root_pos_w,
+        root_quat_w,
+        target_asset.data.body_lin_vel_w.torch[:, target_body_idx].view(-1, 3),
     )
     asset_ang_vel_b, _ = math_utils.subtract_frame_transforms(
-        root_asset.data.root_pos_w,
-        root_asset.data.root_quat_w,
-        target_asset.data.body_ang_vel_w[:, target_body_idx].view(-1, 3),
+        root_pos_w,
+        root_quat_w,
+        target_asset.data.body_ang_vel_w.torch[:, target_body_idx].view(-1, 3),
     )
 
     return torch.cat([asset_lin_vel_b, asset_ang_vel_b], dim=1)
 
 
+def _as_torch(value) -> torch.Tensor:
+    """Return ``value`` as a torch tensor.
+
+    Isaac Lab 3.0 hands back warp-backed data from both asset ``.data`` properties
+    (as :class:`ProxyArray`) and physics view accessors (as raw ``wp.array``).
+    Neither supports torch instance methods such as ``view()`` -- ``wp.array.view()``
+    is a dtype reinterpret with a different signature -- so convert explicitly.
+    """
+    if hasattr(value, "torch"):  # ProxyArray
+        return value.torch
+    if isinstance(value, wp.array):
+        return wp.to_torch(value)
+    return value
+
+
+def _newton_model():
+    try:
+        from isaaclab_newton.physics.newton_manager import NewtonManager
+    except ImportError:
+        return None
+    return NewtonManager._model if NewtonManager._solver is not None else None
+
+
+def _newton_collider_shape_ids(env: ManagerBasedRLEnv, asset, model) -> torch.Tensor:
+    """(num_envs, S) indices of the asset's collision shapes in the Newton model (cached on the asset)."""
+    cached = getattr(asset, "_uwlab_newton_shape_ids", None)
+    if cached is not None:
+        return cached
+    import re
+    prim_path = asset.cfg.prim_path.replace("{ENV_REGEX_NS}", "/World/envs/env_.*")
+    # prim_path is a regex like /World/envs/env_.*/Robot once the scene exists
+    pat = re.compile("^" + prim_path.replace("env_.*", "env_(?P<env>[0-9]+)") + "(/|$)")
+    body_labels = list(model.body_label)
+    shape_body = model.shape_body.numpy(); flags = model.shape_flags.numpy()
+    per_env: dict[int, list[int]] = {}
+    for i, b in enumerate(shape_body):
+        if b < 0 or not (flags[i] & 0x2):
+            continue
+        m = pat.match(body_labels[b])
+        if m:
+            per_env.setdefault(int(m.group("env")), []).append(i)
+    counts = {len(v) for v in per_env.values()}
+    if len(per_env) != env.num_envs or len(counts) != 1:
+        raise RuntimeError(f"newton collider shapes for {asset_cfg_name(asset)}: envs={len(per_env)} counts={counts}")
+    ids = torch.tensor([per_env[e] for e in range(env.num_envs)], device=env.device, dtype=torch.long)
+    asset._uwlab_newton_shape_ids = ids
+    return ids
+
+
+def asset_cfg_name(asset) -> str:
+    return getattr(asset.cfg, "prim_path", "?")
+
+
 def get_material_properties(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
+    num_shapes: int | None = None,
 ):
+    """Per-shape (static friction, dynamic friction, restitution), flattened.
+
+    Newton: read from the model's shape materials (mu used for both frictions). ``num_shapes`` lets
+    the Newton layout match PhysX's shape count (averaged over the asset's colliders and tiled) so
+    the privileged critic keeps the dimension the PhysX-trained checkpoints expect.
+    """
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.root_physx_view.get_material_properties().view(env.num_envs, -1)
+    model = _newton_model()
+    if model is None:
+        # `root_view` replaces the now-deprecated `root_physx_view` in Isaac Lab 3.0.
+        return _as_torch(asset.root_view.get_material_properties()).view(env.num_envs, -1)
+    ids = _newton_collider_shape_ids(env, asset, model)
+    mu = _as_torch(model.shape_material_mu)[ids]
+    rest = _as_torch(model.shape_material_restitution)[ids]
+    props = torch.stack([mu, mu, rest], dim=-1)  # (N, S, 3)
+    if num_shapes is not None and num_shapes != props.shape[1]:
+        props = props.mean(dim=1, keepdim=True).expand(-1, num_shapes, -1)
+    return props.reshape(env.num_envs, -1)
 
 
 def get_mass(
@@ -160,7 +240,9 @@ def get_mass(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.root_physx_view.get_masses().view(env.num_envs, -1)
+    if _newton_model() is not None:
+        return _as_torch(asset.data.default_mass).view(env.num_envs, -1)
+    return _as_torch(asset.root_view.get_masses()).view(env.num_envs, -1)
 
 
 def get_joint_friction(
@@ -168,7 +250,7 @@ def get_joint_friction(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.data.joint_friction_coeff.view(env.num_envs, -1)
+    return asset.data.joint_friction_coeff.torch.view(env.num_envs, -1)
 
 
 def get_joint_armature(
@@ -176,7 +258,7 @@ def get_joint_armature(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.data.joint_armature.view(env.num_envs, -1)
+    return asset.data.joint_armature.torch.view(env.num_envs, -1)
 
 
 def get_joint_stiffness(
@@ -184,7 +266,7 @@ def get_joint_stiffness(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.data.joint_stiffness.view(env.num_envs, -1)
+    return asset.data.joint_stiffness.torch.view(env.num_envs, -1)
 
 
 def get_joint_damping(
@@ -192,7 +274,7 @@ def get_joint_damping(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.data.joint_damping.view(env.num_envs, -1)
+    return asset.data.joint_damping.torch.view(env.num_envs, -1)
 
 
 def time_left(env) -> torch.Tensor:
@@ -299,3 +381,27 @@ def binary_force_contact(
     force_norm = torch.norm(wrench_b[:, :3], dim=-1)  # (N,)
     contact = (force_norm > force_threshold).float()
     return contact.unsqueeze(-1)  # (N, 1)
+
+
+def joint_pos_signed(
+    env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), negate_joints: tuple[str, ...] = ()
+) -> torch.Tensor:
+    """Joint positions with selected joints negated (asset joint-sign conventions -> policy convention).
+
+    Used on Newton with the swapped Robotiq USD, whose two inner_finger_knuckle joints carry the
+    opposite sign from the PhysX asset the policies were trained on.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    q = _as_torch(asset.data.joint_pos)[:, asset_cfg.joint_ids]
+    if not negate_joints:
+        return q
+    key = "_joint_pos_signed_" + asset_cfg.name
+    sign = getattr(env, key, None)
+    if sign is None or sign.shape[0] != q.shape[1]:
+        names = list(asset_cfg.joint_names) if asset_cfg.joint_names is not None else list(asset.joint_names)
+        sign = torch.ones(q.shape[1], device=q.device)
+        for n in negate_joints:
+            if n in names:
+                sign[names.index(n)] = -1.0
+        setattr(env, key, sign)
+    return q * sign

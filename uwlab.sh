@@ -109,14 +109,23 @@ ensure_cuda_torch() {
     local base_index="https://download.pytorch.org/whl"
 
     # choose pins per arch
+    #
+    # 2026-08-28: non-arm pin bumped 2.7.0/0.22.0 -> 2.10.0/0.25.0 for the
+    # IsaacLab 3.0-beta/Newton migration (env_isaaclab3, see ISAACLAB_COMMIT
+    # above). isaacsim-core 6.0.0.0 requires torch==2.10.0 exactly, and
+    # isaaclab/isaaclab-rl/isaaclab-tasks require torch>=2.10,
+    # torchvision>=0.25.0 -- this function used to run *after* those installs
+    # and silently downgrade torch back to 2.7.0, which pip only reports as a
+    # dependency-conflict warning rather than a hard failure. Keep this in
+    # sync with ISAACLAB_COMMIT the same way the rsl-rl-lib pin is.
     local torch_ver tv_ver cuda_ver
     if is_arm; then
         torch_ver="2.9.0"
         tv_ver="0.24.0"
         cuda_ver="130"
     else
-        torch_ver="2.7.0"
-        tv_ver="0.22.0"
+        torch_ver="2.10.0"
+        tv_ver="0.25.0"
         cuda_ver="128"
     fi
 
@@ -587,22 +596,29 @@ while [[ $# -gt 0 ]]; do
             # Pinned deliberately; do not switch this back to tracking main.
             # IsaacLab bumped its rsl-rl-lib requirement 3.1.2 -> 5.0.1 between
             # 2026-02-15 and 2026-03-10, and added an `optimizer` field to
-            # RslRlPpoAlgorithmCfg. UWLab targets the 3.1.2 API (see
-            # source/uwlab_rl/setup.py), so tracking IsaacLab main breaks every
-            # fresh install with one of:
+            # RslRlPpoAlgorithmCfg. Tracking IsaacLab main breaks every fresh
+            # install with one of:
             #
             #   TypeError: PPO.__init__() got an unexpected keyword argument 'optimizer'
             #       (rsl-rl 3.1.2 with a newer IsaacLab passing `optimizer`)
             #   KeyError: 'class_name' in PPO.construct_algorithm
-            #       (rsl-rl 5.0.1, which wants a cfg["actor"] schema UWLab does
-            #        not emit)
+            #       (rsl-rl 5.0.1, which wants a cfg["actor"] schema an older
+            #        uwlab_rl pin does not emit)
             #
             # Neither failure names IsaacLab, so this is expensive to diagnose:
             # it cost a full night of downtime on 2026-08-15.
             #
-            # To upgrade: bump this commit AND the rsl-rl-lib pin in
+            # 2026-08-28: bumped to IsaacLab 3.0.0-beta2.patch1 (Newton migration,
+            # see env_isaaclab3). uwlab_rl/setup.py was bumped in lockstep to
+            # UW-Lab/rsl_rl@vendor/leggedrobotics (== upstream v5.2.0, rsl-rl-lib
+            # >=5.0.1 API). This DROPS support for the old 2.3.2/3.1.2 pairing
+            # that env_uwlab was built against -- that environment is not being
+            # kept in sync and is expected to break until rebuilt against this
+            # pin. The tripwire below now guards the new pairing instead.
+            #
+            # To upgrade further: bump this commit AND the rsl-rl-lib pin in
             # source/uwlab_rl/setup.py together, then verify training runs.
-            ISAACLAB_COMMIT="${UWLAB_ISAACLAB_COMMIT:-2f91d7dd2994246505602526b32ac67ff758d472}"
+            ISAACLAB_COMMIT="${UWLAB_ISAACLAB_COMMIT:-ffff603eafc6b74264a5261cc0183d6a65390d78}"
             echo "[INFO] Installing upstream IsaacLab (pinned ${ISAACLAB_COMMIT:0:9}) in editable mode into ${UWLAB_PATH}/_isaaclab ..."
             repo_root="${UWLAB_PATH}/_isaaclab/IsaacLab"
             mkdir -p "${UWLAB_PATH}/_isaaclab"
@@ -617,11 +633,15 @@ while [[ $# -gt 0 ]]; do
             git -C "${repo_root}" checkout -q --detach FETCH_HEAD
 
             # Fail loudly rather than 40 minutes later with an unrelated error.
-            if grep -q '^    optimizer' \
+            # uwlab_rl/setup.py now targets rsl-rl-lib >= 5.0.1 (the schema that
+            # ships an `optimizer` field on RslRlPpoAlgorithmCfg), so a pinned
+            # IsaacLab commit that predates that field is the incompatible case.
+            if ! grep -q '^    optimizer' \
                 "${repo_root}/source/isaaclab_rl/isaaclab_rl/rsl_rl/rl_cfg.py" 2>/dev/null; then
-                echo "[ERROR] Pinned IsaacLab (${ISAACLAB_COMMIT:0:9}) has an 'optimizer' field in"
-                echo "[ERROR] RslRlPpoAlgorithmCfg, which requires rsl-rl-lib >= 5.0.1, but UWLab"
-                echo "[ERROR] targets the 3.1.2 API. Bump both pins together or revert this one."
+                echo "[ERROR] Pinned IsaacLab (${ISAACLAB_COMMIT:0:9}) has no 'optimizer' field in"
+                echo "[ERROR] RslRlPpoAlgorithmCfg, i.e. it predates rsl-rl-lib 5.0.1, but"
+                echo "[ERROR] source/uwlab_rl/setup.py now targets the 5.0.1+ API. Bump both"
+                echo "[ERROR] pins together or revert this one."
                 exit 1
             fi
             ${pip_command} -e "${repo_root}/source/isaaclab" --extra-index-url https://pypi.nvidia.com

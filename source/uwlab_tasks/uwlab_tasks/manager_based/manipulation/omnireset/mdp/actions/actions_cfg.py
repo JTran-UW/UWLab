@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import MISSING
 
+from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg
 from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.managers.manager_term_cfg import ActionTermCfg
 from isaaclab.utils import configclass
@@ -34,7 +35,7 @@ class RelCartesianOSCActionCfg(ActionTermCfg):
 
         pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
         """Translation offset."""
-        rot: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+        rot: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w) identity, Isaac Lab 3.0 convention
         """Rotation offset as quaternion (w, x, y, z)."""
 
     joint_names: list[str] = MISSING
@@ -57,3 +58,12 @@ class RelCartesianOSCActionCfg(ActionTermCfg):
 
     torque_limit: tuple[float, float, float, float, float, float] = (150.0, 150.0, 150.0, 28.0, 28.0, 28.0)
     """Per-joint torque limits (clamped after J^T multiplication)."""
+
+
+
+@configclass
+class BinaryJointPositionMimicActionCfg(BinaryJointPositionActionCfg):
+    """Binary gripper action that also sets ``gear * target`` on the listed follower joints (Newton)."""
+
+    class_type: type[ActionTerm] = task_space_actions.BinaryJointPositionMimicAction
+    mimic: dict[str, float] = MISSING

@@ -108,7 +108,7 @@ def get_dof_position(
     asset: Articulation = env.scene[asset_cfg.name]
     if env_ids is None:
         env_ids = slice(None)
-    joint_pos = asset.data.joint_pos[env_ids]
+    joint_pos = asset.data.joint_pos.torch[env_ids]
     return joint_pos
 
 
@@ -205,7 +205,7 @@ def get_joint_mechanical_work(
     asset: Articulation = env.scene[asset_cfg.name]
     if env_ids is None:
         env_ids = slice(None)
-    joint_pos = asset.data.joint_pos[env_ids]
+    joint_pos = asset.data.joint_pos.torch[env_ids]
     applied_torque = asset.data.applied_torque[env_ids]
     if "prev_joint_pos" in env.extensions:
         delta_joint_pos = joint_pos - env.extensions["prev_joint_pos"]

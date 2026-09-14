@@ -18,17 +18,23 @@ if TYPE_CHECKING:
 @configclass
 class Offset:
     pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    # Identity quaternion in Isaac Lab 3.0's (x, y, z, w) convention. This was
+    # (1, 0, 0, 0) for 2.x's (w, x, y, z); left unchanged it would silently mean
+    # a 180-degree rotation about X rather than "no rotation", since the
+    # math_utils calls below now interpret the scalar term as the last element.
+    quat: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
 
     @property
     def pose(self) -> tuple[float, float, float, float, float, float, float]:
         return self.pos + self.quat
 
     def apply(self, root: RigidObject | Articulation) -> tuple[torch.Tensor, torch.Tensor]:
-        data = root.data.root_pos_w
+        # `.torch`: Isaac Lab 3.0 returns a warp-backed ProxyArray here, which the
+        # torch.jit.script'd math utils below will not accept.
+        data = root.data.root_pos_w.torch
         pos_w, quat_w = math_utils.combine_frame_transforms(
-            root.data.root_pos_w,
-            root.data.root_quat_w,
+            data,
+            root.data.root_quat_w.torch,
             torch.tensor(self.pos).to(data.device).repeat(data.shape[0], 1),
             torch.tensor(self.quat).to(data.device).repeat(data.shape[0], 1),
         )

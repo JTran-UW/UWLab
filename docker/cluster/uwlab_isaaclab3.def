@@ -1,0 +1,115 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+
+# Apptainer image replicating the validated `env_isaaclab3` stack for Hyak.
+#
+# Built with `apptainer build --fakeroot` from a PUBLIC registry base, not from a
+# local Docker daemon. docker/cluster/cluster_interface.sh uses
+# `docker-daemon://`, which needs a working local Docker install; this uses
+# `docker://` and needs none.
+#
+# A .sif is a single file, which matters here: /gscratch/weirdlab sits at ~97% of
+# its 17M inode quota, and a conda-style install of this stack is ~266k files.
+#
+# UWLab itself is deliberately NOT baked in -- the packages are pure Python and
+# get picked up from the bind-mounted checkout via PYTHONPATH, so code changes
+# do not require a rebuild. Only third-party dependencies are installed here.
+#
+# Version choices all come from debugging documented in ISAACLAB_3_MIGRATION.md:
+#   * torch stays as isaacsim pulls it (2.11.0, CUDA 13.0 build), matching the
+#     CUDA 13.0 driver on Hyak's L40S nodes. The cu128 override used on the
+#     workstation `starfish` (driver 12.6) must NOT be applied here -- see the
+#     long note at step 2.
+#   * rsl-rl must be UW-Lab/rsl_rl@feature/manipulation -- it carries gSDE and
+#     DAgger, which vendor/leggedrobotics does not.
+#   * wandb must stay <0.20; rsl_rl passes the removed Settings(start_method=...).
+#   * pytorch3d 0.7.9's pt2.10.0 build loads fine against torch 2.11.
+
+%files
+    # requirements of the uwlab packages, so PYTHONPATH-only usage works at runtime
+    source/uwlab/setup.py            /tmp/uwlab_setup/uwlab_setup.py
+    source/uwlab_tasks/setup.py      /tmp/uwlab_setup/uwlab_tasks_setup.py
+    source/uwlab_rl/setup.py         /tmp/uwlab_setup/uwlab_rl_setup.py
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev python3-pip \
+        git curl ca-certificates build-essential \
+        libgl1 libglx-mesa0 libegl1 libxrandr2 libxinerama1 libxcursor1 libxi6 \
+        libglu1-mesa libsm6 libxext6 libxrender1 libgomp1
+    rm -rf /var/lib/apt/lists/*
+
+    python3.12 -m venv /opt/venv
+    PIP="/opt/venv/bin/pip"
+    $PIP install --no-cache-dir --upgrade pip setuptools wheel toml
+
+    # 1) Isaac Sim (pulls its own torch, which we override next)
+    $PIP install --no-cache-dir "isaacsim[all,extscache]==6.0.1.0" \
+        --extra-index-url https://pypi.nvidia.com
+
+    # 2) Keep the torch that isaacsim pulls (2.11.0, CUDA 13.0 build).
+    #
+    #    Do NOT force the cu128 wheel here. That override is specific to the
+    #    workstation `starfish`, whose driver is 12.6 and cannot load a cu130
+    #    build. Hyak's L40S nodes run driver 580.178.04 / CUDA 13.0, so cu130 is
+    #    the matching build there.
+    #
+    #    Forcing cu128 on Hyak produced a subtle failure: single-rank NCCL worked
+    #    and all 4 GPUs were visible, but the multi-rank parameter broadcast died
+    #    with SIGSEGV and no traceback (that torch ships NCCL 2.28.9+cuda12.9
+    #    against a CUDA 13.0 driver). A minimal 4-rank all_reduce with no Isaac
+    #    Sim involved reproduced it, which is what isolated the cause.
+
+    # 3) IsaacLab at the pinned beta, all 13 core packages plus the extras.
+    #    uwlab.sh still installs only the old 4-package set, which is why this is
+    #    enumerated explicitly here.
+    mkdir -p /opt/_isaaclab
+    git -C /opt/_isaaclab init -q IsaacLab
+    git -C /opt/_isaaclab/IsaacLab remote add origin https://github.com/isaac-sim/IsaacLab.git
+    git -C /opt/_isaaclab/IsaacLab fetch -q --depth 1 origin ffff603eafc6b74264a5261cc0183d6a65390d78
+    git -C /opt/_isaaclab/IsaacLab checkout -q --detach FETCH_HEAD
+
+    SRC=/opt/_isaaclab/IsaacLab/source
+    for pkg in isaaclab isaaclab_ppisp isaaclab_assets isaaclab_contrib \
+               isaaclab_experimental isaaclab_newton isaaclab_ov isaaclab_ovphysx \
+               isaaclab_physx isaaclab_rl isaaclab_tasks isaaclab_tasks_experimental \
+               isaaclab_visualizers; do
+        $PIP install --no-cache-dir -e "$SRC/$pkg" --extra-index-url https://pypi.nvidia.com
+    done
+    $PIP install --no-cache-dir -e "$SRC/isaaclab_newton[all]"     --extra-index-url https://pypi.nvidia.com
+    $PIP install --no-cache-dir -e "$SRC/isaaclab_physx[newton]"   --extra-index-url https://pypi.nvidia.com
+    $PIP install --no-cache-dir -e "$SRC/isaaclab_rl[all]"         --extra-index-url https://pypi.nvidia.com
+
+    # 4) RL stack + UWLab third-party deps
+    $PIP install --no-cache-dir \
+        "rsl-rl-lib @ git+https://github.com/UW-Lab/rsl_rl.git@92f01d711a08bcabd6391a6fc132dcfb82661795"
+    $PIP install --no-cache-dir \
+        "https://github.com/MiroPsota/torch_packages_builder/releases/download/pytorch3d-0.7.9/pytorch3d-0.7.9%2Bpt2.10.0cu128-cp312-cp312-linux_x86_64.whl"
+    $PIP install --no-cache-dir "wandb>=0.19.6,<0.20" \
+        pybullet "zarr==2.18.3" "numcodecs==0.13.1" cmaes trimesh prettytable \
+        huggingface_hub einops
+
+    # sanity: confirm the torch build actually present (expect 2.11.0 cu130)
+    /opt/venv/bin/python -c "import torch; print('BUILD torch:', torch.__version__)"
+
+%environment
+    export PATH=/opt/venv/bin:$PATH
+    export UWLAB_PATH=/workspace/uwlab
+    # UWLab packages are pure Python and come from the bind-mounted checkout.
+    export PYTHONPATH=/workspace/uwlab/source/uwlab:/workspace/uwlab/source/uwlab_assets:/workspace/uwlab/source/uwlab_rl:/workspace/uwlab/source/uwlab_tasks:$PYTHONPATH
+    # /tmp on a compute node is node-local; keep Isaac Lab's asset cache off the
+    # shared filesystem (and away from other users' /tmp dirs).
+    export TMPDIR=${TMPDIR:-/tmp}/isaaclab_cache
+
+%runscript
+    mkdir -p "$TMPDIR"
+    exec /opt/venv/bin/python "$@"
+
+%labels
+    Description UWLab on IsaacLab 3.0.0-beta2.patch1 / Isaac Sim 6.0.1.0
+    IsaacLabCommit ffff603eafc6b74264a5261cc0183d6a65390d78
+    RslRlCommit 92f01d711a08bcabd6391a6fc132dcfb82661795

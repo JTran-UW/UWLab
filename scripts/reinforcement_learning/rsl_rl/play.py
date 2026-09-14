@@ -157,25 +157,49 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # extract the neural network module
     # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
+    if hasattr(runner.alg, "policy"):
+        # rsl-rl 2.3 .. 3.x
         policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
+    elif hasattr(runner.alg, "actor_critic"):
+        # rsl-rl 2.2 and below
         policy_nn = runner.alg.actor_critic
+    else:
+        # rsl-rl >= 4.0 split the combined actor-critic into separate `actor` and
+        # `critic` models, so neither of the older attributes exists. `_raw_actor`
+        # is the uncompiled module -- prefer it, since torch.compile wrappers do
+        # not export cleanly to jit/onnx.
+        policy_nn = getattr(runner.alg, "_raw_actor", None) or runner.alg.actor
 
     # extract the normalizer
     if hasattr(policy_nn, "actor_obs_normalizer"):
         normalizer = policy_nn.actor_obs_normalizer
     elif hasattr(policy_nn, "student_obs_normalizer"):
         normalizer = policy_nn.student_obs_normalizer
+    elif hasattr(policy_nn, "obs_normalizer"):
+        # rsl-rl >= 4.0: the per-model normalizer lives on the actor itself.
+        # Without this branch the export silently falls through to None and
+        # produces an unnormalized policy -- wrong, but only visibly so at
+        # deployment time.
+        normalizer = policy_nn.obs_normalizer
     else:
         normalizer = None
 
     # export policy to onnx/jit
+    #
+    # Non-fatal: the exporters in isaaclab_rl/uwlab_rl still expect the pre-4.0
+    # rsl-rl layout, where a single ActorCritic module carried a nested `.actor`
+    # or `.student` ("Policy does not have an actor/student module."). Under
+    # rsl-rl >= 4.0 the actor *is* the top-level model, so the export needs
+    # updating separately. Playback below does not depend on it -- it uses
+    # runner.get_inference_policy() -- so a failure here should not stop you
+    # watching the policy run.
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    try:
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+        print(f"[INFO] Exported policy to: {export_model_dir}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Policy export skipped ({type(exc).__name__}: {exc}). Continuing to playback.")
 
     dt = env.unwrapped.step_dt
 

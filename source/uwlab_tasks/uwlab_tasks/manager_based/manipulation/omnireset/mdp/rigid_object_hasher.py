@@ -7,8 +7,7 @@ import hashlib
 import numpy as np
 import torch
 
-import isaacsim.core.utils.prims as prim_utils
-import isaacsim.core.utils.stage as stage_utils
+import isaaclab.sim.utils.stage as stage_utils
 import warp as wp
 from isaaclab.sim import get_all_matching_child_prims
 from pxr import Gf, Usd, UsdGeom, UsdPhysics
@@ -45,6 +44,7 @@ class RigidObjectHasher:
             "root_prim_scales": [],
         }
         stor = HASH_STORE[prim_path_pattern]
+        stage = stage_utils.get_current_stage()
         xform_cache = UsdGeom.XformCache()
         prim_paths = [prim_path_pattern.replace(".*", f"{i}", 1) for i in range(num_envs)]
 
@@ -69,7 +69,7 @@ class RigidObjectHasher:
             collider_prim_env_ids.extend([i] * len(coll_prims))
 
             # 2: Get relative transforms of all collider prims
-            root_xf = xform_cache.GetLocalToWorldTransform(prim_utils.get_prim_at_path(prim_paths[i]))
+            root_xf = xform_cache.GetLocalToWorldTransform(stage.GetPrimAtPath(prim_paths[i]))
             root_tf = Gf.Transform(root_xf)
             rel_tfs = []
             root_prim_scales.append(torch.tensor(root_tf.GetScale()))

@@ -6,13 +6,28 @@
 import asyncio
 import os
 
-import isaacsim.core.utils.prims as prim_utils
+import isaaclab.sim.utils.legacy as prim_utils  # Isaac Sim 6.0.1: isaacsim.core.utils.* no longer importable
 import omni
 import omni.kit.commands
 from isaaclab.sim.converters.asset_converter_base import AssetConverterBase
 from isaaclab.sim.schemas import schemas
 from isaaclab.sim.utils import clone, export_prim_to_file, get_all_matching_child_prims, safe_set_attribute_on_usd_prim
-from isaacsim.coreutils.extensions import enable_extension
+def enable_extension(extension_name: str) -> bool:
+    """Enable a Kit extension by name.
+
+    Replaces ``from isaacsim.core.utils.extensions import enable_extension``. That
+    module is not importable under Isaac Sim 6.0.1 (the extension ships under
+    extsDeprecated but enabling it no longer puts it on ``sys.path``, which did
+    work under 6.0.0). The import here was additionally misspelled as
+    ``isaacsim.coreutils.extensions``, so it had never resolved at all.
+
+    Goes straight to the Kit extension manager, which is what the original helper
+    wrapped. Imported lazily because it requires a running SimulationApp.
+    """
+    import omni.kit.app
+
+    manager = omni.kit.app.get_app().get_extension_manager()
+    return manager.set_extension_enabled_immediate(extension_name, True)
 from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, UsdUtils
 
 from .mesh_converter_cfg import MeshConverterCfg

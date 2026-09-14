@@ -60,6 +60,20 @@ def register_task_to_hydra(
     return env_cfg, agent_cfg
 
 
+def _apply_local_object_assets_if_configured(env_cfg) -> None:
+    """Redirect omnireset scene objects to local (convexified, Newton-ready) USDs when
+    ``UWLAB_ROBOT_ASSETS_DIR`` is set. Must run after hydra composition because object variants replace
+    the whole object cfg. No-op without the env var or for non-omnireset tasks."""
+    try:
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp.utils import apply_local_object_assets
+
+        redirected = apply_local_object_assets(env_cfg)
+        if redirected:
+            print(f"[INFO] local object assets redirected: {redirected}")
+    except Exception:
+        pass
+
+
 def hydra_task_config(task_name: str, agent_cfg_entry_point: str) -> Callable:
     """Decorator to handle the Hydra configuration for a task.
 
@@ -101,6 +115,7 @@ def hydra_task_config(task_name: str, agent_cfg_entry_point: str) -> Callable:
                 else:
                     agent_cfg.from_dict(hydra_env_cfg["agent"])
                 # call the original function
+                _apply_local_object_assets_if_configured(env_cfg)
                 func(env_cfg, agent_cfg, *args, **kwargs)
 
             # call the new Hydra main function
@@ -162,6 +177,7 @@ def hydra_task_compose(task_name: str, agent_cfg_entry_point: str, hydra_args: l
                 else:
                     agent_cfg.from_dict(hydra_cfg["agent"])
             # call the original function
+            _apply_local_object_assets_if_configured(env_cfg)
             return func(env_cfg, agent_cfg, *args, **kwargs)
 
         return wrapper

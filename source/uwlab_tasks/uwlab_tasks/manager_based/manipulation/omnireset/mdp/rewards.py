@@ -59,12 +59,12 @@ class ee_asset_distance_tanh(ManagerTermBase):
         std: float = 0.1,
     ) -> torch.Tensor:
         root_asset_alignment_pos_w, root_asset_alignment_quat_w = self.root_asset_offset.combine(
-            self.root_asset.data.body_link_pos_w[:, root_asset_cfg.body_ids].view(-1, 3),
-            self.root_asset.data.body_link_quat_w[:, root_asset_cfg.body_ids].view(-1, 4),
+            self.root_asset.data.body_link_pos_w.torch[:, root_asset_cfg.body_ids].view(-1, 3),
+            self.root_asset.data.body_link_quat_w.torch[:, root_asset_cfg.body_ids].view(-1, 4),
         )
         if self.target_asset_offset is None:
-            target_asset_alignment_pos_w = self.target_asset.data.root_pos_w.view(-1, 3)
-            target_asset_alignment_quat_w = self.target_asset.data.root_quat_w.view(-1, 4)
+            target_asset_alignment_pos_w = self.target_asset.data.root_pos_w.torch.view(-1, 3)
+            target_asset_alignment_quat_w = self.target_asset.data.root_quat_w.torch.view(-1, 4)
         else:
             target_asset_alignment_pos_w, target_asset_alignment_quat_w = self.target_asset_offset.apply(
                 self.target_asset
@@ -215,3 +215,48 @@ class collision_free(ManagerTermBase):
         collision_free = self.collision_analyzer(env, all_env_ids)
 
         return collision_free
+
+
+
+# --- NaN-safe variants (Newton) -------------------------------------------------------------------
+# A blown-up world is terminated by abnormal_robot, but that step's rewards are computed from the
+# non-finite state first; these variants return 0 there instead of poisoning the episode sums (and
+# rsl_rl's NaN check). They are real module-level symbols so IsaacLab's cfg stringification keeps them.
+
+
+def _finite(x: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+class ProgressContextNanSafe(ProgressContext):
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        insertive_asset_cfg: SceneEntityCfg,
+        receptive_asset_cfg: SceneEntityCfg,
+        command_context: str = "task_command",
+    ) -> torch.Tensor:
+        return _finite(super().__call__(env, insertive_asset_cfg, receptive_asset_cfg, command_context))
+
+
+class ee_asset_distance_tanh_nan_safe(ee_asset_distance_tanh):
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        root_asset_cfg: SceneEntityCfg,
+        target_asset_cfg: SceneEntityCfg,
+        root_asset_offset_metadata_key: str,
+        target_asset_offset_metadata_key: str | None = None,
+        std: float = 0.1,
+    ) -> torch.Tensor:
+        return _finite(
+            super().__call__(env, root_asset_cfg, target_asset_cfg, root_asset_offset_metadata_key, target_asset_offset_metadata_key, std)
+        )
+
+
+def dense_success_reward_nan_safe(env: ManagerBasedRLEnv, std: float, context: str = "progress_context") -> torch.Tensor:
+    return _finite(dense_success_reward(env, std, context))
+
+
+def joint_vel_l2_clamped_nan_safe(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    return _finite(joint_vel_l2_clamped(env, asset_cfg))

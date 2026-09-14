@@ -17,7 +17,14 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import DelayedPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
+import os
+
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+
+# Opt-in override for locally patched robot USDs (see tools/fix_robotiq_usd.py): a directory
+# holding Robots/UniversalRobots/... with metadata.yaml next to each USD.
+UWLAB_ROBOT_ASSETS_DIR = os.environ.get("UWLAB_ROBOT_ASSETS_DIR", UWLAB_CLOUD_ASSETS_DIR)
+ROBOT_ASSETS_PATCHED = UWLAB_ROBOT_ASSETS_DIR != UWLAB_CLOUD_ASSETS_DIR
 
 ROBOTIQ_2F85_DEFAULT_JOINT_POS = {
     "finger_joint": 0.0,
@@ -58,7 +65,7 @@ UR5E_EFFORT_LIMITS = {
 
 UR5E_ARTICULATION = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd",
+        usd_path=f"{UWLAB_ROBOT_ASSETS_DIR}/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd",
         activate_contact_sensors=False,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=True,
@@ -68,14 +75,14 @@ UR5E_ARTICULATION = ArticulationCfg(
             enabled_self_collisions=True, solver_position_iteration_count=36, solver_velocity_iteration_count=0
         ),
     ),
-    init_state=ArticulationCfg.InitialStateCfg(pos=(0, 0, 0), rot=(1, 0, 0, 0), joint_pos=UR5E_DEFAULT_JOINT_POS),
+    init_state=ArticulationCfg.InitialStateCfg(pos=(0, 0, 0), rot=(0, 0, 0, 1), joint_pos=UR5E_DEFAULT_JOINT_POS),
     soft_joint_pos_limit_factor=1,
 )
 
 ROBOTIQ_2F85 = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/RobotiqGripper",
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Robots/UniversalRobots/2f85RobotiqGripperCalibrated/robotiq_2f85_gripper_calibrated.usd",
+        usd_path=f"{UWLAB_ROBOT_ASSETS_DIR}/Robots/UniversalRobots/2f85RobotiqGripperCalibrated/robotiq_2f85_gripper_calibrated.usd",
         activate_contact_sensors=False,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=True,
@@ -87,7 +94,7 @@ ROBOTIQ_2F85 = ArticulationCfg(
         mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0, 0, 0.1), rot=(1, 0, 0, 0), joint_pos=ROBOTIQ_2F85_DEFAULT_JOINT_POS
+        pos=(0, 0, 0.1), rot=(0, 0, 0, 1), joint_pos=ROBOTIQ_2F85_DEFAULT_JOINT_POS
     ),
     actuators={
         "gripper": ImplicitActuatorCfg(

@@ -326,8 +326,8 @@ class grasp_sampling_event(ManagerTermBase):
         """Apply grasp transform to gripper asset."""
         # Get object's current pose in world coordinates
         object_asset = env.scene[self.object_cfg.name]
-        object_pos = object_asset.data.root_pos_w[env_idx]
-        object_quat = object_asset.data.root_quat_w[env_idx]
+        object_pos = object_asset.data.root_pos_w.torch[env_idx]
+        object_quat = object_asset.data.root_quat_w.torch[env_idx]
 
         # Convert numpy transform matrix to torch tensors (object-local coordinates)
         transform_tensor = torch.tensor(grasp_transform, dtype=torch.float32, device=env.device)
@@ -341,20 +341,20 @@ class grasp_sampling_event(ManagerTermBase):
         )
 
         # Apply world transform to gripper asset for the specific environment
-        gripper_asset.data.root_pos_w[env_idx] = world_pos[0]
-        gripper_asset.data.root_quat_w[env_idx] = world_quat[0]
+        gripper_asset.data.root_pos_w.torch[env_idx] = world_pos[0]
+        gripper_asset.data.root_quat_w.torch[env_idx] = world_quat[0]
 
         # Write the new pose to simulation
         indices = torch.tensor([env_idx], device=env.device)
-        root_pose = torch.cat([gripper_asset.data.root_pos_w[indices], gripper_asset.data.root_quat_w[indices]], dim=-1)
+        root_pose = torch.cat([gripper_asset.data.root_pos_w.torch[indices], gripper_asset.data.root_quat_w.torch[indices]], dim=-1)
         gripper_asset.write_root_pose_to_sim(root_pose, env_ids=indices)
 
     def _apply_grasp_transforms_vectorized(self, env, gripper_asset, grasp_transforms, env_ids):
         """Apply grasp transforms to gripper assets for multiple environments (vectorized)."""
         # Get object's current pose in world coordinates for all environments
         object_asset = env.scene[self.object_cfg.name]
-        object_pos = object_asset.data.root_pos_w[env_ids]
-        object_quat = object_asset.data.root_quat_w[env_ids]
+        object_pos = object_asset.data.root_pos_w.torch[env_ids]
+        object_quat = object_asset.data.root_quat_w.torch[env_ids]
 
         # Extract positions and quaternions from transform matrices (already tensors)
         local_positions = grasp_transforms[:, :3, 3]  # Extract translation
@@ -367,8 +367,8 @@ class grasp_sampling_event(ManagerTermBase):
         )
 
         # Apply world transforms to gripper assets (vectorized)
-        gripper_asset.data.root_pos_w[env_ids] = world_positions
-        gripper_asset.data.root_quat_w[env_ids] = world_quaternions
+        gripper_asset.data.root_pos_w.torch[env_ids] = world_positions
+        gripper_asset.data.root_quat_w.torch[env_ids] = world_quaternions
 
         # Write the new poses to simulation (single vectorized call)
         root_poses = torch.cat([world_positions, world_quaternions], dim=-1)
@@ -383,8 +383,8 @@ class grasp_sampling_event(ManagerTermBase):
         object_asset = env.scene[self.object_cfg.name]
 
         # Get object's current pose in world coordinates
-        object_pos = object_asset.data.root_pos_w[0]  # Use first environment
-        object_quat = object_asset.data.root_quat_w[0]  # Use first environment
+        object_pos = object_asset.data.root_pos_w.torch[0]  # Use first environment
+        object_quat = object_asset.data.root_quat_w.torch[0]  # Use first environment
 
         # Convert grasp transforms to poses and transform to world coordinates
         world_positions = []
@@ -414,7 +414,7 @@ class grasp_sampling_event(ManagerTermBase):
     def _open_gripper(self, env, gripper_asset, env_ids):
         """Open gripper to prepare for grasping."""
         # Get current joint positions
-        current_joint_pos = gripper_asset.data.joint_pos[env_ids].clone()
+        current_joint_pos = gripper_asset.data.joint_pos.torch[env_ids].clone()
 
         # Find joint indices using configurable joint names and positions
         joint_configs = []
@@ -443,13 +443,13 @@ class grasp_sampling_event(ManagerTermBase):
         gripper_asset.reset(env_ids)
 
         # 2. Reset to default root state (position and velocity)
-        default_root_state = gripper_asset.data.default_root_state[env_ids].clone()
+        default_root_state = gripper_asset.data.default_root_state.torch[env_ids].clone()
         default_root_state[:, 0:3] += env.scene.env_origins[env_ids]
         gripper_asset.write_root_state_to_sim(default_root_state, env_ids=env_ids)
 
         # 3. Reset all joints to default positions with zero velocities
-        default_joint_pos = gripper_asset.data.default_joint_pos[env_ids].clone()
-        zero_joint_vel = torch.zeros_like(gripper_asset.data.default_joint_vel[env_ids])
+        default_joint_pos = gripper_asset.data.default_joint_pos.torch[env_ids].clone()
+        zero_joint_vel = torch.zeros_like(gripper_asset.data.default_joint_vel.torch[env_ids])
         gripper_asset.write_joint_state_to_sim(default_joint_pos, zero_joint_vel, env_ids=env_ids)
 
         # 4. Set joint targets to default positions to prevent drift
@@ -561,8 +561,8 @@ class reset_end_effector_round_fixed_asset(ManagerTermBase):
             scale=1.0,
         )
         self.solver: DifferentialInverseKinematicsAction = robot_ik_solver_cfg.class_type(robot_ik_solver_cfg, env)  # type: ignore
-        self.reset_velocity = torch.zeros((env.num_envs, self.robot.data.joint_vel.shape[1]), device=env.device)
-        self.reset_position = torch.zeros((env.num_envs, self.robot.data.joint_pos.shape[1]), device=env.device)
+        self.reset_velocity = torch.zeros((env.num_envs, self.robot.data.joint_vel.torch.shape[1]), device=env.device)
+        self.reset_position = torch.zeros((env.num_envs, self.robot.data.joint_pos.torch.shape[1]), device=env.device)
 
     def __call__(
         self,
@@ -575,8 +575,8 @@ class reset_end_effector_round_fixed_asset(ManagerTermBase):
     ) -> None:
         if fixed_asset_offset is None:
             fixed_tip_pos_w, fixed_tip_quat_w = (
-                env.scene[fixed_asset_cfg.name].data.root_pos_w,
-                env.scene[fixed_asset_cfg.name].data.root_quat_w,
+                env.scene[fixed_asset_cfg.name].data.root_pos_w.torch,
+                env.scene[fixed_asset_cfg.name].data.root_quat_w.torch,
             )
         else:
             fixed_tip_pos_w, fixed_tip_quat_w = self.fixed_asset_offset.apply(self.fixed_asset)
@@ -587,16 +587,16 @@ class reset_end_effector_round_fixed_asset(ManagerTermBase):
         pos_w = fixed_tip_pos_w + samples[:, 0:3]
         quat_w = math_utils.quat_from_euler_xyz(samples[:, 3], samples[:, 4], samples[:, 5])
         pos_b, quat_b = math_utils.subtract_frame_transforms(
-            self.robot.data.root_link_pos_w, self.robot.data.root_link_quat_w, pos_w, quat_w
+            self.robot.data.root_link_pos_w.torch, self.robot.data.root_link_quat_w.torch, pos_w, quat_w
         )
         self.solver.process_actions(torch.cat([pos_b, quat_b], dim=1))
 
         # Error Rate 75% ^ 10 = 0.05 (final error)
         for i in range(10):
             self.solver.apply_actions()
-            delta_joint_pos = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            delta_joint_pos = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos.torch[env_ids])
             self.robot.write_joint_state_to_sim(
-                position=(delta_joint_pos + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                position=(delta_joint_pos + self.robot.data.joint_pos.torch[env_ids])[:, self.joint_ids],
                 velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
                 joint_ids=self.joint_ids,
                 env_ids=env_ids,  # type: ignore
@@ -655,6 +655,7 @@ class reset_end_effector_from_grasp_dataset(ManagerTermBase):
         """Load Torch (.pt) grasp data and convert to optimized tensors."""
         local_path = utils.safe_retrieve_file_path(self.grasp_dataset_path)
         data = torch.load(local_path, map_location="cpu")
+        _check_robot_joint_convention(data, self.grasp_dataset_path)
 
         # TorchDatasetFileHandler stores nested dicts; grasp data likely under 'grasp_relative_pose'
         grasp_group = data.get("grasp_relative_pose", data)
@@ -719,8 +720,8 @@ class reset_end_effector_from_grasp_dataset(ManagerTermBase):
     ) -> None:
         """Apply grasp poses to reset end effector."""
         # RigidObject asset
-        object_pos_w = self.fixed_asset.data.root_pos_w[env_ids]
-        object_quat_w = self.fixed_asset.data.root_quat_w[env_ids]
+        object_pos_w = self.fixed_asset.data.root_pos_w.torch[env_ids]
+        object_quat_w = self.fixed_asset.data.root_quat_w.torch[env_ids]
 
         # Randomly sample grasp indices for each environment
         num_envs = len(env_ids)
@@ -759,9 +760,9 @@ class reset_end_effector_from_grasp_dataset(ManagerTermBase):
         # Solve IK iteratively for better convergence
         for i in range(25):
             self.solver.apply_actions()
-            delta_joint_pos = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos[env_ids])
+            delta_joint_pos = 0.25 * (self.robot.data.joint_pos_target[env_ids] - self.robot.data.joint_pos.torch[env_ids])
             self.robot.write_joint_state_to_sim(
-                position=(delta_joint_pos + self.robot.data.joint_pos[env_ids])[:, self.joint_ids],
+                position=(delta_joint_pos + self.robot.data.joint_pos.torch[env_ids])[:, self.joint_ids],
                 velocity=torch.zeros((len(env_ids), self.n_joints), device=env.device),
                 joint_ids=self.joint_ids,
                 env_ids=env_ids,  # type: ignore
@@ -845,8 +846,8 @@ class reset_insertive_object_from_partial_assembly_dataset(ManagerTermBase):
     ) -> None:
         """Reset the insertive object from a partial assembly dataset."""
         # Get receptive object pose (world coordinates)
-        receptive_pos_w = self.receptive_object.data.root_pos_w[env_ids]
-        receptive_quat_w = self.receptive_object.data.root_quat_w[env_ids]
+        receptive_pos_w = self.receptive_object.data.root_pos_w.torch[env_ids]
+        receptive_quat_w = self.receptive_object.data.root_quat_w.torch[env_ids]
 
         # Randomly sample partial assembly indices for each environment
         num_envs = len(env_ids)
@@ -906,10 +907,10 @@ class pose_logging_event(ManagerTermBase):
         """Collect pose data from all environments."""
 
         # Get object poses for all environments
-        receptive_pos = self.receptive_object.data.root_pos_w[env_ids]
-        receptive_quat = self.receptive_object.data.root_quat_w[env_ids]
-        insertive_pos = self.insertive_object.data.root_pos_w[env_ids]
-        insertive_quat = self.insertive_object.data.root_quat_w[env_ids]
+        receptive_pos = self.receptive_object.data.root_pos_w.torch[env_ids]
+        receptive_quat = self.receptive_object.data.root_quat_w.torch[env_ids]
+        insertive_pos = self.insertive_object.data.root_pos_w.torch[env_ids]
+        insertive_quat = self.insertive_object.data.root_quat_w.torch[env_ids]
 
         # Calculate relative transform
         relative_pos, relative_quat = math_utils.subtract_frame_transforms(
@@ -961,8 +962,8 @@ class assembly_sampling_event(ManagerTermBase):
         """Spawn insertive object at assembled offset position."""
 
         # Get receptive object poses
-        receptive_pos = self.receptive_object.data.root_pos_w[env_ids]
-        receptive_quat = self.receptive_object.data.root_quat_w[env_ids]
+        receptive_pos = self.receptive_object.data.root_pos_w.torch[env_ids]
+        receptive_quat = self.receptive_object.data.root_quat_w.torch[env_ids]
 
         # Apply receptive assembled offset to get target position
         target_pos, target_quat = self.receptive_assembled_offset.combine(receptive_pos, receptive_quat)
@@ -990,6 +991,127 @@ class assembly_sampling_event(ManagerTermBase):
             ),
             env_ids=env_ids,
         )
+
+
+# Joint order of the UR5e + Robotiq 2F-85 articulation as recorded in the reset-state datasets
+# (PhysX parse). Newton parses 14 joints in a different order; resets map by name.
+DATASET_ROBOT_JOINT_NAMES = (
+    "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
+    "finger_joint", "right_outer_knuckle_joint", "right_inner_knuckle_joint", "left_inner_knuckle_joint",
+    "right_inner_finger_knuckle_joint", "left_inner_finger_knuckle_joint",
+)
+
+
+def _notify_newton_fixed_base_moved(articulation, root_pose: torch.Tensor, env_ids) -> None:
+    """Newton: make a root-pose write on a fixed-base articulation actually move the base.
+
+    IsaacLab's ``write_root_pose_to_sim`` only fills a detached ``root_link_pose_w`` buffer for fixed
+    bases; the pose lives in ``model.joint_X_p`` of the base joint, and the MuJoCo-Warp solver only
+    re-uploads it on ``notify_model_changed(JOINT_PROPERTIES)``. Without this the base snaps back to
+    its spawn pose and the datasets' per-state base placement is silently dropped (hand-off §15e).
+    ``root_pose`` is (len(env_ids), 7) xyzw in world frame, same layout as ``wp.transform``.
+    """
+    if not getattr(articulation, "is_fixed_base", False):
+        return
+    try:
+        import warp as wp
+        from isaaclab_newton.physics.newton_manager import NewtonManager
+        from newton.solvers import SolverNotifyFlags
+    except ImportError:
+        return
+    model = NewtonManager._model
+    if NewtonManager._solver is None or model is None:
+        return
+    root_ids = getattr(articulation, "_uwlab_root_joint_ids", None)
+    if root_ids is None:
+        import re
+        prefix = articulation.cfg.prim_path.replace("{ENV_REGEX_NS}", "/World/envs/env_.*").replace("env_.*", "env_[0-9]+")
+        pat = re.compile("^" + prefix + r"/[^/]+$")
+        labels = list(model.joint_label)
+        parent = model.joint_parent.numpy()
+        ids = [i for i, l in enumerate(labels) if parent[i] < 0 and pat.match(l)]
+        if len(ids) != articulation.num_instances:
+            raise RuntimeError(f"fixed-base root joints: found {len(ids)} for {articulation.num_instances} envs ({prefix})")
+        root_ids = torch.tensor(ids, device=root_pose.device)
+        articulation._uwlab_root_joint_ids = root_ids
+    jxp = wp.to_torch(model.joint_X_p)
+    env_ids_t = torch.as_tensor(env_ids, device=root_pose.device) if not isinstance(env_ids, slice) else torch.arange(articulation.num_instances, device=root_pose.device)
+    jxp[root_ids[env_ids_t]] = root_pose.to(jxp.dtype)
+    NewtonManager.add_model_change(SolverNotifyFlags.JOINT_PROPERTIES)
+    # Clear the MuJoCo-Warp per-world solver warm start for the reset worlds: after a blow-up it holds
+    # huge/NaN accelerations that IsaacLab's reset (q/qd only) never touches, so the solver keeps
+    # iterating to the cap in those worlds (and can re-diverge).
+    mjd = getattr(NewtonManager._solver, "mjw_data", None)
+    if mjd is not None:
+        for name in ("qacc_warmstart", "qacc"):
+            arr = getattr(mjd, name, None)
+            if arr is not None and arr.ndim == 2:
+                wp.to_torch(arr)[env_ids_t] = 0.0
+
+
+def _map_dataset_joints(articulation, joint_position: torch.Tensor, joint_velocity: torch.Tensor):
+    """Scatter dataset joint arrays (DATASET_ROBOT_JOINT_NAMES order) into the articulation's joint layout."""
+    names = list(articulation.joint_names)
+    if tuple(names) == tuple(DATASET_ROBOT_JOINT_NAMES):
+        return joint_position, joint_velocity
+    # Same joint count is not enough: Newton orders the gripper joints by tree traversal, PhysX does not.
+    if joint_position.shape[1] != len(DATASET_ROBOT_JOINT_NAMES):
+        raise RuntimeError(
+            f"dataset has {joint_position.shape[1]} robot joints, articulation has {len(names)}; expected"
+            f" {len(DATASET_ROBOT_JOINT_NAMES)} in DATASET_ROBOT_JOINT_NAMES order"
+        )
+    idx = [names.index(n) for n in DATASET_ROBOT_JOINT_NAMES]
+    pos = torch.zeros((joint_position.shape[0], len(names)), device=joint_position.device, dtype=joint_position.dtype)
+    vel = torch.zeros_like(pos)
+    pos[:, idx] = joint_position
+    vel[:, idx] = joint_velocity
+    return pos, vel
+
+
+def _check_robot_joint_convention(dataset: dict, dataset_file: str) -> None:
+    """Refuse datasets whose gripper joint sign convention does not match the loaded robot USD.
+
+    ``tools/fix_robotiq_usd.py`` (selected via ``UWLAB_ROBOT_ASSETS_DIR``) swaps body0/body1 on the
+    two inner_finger_knuckle joints, negating their angles; datasets converted for it carry
+    ``robot_joint_convention: "swapped_ifk"``. Writing mismatched joints explodes the linkage.
+    """
+    from uwlab_assets.robots.ur5e_robotiq_gripper.ur5e_robotiq_2f85_gripper import ROBOT_ASSETS_PATCHED
+
+    marker = dataset.get("robot_joint_convention")
+    if ROBOT_ASSETS_PATCHED and marker != "swapped_ifk":
+        raise RuntimeError(
+            f"{dataset_file} was recorded with the original gripper USD but UWLAB_ROBOT_ASSETS_DIR selects the"
+            " patched one; convert it with tools/convert_datasets_for_patched_gripper.py"
+        )
+    if not ROBOT_ASSETS_PATCHED and marker == "swapped_ifk":
+        raise RuntimeError(
+            f"{dataset_file} is converted for the patched gripper USD (robot_joint_convention=swapped_ifk) but"
+            " UWLAB_ROBOT_ASSETS_DIR is not set"
+        )
+
+
+def _reset_state_quat_to_xyzw(root_pose: torch.Tensor) -> torch.Tensor:
+    """Reorder a recorded root_pose quaternion from (w, x, y, z) to (x, y, z, w).
+
+    The reset-state datasets carry Isaac Lab 2.x's (w, x, y, z) convention. Isaac
+    Lab 3.0 consumes (x, y, z, w) and ``write_root_pose_to_sim`` applies the stored
+    value verbatim, so a 2.x identity (1, 0, 0, 0) lands as a 180-degree rotation
+    about X. Measured on the omnireset scene: the robot SPAWNS with base +Z =
+    (0, 0, +1) and comes out of the reset event at (0, 0, -1), with the support
+    plate inverted and the table on its side. Grasping, insertion and task 0/1
+    success all depend on reordering this on load.
+    """
+    out = root_pose.clone()
+    out[:, 3:7] = root_pose[:, [4, 5, 6, 3]]
+    return out
+
+
+def _convert_reset_state_quats_to_xyzw(initial_state: dict) -> None:
+    """In-place (w,x,y,z) -> (x,y,z,w) on every root_pose of a legacy (2.x) reset-state dataset."""
+    for group in ("articulation", "rigid_object"):
+        for asset_state in initial_state.get(group, {}).values():
+            if "root_pose" in asset_state:
+                asset_state["root_pose"] = _reset_state_quat_to_xyzw(asset_state["root_pose"])
 
 
 class MultiResetManager(ManagerTermBase):
@@ -1026,9 +1148,18 @@ class MultiResetManager(ManagerTermBase):
                 raise FileNotFoundError(f"Dataset file {dataset_file} could not be accessed or downloaded.")
 
             dataset = torch.load(local_file_path)
+            _check_robot_joint_convention(dataset, dataset_file)
+            dataset.pop("robot_joint_convention", None)
+            quat_convention = dataset.pop("quat_convention", "wxyz")
             num_states.append(len(dataset["initial_state"]["articulation"]["robot"]["joint_position"]))
             init_indices = torch.arange(num_states[-1], device=env.device)
-            self.datasets.append(sample_state_data_set(dataset, init_indices, env.device))
+            dataset = sample_state_data_set(dataset, init_indices, env.device)
+            if quat_convention == "wxyz":
+                _convert_reset_state_quats_to_xyzw(dataset["initial_state"])
+            elif quat_convention != "xyzw":
+                raise ValueError(f"Unknown quat_convention {quat_convention!r} in {dataset_file}")
+            print(f"[MultiResetManager] {dataset_file}: {num_states[-1]} states, quat_convention={quat_convention}")
+            self.datasets.append(dataset)
 
         # Normalize probabilities and store dataset lengths
         self.probs = torch.tensor(probabilities, device=env.device) / sum(probabilities)
@@ -1127,9 +1258,11 @@ class MultiResetManager(ManagerTermBase):
             root_velocity = asset_state["root_velocity"].clone()
             articulation.write_root_pose_to_sim(root_pose, env_ids=env_ids)
             articulation.write_root_velocity_to_sim(root_velocity, env_ids=env_ids)
+            _notify_newton_fixed_base_moved(articulation, root_pose, env_ids)
             # joint state
             joint_position = asset_state["joint_position"].clone()
             joint_velocity = asset_state["joint_velocity"].clone()
+            joint_position, joint_velocity = _map_dataset_joints(articulation, joint_position, joint_velocity)
             articulation.write_joint_state_to_sim(joint_position, joint_velocity, env_ids=env_ids)
             # FIXME: This is not generic as it assumes PD control over the joints.
             #   This assumption does not hold for effort controlled joints.
@@ -1243,11 +1376,11 @@ class reset_root_states_uniform(ManagerTermBase):
                     torch.tensor(bottom_offset.get("pos"), device=env.device).unsqueeze(0).repeat(env.num_envs, 1)
                 )
                 assert tuple(bottom_offset.get("quat")) == (
+                    0.0,
+                    0.0,
+                    0.0,
                     1.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ), "Bottom offset rotation must be (1.0, 0.0, 0.0, 0.0)"
+                ), "Bottom offset rotation must be identity"
 
     def __call__(
         self,
@@ -1279,14 +1412,14 @@ class reset_root_states_uniform(ManagerTermBase):
             asset: RigidObject | Articulation = env.scene[asset_cfg.name]
 
             # Get default root state for this asset
-            root_states = asset.data.default_root_state[env_ids].clone()
+            root_states = asset.data.default_root_state.torch[env_ids].clone()
 
             # Apply position offset
             positions = root_states[:, 0:3] + env.scene.env_origins[env_ids] + rand_pose_samples[:, 0:3]
 
             if self.offset_asset_cfg:
                 offset_asset: RigidObject | Articulation = env.scene[self.offset_asset_cfg.name]
-                offset_positions = offset_asset.data.default_root_state[env_ids].clone()
+                offset_positions = offset_asset.data.default_root_state.torch[env_ids].clone()
                 positions += offset_positions[:, 0:3]
 
             if self.use_bottom_offset:
@@ -1933,7 +2066,7 @@ class obs_noise_curriculum(ManagerTermBase):
     """Curriculum that gradually increases uniform noise on observation terms.
 
     Monitors success rate and linearly ramps the half-range on the specified
-    observation terms' ``AdditiveUniformNoiseCfg`` from ``initial_half_range``
+    observation terms' ``UniformNoiseCfg`` from ``initial_half_range``
     to ``target_half_range`` as progress goes from 0 to 1.  At full progress
     the noise is U(-target_half_range, +target_half_range).
     """
@@ -1964,7 +2097,7 @@ class obs_noise_curriculum(ManagerTermBase):
             cfg = name_to_cfg[name]
             if cfg.noise is None:
                 raise ValueError(
-                    f"Obs term '{name}' has no noise config. Set noise=AdditiveUniformNoiseCfg(n_min=0.0, n_max=0.0)."
+                    f"Obs term '{name}' has no noise config. Set noise=UniformNoiseCfg(n_min=0.0, n_max=0.0)."
                 )
             self._obs_term_cfgs.append(cfg)
 
@@ -2387,3 +2520,27 @@ class implicit_to_explicit_swap(ManagerTermBase):
             return {"actuator_swapped": False, "scale_progress": self._sysid_term.scale_progress}
 
         return self._do_swap(env)
+
+
+def set_newton_equality_solref(env, env_ids, timeconst: float = 0.005, dampratio: float = 1.0):
+    """Startup event (Newton only): stiffen all MuJoCo equality constraints (the gripper mimic joints).
+
+    Newton hard-codes MuJoCo's default solref (0.02 s) for mimic equalities; under grasp loads the
+    tree-gripper linkage yields and the pads open (hand-off §15f). No-op on PhysX.
+    """
+    try:
+        import warp as wp
+        from isaaclab_newton.physics.newton_manager import NewtonManager
+    except ImportError:
+        return
+    solver = NewtonManager._solver
+    mjw = getattr(solver, "mjw_model", None)
+    if mjw is None or getattr(mjw, "eq_solref", None) is None:
+        return
+    arr = mjw.eq_solref.numpy()
+    if arr.size == 0:
+        return
+    arr[..., 0] = timeconst
+    arr[..., 1] = dampratio
+    mjw.eq_solref.assign(wp.array(arr, dtype=mjw.eq_solref.dtype, device=mjw.eq_solref.device))
+    print(f"[set_newton_equality_solref] eq_solref -> ({timeconst}, {dampratio}) on {arr.shape[:-1]} equalities")

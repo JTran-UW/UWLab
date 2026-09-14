@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import dataclasses
+import torch
+
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
@@ -20,6 +23,7 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab_physx.physics import PhysxCfg
  
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85, IMPLICIT_UR5E_ROBOTIQ_2F85
@@ -51,7 +55,7 @@ class RlStateSceneCfg(InteractiveSceneCfg):
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.02),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0)),
     )
 
     receptive_object: RigidObjectCfg = RigidObjectCfg(
@@ -67,13 +71,13 @@ class RlStateSceneCfg(InteractiveSceneCfg):
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0)),
     )
 
     # Environment
     table = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Table",
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, 0.0, -0.881), rot=(0.707, 0.0, 0.0, -0.707)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.4, 0.0, -0.881), rot=(0.0, 0.0, -0.707, 0.707)),
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Mounts/UWPatVention/pat_vention.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
@@ -82,7 +86,7 @@ class RlStateSceneCfg(InteractiveSceneCfg):
 
     ur5_metal_support = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/UR5MetalSupport",
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0, -0.013), rot=(1.0, 0.0, 0.0, 0.0)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0, -0.013), rot=(0.0, 0.0, 0.0, 1.0)),
         spawn=sim_utils.UsdFileCfg(
             usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Mounts/UWPatVention2/Ur5MetalSupport/ur5plate.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
@@ -571,16 +575,32 @@ class TerminationsCfg:
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
-    # Conservative failure: world Z only (cf. grasp_sampling check_grasp_success pos_above_ground on root_pos_w[:, 2])
-    insertive_fell_too_low = DoneTerm(
-        func=task_mdp.object_root_w_z_below_threshold,
-        params={
-            "object_cfg": SceneEntityCfg("insertive_object"),
-            "min_world_z": -0.2,
-        },
-    )
+    # Disabled to match the task variant that trains successfully on 2.x (see
+    # origin/experimental, and the wandb config of run mh4o92uy, where both of
+    # these are commented out and `first_episode_termination` is active).
+    #
+    # Both terminate episodes early on exactly the trajectories the policy most
+    # needs to learn from: `success` cuts the episode as soon as the peg is
+    # seated, truncating the sustained-success reward the 2.x return depends on,
+    # and `insertive_fell_too_low` ends any episode where the peg is dropped --
+    # which is most of them early in training, and is the dominant failure mode
+    # for task 0 (object anywhere / EE anywhere), the one stuck at 0.0 for us.
+    #
+    # insertive_fell_too_low = DoneTerm(
+    #     func=task_mdp.object_root_w_z_below_threshold,
+    #     params={
+    #         "object_cfg": SceneEntityCfg("insertive_object"),
+    #         "min_world_z": -0.2,
+    #     },
+    # )
+    #
+    # success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 10})
 
-    success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 10})
+    # NOTE: canonical UW-Lab/UWLab main has exactly two terminations here --
+    # time_out and abnormal_robot. `success` and `insertive_fell_too_low` above
+    # were added by this fork and are not in the published recipe.
+    # `first_episode_termination` exists only on origin/experimental, so it is
+    # deliberately NOT used here: this config is exact parity with upstream.
 
 
 @configclass
@@ -638,7 +658,7 @@ def make_insertive_object(usd_path: str):
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.001),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0)),
     )
 
 
@@ -656,7 +676,7 @@ def make_receptive_object(usd_path: str):
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.5),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0)),
     )
 
 
@@ -705,19 +725,29 @@ class Ur5eRobotiq2f85RlStateCfg(ManagerBasedRLEnvCfg):
         # simulation settings
         self.sim.dt = 1 / 120.0
 
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
+        # Contact and solver settings.
+        #
+        # Isaac Lab 3.0 removed `SimulationCfg.physx` (there is no compatibility
+        # shim). The physics backend is now selected by assigning a PhysicsCfg
+        # subclass to `sim.physics` -- PhysxCfg for PhysX, NewtonCfg for Newton.
+        # Every field below kept its name, so this is a straight move.
+        #
+        # These values are tuned for contact-rich peg insertion (note the 192
+        # position iterations) and are what the sim-to-real transfer was
+        # validated against; do not retune them casually.
+        self.sim.physics = PhysxCfg(
+            solver_type=1,
+            max_position_iteration_count=192,
+            max_velocity_iteration_count=1,
+            bounce_threshold_velocity=0.02,
+            friction_offset_threshold=0.01,
+            friction_correlation_distance=0.0005,
+            gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
+            gpu_total_aggregate_pairs_capacity=2**23,
+            gpu_max_rigid_contact_count=2**23,
+            gpu_max_rigid_patch_count=2**23,
+            gpu_collision_stack_size=2**31,
+        )
 
         # Render settings
         self.sim.render.enable_dlssg = True
@@ -768,3 +798,119 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+# Newton (MuJoCo-Warp) configurations -- experimental port
+def _apply_newton_overrides(self, keep_critic: bool) -> None:
+    """Switch an OmniReset cfg to the Newton backend (MuJoCo-Warp) with PhysX-parity settings.
+
+    Requires the patched Robotiq USDs (``UWLAB_ROBOT_ASSETS_DIR``, see tools/fix_robotiq_usd.py) and
+    converted datasets (``Datasets/OmniReset_patched``). See ISAACLAB_3_GRASP_HANDOFF.md §13-§15.
+    """
+    from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonCollisionPipelineCfg, NewtonShapeCfg
+
+    import os
+
+    # Contact stiffness: Newton maps shape (ke, kd) to MuJoCo solref (timeconst=2/kd, dampratio=kd/2*sqrt(1/ke)).
+    # Newton default 2.5e3/100 -> (0.02 s, 1.0); kd=400/ke=4e4 -> (0.005 s, 1.0) for PhysX-like hard contacts.
+    @configclass
+    class _ShapeCfg(NewtonShapeCfg):
+        ke: float = float(os.environ.get("UWLAB_NEWTON_CONTACT_KE", "4e4"))
+        kd: float = float(os.environ.get("UWLAB_NEWTON_CONTACT_KD", "400.0"))
+
+    self.sim.physics = NewtonCfg(
+        solver_cfg=MJWarpSolverCfg(
+            njmax=int(os.environ.get("UWLAB_NEWTON_NJMAX", "2000")),
+            nconmax=int(os.environ.get("UWLAB_NEWTON_NCONMAX", "1000")),
+            cone=os.environ.get("UWLAB_NEWTON_CONE", "elliptic"),
+            impratio=float(os.environ.get("UWLAB_NEWTON_IMPRATIO", "10.0")),
+            integrator="implicitfast",
+            iterations=int(os.environ.get("UWLAB_NEWTON_ITERS", "100")),
+            ls_iterations=int(os.environ.get("UWLAB_NEWTON_LS_ITERS", "50")),
+            use_mujoco_contacts=False,  # Newton collision pipeline; MuJoCo-native contacts NaN on this scene (§15d)
+        ),
+        collision_cfg=NewtonCollisionPipelineCfg(max_triangle_pairs=2_500_000),
+        num_substeps=int(os.environ.get("UWLAB_NEWTON_SUBSTEPS", "4")),
+        use_cuda_graph=os.environ.get("UWLAB_NEWTON_CUDA_GRAPH", "1") == "1",
+        default_shape_cfg=_ShapeCfg(margin=float(os.environ.get("UWLAB_NEWTON_MARGIN", "0.0"))),
+    )
+    # The OSC oscillation on Newton was a gripper-mass discrepancy (fixed in the USD, hand-off §15);
+    # the arm actuator now matches PhysX (damping 0). RelCartesianOSCAction emulates PhysX's joint
+    # velocity clamp on Newton. Knob kept for experiments only.
+    self.scene.robot.actuators["arm"].damping = float(os.environ.get("UWLAB_NEWTON_ARM_DAMPING", "0.0"))
+    if not keep_critic:
+        self.observations.critic = None
+    else:
+        # Keep the privileged critic layout identical to PhysX (16 robot shapes, 1 receptive shape) so
+        # PhysX-trained checkpoints load; Newton has 9 robot colliders and 16 CoACD hulls for the hole.
+        self.observations.critic.robot_material_properties.params["num_shapes"] = 16
+        self.observations.critic.receptive_object_material_properties.params["num_shapes"] = 1
+    # Mimic equalities: stiffen (default 0.02 s lets the linkage yield under grasp load). 0 disables.
+    _eq_tc = float(os.environ.get("UWLAB_NEWTON_EQ_TIMECONST", "0.005"))
+    if _eq_tc > 0:
+        self.events.newton_eq_solref = EventTerm(
+            func=task_mdp.set_newton_equality_solref, mode="startup", params={"timeconst": _eq_tc, "dampratio": 1.0}
+        )
+    # Newton exposes the two loop-closing joints (left/right_inner_finger_joint) as DOFs and orders
+    # the gripper joints differently; keep the policy's joint_pos identical to the PhysX layout.
+    from ...mdp.events import DATASET_ROBOT_JOINT_NAMES
+
+    # Drive the passive linkage joints (soft mimic equalities splay the pads under load; hand-off §15l).
+    if os.environ.get("UWLAB_NEWTON_MIMIC_DRIVE", "1") == "1":
+        from ...mdp.actions.actions_cfg import BinaryJointPositionMimicActionCfg
+
+        g = self.actions.gripper
+        self.actions.gripper = BinaryJointPositionMimicActionCfg(
+            asset_name=g.asset_name, joint_names=list(g.joint_names),
+            open_command_expr=dict(g.open_command_expr), close_command_expr=dict(g.close_command_expr),
+            mimic={
+                "right_outer_knuckle_joint": 1.0, "right_inner_knuckle_joint": -1.0, "left_inner_knuckle_joint": 1.0,
+                "right_inner_finger_knuckle_joint": 1.0, "left_inner_finger_knuckle_joint": 1.0,
+            },
+        )
+        self.scene.robot.actuators["gripper"] = self.scene.robot.actuators["gripper"].replace(
+            joint_names_expr=[
+                "finger_joint", "right_outer_knuckle_joint", "right_inner_knuckle_joint", "left_inner_knuckle_joint",
+                "right_inner_finger_knuckle_joint", "left_inner_finger_knuckle_joint",
+            ]
+        )
+    # A blown-up world is terminated by abnormal_robot, but that step's rewards come from the non-finite
+    # state; swap the state-based terms for their NaN-safe module-level variants (hydra re-resolves cfg
+    # callables by module:qualname, so wrapping in place would be silently undone).
+    _safe = {
+        task_mdp.ProgressContext: task_mdp.ProgressContextNanSafe,
+        task_mdp.ee_asset_distance_tanh: task_mdp.ee_asset_distance_tanh_nan_safe,
+        task_mdp.dense_success_reward: task_mdp.dense_success_reward_nan_safe,
+        task_mdp.joint_vel_l2_clamped: task_mdp.joint_vel_l2_clamped_nan_safe,
+    }
+    for _name in [f.name for f in dataclasses.fields(self.rewards)]:
+        _term = getattr(self.rewards, _name, None)
+        if _term is not None and getattr(_term, "func", None) in _safe:
+            _term.func = _safe[_term.func]
+    # Reset worlds whose solver stopped converging (jammed after a blow-up); see hand-off §15j.
+    if os.environ.get("UWLAB_NEWTON_STUCK_TERM", "1") == "1":
+        self.terminations.newton_solver_stuck = DoneTerm(func=task_mdp.newton_solver_stuck)
+    self.observations.policy.joint_pos.func = task_mdp.joint_pos_signed
+    self.observations.policy.joint_pos.params = {
+        "asset_cfg": SceneEntityCfg("robot", joint_names=list(DATASET_ROBOT_JOINT_NAMES), preserve_order=True),
+        # swapped_ifk asset: these two joints read with the opposite sign from the PhysX asset
+        "negate_joints": ("left_inner_finger_knuckle_joint", "right_inner_finger_knuckle_joint"),
+    }
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCEvalNewtonCfg(Ur5eRobotiq2f85RelCartesianOSCEvalCfg):
+    """Eval config on the Newton backend (critic dropped: eval only)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_newton_overrides(self, keep_critic=False)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCTrainNewtonCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
+    """Stage-1 training config on the Newton backend (same recipe as the PhysX train cfg)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_newton_overrides(self, keep_critic=True)

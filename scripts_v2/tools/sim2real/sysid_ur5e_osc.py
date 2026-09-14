@@ -234,8 +234,8 @@ def main():
     sim_dt = env_cfg.sim.dt
     action_dim = unwrapped.action_manager.total_action_dim  # 7 (arm 6 + gripper 1)
 
-    default_joint_pos = robot.data.default_joint_pos.clone()
-    default_joint_vel = robot.data.default_joint_vel.clone()
+    default_joint_pos = robot.data.default_joint_pos.torch.clone()
+    default_joint_vel = robot.data.default_joint_vel.torch.clone()
     default_joint_pos[:, arm_joint_ids] = initial_joint_pos_dev.unsqueeze(0).expand(N, -1)
     default_joint_vel[:] = 0.0
 
@@ -278,7 +278,7 @@ def main():
             ee_pos_w = robot.data.body_pos_w[:, ee_frame_idx]
             ee_quat_w = robot.data.body_quat_w[:, ee_frame_idx]
             ee_pos_b, ee_quat_b = subtract_frame_transforms(
-                robot.data.root_pos_w, robot.data.root_quat_w, ee_pos_w, ee_quat_w
+                robot.data.root_pos_w.torch, robot.data.root_quat_w.torch, ee_pos_w, ee_quat_w
             )
             target_pos = wp_target_pos[wp_idx].unsqueeze(0).expand(N, -1)
             target_quat = wp_target_quat[wp_idx].unsqueeze(0).expand(N, -1)

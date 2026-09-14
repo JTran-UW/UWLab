@@ -57,15 +57,24 @@ class OffPolicyAlgorithmCfg:
     """The configuration for the offline behavior cloning(dagger)."""
 
 
-@configclass
-class RslRlFancyActorCriticCfg(RslRlPpoActorCriticCfg):
-    """Configuration for the fancy actor-critic networks."""
-
-    state_dependent_std: bool = False
-    """Whether to use state-dependent standard deviation."""
-
-    noise_std_type: Literal["scalar", "log", "gsde"] = "scalar"
-    """The type of noise standard deviation for the policy. Default is scalar."""
+# Kept as an alias rather than a subclass, deliberately.
+#
+# This used to subclass RslRlPpoActorCriticCfg to add `state_dependent_std` and to
+# widen `noise_std_type` with "gsde". As of Isaac Lab 3.0 the base class defines
+# both fields itself, so the subclass added nothing but the wider Literal -- and
+# that Literal is only a type hint, so "gsde" still passes through at runtime
+# (the UW-Lab rsl_rl fork implements it in rsl_rl/modules/distribution.py).
+#
+# Subclassing actively breaks things now: isaaclab_rl's backward-compatibility
+# shim that converts a deprecated `policy` config into rsl-rl >= 4.0 `actor` /
+# `critic` model configs dispatches on `type(cfg.policy) is RslRlPpoActorCriticCfg`
+# -- an exact type check, not isinstance. A subclass silently falls through every
+# branch, leaving `actor` MISSING, which surfaces much later and far away as
+# `KeyError: 'class_name'` inside PPO.construct_algorithm.
+#
+# See isaaclab_rl/rsl_rl/utils.py.
+RslRlFancyActorCriticCfg = RslRlPpoActorCriticCfg
+"""Alias of :class:`RslRlPpoActorCriticCfg`; see the note above."""
 
 
 @configclass

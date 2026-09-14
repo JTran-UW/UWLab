@@ -5,15 +5,22 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation
+from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
 from isaaclab.managers.action_manager import ActionTerm
 
 from uwlab_assets.robots.ur5e_robotiq_gripper.kinematics import compute_jacobian_analytical
+try:
+    from uwlab_assets.robots.ur5e_robotiq_gripper.kinematics import compute_fk_analytical
+except ImportError:
+    compute_fk_analytical = None
 
 from . import actions_cfg
 
@@ -81,6 +88,19 @@ class RelCartesianOSCAction(ActionTerm):
         else:
             self._input_clip = None
 
+        # Joint-velocity clamp emulation. PhysX enforces ``velocity_limit_sim`` inside its solver, which is what
+        # keeps the explicit task-space D-term stable on the low-inertia wrist joints. Newton/MuJoCo has no such
+        # clamp, so the torque is limited such that the predicted post-step velocity (diagonal mass-matrix
+        # approximation) stays within the limit. Auto-enabled on Newton; override with UWLAB_OSC_VEL_CLAMP=0/1.
+        env_flag = os.environ.get("UWLAB_OSC_VEL_CLAMP")
+        is_newton = type(getattr(env.sim.cfg, "physics", None)).__name__.startswith("Newton")
+        self._vel_clamp = bool(int(env_flag)) if env_flag is not None else is_newton
+        if self._vel_clamp:
+            self._vel_max = self._asset.data.joint_vel_limits.torch[:, self._joint_ids].clone()
+            self._physics_dt = float(env.physics_dt)
+            self._vel_clamp_diag_ids = torch.arange(self._num_dof, device=self.device) if self._joint_ids == slice(None) else torch.as_tensor(self._joint_ids, device=self.device)
+            print(f"[RelCartesianOSC] joint-velocity clamp emulation ON (vmax={[round(v,2) for v in self._vel_max[0].tolist()]}, dt={self._physics_dt})")
+
         # Buffers
         self._raw_actions = torch.zeros(self.num_envs, 6, device=self.device)
         self._processed_actions = torch.zeros(self.num_envs, 6, device=self.device)
@@ -132,7 +152,12 @@ class RelCartesianOSCAction(ActionTerm):
         axis = delta_rot / safe_angle
         axis = torch.where(angle > 1e-6, axis, torch.zeros_like(axis))
         half = angle / 2.0
-        delta_quat = torch.cat([torch.cos(half), axis * torch.sin(half)], dim=-1)
+        # Built as (x, y, z, w) -- vector part first, scalar last. Isaac Lab 3.0
+        # switched the quaternion convention from 2.x's (w, x, y, z), and both
+        # `ee_quat_b` (from sim data) and `quat_mul` below now use (x, y, z, w).
+        # Ordering this the old way silently composes the wrong rotation rather
+        # than raising, so keep the scalar term last.
+        delta_quat = torch.cat([axis * torch.sin(half), torch.cos(half)], dim=-1)
         self._ee_quat_des[:] = math_utils.quat_mul(delta_quat, ee_quat_b)
 
     def apply_actions(self):
@@ -142,8 +167,8 @@ class RelCartesianOSCAction(ActionTerm):
         """
         # Current state
         ee_pos_b, ee_quat_b = self._get_ee_pose_root_frame()
-        joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
-        joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
+        joint_pos = self._asset.data.joint_pos.torch[:, self._joint_ids]
+        joint_vel = self._asset.data.joint_vel.torch[:, self._joint_ids]
 
         # Analytical Jacobian (base_link frame, matching EE pose frame)
         jacobian = compute_jacobian_analytical(joint_pos, device=str(self.device))
@@ -162,8 +187,20 @@ class RelCartesianOSCAction(ActionTerm):
         task_force = self._kp * pose_error + self._kd * vel_error
         joint_torques = torch.bmm(jacobian.transpose(-1, -2), task_force.unsqueeze(-1)).squeeze(-1)
         joint_torques = torch.clamp(joint_torques, -self._torque_max, self._torque_max)
+        if self._vel_clamp:
+            joint_torques = self._apply_velocity_clamp(joint_torques, joint_vel)
 
         self._asset.set_joint_effort_target(joint_torques, joint_ids=self._joint_ids)
+
+    def _apply_velocity_clamp(self, tau: torch.Tensor, joint_vel: torch.Tensor) -> torch.Tensor:
+        """Limit torques so ``qd + dt * tau / M_jj`` stays within the joint velocity limits (brakes if over)."""
+        M = self._asset.data.mass_matrix.torch
+        ids = self._vel_clamp_diag_ids
+        m_diag = M[:, ids, ids].clamp_min(1e-6)
+        k = m_diag / self._physics_dt
+        tau_lo = (-self._vel_max - joint_vel) * k
+        tau_hi = (self._vel_max - joint_vel) * k
+        return torch.minimum(torch.maximum(tau, tau_lo), tau_hi)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         """Reset targets to current EE pose to avoid transients."""
@@ -180,12 +217,41 @@ class RelCartesianOSCAction(ActionTerm):
 
     def _get_ee_pose_root_frame(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Get EE pose in root (base_link) frame from sim state."""
-        ee_pos_w = self._asset.data.body_pos_w[:, self._ee_body_idx]
-        ee_quat_w = self._asset.data.body_quat_w[:, self._ee_body_idx]
+        # `.torch`: Isaac Lab 3.0 returns ProxyArray here and the math utils below
+        # are torch.jit.script'd, so they reject anything but a real Tensor.
+        # Quaternions stay (x, y, z, w) on both sides -- no reordering.
+        ee_pos_w = self._asset.data.body_pos_w.torch[:, self._ee_body_idx]
+        ee_quat_w = self._asset.data.body_quat_w.torch[:, self._ee_body_idx]
+        # Use the base_link BODY pose, not the articulation root pose: on the Newton backend
+        # `root_*_w` is the articulation prim transform (identity here) while base_link is yawed
+        # 180 deg, which flips the Cartesian error relative to the base-frame Jacobian. PhysX
+        # reports both the same, so this is a no-op there.
         ee_pos_b, ee_quat_b = math_utils.subtract_frame_transforms(
-            self._asset.data.root_pos_w,
-            self._asset.data.root_quat_w,
+            self._asset.data.body_link_pos_w.torch[:, 0],
+            self._asset.data.body_link_quat_w.torch[:, 0],
             ee_pos_w,
             ee_quat_w,
         )
         return ee_pos_b, ee_quat_b
+
+
+
+class BinaryJointPositionMimicAction(BinaryJointPositionAction):
+    """Binary gripper action that also drives the passive linkage joints to ``gear * target``.
+
+    Newton models the Robotiq four-bar as a tree with soft mimic equalities; under grasp load they
+    yield several degrees, splaying the pads so the peg pivots in the grasp (hand-off §15l). Driving
+    the followers with the same PD gains as ``finger_joint`` holds the pad orientation the way
+    PhysX's rigid loop closure does.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        names = list(self._asset.joint_names)
+        self._mimic_ids = torch.tensor([names.index(n) for n in cfg.mimic], device=self.device, dtype=torch.long)
+        self._mimic_gear = torch.tensor([cfg.mimic[n] for n in cfg.mimic], device=self.device, dtype=torch.float32)
+
+    def apply_actions(self):
+        super().apply_actions()
+        target = self._processed_actions[:, :1] * self._mimic_gear.unsqueeze(0)
+        self._asset.set_joint_position_target_index(target=target, joint_ids=self._mimic_ids)
