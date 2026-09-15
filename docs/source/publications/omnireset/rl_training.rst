@@ -44,23 +44,23 @@ Reproduce our training results from scratch.
              --task OmniReset-UR5eRobotiq2f85-ObjectRestingEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=fbleg env.scene.receptive_object=fbtabletop \
-             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Anywhere, End-Effector Grasped (Grasped)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=fbleg env.scene.receptive_object=fbtabletop \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Partially Assembled, End-Effector Grasped (Near Goal)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectPartiallyAssembledEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=fbleg env.scene.receptive_object=fbtabletop \
-             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Step 3.5: Visualize Reset States (Optional)**
 
@@ -74,7 +74,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    env.scene.insertive_object=fbleg env.scene.receptive_object=fbtabletop
 
          .. tab-item:: Reaching
@@ -83,7 +83,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEAnywhere \
                    env.scene.insertive_object=fbleg env.scene.receptive_object=fbtabletop
 
@@ -93,7 +93,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectRestingEEGrasped \
                    env.scene.insertive_object=fbleg env.scene.receptive_object=fbtabletop
 
@@ -103,7 +103,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEGrasped \
                    env.scene.insertive_object=fbleg env.scene.receptive_object=fbtabletop
 
@@ -113,7 +113,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectPartiallyAssembledEEGrasped \
                    env.scene.insertive_object=fbleg env.scene.receptive_object=fbtabletop
 
@@ -150,7 +150,7 @@ Reproduce our training results from scratch.
              --distributed \
              env.scene.insertive_object=fbleg \
              env.scene.receptive_object=fbtabletop \
-             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Training Curves**
 
@@ -199,23 +199,23 @@ Reproduce our training results from scratch.
              --task OmniReset-UR5eRobotiq2f85-ObjectRestingEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=fbdrawerbottom env.scene.receptive_object=fbdrawerbox \
-             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Anywhere, End-Effector Grasped (Grasped)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=fbdrawerbottom env.scene.receptive_object=fbdrawerbox \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Partially Assembled, End-Effector Grasped (Near Goal)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectPartiallyAssembledEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=fbdrawerbottom env.scene.receptive_object=fbdrawerbox \
-             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Step 3.5: Visualize Reset States (Optional)**
 
@@ -229,7 +229,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    env.scene.insertive_object=fbdrawerbottom env.scene.receptive_object=fbdrawerbox
 
          .. tab-item:: Reaching
@@ -238,7 +238,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEAnywhere \
                    env.scene.insertive_object=fbdrawerbottom env.scene.receptive_object=fbdrawerbox
 
@@ -248,7 +248,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectRestingEEGrasped \
                    env.scene.insertive_object=fbdrawerbottom env.scene.receptive_object=fbdrawerbox
 
@@ -258,7 +258,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEGrasped \
                    env.scene.insertive_object=fbdrawerbottom env.scene.receptive_object=fbdrawerbox
 
@@ -268,7 +268,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectPartiallyAssembledEEGrasped \
                    env.scene.insertive_object=fbdrawerbottom env.scene.receptive_object=fbdrawerbox
 
@@ -305,7 +305,7 @@ Reproduce our training results from scratch.
              --distributed \
              env.scene.insertive_object=fbdrawerbottom \
              env.scene.receptive_object=fbdrawerbox \
-             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Training Curves**
 
@@ -354,23 +354,23 @@ Reproduce our training results from scratch.
              --task OmniReset-UR5eRobotiq2f85-ObjectRestingEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=peg env.scene.receptive_object=peghole \
-             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Anywhere, End-Effector Grasped (Grasped)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=peg env.scene.receptive_object=peghole \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Partially Assembled, End-Effector Grasped (Near Goal)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectPartiallyAssembledEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=peg env.scene.receptive_object=peghole \
-             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Step 3.5: Visualize Reset States (Optional)**
 
@@ -384,7 +384,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    env.scene.insertive_object=peg env.scene.receptive_object=peghole
 
          .. tab-item:: Reaching
@@ -393,7 +393,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEAnywhere \
                    env.scene.insertive_object=peg env.scene.receptive_object=peghole
 
@@ -403,7 +403,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectRestingEEGrasped \
                    env.scene.insertive_object=peg env.scene.receptive_object=peghole
 
@@ -413,7 +413,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEGrasped \
                    env.scene.insertive_object=peg env.scene.receptive_object=peghole
 
@@ -423,7 +423,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectPartiallyAssembledEEGrasped \
                    env.scene.insertive_object=peg env.scene.receptive_object=peghole
 
@@ -460,7 +460,7 @@ Reproduce our training results from scratch.
              --distributed \
              env.scene.insertive_object=peg \
              env.scene.receptive_object=peghole \
-             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Training Curves**
 
@@ -509,23 +509,23 @@ Reproduce our training results from scratch.
              --task OmniReset-UR5eRobotiq2f85-ObjectRestingEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=rectangle env.scene.receptive_object=wall \
-             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Anywhere, End-Effector Grasped (Grasped)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=rectangle env.scene.receptive_object=wall \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Partially Assembled, End-Effector Grasped (Near Goal)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectPartiallyAssembledEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=rectangle env.scene.receptive_object=wall \
-             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Step 3.5: Visualize Reset States (Optional)**
 
@@ -539,7 +539,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    env.scene.insertive_object=rectangle env.scene.receptive_object=wall
 
          .. tab-item:: Reaching
@@ -548,7 +548,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEAnywhere \
                    env.scene.insertive_object=rectangle env.scene.receptive_object=wall
 
@@ -558,7 +558,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectRestingEEGrasped \
                    env.scene.insertive_object=rectangle env.scene.receptive_object=wall
 
@@ -568,7 +568,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEGrasped \
                    env.scene.insertive_object=rectangle env.scene.receptive_object=wall
 
@@ -578,7 +578,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectPartiallyAssembledEEGrasped \
                    env.scene.insertive_object=rectangle env.scene.receptive_object=wall
 
@@ -615,7 +615,7 @@ Reproduce our training results from scratch.
              --distributed \
              env.scene.insertive_object=rectangle \
              env.scene.receptive_object=wall \
-             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       .. warning::
 
@@ -668,23 +668,23 @@ Reproduce our training results from scratch.
              --task OmniReset-UR5eRobotiq2f85-ObjectRestingEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=cube env.scene.receptive_object=cube \
-             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Anywhere, End-Effector Grasped (Grasped)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=cube env.scene.receptive_object=cube \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Partially Assembled, End-Effector Grasped (Near Goal)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectPartiallyAssembledEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=cube env.scene.receptive_object=cube \
-             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Step 3.5: Visualize Reset States (Optional)**
 
@@ -698,7 +698,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    env.scene.insertive_object=cube env.scene.receptive_object=cube
 
          .. tab-item:: Reaching
@@ -707,7 +707,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEAnywhere \
                    env.scene.insertive_object=cube env.scene.receptive_object=cube
 
@@ -717,7 +717,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectRestingEEGrasped \
                    env.scene.insertive_object=cube env.scene.receptive_object=cube
 
@@ -727,7 +727,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEGrasped \
                    env.scene.insertive_object=cube env.scene.receptive_object=cube
 
@@ -737,7 +737,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectPartiallyAssembledEEGrasped \
                    env.scene.insertive_object=cube env.scene.receptive_object=cube
 
@@ -774,7 +774,7 @@ Reproduce our training results from scratch.
              --distributed \
              env.scene.insertive_object=cube \
              env.scene.receptive_object=cube \
-             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Training Curves**
 
@@ -823,23 +823,23 @@ Reproduce our training results from scratch.
              --task OmniReset-UR5eRobotiq2f85-ObjectRestingEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=cupcake env.scene.receptive_object=plate \
-             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Anywhere, End-Effector Grasped (Grasped)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectAnywhereEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=cupcake env.scene.receptive_object=plate \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
          # Object Partially Assembled, End-Effector Grasped (Near Goal)
          python scripts_v2/tools/record_reset_states.py \
              --task OmniReset-UR5eRobotiq2f85-ObjectPartiallyAssembledEEGrasped-v0 \
              --num_envs 4096 --num_reset_states 10000 --headless \
              env.scene.insertive_object=cupcake env.scene.receptive_object=plate \
-             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset \
-             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_insertive_object_pose_from_partial_assembly_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3 \
+             env.events.reset_end_effector_pose_from_grasp_dataset.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Step 3.5: Visualize Reset States (Optional)**
 
@@ -853,7 +853,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    env.scene.insertive_object=cupcake env.scene.receptive_object=plate
 
          .. tab-item:: Reaching
@@ -862,7 +862,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEAnywhere \
                    env.scene.insertive_object=cupcake env.scene.receptive_object=plate
 
@@ -872,7 +872,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectRestingEEGrasped \
                    env.scene.insertive_object=cupcake env.scene.receptive_object=plate
 
@@ -882,7 +882,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectAnywhereEEGrasped \
                    env.scene.insertive_object=cupcake env.scene.receptive_object=plate
 
@@ -892,7 +892,7 @@ Reproduce our training results from scratch.
 
                python scripts_v2/tools/visualize_reset_states.py \
                    --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Play-v0 \
-                   --num_envs 4 --dataset_dir ./Datasets/OmniReset \
+                   --num_envs 4 --dataset_dir ./Datasets/OmniReset_isaaclab3 \
                    --reset_type ObjectPartiallyAssembledEEGrasped \
                    env.scene.insertive_object=cupcake env.scene.receptive_object=plate
 
@@ -929,7 +929,7 @@ Reproduce our training results from scratch.
              --distributed \
              env.scene.insertive_object=cupcake \
              env.scene.receptive_object=plate \
-             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset
+             env.events.reset_from_reset_states.params.dataset_dir=./Datasets/OmniReset_isaaclab3
 
       **Training Curves**
 

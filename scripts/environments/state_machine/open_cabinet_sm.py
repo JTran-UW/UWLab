@@ -11,7 +11,7 @@ It uses the `warp` library to run the state machine in parallel on the GPU.
 
 .. code-block:: bash
 
-    ./isaaclab.sh -p scripts/environments/state_machine/open_cabinet_sm.py --num_envs 32
+    ./isaaclab.sh -p scripts/environments/state_machine/open_cabinet_sm.py --num_envs 32 --viz kit
 
 """
 
@@ -33,21 +33,20 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 # launch omniverse app
-app_launcher = AppLauncher(headless=args_cli.headless)
+app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 """Rest everything else."""
 
-import gymnasium as gym
-import torch
 from collections.abc import Sequence
 
+import gymnasium as gym
+import torch
 import warp as wp
 
 from isaaclab.sensors import FrameTransformer
 
 import isaaclab_tasks  # noqa: F401
-import uwlab_tasks  # noqa: F401
 from isaaclab_tasks.manager_based.manipulation.cabinet.cabinet_env_cfg import CabinetEnvCfg
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -242,9 +241,6 @@ class OpenDrawerSm:
 
     def compute(self, ee_pose: torch.Tensor, handle_pose: torch.Tensor):
         """Compute the desired state of the robot's end-effector and the gripper."""
-        # convert all transformations from (w, x, y, z) to (x, y, z, w)
-        ee_pose = ee_pose[:, [0, 1, 2, 4, 5, 6, 3]]
-        handle_pose = handle_pose[:, [0, 1, 2, 4, 5, 6, 3]]
         # convert to warp
         ee_pose_wp = wp.from_torch(ee_pose.contiguous(), wp.transform)
         handle_pose_wp = wp.from_torch(handle_pose.contiguous(), wp.transform)
@@ -269,10 +265,8 @@ class OpenDrawerSm:
             device=self.device,
         )
 
-        # convert transformations back to (w, x, y, z)
-        des_ee_pose = self.des_ee_pose[:, [0, 1, 2, 6, 3, 4, 5]]
         # convert to torch
-        return torch.cat([des_ee_pose, self.des_gripper_state.unsqueeze(-1)], dim=-1)
+        return torch.cat([self.des_ee_pose, self.des_gripper_state.unsqueeze(-1)], dim=-1)
 
 
 def main():
@@ -306,12 +300,14 @@ def main():
             # observations
             # -- end-effector frame
             ee_frame_tf: FrameTransformer = env.unwrapped.scene["ee_frame"]
-            tcp_rest_position = ee_frame_tf.data.target_pos_w[..., 0, :].clone() - env.unwrapped.scene.env_origins
-            tcp_rest_orientation = ee_frame_tf.data.target_quat_w[..., 0, :].clone()
+            tcp_rest_position = ee_frame_tf.data.target_pos_w.torch[..., 0, :].clone() - env.unwrapped.scene.env_origins
+            tcp_rest_orientation = ee_frame_tf.data.target_quat_w.torch[..., 0, :].clone()
             # -- handle frame
             cabinet_frame_tf: FrameTransformer = env.unwrapped.scene["cabinet_frame"]
-            cabinet_position = cabinet_frame_tf.data.target_pos_w[..., 0, :].clone() - env.unwrapped.scene.env_origins
-            cabinet_orientation = cabinet_frame_tf.data.target_quat_w[..., 0, :].clone()
+            cabinet_position = (
+                cabinet_frame_tf.data.target_pos_w.torch[..., 0, :].clone() - env.unwrapped.scene.env_origins
+            )
+            cabinet_orientation = cabinet_frame_tf.data.target_quat_w.torch[..., 0, :].clone()
 
             # advance state machine
             actions = open_sm.compute(

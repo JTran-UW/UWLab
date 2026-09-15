@@ -27,8 +27,7 @@ instead of *./uwlab.sh -p* or *uwlab.bat -p*.
 
    The Python version of the virtual environment must match the Python version of Isaac Sim.
 
-   - For Isaac Sim 5.X, the required Python version is 3.11.
-   - For Isaac Sim 4.X, the required Python version is 3.10.
+   - For Isaac Sim 6.X, the required Python version is 3.12.
 
    Using a different Python version will result in errors when running UW Lab.
 

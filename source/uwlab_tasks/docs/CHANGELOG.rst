@@ -1,6 +1,17 @@
 Changelog
 ---------
 
+0.14.0 (2026-09-16)
+~~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Ported to Isaac Lab 3.0: ``sim.physics = PhysxCfg(...)`` replaces ``sim.physx``, scalar-last
+  quaternions in task and asset configs, warp-backed data accessors, ``JointWrenchSensor`` for
+  wrist wrenches, and Isaac Lab 3.0 convention-stamped OmniReset datasets.
+
+
 0.13.8 (2025-10-24)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

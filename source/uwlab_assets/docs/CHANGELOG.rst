@@ -1,6 +1,16 @@
 Changelog
 ---------
 
+0.6.0 (2026-09-16)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Ported to Isaac Lab 3.0: asset quaternions are scalar-last ``(x, y, z, w)``; cloud assets
+  are pinned to the ``isaaclab3`` revision of ``UW-Lab/uwlab-assets``.
+
+
 0.5.2 (2025-03-23)
 ~~~~~~~~~~~~~~~~~~
 

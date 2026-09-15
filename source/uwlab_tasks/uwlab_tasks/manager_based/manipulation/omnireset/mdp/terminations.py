@@ -8,7 +8,7 @@
 import numpy as np
 import torch
 
-import isaacsim.core.utils.bounds as bounds_utils
+import isaacsim.core.experimental.utils.bounds as bounds_utils
 from isaaclab.assets import Articulation, RigidObject, RigidObjectCollection
 from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg, TerminationTermCfg
@@ -135,11 +135,11 @@ class check_grasp_success(ManagerTermBase):
 
         object_asset = self._env.scene[self.object_cfg.name]
         if not hasattr(object_asset, "initial_pos"):
-            object_asset.initial_pos = object_asset.data.root_pos_w.clone()
-            object_asset.initial_quat = object_asset.data.root_quat_w.clone()
+            object_asset.initial_pos = object_asset.data.root_pos_w.torch.clone()
+            object_asset.initial_quat = object_asset.data.root_quat_w.torch.clone()
         else:
-            object_asset.initial_pos[env_ids] = object_asset.data.root_pos_w[env_ids].clone()
-            object_asset.initial_quat[env_ids] = object_asset.data.root_quat_w[env_ids].clone()
+            object_asset.initial_pos[env_ids] = object_asset.data.root_pos_w.torch[env_ids].clone()
+            object_asset.initial_quat[env_ids] = object_asset.data.root_quat_w.torch[env_ids].clone()
 
         if env_ids is None:
             self.stability_counter.zero_()
@@ -164,18 +164,18 @@ class check_grasp_success(ManagerTermBase):
         time_out = env.episode_length_buf >= env.max_episode_length
 
         # Check for abnormal gripper state (excessive joint velocities)
-        abnormal_gripper_state = (gripper_asset.data.joint_vel.abs() > (gripper_asset.data.joint_vel_limits * 2)).any(
-            dim=1
-        )
+        abnormal_gripper_state = (
+            gripper_asset.data.joint_vel.torch.abs() > (gripper_asset.data.joint_vel_limits.torch * 2)
+        ).any(dim=1)
 
         # Check if asset velocities are small
         current_step_stable = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
         # Check gripper (articulation) velocities
-        current_step_stable &= gripper_asset.data.joint_vel.abs().sum(dim=1) < 5.0
+        current_step_stable &= gripper_asset.data.joint_vel.torch.abs().sum(dim=1) < 5.0
         # Check object (rigid object) velocities
         if isinstance(object_asset, RigidObject):
-            current_step_stable &= object_asset.data.body_lin_vel_w.abs().sum(dim=2).sum(dim=1) < 0.05
-            current_step_stable &= object_asset.data.body_ang_vel_w.abs().sum(dim=2).sum(dim=1) < 1.0
+            current_step_stable &= object_asset.data.body_lin_vel_w.torch.abs().sum(dim=2).sum(dim=1) < 0.05
+            current_step_stable &= object_asset.data.body_ang_vel_w.torch.abs().sum(dim=2).sum(dim=1) < 1.0
         elif isinstance(object_asset, RigidObjectCollection):
             current_step_stable &= object_asset.data.object_lin_vel_w.abs().sum(dim=2).sum(dim=1) < 0.05
             current_step_stable &= object_asset.data.object_ang_vel_w.abs().sum(dim=2).sum(dim=1) < 1.0
@@ -189,17 +189,17 @@ class check_grasp_success(ManagerTermBase):
         stability_reached = self.stability_counter >= self.consecutive_stability_steps
 
         # Skip if position or quaternion is NaN
-        pos_is_nan = torch.isnan(object_asset.data.root_pos_w).any(dim=1)
-        quat_is_nan = torch.isnan(object_asset.data.root_quat_w).any(dim=1)
+        pos_is_nan = torch.isnan(object_asset.data.root_pos_w.torch).any(dim=1)
+        quat_is_nan = torch.isnan(object_asset.data.root_quat_w.torch).any(dim=1)
         skip_check = pos_is_nan | quat_is_nan
 
         # Object has excessive pose deviation if position exceeds thresholds
-        pos_deviation = (object_asset.data.root_pos_w - object_asset.initial_pos).norm(dim=1)
+        pos_deviation = (object_asset.data.root_pos_w.torch - object_asset.initial_pos).norm(dim=1)
         valid_pos_deviation = torch.where(~skip_check, pos_deviation, torch.zeros_like(pos_deviation))
         excessive_pose_deviation = valid_pos_deviation > self.max_pos_deviation
 
         # Object is above ground if position is greater than z threshold
-        pos_above_ground = object_asset.data.root_pos_w[:, 2] >= self.pos_z_threshold
+        pos_above_ground = object_asset.data.root_pos_w.torch[:, 2] >= self.pos_z_threshold
 
         # Check for collisions between gripper and object
         all_env_ids = torch.arange(env.num_envs, device=env.device)
@@ -285,9 +285,9 @@ class check_reset_state_success(ManagerTermBase):
 
         for asset in self.assets_to_check:
             if asset is self.robot_asset:
-                asset_pos = asset.data.body_link_pos_w[:, self.ee_body_idx].clone()
+                asset_pos = asset.data.body_link_pos_w.torch[:, self.ee_body_idx].clone()
             else:
-                asset_pos = asset.data.root_pos_w.clone()
+                asset_pos = asset.data.root_pos_w.torch.clone()
             if not hasattr(asset, "initial_pos") or env_ids is None:
                 asset.initial_pos = asset_pos
             else:
@@ -335,11 +335,11 @@ class check_reset_state_success(ManagerTermBase):
 
         # Check for abnormal gripper state (excessive joint velocities)
         abnormal_gripper_state = (
-            self.robot_asset.data.joint_vel.abs() > (self.robot_asset.data.joint_vel_limits * 2)
+            self.robot_asset.data.joint_vel.torch.abs() > (self.robot_asset.data.joint_vel_limits.torch * 2)
         ).any(dim=1)
 
         # Check if gripper orientation is pointing downward within 60 degrees of vertical
-        ee_quat = self.robot_asset.data.body_link_quat_w[:, self.ee_body_idx]
+        ee_quat = self.robot_asset.data.body_link_quat_w.torch[:, self.ee_body_idx]
         gripper_approach_local = torch.tensor(
             self.gripper_approach_direction, device=env.device, dtype=torch.float32
         ).expand(env.num_envs, -1)
@@ -352,10 +352,10 @@ class check_reset_state_success(ManagerTermBase):
         current_step_stable = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
         for asset in self.assets_to_check:
             if isinstance(asset, Articulation):
-                current_step_stable &= asset.data.joint_vel.abs().sum(dim=1) < 5.0
+                current_step_stable &= asset.data.joint_vel.torch.abs().sum(dim=1) < 5.0
             elif isinstance(asset, RigidObject):
-                current_step_stable &= asset.data.body_lin_vel_w.abs().sum(dim=2).sum(dim=1) < 0.1
-                current_step_stable &= asset.data.body_ang_vel_w.abs().sum(dim=2).sum(dim=1) < 1.0
+                current_step_stable &= asset.data.body_lin_vel_w.torch.abs().sum(dim=2).sum(dim=1) < 0.1
+                current_step_stable &= asset.data.body_ang_vel_w.torch.abs().sum(dim=2).sum(dim=1) < 1.0
             elif isinstance(asset, RigidObjectCollection):
                 current_step_stable &= asset.data.object_lin_vel_w.abs().sum(dim=2).sum(dim=1) < 0.1
                 current_step_stable &= asset.data.object_ang_vel_w.abs().sum(dim=2).sum(dim=1) < 1.0
@@ -373,13 +373,13 @@ class check_reset_state_success(ManagerTermBase):
         pos_below_threshold = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
         for asset in self.assets_to_check:
             if asset is self.robot_asset:
-                asset_pos = asset.data.body_link_pos_w[:, self.ee_body_idx].clone()
+                asset_pos = asset.data.body_link_pos_w.torch[:, self.ee_body_idx].clone()
             else:
-                asset_pos = asset.data.root_pos_w.clone()
+                asset_pos = asset.data.root_pos_w.torch.clone()
 
             # Skip if position or quaternion is NaN
-            pos_is_nan = torch.isnan(asset.data.root_pos_w).any(dim=1)
-            quat_is_nan = torch.isnan(asset.data.root_quat_w).any(dim=1)
+            pos_is_nan = torch.isnan(asset.data.root_pos_w.torch).any(dim=1)
+            quat_is_nan = torch.isnan(asset.data.root_quat_w.torch).any(dim=1)
             skip_check = pos_is_nan | quat_is_nan
 
             # Asset has excessive pose deviation if position exceeds thresholds
@@ -461,12 +461,12 @@ class check_obb_no_overlap_termination(ManagerTermBase):
 
         # Compute OBB in world frame using Isaac Sim's built-in functions
         insertive_centroid_world, insertive_axes_world, insertive_half_extents = bounds_utils.compute_obb(
-            self._bbox_cache, insertive_prim_path
+            insertive_prim_path, bbox_cache=self._bbox_cache
         )
 
         # Get current world pose of object (env 0) to convert OBB to body frame
-        insertive_pos_world = self.insertive_object.data.root_pos_w[0]  # (3,)
-        insertive_quat_world = self.insertive_object.data.root_quat_w[0]  # (4,)
+        insertive_pos_world = self.insertive_object.data.root_pos_w.torch[0]  # (3,)
+        insertive_quat_world = self.insertive_object.data.root_quat_w.torch[0]  # (4,)
 
         device = self._env.device
 
@@ -495,8 +495,8 @@ class check_obb_no_overlap_termination(ManagerTermBase):
         """Store initial pose of insertive object when environments are reset."""
         super().reset(env_ids)
 
-        insertive_pos = self.insertive_object.data.root_pos_w.clone()
-        insertive_quat = self.insertive_object.data.root_quat_w.clone()
+        insertive_pos = self.insertive_object.data.root_pos_w.torch.clone()
+        insertive_quat = self.insertive_object.data.root_quat_w.torch.clone()
 
         if self._insertive_initial_pos is None or self._insertive_initial_quat is None or env_ids is None:
             # First time initialization or reset all environments
@@ -547,8 +547,8 @@ class check_obb_no_overlap_termination(ManagerTermBase):
         draw_interface.clear_lines()
 
         # Get current world poses of insertive object for all environments
-        insertive_pos = self.insertive_object.data.root_pos_w  # (num_envs, 3)
-        insertive_quat = self.insertive_object.data.root_quat_w  # (num_envs, 4)
+        insertive_pos = self.insertive_object.data.root_pos_w.torch  # (num_envs, 3)
+        insertive_quat = self.insertive_object.data.root_quat_w.torch  # (num_envs, 4)
 
         # Transform current insertive object OBB centroid from body frame to world coordinates for all environments
         insertive_obb_centroid_body = self._insertive_obb_centroid
@@ -685,8 +685,8 @@ class check_obb_no_overlap_termination(ManagerTermBase):
         """Check if OBB overlap condition is violated between initial and current insertive object positions."""
 
         # Get current world poses of insertive object for all environments
-        insertive_pos = self.insertive_object.data.root_pos_w  # (num_envs, 3)
-        insertive_quat = self.insertive_object.data.root_quat_w  # (num_envs, 4)
+        insertive_pos = self.insertive_object.data.root_pos_w.torch  # (num_envs, 3)
+        insertive_quat = self.insertive_object.data.root_quat_w.torch  # (num_envs, 4)
 
         # Transform current insertive object centroid from body frame to world coordinates for all environments
         insertive_obb_centroid_body = self._insertive_obb_centroid

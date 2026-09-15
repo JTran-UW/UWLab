@@ -34,22 +34,21 @@ app_launcher = AppLauncher(headless=args_cli.headless)
 simulation_app = app_launcher.app
 
 # disable metrics assembler due to scene graph instancing
-from isaacsim.core.utils.extensions import disable_extension
+from isaacsim.core.experimental.utils.app import enable_extension
 
-disable_extension("omni.usd.metrics.assembler.ui")
+enable_extension("omni.usd.metrics.assembler.ui", enabled=False)
 
 """Rest everything else."""
 
-import gymnasium as gym
-import torch
 from collections.abc import Sequence
 
+import gymnasium as gym
+import torch
 import warp as wp
 
 from isaaclab.assets.rigid_object.rigid_object_data import RigidObjectData
 
 import isaaclab_tasks  # noqa: F401
-import uwlab_tasks  # noqa: F401
 from isaaclab_tasks.manager_based.manipulation.lift.lift_env_cfg import LiftEnvCfg
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -235,10 +234,6 @@ class PickAndLiftSm:
 
     def compute(self, ee_pose: torch.Tensor, object_pose: torch.Tensor, des_object_pose: torch.Tensor):
         """Compute the desired state of the robot's end-effector and the gripper."""
-        # convert all transformations from (w, x, y, z) to (x, y, z, w)
-        ee_pose = ee_pose[:, [0, 1, 2, 4, 5, 6, 3]]
-        object_pose = object_pose[:, [0, 1, 2, 4, 5, 6, 3]]
-        des_object_pose = des_object_pose[:, [0, 1, 2, 4, 5, 6, 3]]
 
         # convert to warp
         ee_pose_wp = wp.from_torch(ee_pose.contiguous(), wp.transform)
@@ -264,10 +259,8 @@ class PickAndLiftSm:
             device=self.device,
         )
 
-        # convert transformations back to (w, x, y, z)
-        des_ee_pose = self.des_ee_pose[:, [0, 1, 2, 6, 3, 4, 5]]
         # convert to torch
-        return torch.cat([des_ee_pose, self.des_gripper_state.unsqueeze(-1)], dim=-1)
+        return torch.cat([self.des_ee_pose, self.des_gripper_state.unsqueeze(-1)], dim=-1)
 
 
 def main():
@@ -310,11 +303,13 @@ def main():
             # observations
             # -- end-effector frame
             ee_frame_sensor = env.unwrapped.scene["ee_frame"]
-            tcp_rest_position = ee_frame_sensor.data.target_pos_w[..., 0, :].clone() - env.unwrapped.scene.env_origins
-            tcp_rest_orientation = ee_frame_sensor.data.target_quat_w[..., 0, :].clone()
+            tcp_rest_position = (
+                ee_frame_sensor.data.target_pos_w.torch[..., 0, :].clone() - env.unwrapped.scene.env_origins
+            )
+            tcp_rest_orientation = ee_frame_sensor.data.target_quat_w.torch[..., 0, :].clone()
             # -- object frame
             object_data: RigidObjectData = env.unwrapped.scene["object"].data
-            object_position = object_data.root_pos_w - env.unwrapped.scene.env_origins
+            object_position = object_data.root_pos_w.torch - env.unwrapped.scene.env_origins
             object_position += object_local_grasp_position
 
             # -- target object frame

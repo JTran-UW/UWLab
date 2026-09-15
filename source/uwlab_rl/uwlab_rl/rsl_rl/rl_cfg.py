@@ -4,10 +4,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from dataclasses import MISSING
-from typing import Literal
 
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg  # noqa: F401
+from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg  # noqa: F401
 
 
 @configclass
@@ -57,15 +56,12 @@ class OffPolicyAlgorithmCfg:
     """The configuration for the offline behavior cloning(dagger)."""
 
 
-@configclass
-class RslRlFancyActorCriticCfg(RslRlPpoActorCriticCfg):
-    """Configuration for the fancy actor-critic networks."""
-
-    state_dependent_std: bool = False
-    """Whether to use state-dependent standard deviation."""
-
-    noise_std_type: Literal["scalar", "log", "gsde"] = "scalar"
-    """The type of noise standard deviation for the policy. Default is scalar."""
+# Must stay an alias, not a subclass: isaaclab_rl's `policy` -> `actor`/`critic` shim
+# dispatches on `type(cfg.policy) is RslRlPpoActorCriticCfg`, so a subclass falls through
+# every branch and leaves `actor` MISSING (surfacing as `KeyError: 'class_name'` in
+# PPO.construct_algorithm). See isaaclab_rl/rsl_rl/utils.py.
+RslRlFancyActorCriticCfg = RslRlPpoActorCriticCfg
+"""Alias of :class:`RslRlPpoActorCriticCfg`; see the note above."""
 
 
 @configclass
@@ -77,3 +73,38 @@ class RslRlFancyPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
 
     offline_algorithm_cfg: OffPolicyAlgorithmCfg | None = None
     """The configuration for the offline algorithms."""
+
+
+@configclass
+class GsdeDistributionCfg(RslRlMLPModelCfg.DistributionCfg):
+    """Configuration for rsl_rl's ``GSDEGaussianDistribution`` (generalized state-dependent exploration).
+
+    A separate cfg class because ``GaussianDistributionCfg`` carries ``std_type``, which the gSDE
+    constructor does not accept (every field here is forwarded as a constructor kwarg).
+    """
+
+    class_name: str = "rsl_rl.modules.distribution:GSDEGaussianDistribution"
+
+    init_std: float = MISSING
+    """Initial standard deviation (fills every entry of the gSDE log-std matrix)."""
+
+    full_std: bool = True
+    """Learn a full ``(latent_dim, output_dim)`` log-std matrix instead of one row broadcast over the latent."""
+
+    learn_features: bool = False
+    """Let gSDE gradients flow into the policy backbone through the penultimate features."""
+
+    use_expln: bool = False
+    """Use the ``expln`` std parameterization instead of ``exp``."""
+
+
+@configclass
+class RslRlGsdePpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    """PPO configuration with rsl_rl's gSDE resampling knob."""
+
+    sde_sample_freq: int = -1
+    """Re-sample the per-env gSDE exploration matrices every this many env steps during a rollout.
+
+    ``-1`` keeps them fixed for the whole rollout (smooth, time-correlated noise). ``1`` draws fresh
+    noise every step, i.e. exploration independent across steps and environments.
+    """

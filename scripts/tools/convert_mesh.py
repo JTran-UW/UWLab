@@ -93,7 +93,7 @@ import contextlib
 import os
 
 import carb
-import isaacsim.core.utils.stage as stage_utils
+from isaaclab.sim.utils import open_stage
 import omni.kit.app
 
 from isaaclab.sim.converters import MeshConverter, MeshConverterCfg
@@ -187,7 +187,7 @@ def main():
     # Simulate scene (if not headless)
     if local_gui or livestream_gui:
         # Open the stage with USD
-        stage_utils.open_stage(mesh_converter.usd_path)
+        open_stage(mesh_converter.usd_path)
         # Reinitialize the simulation
         app = omni.kit.app.get_app_interface()
         # Run simulation

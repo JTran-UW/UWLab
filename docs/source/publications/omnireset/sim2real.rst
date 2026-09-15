@@ -84,7 +84,7 @@ Install ROS 2 and set up the UR robot driver following the `NVIDIA Isaac ROS Uni
 **2. Update the robot USD**
 
 Download the existing calibrated robot USD from
-`here <https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd>`__
+`here <https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/isaaclab3/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd>`__
 and open it in Isaac Sim. Replace the UR5e/UR7e arm in the USD with the URDF of your newly calibrated UR5e/UR7e. After replacing the arm, relink the joint that attaches the gripper to the arm. This joint connection must be re-established in Isaac Sim for the gripper to remain properly attached.
 
 **3. Verify alignment**
@@ -118,7 +118,7 @@ Place the calibrated USD and a ``metadata.yaml`` side by side:
      ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd
      metadata.yaml
 
-Copy the base ``metadata.yaml`` from `here <https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/metadata.yaml>`__ and update the ``calibrated_joints`` (xyz/rpy) and ``link_inertials`` (masses/coms/inertias) sections with the values from your calibrated URDF. The ``sysid`` block will be filled in after :ref:`system identification <sysid-section>` below.
+Copy the base ``metadata.yaml`` from `here <https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/isaaclab3/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/metadata.yaml>`__ and update the ``calibrated_joints`` (xyz/rpy) and ``link_inertials`` (masses/coms/inertias) sections with the values from your calibrated URDF. The ``sysid`` block will be filled in after :ref:`system identification <sysid-section>` below.
 
 **5. Recollect reset states & retrain**
 
@@ -181,7 +181,7 @@ Inspect the overlay plots. A good fit should show close tracking across all join
 
 **4. Save parameters**
 
-Replace the ``sysid`` block in ``metadata.yaml`` (next to your robot USD) with the identified values for ``armature``, ``static_friction``, ``dynamic_ratio``, and ``viscous_friction``. These are loaded automatically during finetuning and evaluation. See the current calibrated robot's `metadata.yaml <https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/metadata.yaml>`_ for reference.
+Replace the ``sysid`` block in ``metadata.yaml`` (next to your robot USD) with the identified values for ``armature``, ``static_friction``, ``dynamic_ratio``, and ``viscous_friction``. These are loaded automatically during finetuning and evaluation. See the current calibrated robot's `metadata.yaml <https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/isaaclab3/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/metadata.yaml>`_ for reference.
 
 **5. Teleop to verify motion**
 
@@ -716,6 +716,14 @@ After aligning each camera, paste the resulting ``pos``, ``rot``, and ``focal_le
    source/uwlab_tasks/.../omnireset/config/ur5e_robotiq_2f85/data_collection_rgb_cfg.py
 
 Update the ``TiledCameraCfg`` entries (``front_camera``, ``side_camera``, ``wrist_camera``) with the calibrated values. Also update the corresponding ``base_position`` and ``base_rotation`` in the randomization events (``randomize_front_camera``, ``randomize_side_camera``, ``randomize_wrist_camera``) to match.
+
+.. caution::
+
+   Since the Isaac Lab 3.0 bump, every ``rot`` / ``base_rotation`` in these configs is a quaternion in
+   ``(x, y, z, w)`` order. ``2_get_isaacsim_extrinsics.py`` in the diffusion_policy repo prints the 2.x
+   ``(w, x, y, z)`` order, so move the first element to the end before pasting (or convert with
+   ``isaaclab.utils.math.convert_quat(q, to="xyzw")``). A quaternion pasted in the old order is a
+   different camera pose, not an error.
 
 With calibrated cameras, proceed to :doc:`distillation` to collect RGB demos, train a vision policy, evaluate in sim, and deploy on the real robot.
 

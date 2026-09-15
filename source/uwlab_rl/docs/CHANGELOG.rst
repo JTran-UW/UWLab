@@ -1,6 +1,16 @@
 Changelog
 ---------
 
+0.2.0 (2026-09-16)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Ported to rsl-rl 5.x: explicit actor/critic model configs, gSDE as a distribution config,
+  and the runner export API. Requires Isaac Lab 3.0.
+
+
 0.1.3 (2025-11-09)
 ~~~~~~~~~~~~~~~~~~
 

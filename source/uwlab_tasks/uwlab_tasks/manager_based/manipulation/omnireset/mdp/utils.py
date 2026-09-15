@@ -21,14 +21,12 @@ from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
 import isaaclab.utils.math as math_utils
-import isaacsim.core.utils.torch as torch_utils
 import omni
 import warp as wp
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, NVIDIA_NUCLEUS_DIR, retrieve_file_path
+from isaaclab.utils.seed import configure_seed
 from isaaclab.utils.warp import convert_to_warp_mesh
 from pxr import UsdGeom
-from pytorch3d.ops import sample_farthest_points, sample_points_from_meshes
-from pytorch3d.structures import Meshes
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 
@@ -84,6 +82,23 @@ def sample_object_point_cloud(
     Returns:
         torch.Tensor | None: _description_
     """
+    # Imported lazily: pytorch3d is an optional, hard-to-build dependency (it ships as a
+    # wheel compiled against an exact python/torch/CUDA combination, and there is no sdist
+    # fallback). The only caller is CollisionAnalyzer, i.e. the dataset-generation tasks
+    # (reset states, grasp sampling, partial assemblies); the RL envs never reach it. A
+    # module-level import would make every task in the package unimportable wherever no
+    # matching wheel exists. See the wheel table in uwlab_tasks/setup.py.
+    try:
+        from pytorch3d.ops import sample_farthest_points, sample_points_from_meshes
+        from pytorch3d.structures import Meshes
+    except ImportError as exc:
+        raise ImportError(
+            "sample_object_point_cloud() requires pytorch3d, which is not installed. It is "
+            "optional and only needed by the collision analyzer used when generating datasets; "
+            "see the wheel table in uwlab_tasks/setup.py for the supported python/torch/CUDA "
+            "combinations."
+        ) from exc
+
     hasher = (
         rigid_object_hasher
         if rigid_object_hasher is not None
@@ -295,7 +310,7 @@ def temporary_seed(seed: int, restore_numpy: bool = True, restore_python: bool =
     try:
         sink = io.StringIO()
         with redirect_stdout(sink), redirect_stderr(sink):
-            torch_utils.set_seed(seed)
+            configure_seed(seed)
         yield
     finally:
         # restore everything
@@ -374,6 +389,14 @@ def read_metadata_from_usd_directory(usd_path: str) -> dict:
     with open(local_path) as f:
         metadata_file = yaml.safe_load(f)
 
+    # Isaac Lab 3.0 reads quaternions as (x, y, z, w); metadata authored under 2.x is (w, x, y, z)
+    # and would be applied verbatim, i.e. silently rotated. Require the converted, stamped files
+    # published on the ``isaaclab3`` branch of the cloud asset repository.
+    if metadata_file.pop("quat_convention", None) != "xyzw":
+        raise ValueError(
+            f"{metadata_path} is not an Isaac Lab 3.0 metadata file (missing 'quat_convention: xyzw');"
+            " point UWLAB_CLOUD_ASSETS_REVISION at a commit on the isaaclab3 cloud asset branch"
+        )
     return metadata_file
 
 

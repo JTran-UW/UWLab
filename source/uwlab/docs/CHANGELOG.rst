@@ -1,6 +1,17 @@
 Changelog
 ---------
 
+0.9.0 (2026-09-16)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Ported to Isaac Lab 3.0: scalar-last quaternions, warp-backed asset data (``.torch``),
+  ``root_view`` / ``data`` accessors instead of ``root_physx_view``, and ``isaaclab.sim.utils``
+  in place of the deprecated ``isaacsim.core.utils`` helpers.
+
+
 0.8.6 (2025-10-09)
 ~~~~~~~~~~~~~~~~~~
 

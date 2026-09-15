@@ -19,15 +19,27 @@ EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extensio
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
     # generic
-    "wandb>=0.19.6",
+    # rsl_rl's WandbSummaryWriter still passes ``wandb.Settings(start_method="thread")``;
+    # wandb removed that field and its Settings model rejects unknown fields, so newer
+    # releases fail at the first log call. 0.19.x is the last series that accepts it.
+    "wandb>=0.19.6,<0.20",
 ]
 
 PYTORCH_INDEX_URL = ["https://download.pytorch.org/whl/cu118"]
 
 # Extra dependencies for RL agents
+# Pinned to a commit, not a branch: an unpinned git dependency makes a rebuild
+# silently install a different API than the one this code was written against.
+# Must be a commit on UW-Lab/rsl_rl that carries both the rsl-rl >= 5.0 API that
+# Isaac Lab 3.0's isaaclab_rl requires and the gSDE distribution
+# (GSDEGaussianDistribution) -- the vendor/leggedrobotics mirror has the API but
+# not gSDE. Bump together with the Isaac Lab commit pinned in uwlab.sh.
+# TODO(port): point back at UW-Lab/rsl_rl once port_rsl_rl_5 is merged there.
+RSL_RL_REPO = "https://github.com/JTran-UW/rsl_rl.git"
+RSL_RL_COMMIT = "f2c944d524f853e906ce493540cfc76e54cc50ea"  # port_rsl_rl_5
 EXTRAS_REQUIRE = {
     "rsl-rl": [
-        "rsl-rl-lib @ git+https://github.com/UW-Lab/rsl_rl.git@main",
+        f"rsl-rl-lib @ git+{RSL_RL_REPO}@{RSL_RL_COMMIT}",
     ],
 }
 

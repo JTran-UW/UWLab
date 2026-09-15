@@ -64,11 +64,10 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 
-import isaacsim.core.utils.prims as prim_utils
 from isaacsim.core.api.simulation_context import SimulationContext
 from isaacsim.core.cloner import GridCloner
-from isaacsim.core.utils.carb import set_carb_setting
-from isaacsim.core.utils.stage import get_current_stage
+from isaaclab.sim.utils import create_prim, get_current_stage
+from isaaclab.sim.utils.legacy import define_prim
 
 from isaaclab.utils import Timer
 from isaaclab.utils.assets import check_file_path
@@ -96,17 +95,17 @@ def main():
     sim.get_physics_context().set_gpu_total_aggregate_pairs_capacity(2**21)
     # enable hydra scene-graph instancing
     # this is needed to visualize the scene when fabric is enabled
-    set_carb_setting(sim._settings, "/persistent/omnihydra/useSceneGraphInstancing", True)
+    sim._settings.set("/persistent/omnihydra/useSceneGraphInstancing", True)
 
     # Create interface to clone the scene
     cloner = GridCloner(spacing=args_cli.spacing, stage=stage)
     cloner.define_base_env("/World/envs")
-    prim_utils.define_prim("/World/envs/env_0")
+    define_prim("/World/envs/env_0")
     # Spawn things into stage
-    prim_utils.create_prim("/World/Light", "DistantLight")
+    create_prim("/World/Light", "DistantLight")
 
     # Everything under the namespace "/World/envs/env_0" will be cloned
-    prim_utils.create_prim("/World/envs/env_0/Asset", "Xform", usd_path=os.path.abspath(args_cli.input))
+    create_prim("/World/envs/env_0/Asset", "Xform", usd_path=os.path.abspath(args_cli.input))
     # Clone the scene
     num_clones = args_cli.num_clones
 
