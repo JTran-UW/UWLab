@@ -4,15 +4,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg
+from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
-from uwlab_rl.rsl_rl.rl_cfg import (
-    BehaviorCloningCfg,
-    GsdeDistributionCfg,
-    OffPolicyAlgorithmCfg,
-    RslRlFancyPpoAlgorithmCfg,
-    RslRlGsdePpoAlgorithmCfg,
-)
+from uwlab_rl.rsl_rl.rl_cfg import BehaviorCloningCfg, OffPolicyAlgorithmCfg, RslRlFancyPpoAlgorithmCfg
 
 
 def my_experts_observation_func(env):
@@ -25,29 +19,32 @@ class Base_PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 32
     max_iterations = 40000
     save_interval = 100
+    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
     resume = False
     experiment_name = "ur5e_robotiq_2f85_omnireset_agent"
-    # Explicit `actor`/`critic` model cfgs rather than the legacy `policy` cfg: gSDE is a
-    # distribution class, and the legacy path only forwards `std_type` ("scalar"/"log").
+    # Explicit `actor`/`critic` model cfgs preserve the distribution constructor options,
+    # including the action-std bounds not exposed by the legacy `policy` conversion.
     actor = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128, 64],
         activation="elu",
         obs_normalization=True,
-        stochastic=True,
-        init_noise_std=1.0,
-        state_dependent_std=False,
-        # learn_features=True keeps the gradient path from the state-dependent std into the
-        # backbone, as in the rsl-rl 3.x recipe. With it detached (rsl_rl default) the
-        # adaptive-KL schedule floors the LR at iteration 0 and the std runs away.
-        distribution_cfg=GsdeDistributionCfg(init_std=1.0, learn_features=True),
+        # Bound normalized action std rather than feature-space noise weights.
+        # Predict state-dependent log std alongside the action mean while keeping
+        # the initial exploration scale identical to the previous recipe.
+        distribution_cfg={
+            "class_name": "HeteroscedasticGaussianDistribution",
+            "init_std": 1.0,
+            "std_type": "log",
+            "std_range": [0.001, 2.0],
+        },
     )
     critic = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128, 64],
         activation="elu",
         obs_normalization=True,
-        stochastic=False,
+        distribution_cfg=None,
     )
-    algorithm = RslRlGsdePpoAlgorithmCfg(
+    algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         normalize_advantage_per_mini_batch=False,
@@ -61,11 +58,10 @@ class Base_PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
-        # rsl-rl 5.x gSDE holds the exploration matrix fixed for a whole rollout by default
-        # (time-correlated noise). The recipe this task was tuned with (rsl-rl 3.x) drew fresh
-        # noise every step; insertion relies on that dither to discover contacts, so resample
-        # every step. Mean, std, log-prob and entropy are unaffected -- only the sample is.
-        sde_sample_freq=1,
+        # Exploration is handled by the actor's distribution configuration.
+        # Gaussian noise is drawn independently for each action sample.
+        # There is no latent noise matrix to resample on environment steps.
+        # Leave the optimizer and rollout settings unchanged.
     )
 
 
