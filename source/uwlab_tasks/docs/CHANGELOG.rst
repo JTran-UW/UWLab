@@ -1,6 +1,17 @@
 Changelog
 ---------
 
+0.14.1 (2026-09-21)
+~~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed OmniReset and Factory extension velocity observations subtracting the robot's world position
+  from linear and angular velocities. Velocity vectors are now rotated into the root frame without translation.
+* Added regression coverage for stationary and moving links, translated roots, rotated frames, and body selection.
+
+
 0.14.0 (2026-09-16)
 ~~~~~~~~~~~~~~~~~~~
 

@@ -134,16 +134,13 @@ def asset_link_velocity_in_root_asset_frame(
 
     target_body_idx = 0 if isinstance(target_asset_cfg.body_ids, slice) else target_asset_cfg.body_ids
 
-    root_pos_w = root_asset.data.root_pos_w.torch
     root_quat_w = root_asset.data.root_quat_w.torch
 
-    asset_lin_vel_b, _ = math_utils.subtract_frame_transforms(
-        root_pos_w,
+    asset_lin_vel_b = math_utils.quat_apply_inverse(
         root_quat_w,
         target_asset.data.body_lin_vel_w.torch[:, target_body_idx].view(-1, 3),
     )
-    asset_ang_vel_b, _ = math_utils.subtract_frame_transforms(
-        root_pos_w,
+    asset_ang_vel_b = math_utils.quat_apply_inverse(
         root_quat_w,
         target_asset.data.body_ang_vel_w.torch[:, target_body_idx].view(-1, 3),
     )
