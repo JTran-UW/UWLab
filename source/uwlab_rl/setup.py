@@ -31,18 +31,14 @@ PYTORCH_INDEX_URL = ["https://download.pytorch.org/whl/cu118"]
 # written against -- which is exactly how the IsaacLab/rsl-rl mismatch of
 # 2026-08-15 cost a night of downtime.
 #
-# 959ccbc4 is the rsl-rl 3.1.2 API (PPO takes no `optimizer` kwarg, no
-# construct_algorithm/cfg["actor"] schema). It must stay consistent with the
-# IsaacLab commit pinned in uwlab.sh -- bump both together.
+# e7cd3c77 is 959ccbc4 (the rsl-rl 3.1.2 API: PPO takes no `optimizer` kwarg,
+# no construct_algorithm/cfg["actor"] schema) plus only a Greptile-config
+# commit. It must stay consistent with the IsaacLab commit pinned in uwlab.sh
+# -- bump both together.
 EXTRAS_REQUIRE = {
     "rsl-rl": [
-<<<<<<< HEAD
-        "rsl-rl-lib @ git+https://github.com/UW-Lab/rsl_rl.git"
-        "@959ccbc4712400a75efaa63cb827fd8939776825",
-=======
         # Update this pin alongside compatible UWLab changes.
         "rsl-rl-lib @ git+https://github.com/UW-Lab/rsl_rl.git@e7cd3c77bdb3c94753612f208c725e1add38a655",
->>>>>>> upstream/main
     ],
 }
 
