@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-from telnetlib import theNULL
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Generator

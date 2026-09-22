@@ -51,6 +51,31 @@ if args_cli.video:
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
+# Multi-GPU: bring up NCCL BEFORE Isaac touches CUDA.
+#
+# Isaac Sim's CUDA initialisation leaves the context in a state where a NCCL communicator created
+# afterwards fails on its first collective with
+#   enqueue.cc:76 NCCL WARN Cuda failure 'invalid argument'
+# ...which surfaces much later as a DistBackendError inside ppo.broadcast_parameters(), long after
+# every rank has happily built its environment. Verified 2026-08-20 on tillicum: a bare 2-GPU
+# all_reduce succeeds in this container, the same all_reduce after AppLauncher fails, and the same
+# all_reduce warmed up beforehand succeeds BOTH before and after Isaac starts. So the ordering is
+# the whole problem -- once the communicator exists, Isaac does not disturb it.
+if getattr(args_cli, "distributed", False):
+    import os as _os
+
+    import torch as _torch
+    import torch.distributed as _dist
+
+    _local_rank = int(_os.environ.get("LOCAL_RANK", "0"))
+    _torch.cuda.set_device(_local_rank)
+    if not _dist.is_initialized():
+        _dist.init_process_group("nccl")
+    # Touch a collective now: init_process_group is lazy, so the communicator is not actually
+    # built until the first one runs. Doing it here is what pins it to the clean context.
+    _dist.all_reduce(_torch.zeros(1, device=f"cuda:{_local_rank}"))
+    print(f"[train] NCCL warmed on cuda:{_local_rank} before Isaac launch", flush=True)
+
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -82,6 +107,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 import gymnasium as gym
 import logging
 import os
+import re
 import torch
 from datetime import datetime
 
@@ -186,6 +212,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.resume = True
     elif agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    elif int(os.getenv("SLURM_RESTART_COUNT", "0")) > 0:
+        # Job was preempted and requeued by SLURM — auto-resume from latest checkpoint.
+        # Match the most recent run directory for this run_name (or any run if no name set).
+        run_dir_pattern = f".*_{re.escape(agent_cfg.run_name)}" if agent_cfg.run_name else ".*"
+        try:
+            resume_path = get_checkpoint_path(log_root_path, run_dir_pattern, checkpoint="model_.*.pt")
+            agent_cfg.resume = True
+            print(
+                f"[INFO] SLURM requeue detected (SLURM_RESTART_COUNT={os.getenv('SLURM_RESTART_COUNT')}). "
+                f"Auto-resuming from: {resume_path}"
+            )
+        except ValueError:
+            print(
+                f"[INFO] SLURM requeue detected but no checkpoint found in '{log_root_path}' "
+                f"matching run_name='{agent_cfg.run_name}'. Starting fresh."
+            )
 
     # wrap for video recording
     if args_cli.video:
@@ -215,7 +257,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path)
+        try:
+            runner.load(resume_path)
+        except RuntimeError as e:
+            # Tolerate critic-side size mismatches only (e.g. warm-starting a UW-Lab-robot checkpoint
+            # (204-dim privileged critic) in a Yanda-robot env (205)): the actor must load fully; the
+            # critic's mismatched tensors are skipped and PPO relearns the value function.
+            loaded_dict = torch.load(resume_path, weights_only=False, map_location=agent_cfg.device)
+            ckpt_sd = loaded_dict["model_state_dict"]
+            model_sd = runner.alg.policy.state_dict()
+            mismatched = [k for k, v in ckpt_sd.items() if k in model_sd and model_sd[k].shape != v.shape]
+            if any(not k.startswith(("critic.", "critic_obs_normalizer.")) for k in mismatched):
+                raise e
+            filtered = {k: v for k, v in ckpt_sd.items() if k not in mismatched}
+            runner.alg.policy.load_state_dict(filtered, strict=False)
+            print(
+                f"[WARN] Strict checkpoint load failed; skipped critic-side size-mismatched tensors: {mismatched}. "
+                "The critic (value function) will be relearned from its fresh initialization."
+            )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

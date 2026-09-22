@@ -207,6 +207,7 @@ singularity exec \
     -B "$JOB_TMPDIR/$dir_name":/workspace/uwlab:rw \
     -B $CLUSTER_UWLAB_DIR/logs:/workspace/uwlab/logs:rw \
     -B $CLUSTER_MOUNT_DIR:$CLUSTER_MOUNT_DIR:rw \
+    -B /dev/shm:/dev/shm:rw \
     -B /etc/resolv.conf:/etc/resolv.conf:ro \
     -B /etc/pki:/etc/pki:ro \
     -B /etc/ssl:/etc/ssl:ro \
@@ -215,10 +216,18 @@ singularity exec \
     --env SSL_CERT_DIR=/etc/pki/tls/certs \
     --env REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt \
     --env CURL_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt \
+    --env RANK_ISOLATE_DISABLE=${RANK_ISOLATE_DISABLE:-} \
+    --env NCCL_DEBUG=${NCCL_DEBUG:-WARN} \
+    --env NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,ENV} \
+    --env NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0} \
+    --env NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE:-0} \
+    --env NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0} \
+    --env NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-} \
+    --env TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
     --env SLURM_RESTART_COUNT=${SLURM_RESTART_COUNT:-0} \
     --env SLURM_JOB_ID=${SLURM_JOB_ID:-} \
     --nv --containall "$JOB_TMPDIR/$PROFILE_ARG.sif" \
-    bash -c 'export PYTHONUSERBASE=/workspace/holosoma-deps && if [ -d /workspace/rsl_rl ]; then echo "[INFO] Using rsl_rl from local fork (PYTHONPATH override)" && export PYTHONPATH=/workspace/rsl_rl:${PYTHONPATH}; fi && echo "[INFO] Installing holosoma deps (cached after first run)..." && /isaac-sim/python.sh -m pip install --user -q -e /workspace/holosoma/src/holosoma && export PYTHONPATH=/workspace/holosoma-deps/lib/python3.11/site-packages:${PYTHONPATH} && export VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_optimus && export UWLAB_PATH=/workspace/uwlab && cd /workspace/uwlab && /isaac-sim/python.sh -m torch.distributed.run --rdzv_backend=c10d "$@"' _ ${DIST_ARGS[@]} ${CLUSTER_PYTHON_EXECUTABLE} ${CLI_ARGS[@]} --distributed
+    bash -c 'export PYTHONUSERBASE=/workspace/holosoma-deps && if [ -d /workspace/rsl_rl ]; then echo "[INFO] Using rsl_rl from local fork (PYTHONPATH override)" && export PYTHONPATH=/workspace/rsl_rl:${PYTHONPATH}; fi && echo "[INFO] Installing holosoma deps (cached after first run)..." && /isaac-sim/python.sh -m pip install --user -q -e /workspace/holosoma/src/holosoma && export PYTHONPATH=/workspace/holosoma-deps/lib/python3.11/site-packages:${PYTHONPATH} && export VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_optimus && export UWLAB_PATH=/workspace/uwlab && cd /workspace/uwlab && /isaac-sim/python.sh -m torch.distributed.run --rdzv_backend=c10d "$@"' _ ${DIST_ARGS[@]} docker/cluster/rank_isolate.py ${CLUSTER_PYTHON_EXECUTABLE} ${CLI_ARGS[@]} --distributed
 
 # copy resulting cache files back to the persistent storage
 rsync -azPv "${RSYNC_EXCLUDES[@]}" "$JOB_TMPDIR/docker-isaac-sim/" $CLUSTER_ISAAC_SIM_CACHE_DIR

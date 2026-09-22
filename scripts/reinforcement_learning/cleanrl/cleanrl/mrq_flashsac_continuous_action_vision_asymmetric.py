@@ -15,6 +15,42 @@
 # alone. There is no state encoder and no shared encoder, so the policy/critic shape assertion of
 # the symmetric script does not apply -- the streams differ by design.
 #
+# DISTRIBUTED (multi-GPU) variant of the experimental testbed. Launch with torchrun, one process
+# per GPU; docker/cluster/run_singularity.sh already does exactly that and appends --distributed.
+#
+# Data-parallel, replicated-agent design:
+#   * every rank runs its OWN Isaac sim on cuda:{LOCAL_RANK} with its own --num_envs envs, its own
+#     replay buffer of --buffer_size and its own copy of the expert buffer. Every hyperparameter is
+#     PER-GPU: --buffer_size 1000000 means 1M transitions on each GPU, --batch_size 512 means 512
+#     samples drawn per rank per update.
+#   * the agent itself is replicated. Parameters start bitwise identical (broadcast from rank 0) and
+#     stay identical because every gradient is averaged across ranks before the optimizer steps.
+#
+# Equivalence guarantee: one distributed update equals the corresponding single-GPU update on the
+# CONCATENATED global batch (world_size * batch_size). That holds because
+#   * all four losses (model / critic / actor / alpha) are means over the local batch, so the
+#     average of the per-rank gradients IS the gradient of the global-batch mean;
+#   * UnitBatchNorm normalizes with GLOBAL batch statistics under --sync_batchnorm (default on),
+#     via a differentiable SUM all-reduce of the batch sum and sum-of-squares;
+#   * EmpiricalNormalization already all-reduces its running statistics (cleanrl_utils/utils.py).
+# tests/test_distributed_equivalence.py verifies this end-to-end against a world_size=1 reference.
+#
+# Logging, checkpointing and wandb happen on rank 0 only. Diagnostics that issue collectives (the
+# Hessian probe) still RUN on every rank -- skipping them anywhere would desynchronize the
+# collectives and hang the job -- but only rank 0 records the result.
+#
+# EXPERIMENTAL TESTBED -- torch.compile / CUDA graph work. Identical to the production script
+# except for --compile_update, which routes the learning update through a single compiled region.
+#
+# Measured on an RTX 4090 at the L40S job's shapes (batch 512, UTD 256, 32x32 2-cam obs):
+#   eager                                    7.23 ms/update
+#   torch.compile, whole update, one region  5.07 ms/update   1.43x
+#   torch.compile, per-loss regions          5.94 ms/update   1.18x
+#   mode="reduce-overhead" (CUDA graphs)     unavailable -- inductor reports
+#       "skipping cudagraphs due to mutated inputs (22 instances)"; the update mutates BatchNorm
+#       running stats, EmpiricalNormalization buffers and (via normalize_parameters + the Polyak
+#       EMA) the parameters themselves, all of which cudagraph trees refuse to capture.
+#
 # Pairs with the Grayscale-Asymmetric tasks in rl_state_cfg.py.
 from collections import defaultdict, deque
 from contextlib import contextmanager, nullcontext
@@ -29,6 +65,7 @@ import gymnasium as gym
 import imageio
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -44,6 +81,205 @@ from cleanrl_utils.utils import EmpiricalNormalization
 from vecenv_wrapper import IsaacLabVectorEnv
 
 _NULL_CTX = nullcontext()
+
+
+# ────────────────────────────── distributed plumbing ──────────────────────────────
+class _DistState:
+    """Process-group facts, read from the torchrun environment once at startup.
+
+    Module-level rather than passed around because UnitBatchNorm.forward has to consult it deep
+    inside the networks, and threading a context object through every module signature would change
+    the shapes of classes shared with the single-GPU script for no benefit.
+
+    Defaults describe a plain single-process run, so importing this module (as the tests do) without
+    torchrun leaves every collective a no-op.
+    """
+
+    enabled = False          # torch.distributed initialized (true even at world_size 1 under torchrun)
+    rank = 0                 # global rank
+    local_rank = 0           # GPU index within this node
+    world_size = 1
+    is_main = True           # rank 0: the only rank that logs, prints or checkpoints
+    sync_bn = False          # --sync_batchnorm AND enabled
+
+
+DIST = _DistState()
+
+
+def rprint(*a, **kw):
+    """print() on rank 0 only. Every rank runs identical setup, so N copies of it are pure noise."""
+    if DIST.is_main:
+        print(*a, **kw)
+
+
+def milestone(msg: str):
+    """Rank-tagged startup progress, printed by EVERY rank.
+
+    Rank-0-only logging makes a multi-rank stall undiagnosable: if rank 0 blocks in a collective
+    waiting for a rank that is still building its simulation, the log simply stops with no
+    indication of which rank is where. These few lines cost nothing (startup only) and are the
+    difference between "it hung somewhere" and knowing exactly which rank reached which step.
+    """
+    if DIST.enabled:
+        print(f"[rank {DIST.rank}/{DIST.world_size}] {msg}", flush=True)
+    else:
+        print(f"[setup] {msg}", flush=True)
+
+
+def init_distributed(backend: str = None) -> _DistState:
+    """Join the process group described by torchrun's environment variables.
+
+    run_singularity.sh launches `torch.distributed.run --nnodes .. --nproc_per_node ..`, which sets
+    RANK / LOCAL_RANK / WORLD_SIZE. Absent those (a bare `python script.py`) this leaves DIST at its
+    single-process defaults and every collective below degenerates to a no-op, so the same file runs
+    unmodified on one GPU.
+    """
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return DIST
+
+    DIST.rank = int(os.environ["RANK"])
+    DIST.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    DIST.world_size = int(os.environ["WORLD_SIZE"])
+    DIST.is_main = DIST.rank == 0
+
+    if backend is None:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+    # set_device before init_process_group: NCCL binds a device per rank, and it also makes the
+    # bare "cuda" device string (e.g. FlashSACQNetwork's q_support) resolve to this rank's GPU.
+    if torch.cuda.is_available():
+        torch.cuda.set_device(DIST.local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+    DIST.enabled = True
+    return DIST
+
+
+class _AllReduceSum(torch.autograd.Function):
+    """SUM all-reduce that is differentiable, for statistics shared across ranks.
+
+    Forward computes y = sum_r x_r, so dL/dx_r = dL/dy -- but on rank r autograd only holds
+    dL_r/dy, the local term. All-reducing the incoming gradient turns that into sum_s dL_s/dy,
+    which is what the chain rule wants for a quantity every rank's loss depends on. Without this
+    the synced BatchNorm would have a correct forward and a silently wrong backward.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        if DIST.world_size == 1:
+            return x
+        out = x.contiguous().clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        if DIST.world_size == 1:
+            return grad
+        out = grad.contiguous().clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM)
+        return out
+
+
+class GradSync:
+    """Average one optimizer's gradients across ranks, in a single collective.
+
+    Every loss in this script is a mean over the local batch, and every rank uses the same
+    batch_size, so the mean of the per-rank gradients is exactly the gradient of the mean over the
+    concatenated global batch. That is the whole equivalence argument -- it would break if the
+    losses were sums, or if ranks had unequal batch sizes.
+
+    Gradients are packed into one persistent flat buffer so each optimizer costs one all-reduce
+    instead of one per parameter tensor; at UTD 256 that difference is thousands of launches per
+    env step. ReduceOp.SUM followed by a divide rather than ReduceOp.AVG, because gloo (used by the
+    CPU correctness tests) implements SUM but not AVG.
+    """
+
+    def __init__(self, params):
+        self.params = [p for p in params if p.requires_grad]
+        self._flat = None
+        self._views = None
+        self._grads = None
+
+    def _build(self, grads):
+        total = sum(g.numel() for g in grads)
+        self._flat = torch.zeros(total, device=grads[0].device, dtype=grads[0].dtype)
+        views, off = [], 0
+        for g in grads:
+            views.append(self._flat[off : off + g.numel()].view_as(g))
+            off += g.numel()
+        self._views = views
+        self._grads = grads
+
+    def __call__(self):
+        if DIST.world_size == 1:
+            return
+        # Params with no grad are structurally unused (none are, in this model) and stay unused, so
+        # the participating set is fixed after the first backward and the packing order is stable.
+        grads = [p.grad for p in self.params if p.grad is not None]
+        if not grads:
+            return
+        if self._flat is None:
+            self._build(grads)
+        elif len(grads) != len(self._views):
+            raise RuntimeError(
+                f"GradSync saw {len(grads)} gradients but bucketed {len(self._views)}: the set of "
+                "parameters receiving gradients changed between updates, which would silently "
+                "misalign the flat buffer."
+            )
+        torch._foreach_copy_(self._views, grads)
+        dist.all_reduce(self._flat, op=dist.ReduceOp.SUM)
+        self._flat.div_(DIST.world_size)
+        torch._foreach_copy_(grads, self._views)
+
+
+class UpdateSyncs:
+    """The four GradSync buckets of one learning update, one per optimizer.
+
+    Bundled so the eager, compiled and CUDA-graph paths take a single extra argument each and call
+    the reductions at exactly the same four points.
+    """
+
+    def __init__(self, encoder_params, q_params, actor_params, alpha_params=None):
+        self.encoder = GradSync(encoder_params)
+        self.q = GradSync(q_params)
+        self.actor = GradSync(actor_params)
+        self._alpha = GradSync(alpha_params) if alpha_params is not None else None
+
+    def alpha(self):
+        if self._alpha is not None:
+            self._alpha()
+
+
+def broadcast_module_state(*modules_and_tensors):
+    """Force every rank to rank 0's parameters and buffers.
+
+    Identical seeds already produce identical initializations, but this run offsets the RNG per rank
+    (so exploration noise decorrelates) and the guarantee that all replicas start bitwise equal is
+    load-bearing for the whole design -- cheap insurance, paid once.
+    """
+    if DIST.world_size == 1:
+        return
+    for obj in modules_and_tensors:
+        if obj is None:
+            continue
+        tensors = (
+            list(obj.parameters()) + list(obj.buffers()) if isinstance(obj, nn.Module) else [obj]
+        )
+        for t in tensors:
+            dist.broadcast(t.data, src=0)
+
+
+class _NullWriter:
+    """Stand-in for SummaryWriter on non-zero ranks: swallows everything, allocates nothing."""
+
+    def add_scalar(self, *a, **kw):
+        pass
+
+    def add_text(self, *a, **kw):
+        pass
+
+    def close(self):
+        pass
 
 
 def _fmt_bytes(n: float) -> str:
@@ -410,6 +646,36 @@ class Args:
     """print a one-time memory breakdown after setup (envs / networks / optimizers / replay buffer,
     with the device each lives on) and log mem/* scalars every logging_interval. Cheap -- the
     breakdown is a few driver queries and a walk over already-allocated tensors."""
+    sync_batchnorm: bool = True
+    """compute UnitBatchNorm statistics over the GLOBAL batch (all ranks) instead of each rank's own
+    shard. On by default because it is what makes a distributed update identical to the single-GPU
+    update on the concatenated batch -- batch statistics are the only part of this model that data
+    parallelism does not make equivalent for free.
+
+    It costs one extra all-reduce per BatchNorm call that runs with training=True: 20 per update
+    (qf1, qf2 and both targets, 5 layers each) plus 5 more on actor updates. The MR.Q encoder is
+    LayerNorm-based and never participates. Ignored entirely at world_size 1.
+
+    Set False for standard DDP behaviour -- each rank normalizes by its own batch -- which is faster
+    but has two consequences worth knowing. The update is no longer comparable to a single-GPU run
+    (measured: gradients diverge by ~1e-1 rather than ~1e-7). And the BatchNorm running_mean /
+    running_var BUFFERS drift apart across ranks, because each rank accumulates them from its own
+    data; parameters still stay bitwise identical, since those are driven by averaged gradients, but
+    replicas stop being exact copies and each rank's behaviour policy differs slightly. Checkpoints
+    remain self-consistent -- they are written by rank 0, whose buffers match its own weights."""
+    compile_update: bool = False
+    """route the learning update through a single torch.compile'd region (1.43x measured at batch
+    512 / UTD 256). Mutually exclusive with --profile_timing, whose per-block cuda syncs would both
+    defeat the point and force graph breaks. Costs ~25 s of one-time warmup."""
+    cuda_graphs: bool = False
+    """capture the learning update as CUDA graphs via tensordict.nn.CudaGraphModule, on top of
+    torch.compile (measured 1.97x vs eager at batch 512, against 1.37x for compile alone).
+
+    Implies --compile_update. Note inductor's own mode="reduce-overhead" does NOT work here -- it
+    reports "skipping cudagraphs due to mutated inputs (22 instances)" because the update mutates
+    BatchNorm running stats, EmpiricalNormalization buffers and the parameters themselves.
+    CudaGraphModule captures the already-compiled (default-mode) function instead, handling warmup,
+    static input buffers, output cloning and RNG generator state itself."""
     profile_timing: bool = False
     """if toggled, time each major block (rollout, env step, buffer add/sample incl. host<->device
     transfer, encoder+model loss, C51 target, critic/actor/alpha updates, target EMA, KL, Hessian,
@@ -455,6 +721,10 @@ class UnitBatchNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x, training: bool):
+        # training=False reads the running statistics, which are already identical on every rank,
+        # so there is nothing to synchronize and the fast path is exact as-is.
+        if training and DIST.sync_bn:
+            return self._sync_forward(x)
         return F.batch_norm(
             x,
             self.running_mean,
@@ -465,6 +735,46 @@ class UnitBatchNorm(nn.Module):
             momentum=self.momentum,
             eps=self.eps,
         )
+
+    # Kept out of the compiled graph. Dynamo does not reliably trace a custom autograd.Function
+    # wrapping a collective: measured against a world_size=1 reference, the compiled version of this
+    # method produced gradients off by ~1e-2 (eager is ~1e-7), i.e. the synchronization was
+    # effectively lost while every rank still agreed with the others -- silent, not a crash.
+    # Forcing a graph break here keeps the collective in eager mode, where it is verified correct.
+    # The surrounding update still compiles; only these ~25 small BN calls per update fall out.
+    @torch._dynamo.disable
+    def _sync_forward(self, x):
+        """BatchNorm over the GLOBAL batch: what F.batch_norm would compute on the concatenation.
+
+        Batch statistics are the one place data-parallelism is not automatically equivalent -- each
+        rank would otherwise normalize by its own shard's mean/var. One SUM all-reduce of the batch
+        sum and sum-of-squares (stacked into a single collective) yields the global moments, and
+        _AllReduceSum keeps the backward correct.
+
+        Sums are accumulated shifted by running_mean. That constant cancels exactly in both mean and
+        variance, but it keeps E[x^2] - E[x]^2 away from the catastrophic cancellation it suffers
+        when the mean is large relative to the spread. running_mean is a buffer (no grad) and is
+        identical across ranks, so the shift changes nothing about the result or its gradient.
+        """
+        n = x.shape[0] * DIST.world_size
+        shift = self.running_mean.detach()
+        xs = x - shift
+        local = torch.stack([xs.sum(0), (xs * xs).sum(0)])
+        total = _AllReduceSum.apply(local)
+        mean_shifted = total[0] / n
+        # Biased (population) variance, matching what batch_norm normalizes with.
+        var = total[1] / n - mean_shifted * mean_shifted
+        mean = mean_shifted + shift
+
+        with torch.no_grad():
+            # Running stats take the UNBIASED variance, as torch's BatchNorm does, while the
+            # normalization above uses the biased one. Mirroring both keeps a run that toggles
+            # --sync_batchnorm off mid-experiment on the same footing.
+            self.running_mean.mul_(1 - self.momentum).add_(mean * self.momentum)
+            unbiased = var * (n / (n - 1))
+            self.running_var.mul_(1 - self.momentum).add_(unbiased * self.momentum)
+
+        return (x - mean) * torch.rsqrt(var + self.eps) * self.weight + self.bias
 
     def normalize_parameters(self):
         scale, bias = self.weight.data, self.bias.data
@@ -552,7 +862,7 @@ class MRQEncoder(nn.Module):
                 f"input to {tuple(feat.shape[2:])} ({flatten_dim} features) -- reduce "
                 f"--encoder_conv_layers (32x32 wants 3, 84x84 wants 4)."
             )
-        print(
+        rprint(
             f"[encoder] {conv_layers} conv layers on {self.obs_hw[0]}x{self.obs_hw[1]} "
             f"({in_channels} in-ch) -> {tuple(feat.shape[1:])} = {flatten_dim} features -> zs {zs_dim}"
         )
@@ -661,6 +971,7 @@ class FlashSACQNetwork(nn.Module):
         v_min=-20.0,
         v_max=20.0,
         num_blocks=2,
+        device="cuda",
     ):
         super().__init__()
 
@@ -674,7 +985,10 @@ class FlashSACQNetwork(nn.Module):
         self.v_min = v_min
         self.v_max = v_max
         self.num_atoms = num_atoms
-        self.q_support = torch.linspace(v_min, v_max, num_atoms, device="cuda")
+        # Explicit device rather than a bare "cuda": on rank 1+ the default CUDA device is only this
+        # rank's GPU after torch.cuda.set_device, and q_support is a plain attribute that .to(device)
+        # would not move. Parameterizing it also lets the correctness tests run this network on CPU.
+        self.q_support = torch.linspace(v_min, v_max, num_atoms, device=device)
         # Row offsets for the flattened scatter, rebuilt only when the batch size changes.
         # Plain attribute, not a buffer -- stays out of state_dict so checkpoints are unaffected.
         self._offset_cache = None
@@ -1005,11 +1319,252 @@ def lanczos_extreme_eigenvalues(loss: torch.Tensor, params: list[torch.Tensor], 
     return ritz[-1].item(), ritz[0].item()
 
 
+def build_graph_update(args, encoder, encoder_target, qf1, qf2, qf1_target, qf2_target, actor,
+                       encoder_optimizer, q_optimizer, actor_optimizer, a_optimizer, log_alpha,
+                       target_entropy, ema_target_params, ema_online_params,
+                       normalize_obs, normalize_critic_obs, norm_proprio, syncs):
+    """The update split into three separately-captured regions, preserving the eager ordering.
+
+    A captured graph cannot branch on a Python bool, so the delayed actor update has to be its own
+    region. The eager loop runs [main + critic step] -> [optional actor] -> [normalize] -> [EMA], so
+    normalize/EMA go in a third region rather than being folded into `main`: folding them in would
+    make the actor read unit-normalized critic weights and the Polyak EMA read un-normalized ones,
+    both of which change the algorithm.
+
+    Returns plain tuples rather than dicts -- CudaGraphModule handles tensors and tensordicts.
+    """
+    from tensordict.nn import CudaGraphModule
+
+    def main(policy_raw, next_policy_raw, critic_raw, next_critic_raw, proprio_raw,
+             next_proprio_raw, actions, rewards, dones, n_steps):
+        policy_obs, next_policy_obs = policy_raw, next_policy_raw
+        critic_obs, next_critic_obs = critic_raw, next_critic_raw
+        if args.obs_normalization:
+            policy_obs = normalize_obs(policy_raw)
+            next_policy_obs = normalize_obs(next_policy_raw)
+            critic_obs = normalize_critic_obs(critic_raw)
+            next_critic_obs = normalize_critic_obs(next_critic_raw)
+        proprio = norm_proprio(proprio_raw, update=True)
+        next_proprio = norm_proprio(next_proprio_raw, update=True)
+
+        bootstrap = (~dones.bool()).float()
+        discount = args.gamma ** n_steps
+
+        zs = encoder.zs(policy_obs, proprio=proprio)
+        zsa = encoder.zsa(zs, actions)
+        next_zs_hat, reward_hat, done_logit = encoder.predict(zsa)
+        with torch.no_grad():
+            next_zs_target = encoder_target.zs(next_policy_obs, proprio=next_proprio)
+
+        dyn_loss = F.mse_loss(next_zs_hat, next_zs_target)
+        reward_loss = F.mse_loss(reward_hat, rewards.reshape(-1, 1))
+        done_loss = F.binary_cross_entropy_with_logits(done_logit, dones.reshape(-1, 1).float())
+        model_loss = (args.model_dynamics_coef * dyn_loss
+                      + args.model_reward_coef * reward_loss
+                      + args.model_done_coef * done_loss)
+        encoder_optimizer.zero_grad(set_to_none=False)
+        model_loss.backward()
+        syncs.encoder()
+        encoder_optimizer.step()
+
+        with torch.no_grad():
+            nsa, nslp, _ = actor.get_action(next_zs_target, training=False)
+            d1 = F.softmax(qf1_target(next_critic_obs, nsa, training=True), dim=-1)
+            d2 = F.softmax(qf2_target(next_critic_obs, nsa, training=True), dim=-1)
+            reward_term = (rewards.squeeze(-1)
+                           - discount * bootstrap.squeeze(-1) * log_alpha.exp() * nslp.squeeze(-1))
+            target_dists = qf1_target.project_ensemble(
+                torch.stack([d1, d2]), reward_term, bootstrap.squeeze(-1), discount)
+            target_values = torch.sum(target_dists * qf1_target.q_support, dim=-1)
+            use_qf1 = (target_values[0] <= target_values[1]).unsqueeze(-1)
+            qf_target_dist = torch.where(use_qf1, target_dists[0], target_dists[1])
+
+        qf1_log_probs = F.log_softmax(qf1(critic_obs, actions, training=True), dim=-1)
+        qf2_log_probs = F.log_softmax(qf2(critic_obs, actions, training=True), dim=-1)
+        qf1_loss = -torch.sum(qf_target_dist * qf1_log_probs, dim=-1)
+        qf2_loss = -torch.sum(qf_target_dist * qf2_log_probs, dim=-1)
+        qf_loss = torch.stack([qf1_loss, qf2_loss]).mean(dim=1).sum(dim=0)
+        q_optimizer.zero_grad(set_to_none=False)
+        qf_loss.backward()
+        syncs.q()
+        q_optimizer.step()
+
+        return (zs.detach(), critic_obs.detach(), qf_loss.detach(), qf1_loss.detach().mean(),
+                qf2_loss.detach().mean(), target_values.detach(), model_loss.detach(),
+                dyn_loss.detach(), reward_loss.detach(), done_loss.detach())
+
+    def actor_step(zs_pi, critic_obs):
+        pi, log_pi, _ = actor.get_action(zs_pi, training=True)
+        with torch.no_grad():
+            policy_entropy = -log_pi.mean()
+            log_pi_mean = log_pi.mean()
+        alpha_val = log_alpha.detach().exp().squeeze()
+        qf1_pi = qf1.get_value(F.softmax(qf1(critic_obs, pi, training=False), dim=-1))
+        qf2_pi = qf2.get_value(F.softmax(qf2(critic_obs, pi, training=False), dim=-1))
+        actor_loss = ((alpha_val * log_pi) - torch.min(qf1_pi, qf2_pi)).mean()
+        actor_optimizer.zero_grad(set_to_none=False)
+        actor_loss.backward()
+        syncs.actor()
+        actor_optimizer.step()
+
+        alpha_loss = actor_loss.new_zeros(())
+        if args.autotune:
+            with torch.no_grad():
+                _, log_pi2, _ = actor.get_action(zs_pi, training=False)
+            alpha_loss = (-log_alpha.exp() * (log_pi2 + target_entropy)).mean()
+            a_optimizer.zero_grad(set_to_none=False)
+            alpha_loss.backward()
+            syncs.alpha()
+            a_optimizer.step()
+        return actor_loss.detach(), alpha_loss.detach(), policy_entropy, log_pi_mean
+
+    def tail(anchor):
+        # `anchor` is unused; CudaGraphModule needs at least one tensor input to key the capture on.
+        actor.normalize_parameters()
+        qf1.normalize_parameters()
+        qf2.normalize_parameters()
+        with torch.no_grad():
+            torch._foreach_lerp_(ema_target_params, ema_online_params, args.tau)
+        return anchor.new_zeros(())
+
+    fns = [main, actor_step, tail]
+    fns = [torch.compile(f) for f in fns]
+    if args.cuda_graphs:
+        fns = [CudaGraphModule(f) for f in fns]
+    return fns
+
+def build_compiled_update(args, encoder, encoder_target, qf1, qf2, qf1_target, qf2_target, actor,
+                          encoder_optimizer, q_optimizer, actor_optimizer, a_optimizer, log_alpha,
+                          target_entropy, ema_target_params, ema_online_params,
+                          normalize_obs, normalize_critic_obs, norm_proprio, syncs):
+    """The whole learning update as ONE callable, so torch.compile sees a single region.
+
+    Compiling the four loss computations separately only reaches 1.18x: each becomes its own graph,
+    and the eager optimizer steps between them force materialization at every boundary. Folding
+    forwards, backwards and optimizer steps together measured 1.43x.
+
+    zero_grad(set_to_none=False) keeps gradient storage addresses stable across iterations, which
+    costs nothing here and is a prerequisite for any future CUDA-graph capture.
+    """
+    def full_update(data, do_actor: bool):
+        policy_obs = data.policy_observations
+        next_policy_obs = data.next_policy_observations
+        critic_obs = data.critic_observations
+        next_critic_obs = data.next_critic_observations
+        if args.obs_normalization:
+            policy_obs = normalize_obs(data.policy_observations)
+            next_policy_obs = normalize_obs(data.next_policy_observations)
+            critic_obs = normalize_critic_obs(data.critic_observations)
+            next_critic_obs = normalize_critic_obs(data.next_critic_observations)
+        proprio = norm_proprio(data.proprio_observations, update=True)
+        next_proprio = norm_proprio(data.next_proprio_observations, update=True)
+
+        bootstrap = (~data.dones.bool()).float()
+        discount = args.gamma ** data.effective_n_steps
+
+        zs = encoder.zs(policy_obs, proprio=proprio)
+        zsa = encoder.zsa(zs, data.actions)
+        next_zs_hat, reward_hat, done_logit = encoder.predict(zsa)
+        with torch.no_grad():
+            next_zs_target = encoder_target.zs(next_policy_obs, proprio=next_proprio)
+
+        dyn_loss = F.mse_loss(next_zs_hat, next_zs_target)
+        reward_loss = F.mse_loss(reward_hat, data.rewards.reshape(-1, 1))
+        done_loss = F.binary_cross_entropy_with_logits(done_logit, data.dones.reshape(-1, 1).float())
+        model_loss = (args.model_dynamics_coef * dyn_loss
+                      + args.model_reward_coef * reward_loss
+                      + args.model_done_coef * done_loss)
+        encoder_optimizer.zero_grad(set_to_none=False)
+        model_loss.backward()
+        syncs.encoder()
+        encoder_optimizer.step()
+
+        with torch.no_grad():
+            next_state_actions, next_state_log_probs, _ = actor.get_action(next_zs_target, training=False)
+            qf1_next = F.softmax(qf1_target(next_critic_obs, next_state_actions, training=True), dim=-1)
+            qf2_next = F.softmax(qf2_target(next_critic_obs, next_state_actions, training=True), dim=-1)
+            reward_term = (data.rewards.squeeze(-1)
+                           - discount * bootstrap.squeeze(-1) * log_alpha.exp() * next_state_log_probs.squeeze(-1))
+            target_dists = qf1_target.project_ensemble(
+                torch.stack([qf1_next, qf2_next]), reward_term, bootstrap.squeeze(-1), discount)
+            target_values = torch.sum(target_dists * qf1_target.q_support, dim=-1)
+            use_qf1 = (target_values[0] <= target_values[1]).unsqueeze(-1)
+            qf_target_dist = torch.where(use_qf1, target_dists[0], target_dists[1])
+
+        qf1_log_probs = F.log_softmax(qf1(critic_obs, data.actions, training=True), dim=-1)
+        qf2_log_probs = F.log_softmax(qf2(critic_obs, data.actions, training=True), dim=-1)
+        qf1_loss = -torch.sum(qf_target_dist * qf1_log_probs, dim=-1)
+        qf2_loss = -torch.sum(qf_target_dist * qf2_log_probs, dim=-1)
+        qf_loss = torch.stack([qf1_loss, qf2_loss]).mean(dim=1).sum(dim=0)
+        q_optimizer.zero_grad(set_to_none=False)
+        qf_loss.backward()
+        syncs.q()
+        q_optimizer.step()
+
+        actor_loss = qf_loss.new_zeros(())
+        alpha_loss = qf_loss.new_zeros(())
+        policy_entropy = qf_loss.new_zeros(())
+        log_pi_mean = qf_loss.new_zeros(())
+        if do_actor:
+            zs_pi = zs.detach()
+            pi, log_pi, _ = actor.get_action(zs_pi, training=True)
+            with torch.no_grad():
+                policy_entropy = -log_pi.mean()
+                log_pi_mean = log_pi.mean()
+            alpha_val = log_alpha.detach().exp().squeeze()
+            qf1_pi = qf1.get_value(F.softmax(qf1(critic_obs, pi, training=False), dim=-1))
+            qf2_pi = qf2.get_value(F.softmax(qf2(critic_obs, pi, training=False), dim=-1))
+            actor_loss = ((alpha_val * log_pi) - torch.min(qf1_pi, qf2_pi)).mean()
+            actor_optimizer.zero_grad(set_to_none=False)
+            actor_loss.backward()
+            syncs.actor()
+            actor_optimizer.step()
+
+            if args.autotune:
+                with torch.no_grad():
+                    _, log_pi2, _ = actor.get_action(zs_pi, training=False)
+                alpha_loss = (-log_alpha.exp() * (log_pi2 + target_entropy)).mean()
+                a_optimizer.zero_grad(set_to_none=False)
+                alpha_loss.backward()
+                syncs.alpha()
+                a_optimizer.step()
+
+        actor.normalize_parameters()
+        qf1.normalize_parameters()
+        qf2.normalize_parameters()
+        with torch.no_grad():
+            torch._foreach_lerp_(ema_target_params, ema_online_params, args.tau)
+
+        return {
+            "qf_loss": qf_loss.detach(), "qf1_loss": qf1_loss.detach().mean(),
+            "qf2_loss": qf2_loss.detach().mean(), "target_values": target_values.detach(),
+            "actor_loss": actor_loss.detach(), "alpha_loss": alpha_loss.detach(),
+            "policy_entropy": policy_entropy.detach(), "log_pi": log_pi_mean.detach(),
+            "model_loss": model_loss.detach(), "dyn_loss": dyn_loss.detach(),
+            "reward_loss": reward_loss.detach(), "done_loss": done_loss.detach(),
+        }
+
+    return torch.compile(full_update) if args.compile_update else full_update
+
+
 if __name__ == "__main__":
 
     args, launcher_args = tyro.cli(Args, return_unknown_args=True)
+
+    # Join the process group FIRST: rank identity decides who logs, which GPU this process owns and
+    # what seed offsets apply, all of which the setup below depends on.
+    init_distributed()
+    DIST.sync_bn = args.sync_batchnorm and DIST.enabled
+    if DIST.enabled:
+        rprint(
+            f"[dist] world_size={DIST.world_size} backend={dist.get_backend()} "
+            f"sync_batchnorm={DIST.sync_bn} | per-GPU: num_envs={args.num_envs} "
+            f"batch_size={args.batch_size} buffer_size={args.buffer_size:,} "
+            f"-> global batch {args.batch_size * DIST.world_size}"
+        )
+
     run_name = args.run_name if args.run_name else f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
+    if args.track and DIST.is_main:
         import wandb
 
         wandb.init(
@@ -1021,8 +1576,10 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
-    if args.save_depth_video:
+    # Non-zero ranks get a writer that discards everything, so the logging call sites stay identical
+    # across ranks and cannot drift apart.
+    writer = SummaryWriter(f"runs/{run_name}") if DIST.is_main else _NullWriter()
+    if args.save_depth_video and DIST.is_main:
         depth_video_dir = f"runs/{run_name}/depth_videos"
         os.makedirs(depth_video_dir, exist_ok=True)
     writer.add_text(
@@ -1031,12 +1588,18 @@ if __name__ == "__main__":
     )
 
     # TRY NOT TO MODIFY: seeding
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    # Offset by rank so the ranks explore differently -- identical streams would make every replica
+    # collect near-identical data and waste the extra GPUs. Network initialization is put back in
+    # lockstep by the broadcast after construction, so the replicas still start bitwise equal.
+    seed = args.seed + DIST.rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    device = torch.device(
+        f"cuda:{DIST.local_rank}" if torch.cuda.is_available() and args.cuda else "cpu"
+    )
 
     # TF32 for fp32 matmul/conv on Ampere+ (a100 / l40s / h200). The critic and actor are MLP-heavy
     # and run num_updates times per env step, so this is one of the cheapest throughput knobs
@@ -1045,8 +1608,8 @@ if __name__ == "__main__":
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        print("[perf] TF32 enabled for fp32 matmul/conv")
-    print(f"[perf] fused AdamW: {args.fused_optimizer}")
+        rprint("[perf] TF32 enabled for fp32 matmul/conv")
+    rprint(f"[perf] fused AdamW: {args.fused_optimizer}")
 
     # ── memory accounting: baseline before Isaac Sim starts ──
     # Taken here so the env delta below includes Isaac's PhysX/rendering allocations, which live
@@ -1055,7 +1618,11 @@ if __name__ == "__main__":
     mem_baseline_host = _host_rss_bytes()
 
     # env setup
-    envs = IsaacLabVectorEnv(args.env_id, args.num_envs, launcher_args=launcher_args)
+    envs = IsaacLabVectorEnv(
+        args.env_id, args.num_envs, launcher_args=launcher_args, device=device,
+        keep_distributed_flag=DIST.enabled, sim_device=str(device),
+    )
+    milestone("Isaac env ready")
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
     mem_after_env_gpu = cuda_used_bytes()
     mem_after_env_host = _host_rss_bytes()
@@ -1065,7 +1632,7 @@ if __name__ == "__main__":
     critic_obs_dim = int(np.prod(critic_obs_shape))
     # No shape assertion here: unlike the symmetric script there is no shared encoder, so the actor
     # (image) and critic (state) streams are expected to differ.
-    print(f"[obs] asymmetric: actor {tuple(policy_obs_shape)} image | critic {critic_obs_dim}-d state")
+    rprint(f"[obs] asymmetric: actor {tuple(policy_obs_shape)} image | critic {critic_obs_dim}-d state")
 
     action_dim = int(np.prod(envs.single_action_space.shape))
 
@@ -1073,7 +1640,7 @@ if __name__ == "__main__":
     # policy/critic leave proprio_dim at 0, which reproduces the vision-only encoder exactly.
     has_proprio = "proprio" in envs.single_observation_space.spaces
     proprio_dim = int(np.prod(envs.single_observation_space["proprio"].shape)) if has_proprio else 0
-    print(f"[obs] proprio group: {'present' if has_proprio else 'absent'} (dim={proprio_dim})")
+    rprint(f"[obs] proprio group: {'present' if has_proprio else 'absent'} (dim={proprio_dim})")
 
     if args.obs_normalization:
         policy_obs_dim = int(np.prod(envs.single_observation_space["policy"].shape))
@@ -1100,16 +1667,16 @@ if __name__ == "__main__":
     encoder_target = make_encoder()
     encoder_target.load_state_dict(encoder.state_dict())
 
-    qf1 = FlashSACQNetwork(critic_obs_dim, action_dim, num_atoms=args.num_atoms, num_blocks=args.critic_num_blocks).to(device)
-    qf2 = FlashSACQNetwork(critic_obs_dim, action_dim, num_atoms=args.num_atoms, num_blocks=args.critic_num_blocks).to(device)
+    qf1 = FlashSACQNetwork(critic_obs_dim, action_dim, num_atoms=args.num_atoms, num_blocks=args.critic_num_blocks, device=device).to(device)
+    qf2 = FlashSACQNetwork(critic_obs_dim, action_dim, num_atoms=args.num_atoms, num_blocks=args.critic_num_blocks, device=device).to(device)
     # The fused latent is zs_dim wide whether or not proprio is present.
     actor = FlashSACActor(envs, args.zs_dim, num_blocks=args.actor_num_blocks, use_tanh=args.use_tanh).to(device)
     zeta_cdf = _build_truncated_zeta_cdf(args.noise_repeat_zeta_mu, args.noise_repeat_zeta_max, device)
     noise_repeat_n = torch.ones((), dtype=torch.int32, device=device)
     noise_repeat_count = torch.zeros((), dtype=torch.int32, device=device)
     cached_noise = torch.randn((args.num_envs,) + envs.single_action_space.shape, device=device)
-    qf1_target = FlashSACQNetwork(critic_obs_dim, action_dim, num_atoms=args.num_atoms, num_blocks=args.critic_num_blocks).to(device)
-    qf2_target = FlashSACQNetwork(critic_obs_dim, action_dim, num_atoms=args.num_atoms, num_blocks=args.critic_num_blocks).to(device)
+    qf1_target = FlashSACQNetwork(critic_obs_dim, action_dim, num_atoms=args.num_atoms, num_blocks=args.critic_num_blocks, device=device).to(device)
+    qf2_target = FlashSACQNetwork(critic_obs_dim, action_dim, num_atoms=args.num_atoms, num_blocks=args.critic_num_blocks, device=device).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
     # Flat (online, target) lists for the Polyak update, built once so the per-update EMA is a
@@ -1140,6 +1707,29 @@ if __name__ == "__main__":
         a_optimizer = optim.AdamW([log_alpha], lr=args.alpha_lr, betas=(0.9, 0.95), fused=args.fused_optimizer)
     else:
         alpha = args.alpha
+
+    # ── put every replica in lockstep, then wire up the gradient reductions ──
+    # Broadcast covers parameters AND buffers, so the BatchNorm running stats and the (still-empty)
+    # observation normalizers also start equal. From here on the replicas only ever see averaged
+    # gradients and identical deterministic post-steps, so they stay bitwise equal for the run.
+    milestone("networks built; entering broadcast (first collective -- a stall here means some "
+              "rank has not reached it yet)")
+    broadcast_module_state(encoder, encoder_target, qf1, qf2, qf1_target, qf2_target, actor)
+    if args.obs_normalization:
+        broadcast_module_state(actor_obs_normalizer, critic_obs_normalizer)
+        if has_proprio:
+            broadcast_module_state(proprio_obs_normalizer)
+    if args.autotune:
+        broadcast_module_state(log_alpha)
+
+    milestone("broadcast done; replicas in lockstep")
+
+    syncs = UpdateSyncs(
+        encoder_params=list(encoder.parameters()),
+        q_params=unique_params(qf1, qf2),
+        actor_params=list(actor.parameters()),
+        alpha_params=[log_alpha] if args.autotune else None,
+    )
 
     mem_after_nets_gpu = cuda_used_bytes()
 
@@ -1193,7 +1783,7 @@ if __name__ == "__main__":
         ):
             raise ValueError("Expert buffer proprio dim does not match this task's.")
         n_expert_tr = expert_rb.buffer_size * expert_rb.n_envs
-        print(
+        rprint(
             f"[expert] loaded {args.expert_rb_path}: {n_expert_tr:,} transitions "
             f"({expert_rb.buffer_size} steps x {expert_rb.n_envs} envs), "
             f"ratio {args.expert_ratio} -> {round(args.batch_size * args.expert_ratio)}/{args.batch_size} "
@@ -1273,10 +1863,13 @@ if __name__ == "__main__":
                          f"(env +{_fmt_bytes(mem_after_env_host - mem_baseline_host)}, "
                          f"buffer +{_fmt_bytes(mem_after_rb_host - mem_before_rb_host)})")
         lines.append(bar)
-        print("\n".join(lines), flush=True)
+        rprint("\n".join(lines), flush=True)
 
     start_time = time.time()
 
+    # Bound unconditionally: build_compiled_update() takes them as arguments, so they must exist
+    # even when --no-obs_normalization leaves them unused.
+    normalize_obs = normalize_critic_obs = None
     if args.obs_normalization:
         normalize_obs = actor_obs_normalizer.forward
         normalize_critic_obs = critic_obs_normalizer.forward
@@ -1320,13 +1913,64 @@ if __name__ == "__main__":
     depth_video_frames: list[np.ndarray] = []
     depth_video_episode = 0
 
+    if (args.compile_update or args.cuda_graphs) and not args.autotune:
+        # log_alpha only exists under --autotune; the C51 target reads it unconditionally, so the
+        # eager path has the same constraint -- fail loudly rather than with a NameError.
+        raise SystemExit("[error] --compile_update / --cuda_graphs require --autotune")
+    if (args.compile_update or args.cuda_graphs) and args.profile_timing:
+        raise SystemExit("[error] --compile_update and --profile_timing are mutually exclusive: the "
+                         "per-block cuda syncs force graph breaks and make the timings meaningless.")
+    if args.cuda_graphs and DIST.world_size > 1:
+        # Refused rather than shipped untested. Two independent problems, both of which would
+        # corrupt training silently rather than crash:
+        #   1. GradSync's all_reduce sits INSIDE the region CudaGraphModule captures. NCCL
+        #      collectives are capturable only under specific conditions, and a mis-capture
+        #      replays a stale reduction every update -- numerically plausible, completely wrong.
+        #   2. synced UnitBatchNorm carries a deliberate @torch._dynamo.disable graph break (it has
+        #      to: compiling that collective produced ~1e-2 gradient errors), and a graph break
+        #      inside a captured region is not something CudaGraphModule can honour.
+        # The single-GPU path is unaffected -- this only fires at world_size > 1.
+        raise SystemExit(
+            "[error] --cuda_graphs is not supported at world_size > 1 (this run has "
+            f"{DIST.world_size}). The gradient all-reduce and the synced-BatchNorm graph break "
+            "both sit inside the captured region, and a mis-capture there fails silently rather "
+            "than loudly. Use --compile_update instead (verified equivalent to single-GPU by "
+            "tests/test_distributed_equivalence.py --compile), or run --cuda_graphs on 1 GPU."
+        )
+    graph_fns = None
+    if args.cuda_graphs:
+        graph_fns = build_graph_update(
+            args, encoder, encoder_target, qf1, qf2, qf1_target, qf2_target, actor,
+            encoder_optimizer, q_optimizer, actor_optimizer,
+            a_optimizer if args.autotune else None, log_alpha,
+            target_entropy if args.autotune else 0.0,
+            ema_target_params, ema_online_params,
+            normalize_obs, normalize_critic_obs, norm_proprio, syncs)
+        rprint("[perf] --cuda_graphs on: update captured as 3 CUDA graphs over compiled regions "
+              "(main / actor / normalize+EMA). Expect ~40 s warmup.")
+
+    compiled_update = None
+    if args.compile_update and not args.cuda_graphs:
+        compiled_update = build_compiled_update(
+            args, encoder, encoder_target, qf1, qf2, qf1_target, qf2_target, actor,
+            encoder_optimizer, q_optimizer, actor_optimizer,
+            a_optimizer if args.autotune else None, log_alpha,
+            target_entropy if args.autotune else 0.0,
+            ema_target_params, ema_online_params,
+            normalize_obs, normalize_critic_obs, norm_proprio, syncs)
+        rprint("[perf] --compile_update on: update runs as one torch.compile region "
+              "(expect ~25 s warmup on the first updates)")
+
     timer = BlockTimer(args.profile_timing, device)
     if args.profile_timing:
-        print("[profile] --profile_timing on: CUDA syncs added around every block; SPS is not "
+        rprint("[profile] --profile_timing on: CUDA syncs added around every block; SPS is not "
               "comparable to a normal run.")
 
     # TRY NOT TO MODIFY: start the game
-    obs, _ = envs.reset(seed=args.seed)
+    # Rank-offset seed: each replica must roll out a DIFFERENT trajectory, or the extra GPUs would
+    # fill their buffers with near-duplicate data and add nothing.
+    milestone("setup complete; starting rollout")
+    obs, _ = envs.reset(seed=seed)
     global_step = 0
     while global_step < args.num_learning_iterations:
         timer.start("total/iteration")
@@ -1419,6 +2063,41 @@ if __name__ == "__main__":
                 with timer.block("buffer/sample_H2D"):
                     data = sample_batch(args.batch_size)
 
+                if graph_fns is not None:
+                    g_main, g_actor, g_tail = graph_fns
+                    (zs_d, critic_obs_d, qf_loss, qf1_loss, qf2_loss, target_values,
+                     model_loss, dyn_loss, reward_loss, done_loss) = g_main(
+                        data.policy_observations, data.next_policy_observations,
+                        data.critic_observations, data.next_critic_observations,
+                        data.proprio_observations, data.next_proprio_observations,
+                        data.actions, data.rewards, data.dones, data.effective_n_steps)
+                    qf1_target_values, qf2_target_values = target_values[0], target_values[1]
+                    if update_step % args.policy_frequency == 0:
+                        actor_loss, alpha_loss, policy_entropy, log_pi = g_actor(zs_d, critic_obs_d)
+                        alpha = log_alpha.detach().exp().squeeze()
+                    # normalize_parameters + Polyak EMA, kept after the actor update as in the
+                    # eager path (see build_graph_update docstring).
+                    g_tail(zs_d)
+                    update_step += 1
+                    continue
+
+                if compiled_update is not None:
+                    out = compiled_update(data, update_step % args.policy_frequency == 0)
+                    qf_loss = out["qf_loss"]; qf1_loss = out["qf1_loss"]; qf2_loss = out["qf2_loss"]
+                    target_values = out["target_values"]
+                    qf1_target_values, qf2_target_values = target_values[0], target_values[1]
+                    if update_step % args.policy_frequency == 0:
+                        # Critic-only updates leave these untouched in the eager path; overwriting
+                        # them with the compiled function's zero placeholders would log 0.0000
+                        # whenever the last update of a step was not an actor update.
+                        actor_loss = out["actor_loss"]; alpha_loss = out["alpha_loss"]
+                        policy_entropy = out["policy_entropy"]; log_pi = out["log_pi"]
+                    model_loss = out["model_loss"]; dyn_loss = out["dyn_loss"]
+                    reward_loss = out["reward_loss"]; done_loss = out["done_loss"]
+                    alpha = log_alpha.detach().exp().squeeze()
+                    update_step += 1
+                    continue
+
                 with timer.block("update/normalize_obs"):
                     policy_obs = data.policy_observations
                     next_policy_obs = data.next_policy_observations
@@ -1464,8 +2143,9 @@ if __name__ == "__main__":
                         + args.model_reward_coef * reward_loss
                         + args.model_done_coef * done_loss
                     )
-                    encoder_optimizer.zero_grad()
+                    encoder_optimizer.zero_grad(set_to_none=False)
                     model_loss.backward()
+                    syncs.encoder()
                     encoder_optimizer.step()
 
                 # ── C51 target on the STATE critic (no encoder in this path) ──
@@ -1504,8 +2184,9 @@ if __name__ == "__main__":
                     qf_loss = torch.stack([qf1_loss, qf2_loss]).mean(dim=1).sum(dim=0)
 
                     # optimize the model
-                    q_optimizer.zero_grad()
+                    q_optimizer.zero_grad(set_to_none=False)
                     qf_loss.backward()
+                    syncs.q()
                     q_optimizer.step()
 
                 if update_step % args.policy_frequency == 0:
@@ -1527,8 +2208,9 @@ if __name__ == "__main__":
                         min_qf_pi = torch.min(qf1_value, qf2_value)
                         actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
-                        actor_optimizer.zero_grad()
+                        actor_optimizer.zero_grad(set_to_none=False)
                         actor_loss.backward()
+                        syncs.actor()
                         actor_optimizer.step()
 
                     if args.autotune:
@@ -1537,8 +2219,9 @@ if __name__ == "__main__":
                                 _, log_pi, _ = actor.get_action(zs_pi, training=False)
                             alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
-                            a_optimizer.zero_grad()
+                            a_optimizer.zero_grad(set_to_none=False)
                             alpha_loss.backward()
+                            syncs.alpha()
                             a_optimizer.step()
                             # Kept as a detached 0-dim DEVICE tensor rather than .item(): .item() is a
                             # device->host sync, and at high UTD it runs once per policy update
@@ -1636,7 +2319,16 @@ if __name__ == "__main__":
                 writer.add_scalar("metrics/critic_hessian_top_eig_log10", math.log10(max(abs(hess_lambda_max), 1e-12)), global_step)
                 writer.add_scalar("metrics/critic_hessian_cond_number_log10", math.log10(max(hess_cond_number, 1e-12)), global_step)
 
-            if global_step % args.logging_interval == 0:
+            # Rank 0 owns all logging. The reported episode statistics are therefore rank 0's own
+            # envs (num_envs of the world_size * num_envs total) -- a fair sample of the same
+            # policy, since every replica runs identical weights against identically-configured
+            # envs, but a 1/world_size sample, so it is noisier than a single-GPU run's.
+            # Deliberately NOT all-reduced: these are pure diagnostics, and a collective here would
+            # be one more place for the ranks to fall out of step.
+            if not DIST.is_main and global_step % args.logging_interval == 0:
+                num_success_episodes_log = 0
+                num_episodes_log = 0
+            if DIST.is_main and global_step % args.logging_interval == 0:
                 # Every .item() below is a device->host sync; with many scalars this is not free.
                 timer.start("io/logging")
                 writer.add_scalar("losses/qf1_values", qf1_target_values.mean().item(), global_step)
@@ -1747,8 +2439,10 @@ if __name__ == "__main__":
 
                 print("\n".join(lines), flush=True)
 
-        # Periodic checkpoint save (after training starts so model isn't all-zeros)
-        if args.save_model and global_step > args.learning_starts:
+        # Periodic checkpoint save (after training starts so model isn't all-zeros).
+        # Rank 0 only: every replica holds bitwise-identical weights, so N copies would be N-1
+        # redundant multi-GB writes racing for the same path.
+        if args.save_model and DIST.is_main and global_step > args.learning_starts:
             # global_step counts learning iterations (+=1 per iter), so an exact modulo fires once
             # per boundary. A `% interval < num_envs` guard would assume transition-counting and
             # dump num_envs consecutive checkpoints per boundary.
@@ -1787,8 +2481,8 @@ if __name__ == "__main__":
         timer.stop("total/iteration")
         global_step += 1
 
-    # Final checkpoint at end of training
-    if args.save_model:
+    # Final checkpoint at end of training (rank 0 only, as above)
+    if args.save_model and DIST.is_main:
         ckpt_dir = f"{args.ckpt_dir}/{run_name}"
         os.makedirs(ckpt_dir, exist_ok=True)
         ckpt_path = f"{ckpt_dir}/model_final.pt"
@@ -1818,6 +2512,15 @@ if __name__ == "__main__":
         print(f"[ckpt] saved final {ckpt_path}")
         if args.track:
             wandb.save(ckpt_path, base_path=ckpt_dir, policy="now")
+
+    # Collectives are finished with BEFORE the environments are torn down. Ordering matters: the
+    # barrier exists so no rank destroys its communicator while rank 0 is still writing the final
+    # checkpoint (that would abort the write), but putting it *after* envs.close() would mean one
+    # rank's slow Isaac shutdown blocks every other rank inside the barrier indefinitely. Sim
+    # teardown needs no coordination, so each rank does it independently afterwards.
+    if DIST.enabled:
+        dist.barrier()
+        dist.destroy_process_group()
 
     envs.close()
     writer.close()

@@ -4,15 +4,8 @@ import gymnasium as gym
 from gymnasium.spaces import Space
 from gymnasium.vector.vector_env import VectorEnv
 import argparse
-from gymnasium.vector.utils import (
-    batch_differing_spaces,
-    batch_space,
-    concatenate,
-    create_empty_array,
-    iterate,
-)
+from gymnasium.vector.utils import batch_space
 
-import numpy as np
 
 class IsaacLabVectorEnv(VectorEnv):
     """Vectorized env for IsaacLab tasks"""

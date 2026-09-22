@@ -36,6 +36,44 @@ parser.add_argument(
     help="Direct path to a checkpoint file to resume from (bypasses log directory search).",
 )
 parser.add_argument(
+    "--gc_checkpoint", type=str, default=None, required=False,
+    help=(
+        "PPO goal-conditioned policy checkpoint that performs the autonomous resets. Required. "
+        "Must match the task's `gc` observation group term-for-term."
+    ),
+)
+parser.add_argument(
+    "--phase_video", action="store_true", default=False,
+    help=(
+        "Record an annotated mp4 of the collect -> update -> reset cycle: green banner while the "
+        "SAC assembly policy collects, orange while gradient updates run, red while the GC "
+        "disassembly policy performs the reset. Also draws the disassembly target keypoints."
+    ),
+)
+parser.add_argument(
+    "--phase_video_steps", type=int, default=0,
+    help=(
+        "Optional cap on recorded env steps for --phase_video. 0 (default) records for the whole "
+        "run; the file is finalised on exit, including Ctrl+C."
+    ),
+)
+parser.add_argument(
+    "--phase_video_update_frames", type=int, default=30,
+    help="Frames to hold on the orange TRAINING banner (updates consume no env steps).",
+)
+parser.add_argument(
+    "--phase_video_path", type=str, default=None,
+    help="Output mp4 for --phase_video (default: <log_dir>/phase_video.mp4).",
+)
+parser.add_argument(
+    "--collect_steps", type=int, default=160,
+    help="Steps per FastSAC collection episode (replay buffer ON).",
+)
+parser.add_argument(
+    "--reset_steps", type=int, default=160,
+    help="Steps the GC policy gets to drive the robot to the sampled reset state (buffer OFF).",
+)
+parser.add_argument(
     "--replay_buffer_path", type=str, default=None,
     help=(
         "Optional path to an online replay_buffer_*.pt file (saved by save_replay_buffer_interval). "
@@ -54,18 +92,6 @@ parser.add_argument(
         "r_hat = r + gamma*V(s') - V(s) instead of r. V is never updated. Requires --resume_path "
         "(there is nothing to freeze otherwise). Potential-based, so the optimal policy is "
         "unchanged; only credit assignment moves."
-    ),
-)
-parser.add_argument(
-    "--sgft",
-    type=int,
-    default=0,
-    metavar="H",
-    help=(
-        "Full SGFT with horizon H: potential-based shaping (as --sgft-pbrs) PLUS an H-step critic "
-        "objective with no Bellman backup -- the target is the H-step sum of shaped rewards only. "
-        "Sets agent.num_steps=H (the replay buffers' n-step window); a conflicting explicit "
-        "agent.num_steps is an error. Mutually exclusive with --h_step_backup. 0 = off."
     ),
 )
 parser.add_argument(
@@ -128,19 +154,7 @@ parser.add_argument(
     "--expert_ratio_anneal_steps",
     type=int,
     default=0,
-    help="Linearly anneal expert_ratio to --expert_ratio_final over this many global steps. 0 = no annealing (default).",
-)
-parser.add_argument(
-    "--expert_ratio_final",
-    type=float,
-    default=0.0,
-    help="Expert ratio reached at the end of the anneal window (default: 0.0).",
-)
-parser.add_argument(
-    "--expert_ratio_anneal_start",
-    type=int,
-    default=None,
-    help="Global step the anneal window starts at. Default: the step training (re)starts at, so a resumed run anneals over its own steps.",
+    help="Linearly anneal expert_ratio to 0 over this many global steps. 0 = no annealing (default).",
 )
 parser.add_argument(
     "--expert_checkpoint",
@@ -159,7 +173,7 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
 # always enable cameras to record video
-if args_cli.video:
+if args_cli.video or args_cli.phase_video:
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -195,7 +209,6 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 
 import gymnasium as gym
 import logging
-import glob
 import os
 import re
 import torch
@@ -203,7 +216,6 @@ import wandb
 from datetime import datetime
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
-from holosoma.agents.fast_sac.fast_sac_agent import FastSACAgent
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -218,6 +230,8 @@ from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.agents.rsl_rl_cfg import Base_PPORunnerCfg
 from vecenv_wrapper import HolosomaVecEnvWrapper
+
+from autonomous_reset_agent import AutonomousResetFastSACAgent
 from holosoma.config_types.experiment import ExperimentConfig
 
 import isaaclab_tasks  # noqa: F401
@@ -249,15 +263,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # make config compatible with installed rsl-rl version
     agent_cfg = cli_args.sanitize_rsl_rl_cfg(agent_cfg)
-    if args_cli.sgft > 0:
-        # --sgft H: the replay buffers' n-step window must be H. Refuse a conflicting explicit override.
-        explicit = [a for a in hydra_args if a.startswith("agent.num_steps=")]
-        if explicit and int(float(explicit[-1].split("=", 1)[1])) != args_cli.sgft:
-            raise ValueError(f"--sgft {args_cli.sgft} conflicts with {explicit[-1]}; drop one of them.")
-        if not hasattr(agent_cfg, "num_steps"):
-            raise ValueError("--sgft requires an off-policy (FastSAC) agent config with num_steps")
-        agent_cfg.num_steps = args_cli.sgft
-        print(f"[INFO] --sgft {args_cli.sgft}: agent.num_steps set to {args_cli.sgft} (H-step window, no Bellman backup)")
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -304,44 +309,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.log_dir = log_dir
 
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if args_cli.phase_video:
+        # Frame the env being recorded. The default viewer looks at the WORLD origin, but env 0
+        # sits at its own origin (env_spacing offset), so the arm and the goal markers land at the
+        # edge of frame or outside it entirely.
+        env_cfg.viewer.origin_type = "env"
+        env_cfg.viewer.env_index = 0
+        # Head-on down the +x axis at the table. The previous 3/4 view put a scene pole between
+        # the camera and the workspace.
+        env_cfg.viewer.eye = (1.55, 0.0, 0.55)
+        env_cfg.viewer.lookat = (0.40, 0.0, 0.08)
 
-    try:
-        from uwlab_tasks.manager_based.manipulation.omnireset.mdp.utils import describe_assembly_assets
-
-        print(describe_assembly_assets(env_cfg))
-    except Exception as exc:  # noqa: BLE001
-        print(f"[assembly] could not describe peg/hole assets: {exc}")
+    env = gym.make(
+        args_cli.task, cfg=env_cfg, render_mode="rgb_array" if (args_cli.video or args_cli.phase_video) else None
+    )
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
     # save resume path before creating a new log_dir
-    requeue_ckpt = None
-    if int(os.getenv("SLURM_RESTART_COUNT", "0")) > 0 and agent_cfg.run_name:
-        # A SLURM requeue must continue from THIS run's own latest checkpoint, even when the job was
-        # launched with an explicit --resume_path (otherwise every preemption restarts from the
-        # original checkpoint). Take the highest step across ALL run dirs of this run_name, so an
-        # empty or short-lived newer dir can never win over an older dir that got further.
-        run_dir_re = re.compile(f".*_{re.escape(agent_cfg.run_name)}$")
-        ckpts = [
-            f
-            for d in glob.glob(os.path.join(log_root_path, "*"))
-            if os.path.isdir(d) and run_dir_re.match(os.path.basename(d))
-            for f in glob.glob(os.path.join(d, "model_*.pt"))
-        ]
-        if ckpts:
-            requeue_ckpt = max(ckpts, key=lambda f: int(re.findall(r"model_(\d+)\.pt", f)[0]))
-    if requeue_ckpt is not None:
-        resume_path = requeue_ckpt
-        agent_cfg.resume = True
-        print(
-            f"[INFO] SLURM requeue detected (SLURM_RESTART_COUNT={os.getenv('SLURM_RESTART_COUNT')}). "
-            f"Resuming this run from its own latest checkpoint: {resume_path}"
-            + (f" (overrides --resume_path {args_cli.resume_path})" if args_cli.resume_path else "")
-        )
-    elif args_cli.resume_path is not None:
+    if args_cli.resume_path is not None:
         resume_path = retrieve_file_path(args_cli.resume_path)
         agent_cfg.resume = True
     elif agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
@@ -411,23 +399,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "device": agent_cfg.device,
                 "expert_transitions": args_cli.expert_transitions,
                 "expert_ratio": args_cli.expert_ratio,
-                "expert_ratio_final": args_cli.expert_ratio_final,
-                "expert_ratio_anneal_steps": args_cli.expert_ratio_anneal_steps,
-                "expert_ratio_anneal_start": args_cli.expert_ratio_anneal_start,
                 "expert_checkpoint": args_cli.expert_checkpoint,
                 "replay_buffer_path": args_cli.replay_buffer_path,
                 "resume_path": args_cli.resume_path,
             },
             dir=log_dir,
-            # TEMPORARY (UWLAB_WANDB_GLOBAL_STEP=1): log scalars straight to wandb with step=global_step so
-            # the wandb "Step" axis matches runs that log via wandb.log(step=global_step) (e.g. the real-robot
-            # SAC-Real-Finetuning runs). Default path keeps tensorboard sync (wandb Step = log-call counter).
-            sync_tensorboard=os.getenv("UWLAB_WANDB_GLOBAL_STEP", "0") != "1",
+            sync_tensorboard=True,
         )
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = FastSACAgent(env, agent_cfg, log_dir=log_dir, device=agent_cfg.device,
+        runner = AutonomousResetFastSACAgent(env, agent_cfg, log_dir=log_dir, device=agent_cfg.device,
             expert_policy=expert_policy,
             expert_critic=None, # expert_critic,
             lambda_bc_policy=1.0,
@@ -437,27 +419,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.cpu_replay_buffer:
             print("[INFO] Replay buffers (online + expert) held on CPU; batches move to device per update.")
         runner.setup()
-        if os.getenv("UWLAB_WANDB_GLOBAL_STEP", "0") == "1" and agent_cfg.logger == "wandb" and is_rank_zero:
-
-            class _WandbStepWriter:
-                """Tensorboard writer shim: mirrors add_scalar to wandb.log(step=global_step)."""
-
-                def __init__(self, tb):
-                    self._tb = tb
-
-                def add_scalar(self, tag, value, step=None, *a, **k):
-                    self._tb.add_scalar(tag, value, step, *a, **k)
-                    wandb.log({tag: float(value)}, step=int(step))
-
-                def __getattr__(self, name):
-                    return getattr(self._tb, name)
-
-            runner.writer = _WandbStepWriter(runner.writer)
-            print("[INFO] UWLAB_WANDB_GLOBAL_STEP=1: wandb Step axis = global_step (tensorboard sync off).")
+        if args_cli.gc_checkpoint is None:
+            raise ValueError("--gc_checkpoint is required: it is the policy that performs the resets.")
+        runner.configure_autonomous_reset(
+            gc_checkpoint=args_cli.gc_checkpoint,
+            collect_steps=args_cli.collect_steps,
+            reset_steps=args_cli.reset_steps,
+        )
+        if args_cli.phase_video:
+            runner.configure_phase_video(
+                path=args_cli.phase_video_path or os.path.join(log_dir, "phase_video.mp4"),
+                steps=args_cli.phase_video_steps,
+                update_frames=args_cli.phase_video_update_frames,
+            )
+        # update_interval is meaningless here: updates fire once at the end of each collection
+        # episode, so the schedule is (num_updates per collect_steps) by construction.
+        if int(getattr(agent_cfg, "update_interval", 1) or 1) != 1:
+            print(
+                "[WARN]: update_interval is ignored by the autonomous-reset loop; updates run once "
+                "per collection episode. Use --collect_steps and agent.num_updates instead."
+            )
         runner.expert_ratio = args_cli.expert_ratio
         runner.expert_ratio_anneal_steps = args_cli.expert_ratio_anneal_steps
-        runner.expert_ratio_final = args_cli.expert_ratio_final
-        runner.expert_ratio_anneal_start = args_cli.expert_ratio_anneal_start
         runner.attach_checkpoint_metadata(ExperimentConfig(), log_dir)
         if args_cli.expert_transitions is not None:
             runner.load_expert_replay_buffer(args_cli.expert_transitions)
@@ -477,9 +460,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # just-loaded weights. Must run after runner.load() -- before it, the networks are still
     # randomly initialised -- and after the expert buffer is loaded, so enable_sgft() can reshape
     # those stored rewards too.
-    if args_cli.sgft_pbrs or args_cli.h_step_backup or args_cli.sgft > 0:
+    if args_cli.sgft_pbrs or args_cli.h_step_backup:
         _which = " / ".join(f for f, on in (("--sgft-pbrs", args_cli.sgft_pbrs),
-                                            (f"--sgft {args_cli.sgft}", args_cli.sgft > 0),
                                             ("--h_step_backup", args_cli.h_step_backup)) if on)
         if not (agent_cfg.resume or args_cli.resume_path is not None or args_cli.sgft_source_ckpt is not None):
             raise ValueError(
@@ -489,10 +471,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if not hasattr(runner, "enable_sgft"):
             raise ValueError(f"{_which} is only supported by FastSACAgent, got {type(runner).__name__}.")
         runner.enable_sgft(
-            shape_rewards=args_cli.sgft_pbrs or args_cli.sgft > 0,
+            shape_rewards=args_cli.sgft_pbrs,
             h_step_backup=args_cli.h_step_backup,
             ckpt_path=args_cli.sgft_source_ckpt,
-            h_step=args_cli.sgft,
         )
 
     # Optional: load online replay buffer from a saved snapshot (FastSAC only).

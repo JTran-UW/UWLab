@@ -35,7 +35,7 @@ Example (FastSAC state peg expert, same task it trained on):
         --num_envs 1024 --checkpoint peg_state_rl_expert_seed42.pt \
         --record_transitions 1000 --num_steps 3 \
         --output expert_rb/peg_state_expert_rb.pt --headless \
-        env.scene.insertive_object=peg env.scene.receptive_object=peghole
+
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -45,7 +45,11 @@ import sys
 
 from isaaclab.app import AppLauncher
 
-# local imports
+# local imports: cli_args lives with the holosoma scripts (one copy, shared)
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "holosoma"))
 import cli_args  # isort: skip
 
 # add argparse arguments
@@ -174,8 +178,6 @@ import torch
 import tqdm
 from gymnasium import spaces
 from tensordict import TensorDict
-
-import sys, pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 

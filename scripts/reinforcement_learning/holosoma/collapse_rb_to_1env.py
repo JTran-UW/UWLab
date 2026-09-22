@@ -30,8 +30,10 @@ This deliberately replaces the previous *time-major* interleave
 ``SimpleReplayBuffer.sample`` walks ``(i + offset) % buffer_size`` for n-step returns, stopping only
 at a done/truncation -- so with ``n_steps > 1`` *every* sample would sum rewards across unrelated
 trajectories and bootstrap off a foreign state. Env-major leaves only ``n_env - 1`` seams, and each
-is stamped ``truncations = 1`` (unless already a real ``done``) so the n-step walk terminates there.
-That is the same guard ``sample()`` applies to its own circular-wrap seam.
+is stamped ``dones = 1`` AND ``truncations = 1`` (the success-as-truncation convention): the sampler
+cuts the reward walk on ``dones`` only -- a truncation-only flag merely relocates the bootstrap obs
+while rewards keep accumulating into the next env -- and the truncation flag makes the critic
+bootstrap through the seam from that env's true final observation (handle_truncations).
 
 Output ``ptr`` is set to ``n_env * buffer_size`` (fully filled; the next write wraps to 0) and
 ``global_step`` is reset to 0 for the online format.
@@ -96,13 +98,15 @@ def _rotate_env_major(t: torch.Tensor, ptr: int, buffer_size: int) -> torch.Tens
 
 
 def _stamp_seams(out: dict, n_env: int, seg_len: int) -> int:
-    """Flag the last slot of every env segment truncated so n-step walks stop there."""
+    """Flag the last slot of every env segment done+truncated so n-step walks stop there and
+    the target bootstraps through the seam (rows already done keep their own truncation flag)."""
     total = n_env * seg_len
     idx = torch.arange(seg_len - 1, total, seg_len)
     already_done = out["dones"][0, idx] > 0
     out["truncations"][0, idx] = torch.where(
         already_done, out["truncations"][0, idx], torch.ones_like(out["truncations"][0, idx])
     )
+    out["dones"][0, idx] = torch.ones_like(out["dones"][0, idx])
     return int(idx.numel())
 
 
@@ -110,10 +114,10 @@ def _check_seams(out: dict, seg_len: int, n_seams: int) -> None:
     """Assert continuity holds inside segments and every boundary terminates the walk."""
     total = out["dones"].shape[1]
     ends = torch.arange(seg_len - 1, total, seg_len)
-    stops = (out["dones"][0, ends] > 0) | (out["truncations"][0, ends] > 0)
+    stops = out["dones"][0, ends] > 0  # only `dones` cuts the sampler's n-step reward walk
     bad = int((~stops).sum())
     if bad:
-        raise AssertionError(f"{bad}/{len(ends)} segment boundaries lack a done/truncation flag")
+        raise AssertionError(f"{bad}/{len(ends)} segment boundaries lack a done flag")
     # next_obs[i] must equal obs[i+1] within a segment (the env auto-resets, so this holds across
     # dones too); at a boundary the two belong to different envs and should differ.
     obs, nobs = out["observations"][0], out["next_observations"][0]

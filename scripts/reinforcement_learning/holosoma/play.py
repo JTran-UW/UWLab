@@ -48,7 +48,6 @@ parser.add_argument(
     action="store_true",
     help="Use the pre-trained checkpoint from Nucleus.",
 )
-parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument(
     "--record_transitions",
     type=int,
@@ -118,7 +117,28 @@ parser.add_argument(
         "Sample actions from the policy distribution instead of taking its mean. This is what the "
         "TRAINING rollout does (fast_sac_agent sets policy = actor.explore), whereas play.py "
         "otherwise evaluates the deterministic mean -- so a policy whose mean is fine but whose "
-        "log_std has blown up looks healthy here and destabilises during training. FastSAC only."
+        "log_std has blown up looks healthy here and destabilises during training. Also essential "
+        "for dither-dependent experts whose mean action jams. FastSAC and OnPolicyRunner (PPO)."
+    ),
+)
+parser.add_argument(
+    "--record_scene_state",
+    action="store_true",
+    default=False,
+    help=(
+        "With --record_transitions: also store each step's env-relative scene state (scene.get_state) "
+        "under buffer_tensors['scene_state'] so episodes can be replayed exactly (replay_rb_trajectories.py)."
+    ),
+)
+parser.add_argument(
+    "--success_to_truncation",
+    action="store_true",
+    default=False,
+    help=(
+        "When recording transitions, store dones caused by the 'success' termination as truncations "
+        "so the consumer bootstraps through them (FastSAC with handle_truncations bootstraps where "
+        "truncations | ~dones). Use with a Success-Termination task so episodes end at insertion "
+        "without the success step being treated as a zero-value terminal."
     ),
 )
 parser.add_argument(
@@ -137,6 +157,27 @@ parser.add_argument(
     type=int,
     default=None,
     help="If set, run for this many steps collecting EE pose for env 0 (robot base frame), then plot and exit.",
+)
+parser.add_argument(
+    "--record_success_yaw",
+    type=str,
+    default=None,
+    help=(
+        "With --eval_episodes_per_env: at each counted episode's FIRST success, record the peg alignment "
+        "frame's yaw relative to the receptive asset's CANONICAL assembled offset, whether the peg is flipped "
+        "end-over-end, and the same quantities at episode start; save to this .pt and print a histogram. "
+        "A single tight cluster means the policy only ever inserts at one orientation."
+    ),
+)
+parser.add_argument(
+    "--save_failure_states",
+    type=str,
+    default=None,
+    help=(
+        "With --eval_episodes_per_env: save the full scene start state (scene.get_state, env-relative) "
+        "of every counted FAILED episode to this .pt, along with its outcome bucket, duration, env id "
+        "and initial peg xyz, for replaying the failures later."
+    ),
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -160,7 +201,7 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import glob
 import os
-import time
+import math
 import torch
 import tqdm
 from tensordict import TensorDict
@@ -181,11 +222,40 @@ from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
 from vecenv_wrapper import HolosomaVecEnvWrapper
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
+
+
+def _state_index(state, idx):
+    """Index every leaf tensor of a nested scene-state dict along dim 0."""
+    if isinstance(state, dict):
+        return {k: _state_index(v, idx) for k, v in state.items()}
+    return state[idx]
+
+
+def _state_scatter(dst, src, idx):
+    """dst[leaf][idx] = src[leaf][idx] for every leaf of two same-shaped nested state dicts."""
+    for k, v in dst.items():
+        if isinstance(v, dict):
+            _state_scatter(v, src[k], idx)
+        else:
+            v[idx] = src[k][idx].to(v.device)
+
+
+def _to_cpu_state(state):
+    if isinstance(state, dict):
+        return {k: _to_cpu_state(v) for k, v in state.items()}
+    return None if state is None else state.detach().cpu()
+
+
+def _state_cat(states):
+    """Concatenate a list of nested state dicts along dim 0 (leaf-wise)."""
+    first = states[0]
+    if isinstance(first, dict):
+        return {k: _state_cat([st[k] for st in states]) for k in first}
+    return torch.cat(states, dim=0)
 from isaaclab_tasks.utils import get_checkpoint_path
 from uwlab_tasks.utils.hydra import hydra_task_config
 
@@ -254,6 +324,8 @@ def record_transitions_to_replay_buffer(
     gamma: float = 0.99,
     n_steps: int = 1,
     single_env_rb: bool = False,
+    success_to_truncation: bool = False,
+    record_scene_state: bool = False,
 ) -> None:
     """Run a policy for ``num_steps`` and save transitions in SimpleReplayBuffer format.
 
@@ -282,6 +354,15 @@ def record_transitions_to_replay_buffer(
     n_env = env.num_envs
     n_act = env.num_actions
 
+    if success_to_truncation:
+        term_mgr = env.unwrapped.termination_manager
+        if "success" not in list(term_mgr.active_terms):
+            raise ValueError(
+                "--success_to_truncation requires a task with a 'success' termination term; "
+                f"active terms: {list(term_mgr.active_terms)}"
+            )
+        print("[INFO] --success_to_truncation: success-caused dones will be recorded as truncations.")
+
     # Initial obs
     obs_td = env.get_observations().to(device)
     actor_obs = _flatten_obs_groups(obs_td, actor_obs_keys)
@@ -300,16 +381,21 @@ def record_transitions_to_replay_buffer(
         device=device,
     )
 
+    scene_states: list = []  # per-step env-relative scene state at s_t (only with record_scene_state)
+
+    def _flatten_state(st: dict, prefix: str = "") -> dict:
+        out = {}
+        for k, v in st.items():
+            key = f"{prefix}/{k}" if prefix else k
+            out.update(_flatten_state(v, key) if isinstance(v, dict) else {key: v.detach().cpu().clone()})
+        return out
+
     pbar = tqdm.tqdm(total=num_steps, desc="Recording transitions")
     for i in range(num_steps):
         with torch.inference_mode():
+            if record_scene_state:
+                scene_states.append(_flatten_state(env.unwrapped.scene.get_state(is_relative=True)))
             actions = policy(obs_td)
-            # 1% per-env chance to replace with uniform random action in [-1, 1]
-            # random_mask = torch.rand(n_env, 1, device=actions.device) < 0.01
-            # random_actions = torch.rand_like(actions) * 2.0 - 1.0
-            # actions = torch.where(random_mask, random_actions, actions)
-            # actions = torch.ones_like(actions)
-
             next_obs_td, rewards, dones, extras = env.step(actions.to(env.device))
             next_obs_td = next_obs_td.to(device)
             rewards = rewards.to(device=device, dtype=torch.float)
@@ -318,6 +404,9 @@ def record_transitions_to_replay_buffer(
                 "time_outs", torch.zeros(n_env, dtype=torch.bool, device=device)
             )
             truncations = truncations.to(device).long()
+            if success_to_truncation:
+                success = term_mgr.get_term("success").to(device).long()
+                truncations = (truncations | success).long()
 
             next_actor_obs = _flatten_obs_groups(next_obs_td, actor_obs_keys)
             next_critic_obs = _flatten_obs_groups(next_obs_td, critic_obs_keys)
@@ -381,6 +470,11 @@ def record_transitions_to_replay_buffer(
         )
         return
 
+    scene_state_payload = None
+    if record_scene_state:
+        # dict key -> (n_env, num_steps, dim), same layout as the transition tensors
+        scene_state_payload = {k: torch.stack([st[k] for st in scene_states], dim=1) for k in scene_states[0]}
+
     payload = {
         "buffer_tensors": {
             "observations": rb.observations.detach().cpu(),
@@ -405,8 +499,12 @@ def record_transitions_to_replay_buffer(
             "critic_obs_keys": critic_obs_keys,
             "task": task_name,
             "total_transitions": n_env * num_steps,
+            "success_to_truncation": success_to_truncation,
+            "has_scene_state": scene_state_payload is not None,
         },
     }
+    if scene_state_payload is not None:
+        payload["buffer_tensors"]["scene_state"] = scene_state_payload
 
     torch.save(payload, output_path)
     print(f"[INFO] Saved {n_env * num_steps} transitions to: {output_path}")
@@ -465,6 +563,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     record_video = args_cli.video or bool(args_cli.checkpoint_dir)
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if record_video else None)
 
+    try:
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp.utils import describe_assembly_assets
+
+        print(describe_assembly_assets(env_cfg))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[assembly] could not describe peg/hole assets: {exc}")
+
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
@@ -498,7 +603,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.setup()
         runner.load(resume_path)
         policy = runner.get_inference_policy(device=env.unwrapped.device)
-        critic = runner.get_inference_critic(device=env.unwrapped.device)
         actor_obs_keys = agent_cfg.actor_obs_keys
         critic_obs_keys = agent_cfg.critic_obs_keys
 
@@ -522,16 +626,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # Optional: record transitions into a replay buffer and exit
         if args_cli.record_transitions is not None and args_cli.record_transitions > 0:
-            # FastSAC policy expects {"actor_obs": tensor}; wrap for compatibility
-            def fastsac_sample_policy(obs_td):
-                a_obs = torch.cat([obs_td[k] for k in actor_obs_keys], dim=-1)
-                return policy({"actor_obs": a_obs})
-
             rec_actor_keys, rec_critic_keys = resolve_record_obs_keys(env, actor_obs_keys, critic_obs_keys)
             output_path = args_cli.transitions_output or os.path.join(log_dir, "play_transitions.pt")
             record_transitions_to_replay_buffer(
                 env=env,
-                policy=fastsac_sample_policy,
+                policy=lambda obs_td: policy({"actor_obs": torch.cat([obs_td[k] for k in actor_obs_keys], dim=-1)}),
                 actor_obs_keys=rec_actor_keys,
                 critic_obs_keys=rec_critic_keys,
                 num_steps=args_cli.record_transitions,
@@ -541,13 +640,37 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 gamma=getattr(agent_cfg.algorithm, "gamma", 0.99) if hasattr(agent_cfg, "algorithm") else 0.99,
                 n_steps=args_cli.record_n_steps,
                 single_env_rb=args_cli.single_env_rb,
+                success_to_truncation=args_cli.success_to_truncation,
+                record_scene_state=args_cli.record_scene_state,
             )
             env.close()
             return
     elif agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        runner.load(resume_path)
-        policy = runner.get_inference_policy(device=env.unwrapped.device)
+        try:
+            runner.load(resume_path)
+        except RuntimeError as e:
+            # Tolerate critic-side size mismatches only (e.g. the env's privileged critic group has a
+            # different dim than the checkpoint's): the critic is unused at play/recording time.
+            loaded_dict = torch.load(resume_path, weights_only=False, map_location=agent_cfg.device)
+            ckpt_sd = loaded_dict["model_state_dict"]
+            model_sd = runner.alg.policy.state_dict()
+            mismatched = [
+                k for k, v in ckpt_sd.items() if k in model_sd and model_sd[k].shape != v.shape
+            ]
+            if any(not k.startswith(("critic.", "critic_obs_normalizer.")) for k in mismatched):
+                raise e
+            filtered = {k: v for k, v in ckpt_sd.items() if k not in mismatched}
+            runner.alg.policy.load_state_dict(filtered, strict=False)
+            print(
+                f"[WARN] Strict checkpoint load failed; skipped critic-side size-mismatched tensors: {mismatched}. "
+                "Critic outputs are untrained/meaningless for this run."
+            )
+        if args_cli.stochastic:
+            policy = runner.get_inference_policy_stochastic(device=env.unwrapped.device)
+            print("[INFO] --stochastic: sampling actions from the policy distribution (matches training rollout).")
+        else:
+            policy = runner.get_inference_policy(device=env.unwrapped.device)
 
         obs_groups = runner.cfg["obs_groups"]
         ppo_actor_keys = list(obs_groups["policy"])
@@ -555,7 +678,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # Optional: record transitions into a replay buffer and exit
         if args_cli.record_transitions is not None and args_cli.record_transitions > 0:
-            # policy = runner.get_inference_policy_sample(device=env.unwrapped.device)
             rec_actor_keys, rec_critic_keys = resolve_record_obs_keys(env, ppo_actor_keys, ppo_critic_keys)
             output_path = args_cli.transitions_output or os.path.join(log_dir, "play_transitions.pt")
             record_transitions_to_replay_buffer(
@@ -570,6 +692,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 gamma=float(runner.alg_cfg.get("gamma", 0.99)),
                 n_steps=args_cli.record_n_steps,
                 single_env_rb=args_cli.single_env_rb,
+                success_to_truncation=args_cli.success_to_truncation,
+                record_scene_state=args_cli.record_scene_state,
             )
             env.close()
             return
@@ -580,8 +704,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
 
-    if args_cli.stochastic and not is_fastsac:
-        print("[WARN] --stochastic is only wired for FastSAC; evaluating the deterministic policy instead.")
+    def make_act(policy_fn):
+        """Wrap a runner's inference policy so both runner types take the raw obs TensorDict.
+
+        FastSAC's policy expects ``{"actor_obs": flat_tensor}`` built from ``actor_obs_keys``;
+        rsl_rl's takes the TensorDict as is.
+        """
+        if not is_fastsac:
+            return policy_fn
+
+        def _act(obs_td):
+            return policy_fn({"actor_obs": torch.cat([obs_td[k] for k in actor_obs_keys], dim=1)})
+
+        return _act
+
+    act = make_act(policy)
+
+    if args_cli.stochastic and not is_fastsac and agent_cfg.class_name != "OnPolicyRunner":
+        print("[WARN] --stochastic is only wired for FastSAC and OnPolicyRunner; evaluating the deterministic policy instead.")
 
     # --checkpoint_dir sweep: record one video per checkpoint, reusing this Isaac Sim instance.
     if args_cli.checkpoint_dir:
@@ -594,18 +734,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             name = args_cli.video_name or os.path.splitext(os.path.basename(ckpt))[0]
             print(f"[INFO] Recording {name} from checkpoint: {ckpt}")
             runner.load(ckpt)
-            policy = runner.get_inference_policy(device=env.unwrapped.device)
+            if args_cli.stochastic and agent_cfg.class_name == "OnPolicyRunner":
+                act = make_act(runner.get_inference_policy_stochastic(device=env.unwrapped.device))
+            else:
+                act = make_act(runner.get_inference_policy(device=env.unwrapped.device))
             env.unwrapped.reset()
             obs = env.get_observations()
             frames = []
             for _ in range(args_cli.video_length):
                 with torch.inference_mode():
-                    if is_fastsac:
-                        actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=1)
-                        actions = policy({"actor_obs": actor_obs})
-                    else:
-                        actions = policy(obs)
-                    obs, _, _, _ = env.step(actions)
+                    obs, _, _, _ = env.step(act(obs))
                 frame = env.unwrapped.render()
                 if frame is not None:
                     frames.append(frame)
@@ -615,38 +753,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env.close()
         return
 
-    dt = env.unwrapped.step_dt
-
     # reset environment
     obs = env.get_observations()
 
     # --eval: run for a fixed number of episodes, report success rate, then exit.
-    # Success isn't a termination (only timeout / abnormal_robot are), so we replicate
-    # ProgressContext's check from the newest `insertive_asset_in_receptive_asset_frame`
-    # frame: pos_norm < pos_thresh AND |aa_x|+|aa_y| < orient_thresh (approximates the
-    # exact Euler-XY L1 used by the reward; matches it well near success). An episode
-    # counts as success if any of its steps satisfied the check.
+    # Success isn't a termination on every task (some only have timeout / abnormal_robot), so it is
+    # read from ProgressContext's instantaneous flags and OR'd over the episode.
     if args_cli.eval_episodes_per_env is not None:
-        obs_mgr = env.unwrapped.observation_manager
-        term_names = list(obs_mgr.active_terms["policy"])
-        term_dims = list(obs_mgr.group_obs_term_dim["policy"])
-        offsets = {}
-        cursor = 0
-        for name, shape in zip(term_names, term_dims):
-            dim = shape[0] if isinstance(shape, tuple) else int(shape)
-            offsets[name] = (cursor, cursor + dim)
-            cursor += dim
-        if "insertive_asset_in_receptive_asset_frame" not in offsets:
-            raise RuntimeError(
-                "Task has no `insertive_asset_in_receptive_asset_frame` obs term; "
-                "cannot compute success from obs for this task."
-            )
-        ins_block_start, ins_block_end = offsets["insertive_asset_in_receptive_asset_frame"]
-        ins_newest_start = ins_block_end - 6  # last 6 dims of the block = newest frame
-        POS_THRESH = 0.03
-        ORIENT_THRESH = 0.2
-        print(f"[eval] success check: pos_norm < {POS_THRESH}  AND  |aa_x|+|aa_y| < {ORIENT_THRESH}")
-        print(f"[eval] ins_in_rec newest slice: [{ins_newest_start}:{ins_block_end}]")
+        context_term = env.unwrapped.reward_manager.get_term_cfg("progress_context").func  # type: ignore
+        print("[eval] success = ProgressContext orientation_aligned & position_aligned, ever true in the episode")
 
         # Episode outcome codes, shared by the printed breakdown and the scatter plot.
         OUTCOME_SUCCESS, OUTCOME_TIMEOUT, OUTCOME_ABNORMAL, OUTCOME_OTHER = 0, 1, 2, 3
@@ -668,6 +783,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # auto-resets on done and zeroes that buffer before we get to look at it.
         ep_steps = torch.zeros(env.num_envs, dtype=torch.long, device=device)
         episode_durations: list[int] = []
+        # Local timestep (1-indexed within the episode) at which each env FIRST met the success
+        # condition; -1 while it has not. Success is not a termination here, so the episode keeps
+        # running afterwards -- this is time-to-success, not episode duration.
+        first_success_step = torch.full((env.num_envs,), -1, dtype=torch.long, device=device)
+        episode_success_steps: list[int] = []
         step_dt = float(getattr(env.unwrapped, "step_dt", 0.0))
         # Failure breakdown. Which termination actually fired is read per-term off the
         # TerminationManager rather than inferred, so an episode that ended for some third reason
@@ -694,32 +814,61 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         receptive = env.unwrapped.scene["receptive_object"]
         env_origins = env.unwrapped.scene.env_origins  # [num_envs, 3]
         init_peg_xyz = (insertive.data.root_pos_w - env_origins)[:, :3].clone()
+        record_yaw = args_cli.record_success_yaw is not None
+        if record_yaw:
+            import isaaclab.utils.math as _mu
+            _pc = env.unwrapped.reward_manager.get_term_cfg("progress_context").func
+            _rec = _pc.receptive_asset
+            _off_p, _off_q = _pc.receptive_offsets_pos[0], _pc.receptive_offsets_quat[0]
+
+            def _rel_yaw_flip():
+                n = env.num_envs
+                ins_pos, ins_quat = _pc.insertive_asset_offset.apply(_pc.insertive_asset)
+                hole_pos, hole_quat = _mu.combine_frame_transforms(
+                    _rec.data.root_pos_w, _rec.data.root_quat_w, _off_p.expand(n, 3), _off_q.expand(n, 4)
+                )
+                _, rq = _mu.subtract_frame_transforms(hole_pos, hole_quat, ins_pos, ins_quat)
+                _, _, ez = _mu.euler_xyz_from_quat(rq)
+                zax = _mu.quat_apply(rq, torch.tensor([0.0, 0.0, 1.0], device=rq.device).expand(n, 3))
+                return _mu.wrap_to_pi(ez), zax[:, 2] < 0
+
+            start_yaw, start_flip = (t.clone() for t in _rel_yaw_flip())
+            succ_yaw = torch.full((env.num_envs,), float("nan"), device=device)
+            succ_flip = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+            yaw_records: dict[str, list] = {"start_yaw": [], "start_flip": [], "success_yaw": [], "success_flip": []}
         peghole_xyz_env0 = (receptive.data.root_pos_w[0] - env_origins[0])[:3].cpu().numpy()
         # Collected per completed episode: (x, y, z) and an outcome code from OUTCOME_*.
         episode_init_xyzs: list[torch.Tensor] = []
         episode_outcomes: list[int] = []
+        # --save_failure_states: per-env scene state at episode start (refreshed on every done,
+        # like init_peg_xyz), from which each counted failure's start state is sliced out.
+        save_failures = args_cli.save_failure_states is not None
+        if save_failures:
+            init_state = env.unwrapped.scene.get_state(is_relative=True)
+            failure_states: list = []
+            failure_meta: dict[str, list] = {"env_id": [], "outcome": [], "duration": [], "init_peg_xyz": []}
 
         pbar = tqdm.tqdm(total=episodes_per_env * env.num_envs, desc="Eval episodes", unit="ep")
         while bool((ep_count < episodes_per_env).any()):
             with torch.inference_mode():
-                if is_fastsac:
-                    actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=1)
-                    actions = policy({"actor_obs": actor_obs})
-                else:
-                    actor_obs = obs["policy"] if isinstance(obs, dict) else obs
-                    actions = policy(obs)
-                # Accumulate success at the pre-step state (obs at iter start).
-                obs, _, dones, _ = env.step(actions)
-
-                context_term = env.env.env.reward_manager.get_term_cfg("progress_context").func  # type: ignore
-                orientation_aligned = getattr(context_term, "orientation_aligned")
-                position_aligned = getattr(context_term, "position_aligned")
+                obs, _, dones, _ = env.step(act(obs))
+                # Sticky per-episode success: ProgressContext's instantaneous flags, OR'd over the
+                # episode (a task without a `success` termination never ends on success).
                 before_es = ever_success.clone()
-                ever_success |= torch.where(orientation_aligned & position_aligned, True, False)
-                new_success = torch.argwhere(~before_es & ever_success)
+                ever_success |= context_term.orientation_aligned & context_term.position_aligned
+                newly_succeeded = ~before_es & ever_success
+                # ep_steps is still the pre-step count, so the step just taken is ep_steps + 1.
+                # Same 1-indexed convention as episode_durations below.
+                first_success_step[newly_succeeded] = ep_steps[newly_succeeded] + 1
+                if record_yaw and bool(newly_succeeded.any()):
+                    _y, _f = _rel_yaw_flip()
+                    succ_yaw[newly_succeeded] = _y[newly_succeeded]
+                    succ_flip[newly_succeeded] = _f[newly_succeeded]
+                new_success = torch.argwhere(newly_succeeded)
                 if len(new_success) > 0:
-                    print(f"new success at: {torch.argwhere(~before_es & ever_success)}")
-                
+                    print(f"new success at: envs {new_success.flatten().tolist()} "
+                          f"step {first_success_step[newly_succeeded].tolist()}")
+
             ep_steps += 1
             done_mask = dones.bool()
             # Only an env's first `episodes_per_env` episodes count. Dropping the surplus is what
@@ -756,18 +905,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 xyz_cpu = init_peg_xyz[counted_idx].cpu()
                 out_cpu = outcome[counted_idx].cpu()
                 dur_cpu = ep_steps[counted_idx].cpu()
+                fss_cpu = first_success_step[counted_idx].cpu()
                 for k in range(counted_idx.numel()):
                     episode_init_xyzs.append(xyz_cpu[k])
                     episode_outcomes.append(int(out_cpu[k]))
                     episode_durations.append(int(dur_cpu[k]))
+                    episode_success_steps.append(int(fss_cpu[k]))
+                if save_failures:
+                    failed_idx = torch.nonzero(failed, as_tuple=False).flatten()
+                    if failed_idx.numel() > 0:
+                        failure_states.append(_state_index(init_state, failed_idx))
+                        failure_meta["env_id"].extend(failed_idx.tolist())
+                        failure_meta["outcome"].extend(outcome[failed_idx].tolist())
+                        failure_meta["duration"].extend(ep_steps[failed_idx].tolist())
+                        failure_meta["init_peg_xyz"].append(init_peg_xyz[failed_idx].cpu())
             # Refresh on EVERY done, not just counted ones: the env resets regardless, so a stale
             # init pose would otherwise be attributed to a later episode that does count.
+            if record_yaw and n_counted > 0:
+                s_idx = torch.nonzero(successes, as_tuple=False).flatten()
+                yaw_records["start_yaw"].append(start_yaw[s_idx].cpu())
+                yaw_records["start_flip"].append(start_flip[s_idx].cpu())
+                yaw_records["success_yaw"].append(succ_yaw[s_idx].cpu())
+                yaw_records["success_flip"].append(succ_flip[s_idx].cpu())
             if bool(done_mask.any()):
                 new_xyz = (insertive.data.root_pos_w - env_origins)[:, :3]
                 init_peg_xyz[done_mask] = new_xyz[done_mask]
+                if record_yaw:
+                    _y, _f = _rel_yaw_flip()
+                    start_yaw[done_mask] = _y[done_mask]; start_flip[done_mask] = _f[done_mask]
+                    succ_yaw[done_mask] = float("nan"); succ_flip[done_mask] = False
+                if save_failures:
+                    done_idx = torch.nonzero(done_mask, as_tuple=False).flatten()
+                    _state_scatter(init_state, env.unwrapped.scene.get_state(is_relative=True), done_idx)
             # Reset success flag and step counter for envs that just finished an episode.
             ever_success[done_mask] = False
             ep_steps[done_mask] = 0
+            first_success_step[done_mask] = -1
 
         pbar.close()
         total_episodes = int(ep_count.sum().item())
@@ -782,6 +955,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[EVAL]   timeout        : {n_timeout:6d}  ({pct(n_timeout):.2%} of episodes)")
         print(f"[EVAL]   abnormal_robot : {n_abnormal:6d}  ({pct(n_abnormal):.2%} of episodes)")
         print(f"[EVAL]   other          : {n_other:6d}  ({pct(n_other):.2%} of episodes)")
+        if record_yaw:
+            rec = {k: (torch.cat(v) if v else torch.zeros(0)) for k, v in yaw_records.items()}
+            torch.save(rec, args_cli.record_success_yaw)
+            deg = torch.rad2deg(rec["success_yaw"]); d0 = torch.rad2deg(rec["start_yaw"])
+            hist = lambda x: [int(v) for v in torch.histc(x, bins=24, min=-180, max=180).tolist()]
+            print(f"[YAW] successful episodes: {len(deg)}; flipped at success: {int(rec['success_flip'].sum())}; flipped at start: {int(rec['start_flip'].sum())}")
+            print(f"[YAW] success-time yaw vs canonical hole frame, 15-deg bins from -180: {hist(deg)}")
+            print(f"[YAW] start yaw, same bins: {hist(d0)}")
+            r90 = torch.remainder(deg, 90.0)
+            print(f"[YAW] success yaw mod 90: mean {r90.mean():.1f} deg, std {r90.std():.1f} deg; "
+                  f"mean |success - start| yaw = {torch.rad2deg((rec['success_yaw'] - rec['start_yaw'] + math.pi) % (2 * math.pi) - math.pi).abs().mean():.1f} deg")
+            print(f"[YAW] saved: {args_cli.record_success_yaw}")
         if n_other:
             print(
                 "[EVAL]   NOTE: 'other' means an episode ended on neither time_out nor "
@@ -808,12 +993,49 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 st = _dur_stats({code})
                 if st:
                     print(f"[EVAL]   {OUTCOME_STYLE[code][1]:<15}: mean {_fmt(st[0])}  (n={st[3]})")
+        # Time to success: mean over SUCCESSFUL episodes only of the local step at which the
+        # success condition was first met. Distinct from the success-episode duration above --
+        # success is not a termination, so the episode runs on to timeout after reaching it.
+        succ_steps = [s for s, o in zip(episode_success_steps, episode_outcomes)
+                      if o == OUTCOME_SUCCESS and s > 0]
+        assert len(succ_steps) == successful_episodes, (
+            f"time-to-success mismatch: {len(succ_steps)} recorded vs {successful_episodes} successes"
+        )
+        if succ_steps:
+            mean_tts = sum(succ_steps) / len(succ_steps)
+            print(f"[EVAL] Mean time to success: {_fmt(mean_tts)}  "
+                  f"[min {min(succ_steps)}, max {max(succ_steps)} steps over {len(succ_steps)} successes]")
+        else:
+            print("[EVAL] Mean time to success: n/a (no successful episodes)")
+
         # Buckets partition the counted episodes; a mismatch means an episode was double-counted or
         # missed, which would silently corrupt every rate above.
         assert successful_episodes + n_timeout + n_abnormal + n_other == total_episodes, (
             f"bucket mismatch: {successful_episodes}+{n_timeout}+{n_abnormal}+{n_other} "
             f"!= {total_episodes}"
         )
+
+        if save_failures:
+            n_fail = len(failure_meta["env_id"])
+            assert n_fail == total_episodes - successful_episodes, (
+                f"failure-state count mismatch: {n_fail} saved vs {total_episodes - successful_episodes} failures"
+            )
+            out = {
+                "task": args_cli.task,
+                "checkpoint": resume_path,
+                "stochastic": bool(args_cli.stochastic),
+                "is_relative": True,
+                "outcome_names": {code: name for code, (_, name) in OUTCOME_STYLE.items()},
+                "num_failures": n_fail,
+                "states": _state_cat(failure_states) if n_fail else None,
+                "env_id": failure_meta["env_id"],
+                "outcome": failure_meta["outcome"],
+                "duration": failure_meta["duration"],
+                "init_peg_xyz": torch.cat(failure_meta["init_peg_xyz"], dim=0) if n_fail else torch.zeros(0, 3),
+            }
+            os.makedirs(os.path.dirname(os.path.abspath(args_cli.save_failure_states)), exist_ok=True)
+            torch.save({k: (_to_cpu_state(v) if k == "states" else v) for k, v in out.items()}, args_cli.save_failure_states)
+            print(f"[EVAL] Saved {n_fail} failure start states to: {args_cli.save_failure_states}")
 
         # Plot 3D initial peg positions colored by episode outcome.
         if len(episode_init_xyzs) > 0:
@@ -838,21 +1060,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             ax.set_zlabel("z (m, env-local)")
 
             import numpy as np
-            from matplotlib.animation import FuncAnimation
-
-            # 3. Define the animation update function
-            def rotate(angle):
-                # Set the camera view (elevation, azimuth)
-                # azimuth loops from 0 to 360 degrees for a full spin
-                ax.view_init(elev=30, azim=angle)
-
-            # 4. Create the slow 360 rotation
-            ani = FuncAnimation(
-                fig, 
-                rotate, 
-                frames=np.arange(0, 360, 1), # 1 frame per degree for a slow, smooth spin
-                interval=50                  # 50 milliseconds pause between frames (~20 FPS)
-            )
 
             ax.set_title(f"Initial peg xyz by outcome  ({successful_episodes}/{total_episodes} = {success_rate:.1%})")
             ax.legend(loc="best")
@@ -864,8 +1071,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             plt.savefig(out_path, dpi=150)
             print(f"[EVAL] Saved initial-pose scatter plot to: {out_path}")
 
-            # Episode-duration histogram, stacked by outcome. Kept as its own figure rather than a
-            # subplot so the 3D scatter above keeps its layout and rotation animation.
+            # Episode-duration histogram, stacked by outcome.
             fig2, ax2 = plt.subplots(figsize=(8, 4.5))
             durs = np.asarray(episode_durations, dtype=float)
             codes = np.asarray(episode_outcomes)
@@ -889,7 +1095,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             fig2.tight_layout()
             fig2.savefig(dur_path, dpi=150)
             print(f"[EVAL] Saved episode-duration histogram to: {dur_path}")
-            plt.show()
 
         env.close()
         return
@@ -929,16 +1134,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         ee_list = []
         for _ in range(args_cli.plot_ee):
+            ee_list.append(obs["policy"][0, ee_start:ee_end].cpu())
             with torch.inference_mode():
-                if is_fastsac:
-                    actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=1)
-                    actions = policy({"actor_obs": actor_obs})
-                else:
-                    actor_obs = obs if isinstance(obs, torch.Tensor) else torch.cat(list(obs.values()), dim=-1)
-                    actions = policy(obs)
-                obs, _, _, _ = env.step(actions)
-
-            ee_list.append(actor_obs[0, ee_start:ee_end].cpu())
+                obs, _, _, _ = env.step(act(obs))
 
         env.close()
 
@@ -957,37 +1155,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         out_path = os.path.join(log_dir, "ee_pose_over_time.png")
         plt.savefig(out_path)
         print(f"[INFO] Saved EE pose plot to: {out_path}")
-        plt.show()
         return
 
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
-        start_time = time.time()
-        # run everything in inference mode
         with torch.inference_mode():
-            if is_fastsac:
-                # FastSACAgent policy expects {"actor_obs": tensor}
-                actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=1)
-                actions = policy({"actor_obs": actor_obs})
-                obs, _, dones, _ = env.step(actions)
-            else:
-                actions = policy(obs)
-                obs, _, dones, _ = env.step(actions)
-
-            critic_obs = torch.cat([obs[k] for k in critic_obs_keys], dim=1)
-            print(critic(critic_obs, actions)[0])
+            obs, _, _, _ = env.step(act(obs))
 
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
-
-        # time delay for real-time evaluation
-        # sleep_time = dt - (time.time() - start_time)
-        # if args_cli.real_time and sleep_time > 0:
-        #     time.sleep(sleep_time)
 
     # close the simulator
     env.close()

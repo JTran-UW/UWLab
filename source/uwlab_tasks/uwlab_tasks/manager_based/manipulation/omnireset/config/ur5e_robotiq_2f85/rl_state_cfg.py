@@ -199,20 +199,6 @@ class RlStateReachingSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # front_camera = TiledCameraCfg(
-    #     prim_path="{ENV_REGEX_NS}/Robot/depth_front_camera",
-    #     update_period=0,
-    #     height=240,
-    #     width=320,
-    #     offset=TiledCameraCfg.OffsetCfg(
-    #         pos=(1.0770121, -0.1679045, 0.4486344),
-    #         rot=(0.70564552, 0.46613815, 0.25072644, 0.47107948),
-    #         convention="opengl",
-    #     ),
-    #     data_types=["distance_to_camera"],
-    #     spawn=sim_utils.PinholeCameraCfg(focal_length=13.20, clipping_range=(0.1, 1.25)),
-    # )
-
     front_camera = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/depth_front_camera",
         update_period=0,
@@ -441,65 +427,6 @@ class RlStateGrayscaleSceneCfg(RlStateSceneCfg):
 
 
 @configclass
-class RlStateDepthSceneCfg(RlStateGrayscaleSceneCfg):
-    """Same three-camera rig as ``RlStateGrayscaleSceneCfg`` but rendering depth instead of rgb.
-
-    Subclassed rather than re-declared so the poses, focal lengths, resolution and the black
-    curtains stay in exact correspondence with the grayscale rig -- only ``data_types`` and the prim
-    names change. The curtains are kept deliberately: they give the background a finite depth
-    (~1.3 m) instead of leaving it unhit, which ``process_image`` would map to 0.0 and make
-    indistinguishable from a surface at the near plane.
-
-    ``clipping_range`` is set because depth is consumed as raw metric distance, so the far plane
-    directly bounds the observation's value range. (0.1, 2.0) follows the existing depth camera in
-    this module and comfortably covers the workspace -- the furthest curtain is ~1.3 m from the
-    front camera. Anything past 2.0 m returns inf and is mapped to 0.0.
-    """
-
-    front_camera = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/depth_front_camera",
-        update_period=0,
-        height=126,
-        width=168,
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(1.0770121, -0.1679045, 0.4486344),
-            rot=(0.70564552, 0.46613815, 0.25072644, 0.47107948),
-            convention="opengl",
-        ),
-        data_types=["distance_to_camera"],
-        spawn=sim_utils.PinholeCameraCfg(focal_length=13.20, clipping_range=(0.1, 2.0)),
-    )
-
-    side_camera = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/depth_side_camera",
-        update_period=0,
-        height=126,
-        width=168,
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.8323904, 0.5877843, 0.2805111),
-            rot=(0.29008842, 0.22122445, 0.51336143, 0.77676798),
-            convention="opengl",
-        ),
-        data_types=["distance_to_camera"],
-        spawn=sim_utils.PinholeCameraCfg(focal_length=20.10, clipping_range=(0.1, 2.0)),
-    )
-
-    wrist_camera = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/robotiq_base_link/depth_wrist_camera",
-        update_period=0,
-        height=126,
-        width=168,
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.0182505, -0.00408447, -0.0689107),
-            rot=(0.34254336, -0.61819255, -0.6160212, 0.347879),
-            convention="opengl",
-        ),
-        data_types=["distance_to_camera"],
-        spawn=sim_utils.PinholeCameraCfg(focal_length=24.55, clipping_range=(0.1, 2.0)),
-    )
-
-
-@configclass
 class RlStateGrayscale2CamSceneCfg(RlStateGrayscaleSceneCfg):
     """Grayscale rig with the FRONT camera removed -- side + wrist only.
 
@@ -514,71 +441,6 @@ class RlStateGrayscale2CamSceneCfg(RlStateGrayscaleSceneCfg):
     """
 
     front_camera = None
-
-
-@configclass
-class RlStateGrayscale2CamLowResSceneCfg(RlStateGrayscale2CamSceneCfg):
-    """Side + wrist rig rendered at 112x84 instead of 168x126 -- 2.25x fewer rendered pixels.
-
-    Every observation is downsampled to 84x84 regardless, so 168x126 (21,168 px) renders 3x more
-    pixels than are ever consumed. 112x84 (9,408 px) is the smallest 4:3 size that still covers
-    84x84 without upsampling in either axis.
-
-    The 4:3 aspect is preserved deliberately: ``vertical_aperture`` defaults to None and is derived
-    from ``horizontal_aperture * height/width``, so changing the aspect would silently alter the
-    vertical FOV and change what the cameras see. Pose and focal lengths are untouched, so this is
-    purely a rasterization-cost change -- the observation dim is unchanged at 14,112.
-    """
-
-    side_camera = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/rgb_side_camera",
-        update_period=0,
-        height=84,
-        width=112,
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.8323904, 0.5877843, 0.2805111),
-            rot=(0.29008842, 0.22122445, 0.51336143, 0.77676798),
-            convention="opengl",
-        ),
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(focal_length=20.10),
-    )
-
-    wrist_camera = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/robotiq_base_link/rgb_wrist_camera",
-        update_period=0,
-        height=84,
-        width=112,
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.0182505, -0.00408447, -0.0689107),
-            rot=(0.34254336, -0.61819255, -0.6160212, 0.347879),
-            convention="opengl",
-        ),
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(focal_length=24.55),
-    )
-
-
-@configclass
-class BaseEventWithDynamicsGapCfg:
-    """Shared events: material/mass randomization, gripper gains, scene reset.
-
-    Does NOT include arm sysid or OSC gain randomization -- those differ
-    between finetune (curriculum-ramped) and eval (fixed) stages.  See
-    ``FinetuneEventCfg`` and ``FinetuneEvalEventCfg``.
-    """
-
-    randomize_osc_gains = EventTerm(
-        func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
-        mode="reset",
-        params={
-            "action_name": "arm",
-            "scale_range": (0.8, 0.8),
-        },
-    )
-
-    # mode: reset
-    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
 
 
 @configclass
@@ -707,6 +569,31 @@ class BaseEventCfg:
     # mode: reset
     reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
 
+    # Declared last so it runs after every DR term within the reset mode; negative = disabled
+    # (float sentinel, not None -- update_class_from_dict rejects a float override of None).
+    # Override scalars from the CLI to turn any task into a dynamics-gap benchmark, e.g.
+    #   env.events.dynamics_gap.params.peg_mass=0.5
+    dynamics_gap = EventTerm(
+        func=task_mdp.apply_dynamics_gap,
+        mode="reset",
+        params={
+            "peg_mass": -1.0,
+            "socket_mass": -1.0,
+            "table_mass_scale": -1.0,
+            "robot_mass_scale": -1.0,
+            "peg_friction": -1.0,
+            "socket_friction": -1.0,
+            "table_friction": -1.0,
+            "robot_friction": -1.0,
+            "gripper_stiffness_scale": -1.0,
+            "gripper_damping_scale": -1.0,
+            "osc_kp_xyz_scale": -1.0,
+            "osc_kp_rpy_scale": -1.0,
+            "osc_damping_ratio_xyz_scale": -1.0,
+            "osc_damping_ratio_rpy_scale": -1.0,
+        },
+    )
+
 @configclass
 class BaseEventNoDRCfg:
     """Shared events: material/mass randomization, gripper gains, scene reset.
@@ -720,132 +607,6 @@ class BaseEventNoDRCfg:
     reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
 
     
-@configclass
-class BaseEventNoDR_6bdbe5e_Cfg:
-    """Shared events: material/mass randomization, gripper gains, scene reset.
-
-    Does NOT include arm sysid or OSC gain randomization -- those differ
-    between finetune (curriculum-ramped) and eval (fixed) stages.  See
-    ``FinetuneEventCfg`` and ``FinetuneEvalEventCfg``.
-    """
-
-    # mode: startup (randomize dynamics)
-    robot_material = EventTerm(
-        func=task_mdp.randomize_rigid_body_material,  # type: ignore
-        mode="startup",
-        params={
-            "static_friction_range": (0.3, 0.3), # (0.3, 1.2),
-            "dynamic_friction_range": (0.5, 0.5), # (0.2, 1.0),
-            "restitution_range": (0.0, 0.0),
-            "num_buckets": 256,
-            "asset_cfg": SceneEntityCfg("robot"),
-            "make_consistent": True,
-        },
-    )
-
-    insertive_object_material = EventTerm(
-        func=task_mdp.randomize_rigid_body_material,  # type: ignore
-        mode="startup",
-        params={
-            "static_friction_range": (1.5, 1.5), # (1.0, 2.0),
-            "dynamic_friction_range": (1.5, 1.5), #  (0.9, 1.9),
-            "restitution_range": (0.0, 0.0),
-            "num_buckets": 256,
-            "asset_cfg": SceneEntityCfg("insertive_object"),
-            "make_consistent": True,
-        },
-    )
-
-    receptive_object_material = EventTerm(
-        func=task_mdp.randomize_rigid_body_material,  # type: ignore
-        mode="startup",
-        params={
-            "static_friction_range": (0.4, 0.4), # (0.2, 0.6),
-            "dynamic_friction_range": (0.3, 0.3), # (0.15, 0.5),
-            "restitution_range": (0.0, 0.0),
-            "num_buckets": 256,
-            "asset_cfg": SceneEntityCfg("receptive_object"),
-            "make_consistent": True,
-        },
-    )
-
-    table_material = EventTerm(
-        func=task_mdp.randomize_rigid_body_material,  # type: ignore
-        mode="startup",
-        params={
-            "static_friction_range": (0.4, 0.4), # (0.3, 0.6),
-            "dynamic_friction_range": (0.3, 0.3), # (0.2, 0.5),
-            "restitution_range": (0.0, 0.0),
-            "num_buckets": 256,
-            "asset_cfg": SceneEntityCfg("table"),
-            "make_consistent": True,
-        },
-    )
-
-    randomize_robot_mass = EventTerm(
-        func=task_mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "mass_distribution_params": (0.7, 0.7), # (0.7, 1.3),
-            "operation": "scale",
-            "distribution": "uniform",
-            "recompute_inertia": True,
-        },
-    )
-
-    randomize_insertive_object_mass = EventTerm(
-        func=task_mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("insertive_object"),
-            # we assume insertive object is somewhere between 20g and 200g
-            "mass_distribution_params": (0.1, 0.1), # (0.02, 0.2),
-            "operation": "abs",
-            "distribution": "uniform",
-            "recompute_inertia": True,
-        },
-    )
-
-    randomize_receptive_object_mass = EventTerm(
-        func=task_mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("receptive_object"),
-            "mass_distribution_params": (0.5, 0.5), # (0.5, 1.5),
-            "operation": "scale",
-            "distribution": "uniform",
-            "recompute_inertia": True,
-        },
-    )
-
-    randomize_table_mass = EventTerm(
-        func=task_mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("table"),
-            "mass_distribution_params": (1.0, 1.0), # (0.5, 1.5),
-            "operation": "scale",
-            "distribution": "uniform",
-            "recompute_inertia": True,
-        },
-    )
-
-    randomize_gripper_actuator_parameters = EventTerm(
-        func=task_mdp.randomize_actuator_gains,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["finger_joint"]),
-            "stiffness_distribution_params": (1.5, 1.5), # (0.5, 2.0),
-            "damping_distribution_params": (1.5, 1.5), # (0.5, 2.0),
-            "operation": "scale",
-            "distribution": "log_uniform",
-        },
-    )
-
-    # mode: reset
-    reset_everything = EventTerm(func=task_mdp.reset_scene_to_default, mode="reset", params={})
-
 @configclass
 class BaseReachingEventCfg:
     """Shared events: material/mass randomization, gripper gains, scene reset.
@@ -904,7 +665,40 @@ class TrainEventCfg(BaseEventCfg):
 
 
 @configclass
-class TrainEventPegMassGapFullResetCfg(TrainEventCfg):
+class TrainEventSymRelabelCfg(TrainEventCfg):
+    """``TrainEventCfg`` plus the peg symmetry relabel at reset (see ``randomize_peg_symmetry``)."""
+
+    # Declared LAST so it runs after the dataset reset and every DR term: relabels the peg pose by a random
+    # element of its 8-fold symmetry group (physically identical scene, different label).
+    peg_symmetry_relabel = EventTerm(
+        func=task_mdp.randomize_peg_symmetry,
+        mode="reset",
+        params={"asset_cfg": SceneEntityCfg("insertive_object"), "prob": 1.0, "allow_flip": True, "element": -1},
+    )
+
+
+@configclass
+class TrainEventSingleResetCfg(TrainEventCfg):
+    """``TrainEventCfg`` with every reset pinned to ONE stored scene state.
+
+    ``dataset_dir`` is a single-state file in the reset-dataset format, produced by
+    ``scripts/tools/export_single_reset_state.py`` (sidecar ``.json`` records provenance).
+    Everything else (materials, mass, ``dynamics_gap``) is inherited.
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.SingleResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": "reset_states/single_reset_seed42_r0.pt",
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+        },
+    )
+
+
+@configclass
+class TrainEventDynamicsGapCfg(TrainEventCfg):
     """``TrainEventCfg`` with the peg pinned to 500 g, keeping the full 4-path reset mixture.
 
     ``randomize_insertive_object_mass`` REPLACES the inherited term, so both value and mode change:
@@ -928,109 +722,6 @@ class TrainEventPegMassGapFullResetCfg(TrainEventCfg):
         },
     )
 
-
-@configclass
-class TrainEventPegMassGapCfg(TrainEventPegMassGapFullResetCfg):
-    """The peg-mass gap PLUS resets restricted to ``ObjectAnywhereEEAnywhere``.
-
-    Inherits the mass override from its parent rather than restating it, so the two gap variants
-    cannot drift apart if the pinned mass is retuned. Only the reset distribution is added here:
-    every episode starts from the hardest path (object loose, gripper empty and anywhere) instead
-    of a quarter of them starting already grasped or partly assembled.
-
-    Matches ``TrainEvalEventAnywhereOnlyPegMassGapCfg`` term for term, so this finetune and its
-    eval env see the same initial-state distribution.
-    """
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": ["ObjectAnywhereEEAnywhere"],
-            "probs": [1.0],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-
-@configclass
-class TrainEventNoDRCfg(BaseEventNoDRCfg):
-    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectAnywhereEEAnywhere",
-                "ObjectRestingEEGrasped",
-                "ObjectAnywhereEEGrasped",
-                "ObjectPartiallyAssembledEEGrasped",
-            ],
-            "probs": [0.25, 0.25, 0.25, 0.25],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-@configclass
-class TrainEventNoDR_6bdbe5e_Cfg(BaseEventNoDR_6bdbe5e_Cfg):
-    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectAnywhereEEAnywhere",
-                "ObjectRestingEEGrasped",
-                "ObjectAnywhereEEGrasped",
-                "ObjectPartiallyAssembledEEGrasped",
-            ],
-            "probs": [0.25, 0.25, 0.25, 0.25],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-@configclass
-class TrainEventWithDynamicsGapCfg(BaseEventWithDynamicsGapCfg):
-    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectAnywhereEEAnywhere"
-            ],
-            "probs": [1.0],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-@configclass
-class TrainEventWithSuboptimalCfg(BaseEventNoDRCfg):
-    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
-
-    # TEMPORARILY SETTING THIS TO FULL RESET DISTRIBUTION
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectAnywhereEEAnywhere",
-                "ObjectRestingEEGrasped",
-                "ObjectAnywhereEEGrasped",
-                "ObjectPartiallyAssembledEEGrasped",
-            ],
-            "probs": [0.25, 0.25, 0.25, 0.25],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
 
 import numpy as np
 @configclass
@@ -1085,40 +776,6 @@ class TrainReachingGrayscaleEventCfg(TrainReachingEventCfg):
 
 
 @configclass
-class TrainEasyEventCfg(BaseEventCfg):
-    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectPartiallyAssembledEEGrasped",
-            ],
-            "probs": [1.0],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-@configclass
-class TrainEasyEventNoDRCfg(BaseEventNoDRCfg):
-    """Training events: material/mass randomization + 4-path resets. No sysid or OSC gain randomization."""
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectPartiallyAssembledEEGrasped",
-            ],
-            "probs": [1.0],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-@configclass
 class TrainEvalEventCfg(BaseEventCfg):
     """Eval after Stage 1: no sysid/OSC gain randomization, 1-path resets."""
 
@@ -1155,51 +812,6 @@ class TrainEvalEventAnywhereOnlyCfg(TrainEventCfg):
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-
-@configclass
-class TrainEvalEventAnywhereOnlyPegMassGapCfg(TrainEvalEventAnywhereOnlyCfg):
-    """``TrainEvalEventAnywhereOnlyCfg`` with the peg pinned to 500 g.
-
-    Same single-path resets as its parent, so this and ``TrainEvalEventAnywhereOnlyCfg`` differ only
-    in peg mass -- the eval-side counterpart of ``TrainEventPegMassGapCfg``.
-    """
-
-    # randomize_osc_gains = EventTerm(
-    #     func=task_mdp.randomize_rel_cartesian_osc_gains_fixed,
-    #     mode="reset",
-    #     params={
-    #         "action_name": "arm",
-    #         "scale_range": (0.6, 0.6),
-    #     },
-    # )
-
-
-    # randomize_robot_mass = EventTerm(
-    #     func=task_mdp.randomize_rigid_body_mass,
-    #     mode="startup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot"),
-    #         "mass_distribution_params": (1.6, 1.6),
-    #         "operation": "scale",
-    #         "distribution": "uniform",
-    #         "recompute_inertia": True,
-    #     },
-    # )
-
-
-    randomize_insertive_object_mass = EventTerm(
-        func=task_mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("insertive_object"),
-            # we assume insertive object is somewhere between 20g and 200g
-            "mass_distribution_params": (0.5, 0.5), # (0.02, 0.2),
-            "operation": "abs",
-            "distribution": "uniform",
-            "recompute_inertia": True,
         },
     )
 
@@ -1254,99 +866,6 @@ class TrainEvalEventNoDRWristCamCfg(TrainEvalEventNoDRCfg):
             "base_rotation": (0.34254336, -0.61819255, -0.6160212, 0.347879),
             "position_deltas": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
             "euler_deltas": {"pitch": (0.0, 0.0), "yaw": (0.0, 0.0), "roll": (0.0, 0.0)},
-        },
-    )
-
-
-@configclass
-class TrainEvalEventNoDRWristCamDepthCfg(TrainEvalEventNoDRWristCamCfg):
-    """As above, but targeting the depth rig's prim name (``depth_wrist_camera``).
-
-    The path is matched by name, so the rgb-named term would silently no-op here --
-    ``randomize_tiled_cameras`` skips prims it cannot resolve.
-    """
-
-    place_wrist_camera = EventTerm(
-        func=task_mdp.randomize_tiled_cameras,
-        mode="reset",
-        params={
-            "camera_path_template": "/World/envs/env_{}/Robot/robotiq_base_link/depth_wrist_camera",
-            "base_position": (0.0182505, -0.00408447, -0.0689107),
-            "base_rotation": (0.34254336, -0.61819255, -0.6160212, 0.347879),
-            "position_deltas": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
-            "euler_deltas": {"pitch": (0.0, 0.0), "yaw": (0.0, 0.0), "roll": (0.0, 0.0)},
-        },
-    )
-
-
-@configclass
-class TrainEvalEventNoDR_6bdbe5e_Cfg(BaseEventNoDR_6bdbe5e_Cfg):
-    """Eval after Stage 1: no sysid/OSC gain randomization, 1-path resets."""
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectAnywhereEEAnywhere",
-                "ObjectRestingEEGrasped",
-                "ObjectAnywhereEEGrasped",
-                "ObjectPartiallyAssembledEEGrasped",
-            ],
-            "probs": [0.25, 0.25, 0.25, 0.25],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-@configclass
-class TrainEvalEasyEventCfg(BaseEventCfg):
-    """Eval after Stage 1: no sysid/OSC gain randomization, 1-path resets."""
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": ["ObjectPartiallyAssembledEEGrasped"],
-            "probs": [1.0],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-
-@configclass
-class TrainEvalEasyEventNoDRCfg(BaseEventNoDRCfg):
-    """Eval after Stage 1: no sysid/OSC gain randomization, 1-path resets."""
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": ["ObjectPartiallyAssembledEEGrasped"],
-            "probs": [1.0],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
-        },
-    )
-
-@configclass
-class TrainEvalEventWithDynamicsGapCfg(BaseEventWithDynamicsGapCfg):
-    """Eval after Stage 1: no sysid/OSC gain randomization, 1-path resets."""
-
-    reset_from_reset_states = EventTerm(
-        func=task_mdp.MultiResetManager,
-        mode="reset",
-        params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
-            "reset_types": [
-                "ObjectAnywhereEEAnywhere",
-                "ObjectRestingEEGrasped",
-                "ObjectAnywhereEEGrasped",
-                "ObjectPartiallyAssembledEEGrasped",
-            ],
-            "probs": [0.25, 0.25, 0.25, 0.25],
-            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
         },
     )
 
@@ -1423,6 +942,19 @@ class FinetuneFullResetEventCfg(FinetuneEvalEventCfg):
             "probs": [0.25, 0.25, 0.25, 0.25],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
         },
+    )
+
+
+@configclass
+class FinetuneFullResetEventSymRelabelCfg(FinetuneFullResetEventCfg):
+    """``FinetuneFullResetEventCfg`` plus the peg symmetry relabel at reset (see ``randomize_peg_symmetry``)."""
+
+    # Declared LAST so it runs after the dataset reset and every DR term: relabels the peg pose by a random
+    # element of its 8-fold symmetry group (physically identical scene, different label).
+    peg_symmetry_relabel = EventTerm(
+        func=task_mdp.randomize_peg_symmetry,
+        mode="reset",
+        params={"asset_cfg": SceneEntityCfg("insertive_object"), "prob": 1.0, "allow_flip": True, "element": -1},
     )
 
 
@@ -1508,30 +1040,60 @@ class ObservationsCfg:
             },
         )
 
+        # Peg-pose terms use the gap-capable wrapper; all knobs None = identical to the plain
+        # function. Override scalars from the CLI for an observation-gap benchmark, e.g.
+        #   env.observations.policy.insertive_asset_pose.params.pos_noise_std=0.005
         insertive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
+                "target_local_rot": [0.0, 0.0, 0.0],
             },
         )
 
+        # Peghole pose: same gap-capable wrapper (own hold group), so a peghole miscalibration can
+        # be injected via world_pos_bias here + root_world_pos_bias on the peg-in-peghole term.
         receptive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("receptive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
+                "hold_group": "peghole_pose_hold",
             },
         )
 
         insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("receptive_object"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "root_world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
+                "target_local_rot": [0.0, 0.0, 0.0],
             },
         )
 
@@ -1666,30 +1228,60 @@ class ObservationsNoPrivilegedObsCfg:
             },
         )
 
+        # Peg-pose terms use the gap-capable wrapper; all knobs None = identical to the plain
+        # function. Override scalars from the CLI for an observation-gap benchmark, e.g.
+        #   env.observations.policy.insertive_asset_pose.params.pos_noise_std=0.005
         insertive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
+                "target_local_rot": [0.0, 0.0, 0.0],
             },
         )
 
+        # Peghole pose: same gap-capable wrapper (own hold group), so a peghole miscalibration can
+        # be injected via world_pos_bias here + root_world_pos_bias on the peg-in-peghole term.
         receptive_asset_pose = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("receptive_object"),
                 "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
+                "hold_group": "peghole_pose_hold",
             },
         )
 
         insertive_asset_in_receptive_asset_frame: ObsTerm = ObsTerm(
-            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
             params={
                 "target_asset_cfg": SceneEntityCfg("insertive_object"),
                 "root_asset_cfg": SceneEntityCfg("receptive_object"),
                 "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+                "pos_bias": [0.0, 0.0, 0.0],
+                "rot_bias": [0.0, 0.0, 0.0],
+                "world_pos_bias": [0.0, 0.0, 0.0],
+                "root_world_pos_bias": [0.0, 0.0, 0.0],
+                "hold_prob": 0.0,
+                "hold_steps": 0,
+                "target_local_rot": [0.0, 0.0, 0.0],
             },
         )
 
@@ -1768,6 +1360,136 @@ class ObservationsDataCollectionNoPrivilegedObsCfg(ObservationsCfg):
     """
 
     critic_no_priv: ObservationsNoPrivilegedObsCfg.CriticCfg = ObservationsNoPrivilegedObsCfg.CriticCfg()
+
+
+@configclass
+class ObservationsSymmetricCfg:
+    """Symmetry-invariant observations for the rectangular peg (see ``mdp/symmetric_obs.py``).
+
+    Policy and critic see the SAME terms with the SAME histories (one frame of actions, five of
+    everything else; the critic just has no corruption). No term exposes the peg's absolute
+    orientation, so the policy cannot depend on which of the 8 symmetric labels the peg carries;
+    the spin that physically matters (modulo 90 deg) enters through ``peg_spin_in_hole`` (for the
+    insertion), ``peg_spin_in_gripper`` (for aligning the fingers with the flats when grasping),
+    the hole yaw (modulo 90 deg) and the gripper's own pose.
+
+    Layout (per frame): prev_actions 7 | joint_pos 12 | end_effector_pose 6 | peg_in_gripper 9 |
+    peg_in_hole 9 | hole_sym 5 | peg_spin_in_hole 2 | peg_spin_in_gripper 2  ->  7 + 5 * 45 = 232 dims.
+    """
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        peg_in_gripper = ObsTerm(func=task_mdp.SymmetricPegObs, params={"mode": "segment_in_gripper"})
+        peg_in_hole = ObsTerm(func=task_mdp.SymmetricPegObs, params={"mode": "segment_in_hole"})
+        hole_sym = ObsTerm(func=task_mdp.SymmetricPegObs, params={"mode": "hole_sym"})
+        peg_spin_in_hole = ObsTerm(func=task_mdp.SymmetricPegObs, params={"mode": "spin_in_hole"})
+        # Spin relative to the gripper: needed to align the fingers with the peg's flats for the grasp.
+        peg_spin_in_gripper = ObsTerm(func=task_mdp.SymmetricPegObs, params={"mode": "spin_in_gripper"})
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+            self.history_length = None  # per-term histories below (a group value would override them)
+            self.prev_actions.history_length = 1
+            for term in (
+                self.joint_pos,
+                self.end_effector_pose,
+                self.peg_in_gripper,
+                self.peg_in_hole,
+                self.hole_sym,
+                self.peg_spin_in_hole,
+                self.peg_spin_in_gripper,
+            ):
+                term.history_length = 5
+
+    @configclass
+    class CriticCfg(PolicyCfg):
+        def __post_init__(self):
+            super().__post_init__()
+            self.enable_corruption = False
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class ObservationsSymT4Cfg:
+    """``ObservationsNoPrivilegedObsCfg`` with a one-frame ``prev_actions`` and the two peg-pose terms replaced by their
+    symmetry-invariant tensor encodings (``SymmetricPegObs`` modes ``tensor4_in_hole`` / ``tensor4_in_gripper``):
+    peg centre (3) + degree-4 tensor of the face normals (15) per frame instead of position + axis-angle (6).
+    Term order, reference frames and histories are otherwise unchanged (one action frame, five of the rest),
+    and actor == critic (critic uncorrupted).
+
+    Layout: peg_in_hole_t4 90 | prev_actions 7 | joint_pos 60 | end_effector_pose 30 | peg_in_gripper_t4 90 |
+    receptive_asset_pose 30  ->  307 dims.
+    """
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        peg_in_hole_t4 = ObsTerm(func=task_mdp.SymmetricPegObs, params={"mode": "tensor4_in_hole"})
+        prev_actions = ObsTerm(func=task_mdp.last_action)
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        end_effector_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame,
+            params={
+                "target_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "root_asset_cfg": SceneEntityCfg("robot"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+        peg_in_gripper_t4 = ObsTerm(func=task_mdp.SymmetricPegObs, params={"mode": "tensor4_in_gripper"})
+        receptive_asset_pose = ObsTerm(
+            func=task_mdp.target_asset_pose_in_root_asset_frame_with_gap_and_hold,
+            params={
+                "target_asset_cfg": SceneEntityCfg("receptive_object"),
+                "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+                "pos_noise_std": 0.0,
+                "rot_noise_std": 0.0,
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+            self.history_length = None  # per-term histories (a group value would override them)
+            self.prev_actions.history_length = 1
+            for term in (
+                self.peg_in_hole_t4,
+                self.joint_pos,
+                self.end_effector_pose,
+                self.peg_in_gripper_t4,
+                self.receptive_asset_pose,
+            ):
+                term.history_length = 5
+
+    @configclass
+    class CriticCfg(PolicyCfg):
+        def __post_init__(self):
+            super().__post_init__()
+            self.enable_corruption = False
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class ObservationsDataCollectionSymT4Cfg(ObservationsDataCollectionNoPrivilegedObsCfg):
+    """Expert keeps ``policy``/``critic``/``critic_no_priv``; ``policy_t4``/``critic_t4`` are recorded with
+    ``play.py --record_actor_obs_keys policy_t4 --record_critic_obs_keys critic_t4``."""
+
+    policy_t4: ObservationsSymT4Cfg.PolicyCfg = ObservationsSymT4Cfg.PolicyCfg()
+    critic_t4: ObservationsSymT4Cfg.CriticCfg = ObservationsSymT4Cfg.CriticCfg()
 
 
 @configclass
@@ -1868,281 +1590,13 @@ class ObservationsDataCollectionGrayscaleAsymmetricCfg(ObservationsDataCollectio
 
 
 @configclass
-class ObservationsDataCollectionDepthCfg(ObservationsCfg):
-    """Depth counterpart of ``ObservationsDataCollectionGrayscaleCfg``.
-
-    Inherits the expert's state ``policy`` and privileged ``critic`` unchanged so a state-trained
-    PPO checkpoint still loads and acts, and adds a ``depth`` group holding the three-camera stack.
-
-    The tensor layout matches the grayscale group exactly -- ``distance_to_camera`` yields one
-    channel per camera, so three cameras concatenate to (history, 3, 84, 84) just as three luma
-    channels do, and a buffer recorded here has the same 63504-element rows. The *values* differ:
-    depth is raw metric distance in metres with inf mapped to 0.0, not scaled to [0, 1] like rgb.
-    """
-
-    @configclass
-    class DepthCfg(ObsGroup):
-        """Three-camera depth stack -- (history_length, 3, 84, 84), one distance channel per camera."""
-
-        depth_image = ObsTerm(
-            func=task_mdp.process_multi_camera_image,
-            params={
-                "sensor_cfgs": [
-                    SceneEntityCfg("front_camera"),
-                    SceneEntityCfg("side_camera"),
-                    SceneEntityCfg("wrist_camera"),
-                ],
-                "data_type": "distance_to_camera",
-                "output_size": (84, 84),
-                # grayscale stays False -- process_image asserts it is rgb-only.
-                "grayscale": False,
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-            self.history_length = 3
-            self.flatten_history_dim = False
-
-    depth: DepthCfg = DepthCfg()
-
-
-@configclass
-class ObservationsDataCollectionDepthAsymmetricCfg(ObservationsDataCollectionDepthCfg):
-    """Collection-side observation set for the asymmetric *depth* task.
-
-    Exactly ``ObservationsDataCollectionGrayscaleAsymmetricCfg`` with the vision group swapped from
-    grayscale to depth. Collect with
-    ``--record_actor_obs_keys depth --record_critic_obs_keys critic_no_priv
-    --record_proprio_obs_keys proprio``.
-    """
-
-    proprio: ObservationsGrayscaleAsymmetricCfg.ProprioCfg = ObservationsGrayscaleAsymmetricCfg.ProprioCfg()
-    critic_no_priv: ObservationsNoPrivilegedObsCfg.CriticCfg = ObservationsNoPrivilegedObsCfg.CriticCfg()
-
-
-@configclass
-class ObservationsGrayscale2CamAsymmetricCfg(ObservationsGrayscaleAsymmetricCfg):
-    """Asymmetric grayscale observations with the front camera dropped -- side + wrist only.
-
-    Vision obs becomes (history 3, 2 cameras, 84, 84) = 42,336 elements, down from 63,504. That
-    changes the actor's input width, so buffers recorded against the 3-camera task are NOT
-    compatible -- an expert buffer for this task has to be re-collected.
-
-    ``proprio`` and the non-privileged state ``critic`` are inherited unchanged, so the critic side
-    of the asymmetry is identical to the 3-camera task and the comparison isolates the camera count.
-    """
-
-    @configclass
-    class Grayscale2CamCfg(ObsGroup):
-        """Two-camera grayscale stack -- (history_length, 2, 84, 84), one luma channel per camera."""
-
-        grayscale_image = ObsTerm(
-            func=task_mdp.process_multi_camera_image,
-            params={
-                "sensor_cfgs": [
-                    SceneEntityCfg("side_camera"),
-                    SceneEntityCfg("wrist_camera"),
-                ],
-                "data_type": "rgb",
-                "output_size": (84, 84),
-                "grayscale": True,
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-            self.history_length = 3
-            self.flatten_history_dim = False
-
-    policy: Grayscale2CamCfg = Grayscale2CamCfg()
-
-
-@configclass
-class ObservationsGrayscale2CamNoHistAsymmetricCfg(ObservationsGrayscale2CamAsymmetricCfg):
-    """Side + wrist cameras with NO image history -- a single frame instead of a 3-frame stack.
-
-    Vision obs becomes (1, 2, 84, 84) = 14,112 elements, vs 42,336 for the 2-camera stack and
-    63,504 for the original 3-camera stack.
-
-    Note this targets a different bottleneck than the camera-count ablation. History costs nothing
-    to render -- each frame is rendered once and retained -- so this saves no render time. What it
-    saves is 3x on everything sized by the observation: replay-buffer memory and, notably, the
-    CPU->GPU sample path, which profiling put at 39% of an iteration.
-
-    ``proprio`` keeps its 3-step history: only the image stack is collapsed, so the policy retains
-    joint/end-effector velocity information and the ablation isolates *visual* history.
-    """
-
-    @configclass
-    class Grayscale2CamNoHistCfg(ObservationsGrayscale2CamAsymmetricCfg.Grayscale2CamCfg):
-        """Single-frame two-camera grayscale -- same term and cameras, history collapsed to 1."""
-
-        def __post_init__(self):
-            super().__post_init__()
-            self.history_length = 1
-
-    policy: Grayscale2CamNoHistCfg = Grayscale2CamNoHistCfg()
-
-
-@configclass
-class ObservationsGrayscale2CamNoHistObs32AsymmetricCfg(ObservationsGrayscale2CamNoHistAsymmetricCfg):
-    """Side + wrist, single frame, downsampled to 32x32 instead of 84x84.
-
-    Vision obs becomes (1, 2, 32, 32) = 2,048 elements, a 6.9x cut from 14,112 and 31x from the
-    original 63,504. ``sample_H2D`` measured as ~2.2 ms fixed + 0.41 us/element, so this should take
-    that block from ~8.0 ms to ~3.0 ms per call.
-
-    32x32 is a deliberate midpoint: SQuInT-style pipelines go to 16x16, which risks losing the peg
-    and hole at the scale they occupy in these views, while 84x84 is more resolution than the
-    encoder demonstrably needs. Unlike the resolution rung below it, this DOES discard information
-    the policy sees, so it is the rung most likely to cost task performance.
-
-    The term is redeclared in full rather than mutating the inherited ``params`` dict, so there is
-    no chance of aliasing the parent task's params and silently changing its resolution too.
-    """
-
-    @configclass
-    class Grayscale2CamNoHist32Cfg(ObsGroup):
-        """Two-camera single-frame grayscale at 32x32 -- (1, 2, 32, 32)."""
-
-        grayscale_image = ObsTerm(
-            func=task_mdp.process_multi_camera_image,
-            params={
-                "sensor_cfgs": [
-                    SceneEntityCfg("side_camera"),
-                    SceneEntityCfg("wrist_camera"),
-                ],
-                "data_type": "rgb",
-                "output_size": (32, 32),
-                "grayscale": True,
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-            self.history_length = 1
-            self.flatten_history_dim = False
-
-    policy: Grayscale2CamNoHist32Cfg = Grayscale2CamNoHist32Cfg()
-
-
-@configclass
-class ObservationsDataCollectionGrayscale2CamNoHistObs32AsymmetricCfg(ObservationsCfg):
-    """Collection-side mirror of ``ObservationsGrayscale2CamNoHistObs32AsymmetricCfg``.
-
-    Keeps the expert's own state ``policy`` and privileged ``critic`` so a state-trained PPO
-    checkpoint loads and acts unchanged, and adds the three groups the ablated vision task needs to
-    record: ``grayscale`` (2 cameras, single frame, 32x32), ``proprio`` and ``critic_no_priv``.
-
-    The vision group is the *same class object* the training task uses, so the recorded rows cannot
-    drift from what training consumes -- resolution, camera order and history are shared by
-    construction rather than by two copies of the same literals.
-
-        --record_actor_obs_keys grayscale --record_critic_obs_keys critic_no_priv
-        --record_proprio_obs_keys proprio
-    """
-
-    grayscale: ObservationsGrayscale2CamNoHistObs32AsymmetricCfg.Grayscale2CamNoHist32Cfg = (
-        ObservationsGrayscale2CamNoHistObs32AsymmetricCfg.Grayscale2CamNoHist32Cfg()
-    )
-    proprio: ObservationsGrayscaleAsymmetricCfg.ProprioCfg = ObservationsGrayscaleAsymmetricCfg.ProprioCfg()
-    critic_no_priv: ObservationsNoPrivilegedObsCfg.CriticCfg = ObservationsNoPrivilegedObsCfg.CriticCfg()
-
-
-@configclass
-class ObservationsGrayscale2CamNoHistObs64AsymmetricCfg(ObservationsGrayscale2CamNoHistAsymmetricCfg):
-    """Side + wrist, single frame, downsampled to 64x64 -- the rung between Obs32 and the 84x84 parent.
-
-    Vision obs is (1, 2, 64, 64) = 8,192 elements: 4x Obs32's 2,048 and 0.58x the parent's 14,112.
-    The render is unchanged at 112x84, so this differs from its neighbours in downsampling only.
-
-    64 is also the largest size Squint's CNNEncoder accepts (it supports 64/32/16 square only), so
-    this is the top of the ladder for that architecture; the 84x84 parent is MR.Q-only.
-
-    The term is redeclared in full rather than mutating the inherited ``params`` dict, so there is
-    no chance of aliasing the parent task's params and silently changing its resolution too.
-    """
-
-    @configclass
-    class Grayscale2CamNoHist64Cfg(ObsGroup):
-        """Two-camera single-frame grayscale at 64x64 -- (1, 2, 64, 64)."""
-
-        grayscale_image = ObsTerm(
-            func=task_mdp.process_multi_camera_image,
-            params={
-                "sensor_cfgs": [
-                    SceneEntityCfg("side_camera"),
-                    SceneEntityCfg("wrist_camera"),
-                ],
-                "data_type": "rgb",
-                "output_size": (64, 64),
-                "grayscale": True,
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-            self.history_length = 1
-            self.flatten_history_dim = False
-
-    policy: Grayscale2CamNoHist64Cfg = Grayscale2CamNoHist64Cfg()
-
-
-@configclass
-class ObservationsDataCollectionGrayscale2CamNoHistObs64AsymmetricCfg(ObservationsCfg):
-    """Collection-side mirror of ``ObservationsGrayscale2CamNoHistObs64AsymmetricCfg``.
-
-    Same construction as the Obs32 collection cfg: the expert's state ``policy`` and privileged
-    ``critic`` are kept so a state-trained PPO checkpoint loads and acts unchanged, and the vision
-    group is the *same class object* the training task uses, so recorded rows cannot drift from
-    what training consumes.
-
-        --record_actor_obs_keys grayscale --record_critic_obs_keys critic_no_priv
-        --record_proprio_obs_keys proprio
-    """
-
-    grayscale: ObservationsGrayscale2CamNoHistObs64AsymmetricCfg.Grayscale2CamNoHist64Cfg = (
-        ObservationsGrayscale2CamNoHistObs64AsymmetricCfg.Grayscale2CamNoHist64Cfg()
-    )
-    proprio: ObservationsGrayscaleAsymmetricCfg.ProprioCfg = ObservationsGrayscaleAsymmetricCfg.ProprioCfg()
-    critic_no_priv: ObservationsNoPrivilegedObsCfg.CriticCfg = ObservationsNoPrivilegedObsCfg.CriticCfg()
-
-
-@configclass
-class ObservationsDataCollectionGrayscale2CamNoHistAsymmetricCfg(ObservationsCfg):
-    """Collection-side mirror of ``ObservationsGrayscale2CamNoHistAsymmetricCfg`` (84x84).
-
-    The 84x84 training task already existed as the LowRes rung; only its collection counterpart was
-    missing. Vision obs is (1, 2, 84, 84) = 14,112 elements, consuming nearly all of the 112x84
-    render rather than throwing most of it away as the smaller rungs do.
-    """
-
-    grayscale: ObservationsGrayscale2CamNoHistAsymmetricCfg.Grayscale2CamNoHistCfg = (
-        ObservationsGrayscale2CamNoHistAsymmetricCfg.Grayscale2CamNoHistCfg()
-    )
-    proprio: ObservationsGrayscaleAsymmetricCfg.ProprioCfg = ObservationsGrayscaleAsymmetricCfg.ProprioCfg()
-    critic_no_priv: ObservationsNoPrivilegedObsCfg.CriticCfg = ObservationsNoPrivilegedObsCfg.CriticCfg()
-
-
-@configclass
-class ObservationsGrayscale2CamNoHistObs126AsymmetricCfg(ObservationsGrayscale2CamNoHistAsymmetricCfg):
-    """Side + wrist, single frame, downsampled to 126x126 -- the top of the resolution ladder.
-
-    Vision obs is (1, 2, 126, 126) = 31,752 elements: 2.25x the 84x84 rung's 14,112, 3.9x Obs64 and
-    15.5x Obs32.
-
-    Unlike the Obs32/Obs64 rungs this one must NOT sit on the 112x84 LowRes scene: 126 exceeds that
-    render's height, so the resize would upsample vertically and invent rows. It pairs with the
-    168x126 two-camera rig instead, where 168->126 downsamples width and height passes through 1:1,
-    so no axis is upsampled.
-
-    The term is redeclared in full rather than mutating the inherited ``params`` dict, so there is
-    no chance of aliasing the parent task's params and silently changing its resolution too.
+class ObservationsGrayscale2CamNoHistObs126AsymmetricCfg(ObservationsGrayscaleAsymmetricCfg):
+    """Side + wrist cameras, single frame (no image history), downsampled to 126x126.
+
+    Vision obs is (1, 2, 126, 126) = 31,752 elements, vs (3, 3, 84, 84) = 63,504 for the 3-camera
+    stack. ``proprio`` keeps its 3-step history: only the image stack is collapsed. It pairs with the
+    168x126 two-camera rig, where 168->126 downsamples width and height passes through 1:1, so no
+    axis is upsampled.
     """
 
     @configclass
@@ -2175,8 +1629,7 @@ class ObservationsGrayscale2CamNoHistObs126AsymmetricCfg(ObservationsGrayscale2C
 class ObservationsDataCollectionGrayscale2CamNoHistObs126AsymmetricCfg(ObservationsCfg):
     """Collection-side mirror of ``ObservationsGrayscale2CamNoHistObs126AsymmetricCfg``.
 
-    Same construction as the Obs32/Obs64 collection cfgs: the expert's state ``policy`` and
-    privileged ``critic`` are kept so a state-trained PPO checkpoint loads and acts unchanged, and
+    The expert's state ``policy`` and privileged ``critic`` are kept so a state-trained PPO checkpoint loads and acts unchanged, and
     the vision group is the *same class object* the training task uses, so recorded rows cannot
     drift from what training consumes.
 
@@ -2189,27 +1642,6 @@ class ObservationsDataCollectionGrayscale2CamNoHistObs126AsymmetricCfg(Observati
     )
     proprio: ObservationsGrayscaleAsymmetricCfg.ProprioCfg = ObservationsGrayscaleAsymmetricCfg.ProprioCfg()
     critic_no_priv: ObservationsNoPrivilegedObsCfg.CriticCfg = ObservationsNoPrivilegedObsCfg.CriticCfg()
-
-
-@configclass
-class ObservationsDepthAsymmetricCfg:
-    """Training-side observation set for the asymmetric depth task.
-
-    Exactly ``ObservationsGrayscaleAsymmetricCfg`` with the actor's vision group swapped from
-    grayscale to depth; ``proprio`` is reused verbatim so the two modalities stay interchangeable
-    from the training script's point of view.
-
-    - ``policy``  : three-camera depth stack (history, 3, 84, 84), raw metres with inf -> 0.0.
-    - ``proprio`` : joint state / end-effector / previous action.
-    - ``critic``  : full state, no privileged terms and no ``time_left``.
-
-    As with the grayscale task the actor and critic streams have different shapes, so training code
-    must not assume one shared encoder spans both.
-    """
-
-    policy: ObservationsDataCollectionDepthCfg.DepthCfg = ObservationsDataCollectionDepthCfg.DepthCfg()
-    proprio: ObservationsGrayscaleAsymmetricCfg.ProprioCfg = ObservationsGrayscaleAsymmetricCfg.ProprioCfg()
-    critic: ObservationsNoPrivilegedObsCfg.CriticCfg = ObservationsNoPrivilegedObsCfg.CriticCfg()
 
 
 @configclass
@@ -2300,60 +1732,11 @@ class ObservationsReachingCfg:
 
 
 @configclass
-class ObservationsReachingDepthCfg:
-    """Observation specifications for the MDP."""
-
-    @configclass
-    class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
-
-        depth_image = ObsTerm(
-            func=task_mdp.process_image,
-            params={
-                "sensor_cfg": SceneEntityCfg("front_camera"),
-                "data_type": "distance_to_camera",
-                "output_size": (84, 84),
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-            self.history_length = 3
-            self.flatten_history_dim = False
-
-    @configclass
-    class CriticCfg(ObsGroup):
-        """Critic observations for policy group."""
-
-
-        depth_image = ObsTerm(
-            func=task_mdp.process_image,
-            params={
-                "sensor_cfg": SceneEntityCfg("front_camera"),
-                "data_type": "distance_to_camera",
-                "output_size": (84, 84),
-            },
-        )
-
-        def __post_init__(self):
-            self.enable_corruption = False
-            self.concatenate_terms = True
-            self.history_length = 3
-            self.flatten_history_dim = False
-
-    # observation groups
-    policy: PolicyCfg = PolicyCfg()
-    critic: CriticCfg = CriticCfg()
-
-
-@configclass
 class ObservationsReachingGrayscaleCfg:
     """Reaching observations from the three-camera rig (front / side / wrist), grayscale + proprioception.
 
     Each camera contributes one luma channel, concatenated on the channel dim, so the image groups are
-    (history_length, 3, *output_size) -- the same (history, C, H, W) layout the depth reaching task
-    produces, with C=3 cameras instead of C=1 depth image.
+    (history_length, 3, *output_size).
 
     Three groups, because an image (history, 3, 84, 84) and a proprio vector (history, D) cannot be
     concatenated into one group (rank mismatch):
@@ -2472,51 +1855,8 @@ class RewardsCfg:
     success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
 
 @configclass
-class RewardsScaledCfg:
-
-    # safety rewards
-
-    action_magnitude = RewTerm(func=task_mdp.action_l2_clamped, weight=-1e-4)
-
-    action_rate = RewTerm(func=task_mdp.action_rate_l2_clamped, weight=-1e-3)
-
-    joint_vel = RewTerm(
-        func=task_mdp.joint_vel_l2_clamped,
-        weight=-1e-3,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
-    )
-
-    abnormal_robot = RewTerm(func=task_mdp.abnormal_robot_state, weight=-10.0)
-
-    # task rewards
-
-    progress_context = RewTerm(
-        func=task_mdp.ProgressContext,  # type: ignore
-        weight=0.1,
-        params={
-            "insertive_asset_cfg": SceneEntityCfg("insertive_object"),
-            "receptive_asset_cfg": SceneEntityCfg("receptive_object"),
-        },
-    )
-
-    ee_asset_distance = RewTerm(
-        func=task_mdp.ee_asset_distance_tanh,
-        weight=0.1,
-        params={
-            "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
-            "target_asset_cfg": SceneEntityCfg("insertive_object"),
-            "root_asset_offset_metadata_key": "gripper_offset",
-            "std": 1.0,
-        },
-    )
-
-    dense_success_reward = RewTerm(func=task_mdp.dense_success_reward, weight=0.1, params={"std": 1.0})
-
-    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
-
-@configclass
 class RewardsScaledSparseCfg:
-    """``RewardsScaledCfg`` without the dense shaping terms (``ee_asset_distance``,
+    """Scaled rewards without the dense shaping terms (``ee_asset_distance``,
     ``dense_success_reward``). ``progress_context`` is kept -- the reset managers read
     ``func.success`` off it."""
 
@@ -2590,15 +1930,6 @@ class TerminationsCfg:
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
-    # Conservative failure: world Z only (cf. grasp_sampling check_grasp_success pos_above_ground on root_pos_w[:, 2])
-    # insertive_fell_too_low = DoneTerm(
-    #     func=task_mdp.object_root_w_z_below_threshold,
-    #     params={
-    #         "object_cfg": SceneEntityCfg("insertive_object"),
-    #         "min_world_z": -0.2,
-    #     },
-    # )
-
     # Nullable so submissions can disable it from the CLI via Hydra:
     #   env.terminations.first_episode_termination=null
     # IsaacLab's TerminationManager skips None-valued term fields.
@@ -2615,22 +1946,12 @@ class TerminationsSuccessTerminationCfg:
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
-    # Conservative failure: world Z only (cf. grasp_sampling check_grasp_success pos_above_ground on root_pos_w[:, 2])
-    # insertive_fell_too_low = DoneTerm(
-    #     func=task_mdp.object_root_w_z_below_threshold,
-    #     params={
-    #         "object_cfg": SceneEntityCfg("insertive_object"),
-    #         "min_world_z": -0.2,
-    #     },
-    # )
-
     # Nullable so submissions can disable it from the CLI via Hydra:
     #   env.terminations.first_episode_termination=null
     # IsaacLab's TerminationManager skips None-valued term fields.
     first_episode_termination: DoneTerm | None = DoneTerm(func=task_mdp.terminate_first_episode)
 
     success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1})
-
 
 
 @configclass
@@ -2641,18 +1962,18 @@ class TerminationsEvalCfg:
 
     abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
-    # Conservative failure: world Z only (cf. grasp_sampling check_grasp_success pos_above_ground on root_pos_w[:, 2])
-    # insertive_fell_too_low = DoneTerm(
-    #     func=task_mdp.object_root_w_z_below_threshold,
-    #     params={
-    #         "object_cfg": SceneEntityCfg("insertive_object"),
-    #         "min_world_z": -0.2,
-    #     },
-    # )
-
     # first_episode_termination = DoneTerm(func=task_mdp.terminate_first_episode)
 
     success = DoneTerm(func=task_mdp.consecutive_success_state, params={"num_consecutive_successes": 1})
+
+
+@configclass
+class TerminationsEvalNoSuccessCfg:
+    """``TerminationsEvalCfg`` minus ``success``: episodes end only on time-out or abnormal robot state."""
+
+    time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+
+    abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
 
 @configclass
@@ -2811,130 +2132,11 @@ class Ur5eRobotiq2f85RlStateCfg(ManagerBasedRLEnvCfg):
         self.sim.render.enable_dl_denoiser = True
 
 @configclass
-class Ur5eRobotiq2f85RlStateRewardScalingCfg(ManagerBasedRLEnvCfg):
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsScaledCfg = RewardsScaledCfg()
-    terminations: TerminationsCfg = TerminationsCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 16.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-@configclass
-class Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationCfg(ManagerBasedRLEnvCfg):
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsScaledCfg = RewardsScaledCfg()
-    terminations: TerminationsSuccessTerminationCfg = TerminationsSuccessTerminationCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 16.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-
-@configclass
-class Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseCfg(ManagerBasedRLEnvCfg):
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsScaledSparseCfg = RewardsScaledSparseCfg()
-    terminations: TerminationsSuccessTerminationCfg = TerminationsSuccessTerminationCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 16.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-
-@configclass
-class Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg(ManagerBasedRLEnvCfg):
-    """``Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseCfg`` with a non-privileged critic.
+class Ur5eRobotiq2f85RlStateOffPolicyRecipeCfg(ManagerBasedRLEnvCfg):
+    """Scaled-sparse task with success termination and a non-privileged critic.
 
     Consumes buffers recorded by
-    ``OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-DataCollection-Reward-Scaling-Sparse-No-Privileged-Obs-v0``:
+    ``OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-OffPolicy-Recipe-DataCollection-v0``:
     both sides use ``ObservationsNoPrivilegedObsCfg``'s critic (six terms, 5-frame history), so the
     recorded ``n_critic_obs`` matches what ``load_expert_replay_buffer`` checks against.
     """
@@ -2978,123 +2180,6 @@ class Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseNoPrivilegedObs
 
 
 @configclass
-class Ur5eRobotiq2f85RlStateNoPrivilegedObsCfg(ManagerBasedRLEnvCfg):
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsNoPrivilegedObsCfg = ObservationsNoPrivilegedObsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsCfg = RewardsCfg()
-    terminations: TerminationsCfg = TerminationsCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 16.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-@configclass
-class Ur5eRobotiq2f85RlStateSuccessTerminationCfg(ManagerBasedRLEnvCfg):
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsCfg = RewardsCfg()
-    terminations: TerminationsSuccessTerminationCfg = TerminationsSuccessTerminationCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 16.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-@configclass
-class Ur5eRobotiq2f85RlStateEasyCfg(ManagerBasedRLEnvCfg):
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsCfg = RewardsCfg()
-    terminations: TerminationsCfg = TerminationsCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 4.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-@configclass
 class Ur5eRobotiq2f85RlStateEvalCfg(ManagerBasedRLEnvCfg):
     scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
     observations: ObservationsCfg = ObservationsCfg()
@@ -3134,141 +2219,11 @@ class Ur5eRobotiq2f85RlStateEvalCfg(ManagerBasedRLEnvCfg):
         self.sim.render.enable_dl_denoiser = True
 
 @configclass
-class Ur5eRobotiq2f85RlStateEvalRewardScalingCfg(ManagerBasedRLEnvCfg):
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsScaledCfg = RewardsScaledCfg()
-    terminations: TerminationsEvalCfg = TerminationsEvalCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 16.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-@configclass
-class Ur5eRobotiq2f85RlStateEvalRewardScalingSparseCfg(ManagerBasedRLEnvCfg):
-    """Eval counterpart of ``Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseCfg``.
-
-    ``TerminationsEvalCfg`` already carries the ``success`` termination (and drops
-    ``first_episode_termination``), so the name does not repeat "SuccessTermination".
-    """
-
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsScaledSparseCfg = RewardsScaledSparseCfg()
-    terminations: TerminationsEvalCfg = TerminationsEvalCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 16.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-@configclass
-class Ur5eRobotiq2f85RlStateEvalRewardScalingNoPrivilegedObsCfg(ManagerBasedRLEnvCfg):
-    """``Ur5eRobotiq2f85RlStateEvalRewardScalingCfg`` with a non-privileged critic.
-
-    ``ObservationsNoPrivilegedObsCfg`` keeps the policy group identical and drops every privileged
-    critic term -- ``time_left``, ``joint_vel``, ee velocity, material properties, masses, and joint
-    friction/armature/stiffness/damping -- so the critic sees only what the policy sees.
-    """
-
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsNoPrivilegedObsCfg = ObservationsNoPrivilegedObsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsScaledCfg = RewardsScaledCfg()
-    terminations: TerminationsEvalCfg = TerminationsEvalCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 16.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-@configclass
 class Ur5eRobotiq2f85RlStateDataCollectionGrayscaleCfg(ManagerBasedRLEnvCfg):
     """Eval env for recording expert transitions with grayscale observations.
 
     Dynamics, action term, rewards and terminations match
-    ``Ur5eRobotiq2f85RlStateDataCollectionRewardScalingSparseNoPrivilegedObsCfg`` so the expert
+    ``Ur5eRobotiq2f85RlStateOffPolicyRecipeDataCollectionCfg`` so the expert
     behaves the same and recorded rewards are the sparse ones; only the scene gains cameras and the
     observations gain the ``grayscale`` group.
     """
@@ -3321,11 +2276,11 @@ class Ur5eRobotiq2f85RlStateDataCollectionGrayscaleCfg(ManagerBasedRLEnvCfg):
 
 
 @configclass
-class Ur5eRobotiq2f85RlStateDataCollectionRewardScalingSparseNoPrivilegedObsCfg(ManagerBasedRLEnvCfg):
+class Ur5eRobotiq2f85RlStateOffPolicyRecipeDataCollectionCfg(ManagerBasedRLEnvCfg):
     """Eval env for recording expert transitions destined for the No-Privileged-Obs task.
 
-    Identical to ``Ur5eRobotiq2f85RlStateEvalRewardScalingSparseCfg`` except for the observations,
-    which add a ``critic_no_priv`` group alongside the privileged ``critic``.
+    Stage-1 eval dynamics (implicit actuator, soft gains, no sysid DR) with observations that add a
+    ``critic_no_priv`` group alongside the privileged ``critic``.
     """
 
     scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
@@ -3342,45 +2297,6 @@ class Ur5eRobotiq2f85RlStateDataCollectionRewardScalingSparseNoPrivilegedObsCfg(
     def __post_init__(self):
         self.decimation = 12
         self.episode_length_s = 16.0
-        # simulation settings
-        self.sim.dt = 1 / 120.0
-
-        # Contact and solver settings
-        self.sim.physx.solver_type = 1
-        self.sim.physx.max_position_iteration_count = 192
-        self.sim.physx.max_velocity_iteration_count = 1
-        self.sim.physx.bounce_threshold_velocity = 0.02
-        self.sim.physx.friction_offset_threshold = 0.01
-        self.sim.physx.friction_correlation_distance = 0.0005
-
-        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 2**23
-        self.sim.physx.gpu_max_rigid_contact_count = 2**23
-        self.sim.physx.gpu_max_rigid_patch_count = 2**23
-        self.sim.physx.gpu_collision_stack_size = 2**31
-
-        # Render settings
-        self.sim.render.enable_dlssg = True
-        self.sim.render.enable_ambient_occlusion = True
-        self.sim.render.enable_reflections = True
-        self.sim.render.enable_dl_denoiser = True
-
-@configclass
-class Ur5eRobotiq2f85RlStateEvalEasyCfg(ManagerBasedRLEnvCfg):
-    scene: RlStateSceneCfg = RlStateSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    rewards: RewardsCfg = RewardsCfg()
-    terminations: TerminationsEvalCfg = TerminationsEvalCfg()
-    curriculum: NoCurriculumsCfg = NoCurriculumsCfg()
-    events: BaseEventCfg = MISSING
-    commands: CommandsCfg = CommandsCfg()
-    viewer: ViewerCfg = ViewerCfg(eye=(2.0, 0.0, 0.75), origin_type="world", env_index=0, asset_name="robot")
-    variants = variants
-
-    def __post_init__(self):
-        self.decimation = 12
-        self.episode_length_s = 4.0
         # simulation settings
         self.sim.dt = 1 / 120.0
 
@@ -3443,9 +2359,11 @@ class Ur5eRobotiq2f85RlStateReachingCfg(ManagerBasedRLEnvCfg):
         self.sim.render.enable_dl_denoiser = True
 
 @configclass
-class Ur5eRobotiq2f85RlStateReachingDepthCfg(ManagerBasedRLEnvCfg):
-    scene: RlStateReachingSceneCfg = RlStateReachingSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsReachingDepthCfg = ObservationsReachingDepthCfg()
+class Ur5eRobotiq2f85RlStateReachingGrayscaleCfg(ManagerBasedRLEnvCfg):
+    """Reaching from the three-camera (front / side / wrist) grayscale rig."""
+
+    scene: RlStateReachingGrayscaleSceneCfg = RlStateReachingGrayscaleSceneCfg(num_envs=32, env_spacing=1.5)
+    observations: ObservationsReachingGrayscaleCfg = ObservationsReachingGrayscaleCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
     rewards: RewardsReachingCfg = RewardsReachingCfg()
     terminations: TerminationsReachingCfg = TerminationsReachingCfg()
@@ -3487,81 +2405,464 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
     events: TrainEventCfg = TrainEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingCfg(Ur5eRobotiq2f85RlStateRewardScalingCfg):
-
-    events: TrainEventCfg = TrainEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationCfg(Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationCfg):
+class GCObservationsCfg(ObservationsCfg):
+    """ObservationsCfg with goal-conditioned relative-pose terms.
 
-    events: TrainEventCfg = TrainEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseCfg(
-    Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseCfg
-):
-
-    events: TrainEventCfg = TrainEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg(
-    Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
-):
-
-    events: TrainEventCfg = TrainEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
-):
-    """Its parent minus the ``success`` termination: episodes end only on time-out, abnormal
-    robot state, or ``first_episode_termination``.
-
-    Observations, rewards, actions and the reset distribution are inherited unchanged, so a
-    policy transfers between this and the parent and any difference is attributable to the
-    termination alone.
+    Replaces ``insertive_asset_in_receptive_asset_frame`` with the insertive object's pose in its
+    goal-pose frame, and adds the EE pose in its goal-EE-pose frame. Applied to both groups.
     """
 
+    @configclass
+    class PolicyCfg(ObservationsCfg.PolicyCfg):
+        insertive_asset_in_receptive_asset_frame: ObsTerm | None = None
+
+        insertive_asset_in_goal_frame = ObsTerm(
+            func=task_mdp.asset_pose_in_gc_goal_frame,
+            params={"target": "insertive_object", "rotation_repr": "axis_angle"},
+        )
+
+        end_effector_in_goal_ee_frame = ObsTerm(
+            func=task_mdp.asset_pose_in_gc_goal_frame,
+            params={
+                "target": "ee",
+                "ee_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+    @configclass
+    class CriticCfg(ObservationsCfg.CriticCfg):
+        insertive_asset_in_receptive_asset_frame: ObsTerm | None = None
+
+        insertive_asset_in_goal_frame = ObsTerm(
+            func=task_mdp.asset_pose_in_gc_goal_frame,
+            params={"target": "insertive_object", "rotation_repr": "axis_angle"},
+        )
+
+        end_effector_in_goal_ee_frame = ObsTerm(
+            func=task_mdp.asset_pose_in_gc_goal_frame,
+            params={
+                "target": "ee",
+                "ee_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "rotation_repr": "axis_angle",
+            },
+        )
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class GCRewardsCfg:
+    """Goal-conditioned reward weights, simplified for learnability.
+
+    Success and the dense shaping term depend on the INSERTIVE OBJECT's pose only; the EE may end
+    anywhere. Requiring the EE to hit its own goal too made success a conjunction of two 6-DoF
+    constraints, a much sparser target. Both terms take ``include_ee`` (see GCProgressContext),
+    so the stricter criterion is one config flip away.
+
+    There are deliberately no per-asset intermediate rewards here -- see GCRewardIntermediateCfg.
+    """
+
+    # safety rewards
+
+    action_magnitude = RewTerm(func=task_mdp.action_l2_clamped, weight=-1e-4)
+
+    action_rate = RewTerm(func=task_mdp.action_rate_l2_clamped, weight=-1e-3)
+
+    joint_vel = RewTerm(
+        func=task_mdp.joint_vel_l2_clamped,
+        weight=-1e-2,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
+    )
+
+    abnormal_robot = RewTerm(func=task_mdp.abnormal_robot_state, weight=-100.0)
+
+    # task rewards
+
+    progress_context = RewTerm(
+        func=task_mdp.GCProgressContext,  # type: ignore
+        weight=0.1,
+        params={
+            "insertive_asset_cfg": SceneEntityCfg("insertive_object"),
+            "ee_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "include_ee": False,
+            # Difficulty levers, all Hydra-overridable. require_orientation=False drops the
+            # orientation conjunct; the *_threshold sentinels (-1.0 = use the object's USD
+            # metadata value, any value > 0 overrides it) loosen the success ball.
+            "require_orientation": True,
+            "position_threshold": -1.0,
+            "orientation_threshold": -1.0,
+            # Keypoint objective: success when ALL axis keypoints are within keypoint_threshold
+            # metres of their goal counterparts. Spin about the peg axis is free by construction,
+            # matching the base task's euler-XY criterion ("yaw could be different").
+            "success_mode": "pose",
+            "num_keypoints": 4,
+            "keypoint_extent": -1.0,
+            "keypoint_threshold": 0.01,
+            # Tolerance curriculum (second difficulty axis, alongside the reset manager's
+            # neighbour-rank curriculum). keypoint_threshold_start <= 0 disables it and pins the
+            # tolerance at keypoint_threshold. Both axes read the same per-episode success rate,
+            # so a step on either depresses the shared rate and gates the other -- the pair is
+            # self-regulating. The cooldown is deliberately 2x the rank curriculum's so tolerance
+            # steps at half the rank cadence instead of compounding with it every window.
+            "keypoint_threshold_start": -1.0,
+            "keypoint_threshold_min": 0.01,
+            "threshold_promote_at": 0.7,
+            "threshold_demote_at": 0.55,
+            "threshold_factor": 0.9,
+            "threshold_cooldown": 12800,
+        },
+    )
+
+    dense_success_reward = RewTerm(
+        func=task_mdp.gc_dense_success_reward,
+        weight=0.1,
+        # std sets the length-scale of the shaping. At std=1.0 the position term only spans
+        # ~0.15 over the whole 0-0.2 m working range, i.e. almost no gradient; drop it toward
+        # 0.1 to sharpen. include_orientation=False pairs with require_orientation=False.
+        params={
+            "std": 1.0,
+            "include_ee": False,
+            "include_orientation": True,
+            "rot_std": -1.0,
+            # use_keypoints=True switches shaping to mean keypoint distance (one unit, one std);
+            # pair it with progress_context success_mode="keypoint".
+            "use_keypoints": False,
+        },
+    )
+
+    # Straight from the base omnireset reward set: keeps the gripper on the peg. Success ignores
+    # the EE, so nothing else in this config penalises dropping the object mid-transport.
+    ee_asset_distance = RewTerm(
+        func=task_mdp.ee_asset_distance_tanh,
+        weight=0.1,
+        params={
+            "root_asset_cfg": SceneEntityCfg("robot", body_names="robotiq_base_link"),
+            "target_asset_cfg": SceneEntityCfg("insertive_object"),
+            "root_asset_offset_metadata_key": "gripper_offset",
+            "std": 1.0,
+        },
+    )
+
+    success_reward = RewTerm(func=task_mdp.success_reward, weight=1.0)
+
+
+@configclass
+class GCTrainEventCfg(BaseEventCfg):
+    """Training events with goal-conditioned 4-path resets and a goal-distance curriculum.
+
+    The goal is sampled near each env's own start state at first (``curriculum_pos_start`` metres,
+    ``curriculum_rot_start`` radians) and the radii widen linearly over ``curriculum_steps`` env
+    steps until every dataset state qualifies -- at which point the distribution is exactly the
+    original uniform one. Early goals are therefore reachable in a few steps, so the sparse
+    success term fires often enough to learn from before long-horizon goals appear.
+
+    Progress is logged as ``curriculum/goal_pos_radius``, ``curriculum/goal_rot_radius`` and
+    ``curriculum/goal_in_range_frac`` (the fraction of envs that found an in-radius goal;
+    persistently < 1 means the start radius is tighter than the dataset can supply).
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.GoalConditionedMultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "debug_vis": True,
+            "goal_curriculum": True,
+            "curriculum_pos_start": 0.05,
+            "curriculum_pos_end": 100.0,
+            "curriculum_rot_start": 0.3,
+            "curriculum_rot_end": 100.0,
+            "curriculum_steps": 100000,
+            # Candidates drawn per env per reset. The radius is only honoured if some candidate
+            # lands inside it; with too few, the term degrades to "nearest of K" and the
+            # effective radius is set by candidate density, not by the schedule. Watch
+            # curriculum/goal_in_range_frac and raise this if it sits well below 1.
+            "curriculum_candidates": 256,
+            # Schedule mode. "success" widens the radii only when the rolling success rate clears
+            # `curriculum_promote_at`, and shrinks below `curriculum_demote_at`. "steps" is the old
+            # open-loop linear ramp, kept for comparison -- note it has to guess the data's scale
+            # in advance, and a too-large `*_end` makes it a no-op within a few hundred steps.
+            "curriculum_mode": "success",
+            "curriculum_promote_at": 0.7,
+            "curriculum_demote_at": 0.55,
+            "curriculum_expand_factor": 1.15,
+            # Reset events between adjustments. The success window is ~100 episodes, so adjusting
+            # every reset would move the radius faster than the signal driving it can respond.
+            "curriculum_cooldown": 6400,
+            # k-NN rank curriculum ("knn" mode): difficulty is the neighbour RANK limit rather
+            # than a metric radius, so it is independent of dataset density. Neighbours are ranked
+            # by mean KEYPOINT distance -- the same quantity success is scored on. rank_limit >=
+            # knn_k falls back to a uniform draw, i.e. the unrestricted distribution.
+            "curriculum_rank_start": 8,
+            # Per-task start ranks for resumes ("1800,114"); empty = rank_start everywhere.
+            "curriculum_rank_starts": "",
+            # Demote floor; 0 = fall back to rank_start.
+            "curriculum_rank_floor": 0,
+            "curriculum_rank_max": 0,
+            "knn_k": 256,
+            "keypoint_extent": -1.0,
+            "num_keypoints": 4,
+            # Fraction of envs whose goal IS their own start state (see GCMRM.__call__).
+            "identity_goal_prob": 0.0,
+        },
+    )
+
+
+@configclass
+class GCMRMVisualizationEventCfg(BaseEventNoDRCfg):
+    """Goal-conditioned resets only, no domain randomization: for visual inspection."""
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.GoalConditionedMultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+        },
+    )
+
+
+@configclass
+class VisualizationTerminationsCfg:
+    """Time-out only, so the env resets on a fixed cadence."""
+
+    time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+
+
+@configclass
+class Ur5eRobotiq2f85GCMRMVisualizationCfg(Ur5eRobotiq2f85RlStateCfg):
+    """Peg-insertion scene with GoalConditionedMultiResetManager resets and 2 s episodes.
+
+    No success termination and no DR: every episode runs exactly 2 s, then all envs reset to a
+    fresh (initial state, goal state) pair. Intended for visual inspection with no policy.
+    """
+
+    events: GCMRMVisualizationEventCfg = GCMRMVisualizationEventCfg()
+    terminations: VisualizationTerminationsCfg = VisualizationTerminationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = 2.0
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCGCTrainCfg(Ur5eRobotiq2f85RlStateCfg):
+    """Goal-conditioned training env: GCMRM resets, goal-frame observations, goal-reaching rewards.
+
+    Terminations are the inherited TerminationsCfg (time_out, abnormal_robot,
+    first_episode_termination) -- no success termination.
+    """
+
+    observations: GCObservationsCfg = GCObservationsCfg()
+    rewards: GCRewardsCfg = GCRewardsCfg()
+    events: GCTrainEventCfg = GCTrainEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeCfg(Ur5eRobotiq2f85RlStateOffPolicyRecipeCfg):
+    """The off-policy training recipe: scaled sparse rewards, non-privileged critic, no ``success``
+    termination (episodes end only on time-out, abnormal robot state, or
+    ``first_episode_termination``), training events with DR, and the relative-OSC action.
+    """
+
+    events: TrainEventCfg = TrainEventCfg()
+    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
     terminations: TerminationsCfg = TerminationsCfg()
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
-):
-    """Dynamics-gap twin of its parent: identical in every respect except a fixed 0.8 OSC gain scale.
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeSymT4Cfg(Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeCfg):
+    """The recipe with symmetric treatment of the rectangular peg: symmetry-invariant tensor observations
+    for actor and critic (``ObservationsSymT4Cfg``, 307 dims, one action frame), peg symmetry relabel at
+    every reset, and the UW-Lab hole's single assembled offset expanded to the 8 symmetric poses in the
+    success scorer (rewards, task command, reset-state check)."""
 
-    Observations, rewards, terminations, actions and the reset distribution are all inherited, so a
-    policy trained on the parent can be evaluated here (or finetuned from a parent checkpoint) and
-    any difference is attributable to the controller gap alone.
-    """
+    observations: ObservationsSymT4Cfg = ObservationsSymT4Cfg()
+    events: TrainEventSymRelabelCfg = TrainEventSymRelabelCfg()
 
-    events: TrainEventPegMassGapCfg = TrainEventPegMassGapCfg()
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapFullResetCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
-):
-    """Dynamics-gap twin of the base task with the 4-path reset mixture left intact.
-
-    Differs from the base task in peg mass alone, so a comparison against it isolates the gap.
-    The sibling ``...PegMassGapCfg`` additionally narrows resets to one path, which confounds the
-    gap with a change of initial-state distribution -- use this one when that matters.
-    """
-
-    events: TrainEventPegMassGapFullResetCfg = TrainEventPegMassGapFullResetCfg()
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.progress_context.params["expand_symmetric_offsets"] = True
+        self.commands.task_command.expand_symmetric_offsets = True
+        for name, term in vars(self.terminations).items():
+            if getattr(term, "func", None) is task_mdp.check_reset_state_success:
+                term.params["expand_symmetric_offsets"] = True
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsPegMassGapFullResetCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapFullResetCfg
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeSingleResetCfg(
+    Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeCfg
+):
+    """Its parent with resets pinned to one stored state (``TrainEventSingleResetCfg``)."""
+
+    events: TrainEventSingleResetCfg = TrainEventSingleResetCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeSingleResetPPOControlCfg(
+    Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeSingleResetCfg
+):
+    """The single-reset sparse task with the privileged-critic ``ObservationsCfg`` (policy group unchanged),
+    so rsl_rl PPO checkpoints trained with that observation config (e.g. the Yanda-sysid PPO expert) load
+    unchanged. PPO control arm."""
+
+    observations: ObservationsCfg = ObservationsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeDynamicsGapCfg(Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeCfg):
+    """Dynamics-gap twin of the recipe: identical except the peg is pinned to 500 g at startup.
+
+    Observations, rewards, terminations, actions and the 4-path reset mixture are inherited
+    unchanged, so any difference against the recipe is attributable to the peg mass alone.
+    """
+
+    events: TrainEventDynamicsGapCfg = TrainEventDynamicsGapCfg()
+
+
+@configclass
+class GCAutoResetEventCfg(TrainEventDynamicsGapCfg):
+    """Its parent with the reset term upgraded to ``GoalConditionedMultiResetManager``.
+
+    GCMRM SUBCLASSES MultiResetManager, so the 4-path reset mixture and per-path success
+    accounting are inherited unchanged -- it only additionally samples and exposes ``goal_state``,
+    which the ``gc`` observation group reads. ``goal_curriculum=False`` draws goals uniformly, so
+    a sampled goal is exactly a draw from the task's own reset distribution.
+    """
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.GoalConditionedMultiResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset",
+            "reset_types": [
+                "ObjectAnywhereEEAnywhere",
+                "ObjectRestingEEGrasped",
+                "ObjectAnywhereEEGrasped",
+                "ObjectPartiallyAssembledEEGrasped",
+            ],
+            "probs": [0.25, 0.25, 0.25, 0.25],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+            "goal_curriculum": False,
+            # Draws the disassembly policy's target keypoints (blue) and the peg's current ones
+            # (orange). The training loop toggles visibility so they show only while that policy
+            # is driving.
+            "debug_vis": True,
+            "identity_goal_prob": 0.0,
+        },
+    )
+
+
+@configclass
+class GCAutoResetNoGapEventCfg(GCAutoResetEventCfg):
+    """``GCAutoResetEventCfg`` minus the peg-mass gap.
+
+    The gap is exactly one term -- ``randomize_insertive_object_mass``, pinned to 500 g at startup
+    instead of resampled per reset. Restoring it by REFERENCE to ``BaseEventCfg`` rather than
+    restating the distribution means the two variants cannot drift apart if the base range is
+    retuned, which is the same reasoning the PegMassGap configs give for not restating the mass.
+    """
+
+    def __post_init__(self):
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__()
+        self.randomize_insertive_object_mass = BaseEventCfg().randomize_insertive_object_mass
+
+
+@configclass
+class TerminationsGCAutoResetCfg(TerminationsCfg):
+    """``TerminationsCfg`` with ``first_episode_termination`` disabled.
+
+    That term staggers env start times by killing envs still on their first episode, and its guard
+    (``common_step_counter >= max_episode_length``) never trips here because the horizon is huge --
+    so it would keep teleporting roughly one env every ``max_episode_length / num_envs`` steps,
+    forever. Its purpose, desynchronizing episode boundaries, is also the opposite of what this
+    task wants: phases are deliberately synchronized. ``abnormal_robot`` stays the ONLY teleport.
+    """
+
+    first_episode_termination: DoneTerm | None = None
+
+
+@configclass
+class ObservationsGCAutoResetCfg(ObservationsNoPrivilegedObsCfg):
+    """The finetune task's observations plus a ``gc`` group carrying the GC policy's own inputs.
+
+    The group is ``GCObservationsCfg.PolicyCfg`` verbatim, so the PPO goal-conditioned policy sees
+    byte-for-byte the observation it was trained on. FastSAC never reads it: the vec-env wrapper
+    concatenates explicitly named actor/critic groups, so an extra group is inert for it.
+    """
+
+    gc: GCObservationsCfg.PolicyCfg = GCObservationsCfg.PolicyCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeGCAutoResetDynamicsGapCfg(
+    Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeDynamicsGapCfg
+):
+    """Finetune task wired for AUTONOMOUS RESETS driven by the goal-conditioned policy.
+
+    Differences from the plain dynamics-gap finetune task:
+
+    * ``time_out`` is effectively disabled (huge ``episode_length_s``). The 160-step collect and
+      160-step GC-reset phases are driven by the training script, because an env auto-reset at the
+      phase boundary would TELEPORT the robot -- exactly the scripted reset this setup exists to
+      avoid. ``abnormal_robot`` still terminates and resets immediately, and is the only teleport.
+    * The reset term is GCMRM so a sampled goal state is available to condition the GC policy on.
+    * A ``gc`` observation group supplies that policy's inputs.
+
+    No observation seen by FastSAC changes, so a checkpoint trained on the plain task loads here
+    unchanged (there is no time-remaining term whose meaning the longer horizon would alter).
+    """
+
+    events: GCAutoResetEventCfg = GCAutoResetEventCfg()
+    observations: ObservationsGCAutoResetCfg = ObservationsGCAutoResetCfg()
+    # Plain TerminationsCfg == time_out + abnormal_robot, i.e. NO success termination. Inheriting
+    # the parent's would end an episode the moment the peg seats and TELEPORT the env -- the
+    # scripted reset this task exists to avoid. Matches the recipe's dynamics-gap sibling.
+    terminations: TerminationsGCAutoResetCfg = TerminationsGCAutoResetCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # 1e6 s at a 0.1 s control step: time_out never fires within any realistic run.
+        self.episode_length_s = 1.0e6
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeGCAutoResetCfg(
+    Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeGCAutoResetDynamicsGapCfg
+):
+    """``Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeGCAutoResetDynamicsGapCfg`` without the peg-mass gap.
+
+    Peg mass is the ONLY difference, so a comparison against the gap twin isolates the dynamics
+    gap under identical autonomous-reset mechanics: same GC-driven resets, same disabled time_out,
+    same 4-path goal distribution, same terminations.
+    """
+
+    events: GCAutoResetNoGapEventCfg = GCAutoResetNoGapEventCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeDynamicsGapCfg(
+    Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeDynamicsGapCfg
 ):
     """Its parent minus the ``success`` termination: episodes end only on time-out, abnormal
     robot state, or ``first_episode_termination``, so a solved episode runs to the horizon.
@@ -3574,10 +2875,8 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSparseNoPrivilegedObsPegMa
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
-):
-    """Eval twin of its parent: identical except resets are restricted to ``ObjectAnywhereEEAnywhere``.
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeEvalCfg(Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeCfg):
+    """Eval twin of the recipe: identical except resets are restricted to ``ObjectAnywhereEEAnywhere``.
 
     Observations, rewards, terminations and actions are inherited, so a checkpoint trained on the
     parent loads here unchanged.
@@ -3586,95 +2885,13 @@ class Ur5eRobotiq2f85RelCartesianOSCEvalRewardScalingSuccessTerminationSparseNoP
     events: TrainEvalEventAnywhereOnlyCfg = TrainEvalEventAnywhereOnlyCfg()
 
 
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalRewardScalingSuccessTerminationSparseNoPrivilegedObsPegMassGapCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
-):
-    """Eval twin with BOTH the single-path resets and the fixed 0.8 OSC gain scale.
-
-    Differs from ``...EvalRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg`` in the gains
-    alone, so the pair isolates the dynamics gap under a fixed initial-state distribution.
-    """
-
-    events: TrainEvalEventAnywhereOnlyPegMassGapCfg = TrainEvalEventAnywhereOnlyPegMassGapCfg()
-
-
 # Training configuration (Stage 1: no curriculum, implicit actuator, no sysid DR)
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainNoPrivilegedObsCfg(Ur5eRobotiq2f85RlStateNoPrivilegedObsCfg):
-
-    events: TrainEventCfg = TrainEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
-
 # Training configuration (Stage 1: no curriculum, implicit actuator, no sysid DR)
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainSuccessTerminationCfg(Ur5eRobotiq2f85RlStateSuccessTerminationCfg):
-
-    events: TrainEventCfg = TrainEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainNoDRCfg(Ur5eRobotiq2f85RlStateCfg):
-
-    events: TrainEventNoDRCfg = TrainEventNoDRCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainNoDR_6bdbe5e_Cfg(Ur5eRobotiq2f85RlStateCfg):
-
-    events: TrainEventNoDR_6bdbe5e_Cfg = TrainEventNoDR_6bdbe5e_Cfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainFinetuneDynamicsCfg(Ur5eRobotiq2f85RlStateCfg):
-
-    events: TrainEventWithDynamicsGapCfg = TrainEventWithDynamicsGapCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainFinetuneSuboptimalCfg(Ur5eRobotiq2f85RlStateCfg):
-
-    events: TrainEventWithSuboptimalCfg = TrainEventWithSuboptimalCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainEasyCfg(Ur5eRobotiq2f85RlStateEasyCfg):
-
-    events: TrainEasyEventCfg = TrainEasyEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainEasyNoDRCfg(Ur5eRobotiq2f85RlStateEasyCfg):
-
-    events: TrainEasyEventNoDRCfg = TrainEasyEventNoDRCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainReachingCfg(Ur5eRobotiq2f85RlStateReachingCfg):
 
     events: TrainReachingEventCfg = TrainReachingEventCfg()
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainReachingDepthCfg(Ur5eRobotiq2f85RlStateReachingDepthCfg):
-
-    events: TrainReachingEventCfg = TrainReachingEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
-@configclass
-class Ur5eRobotiq2f85RlStateReachingGrayscaleCfg(Ur5eRobotiq2f85RlStateReachingDepthCfg):
-    """Reaching from the three-camera (front / side / wrist) grayscale rig.
-
-    Inherits the depth reaching task's sim/physx/render settings, rewards, and terminations; swaps in
-    the rgb three-camera scene and the grayscale multi-camera observations.
-    """
-
-    scene: RlStateReachingGrayscaleSceneCfg = RlStateReachingGrayscaleSceneCfg(num_envs=32, env_spacing=1.5)
-    observations: ObservationsReachingGrayscaleCfg = ObservationsReachingGrayscaleCfg()
 
 
 @configclass
@@ -3726,31 +2943,14 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneCfg(Ur5eRobotiq2f85RlStateCfg):
 
 
 # Finetune configuration with scaled sparse rewards, success termination and a non-privileged critic
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg(
-    Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
-):
-    """Off-policy finetune: Stage 2 events/curriculum on top of the scaled-sparse, no-privileged-obs base."""
-
-    events: FinetuneEventCfg = FinetuneEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-    curriculum: FinetuneCurriculumsCfg = FinetuneCurriculumsCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
-
-
 # Finetune TRAINING configuration: no curriculum, fixed/maximal gains, full reset distribution
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsFullResetCfg(
-    Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
+    Ur5eRobotiq2f85RlStateOffPolicyRecipeCfg
 ):
     """Off-policy finetune, trained on the final dynamics from step 0 over all four reset paths.
 
-    Differs from the sibling
-    ``Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg``
-    in that nothing ramps: that one pairs ``FinetuneEventCfg`` with ``FinetuneCurriculumsCfg`` to
+    Differs from the curriculum-ramped Stage-2 finetune in that nothing ramps: that one pairs ``FinetuneEventCfg`` with ``FinetuneCurriculumsCfg`` to
     walk sysid / OSC gains up over training, whereas this one takes the ``*_fixed`` randomizers at
     scale_progress=1 and inherits the base's ``NoCurriculumsCfg``.
 
@@ -3771,6 +2971,113 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSpars
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 
+# Robot variant whose USD (and therefore the co-located metadata.yaml the sysid randomizers read)
+# comes from yandabao/uwlab-assets instead of UW-Lab/uwlab-assets. Only the arm sysid nominals
+# (armature / static_friction / dynamic_ratio / viscous_friction) differ between the two.
+YANDA_CLOUD_ASSETS_DIR = "https://huggingface.co/datasets/yandabao/uwlab-assets/resolve/main"
+
+EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID = EXPLICIT_UR5E_ROBOTIQ_2F85.copy()  # type: ignore
+EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.spawn.usd_path = (
+    f"{YANDA_CLOUD_ASSETS_DIR}/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/"
+    "ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd"
+)
+
+
+def _use_yanda_peg_and_hole(cfg):
+    """Point the peg/hole at yandabao/uwlab-assets. Same nominal geometry as UW-Lab's, but the
+    hole's collision mesh differs (53 verts vs 2444) and the PegHole metadata.yaml carries 8
+    symmetric assembled offsets at 0.1 rad tolerance instead of one at 0.025 -- both what Yanda's
+    experts trained against.
+
+    Also rebinds the ``peg``/``peghole`` CLI variants to these same assets: variant tokens resolve
+    AFTER ``__post_init__``, so without this ``env.scene.insertive_object=peg`` would silently revert
+    the cfg to UW-Lab assets (and their 0.025 rad thresholds). With it, the tokens are no-ops here.
+    """
+    cfg.scene.insertive_object.spawn.usd_path = f"{YANDA_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"
+    cfg.scene.receptive_object.spawn.usd_path = f"{YANDA_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"
+    yanda_variants = {k: dict(v) for k, v in variants.items()}
+    yanda_variants["scene.insertive_object"]["peg"] = cfg.scene.insertive_object.copy()
+    yanda_variants["scene.receptive_object"]["peghole"] = cfg.scene.receptive_object.copy()
+    cfg.variants = yanda_variants
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRecipeYandaSysidCfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsFullResetCfg
+):
+    """Off-policy finetune on the final dynamics from step 0 over all four reset paths, with the robot
+    USD (and thus sysid metadata.yaml) and the peg/hole assets sourced from yandabao/uwlab-assets, and
+    no ``success`` termination: episodes run past insertion to time-out, matching the
+    ...NoSuccessTerminationYandaSysid data-collection config. Keeps ``first_episode_termination``
+    for training; curriculum stays ``NoCurriculumsCfg`` from the base (nothing ramps).
+    """
+
+    terminations: TerminationsCfg = TerminationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        _use_yanda_peg_and_hole(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRecipeYandaSysidSymT4Cfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneRecipeYandaSysidCfg
+):
+    """The Yanda sys-id finetune task with the symmetry-invariant tensor observations for actor and critic
+    (``ObservationsSymT4Cfg``, 307 dims, one action frame) and the peg symmetry relabel at every reset;
+    the yandabao hole already lists the 8 symmetric assembled offsets."""
+
+    observations: ObservationsSymT4Cfg = ObservationsSymT4Cfg()
+    events: FinetuneFullResetEventSymRelabelCfg = FinetuneFullResetEventSymRelabelCfg()
+
+
+@configclass
+class FinetuneSingleResetEventCfg(FinetuneFullResetEventCfg):
+    """``FinetuneFullResetEventCfg`` with every reset pinned to ONE stored scene state (``dataset_dir`` is a
+    one-state file in the reset-dataset format; see ``scripts/tools/export_single_reset_state.py``)."""
+
+    reset_from_reset_states = EventTerm(
+        func=task_mdp.SingleResetManager,
+        mode="reset",
+        params={
+            "dataset_dir": "reset_states/yanda/narrow_reaching_0.pt",
+            "probs": [1.0],
+            "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
+        },
+    )
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRecipeYandaSysidSingleResetCfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneRecipeYandaSysidCfg
+):
+    """Its parent (Yanda sysid finetune, no success termination) with resets pinned to one stored state."""
+
+    events: FinetuneSingleResetEventCfg = FinetuneSingleResetEventCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneYandaSysidPPOCfg(Ur5eRobotiq2f85RelCartesianOSCFinetuneCfg):
+    """Curriculum-ramped on-policy finetune (``FinetuneEventCfg`` + ``FinetuneCurriculumsCfg``:
+    adr_sysid and action_scale ramp with success) with the robot USD and peg/hole assets sourced
+    from yandabao/uwlab-assets. On-policy counterpart of the Yanda OffPolicy finetune tasks.
+
+    The privileged critic is pinned to the UW-Lab-robot body set: the yandabao USD carries an extra
+    massless helper frame (``robotiq_fingertip_centered``) that would grow ``robot_mass`` to 205
+    dims and break strict loading of Stage-1 checkpoints (204). Excluding it keeps the checkpoint's
+    exact critic layout so warm-starts load the value function verbatim.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        _use_yanda_peg_and_hole(self)
+        self.observations.critic.robot_mass.params["asset_cfg"] = SceneEntityCfg(
+            "robot", body_names="^(?!robotiq_fingertip_centered$).*"
+        )
+
+
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCEvalCfg(Ur5eRobotiq2f85RlStateEvalCfg):
@@ -3781,34 +3088,8 @@ class Ur5eRobotiq2f85RelCartesianOSCEvalCfg(Ur5eRobotiq2f85RlStateEvalCfg):
 
 
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalRewardScalingCfg(Ur5eRobotiq2f85RlStateEvalRewardScalingCfg):
-    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
-
-    events: TrainEvalEventCfg = TrainEvalEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalRewardScalingSparseCfg(Ur5eRobotiq2f85RlStateEvalRewardScalingSparseCfg):
-    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
-
-    events: TrainEvalEventCfg = TrainEvalEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalRewardScalingNoPrivilegedObsCfg(
-    Ur5eRobotiq2f85RlStateEvalRewardScalingNoPrivilegedObsCfg
-):
-    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
-
-    events: TrainEvalEventCfg = TrainEvalEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
 # Data-collection configuration: PPO expert acts from state obs, records `grayscale`
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleCfg(Ur5eRobotiq2f85RlStateDataCollectionGrayscaleCfg):
@@ -3840,48 +3121,6 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleAsymmetricCfg(
     observations: ObservationsDataCollectionGrayscaleAsymmetricCfg = (
         ObservationsDataCollectionGrayscaleAsymmetricCfg()
     )
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCDataCollectionDepthAsymmetricCfg(
-    Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleAsymmetricCfg
-):
-    """Depth version of the asymmetric collection env.
-
-    Inherits the grayscale asymmetric env wholesale -- same dynamics, action term, sparse scaled
-    rewards, terminations and no-DR events -- and swaps exactly two things: the camera rig now
-    renders ``distance_to_camera`` and the vision observation group is ``depth`` instead of
-    ``grayscale``. A buffer recorded here therefore has the same row layout (63504-element vision,
-    proprio, non-privileged state critic) as the grayscale one, differing only in pixel semantics.
-
-        --record_actor_obs_keys depth --record_critic_obs_keys critic_no_priv
-        --record_proprio_obs_keys proprio
-    """
-
-    scene: RlStateDepthSceneCfg = RlStateDepthSceneCfg(num_envs=32, env_spacing=1.5, replicate_physics=False)
-    observations: ObservationsDataCollectionDepthAsymmetricCfg = ObservationsDataCollectionDepthAsymmetricCfg()
-    # Depth rig prims are named depth_wrist_camera, so the inherited rgb-named term would no-op.
-    events: TrainEvalEventNoDRWristCamDepthCfg = TrainEvalEventNoDRWristCamDepthCfg()
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainDepthAsymmetricCfg(
-    Ur5eRobotiq2f85RelCartesianOSCDataCollectionDepthAsymmetricCfg
-):
-    """Training env: depth + proprio actor, non-privileged full-state critic.
-
-    Depth counterpart of ``Ur5eRobotiq2f85RelCartesianOSCTrainGrayscaleAsymmetricCfg``, and stands
-    in the same relation to the depth collection env: it shares that env's scene, dynamics, sparse
-    scaled rewards and disabled domain randomization, so a buffer recorded there is on-distribution
-    here. Two things change: the state ``policy`` / privileged ``critic`` groups the expert needed
-    are dropped (leaving ``policy`` = depth, ``proprio``, ``critic`` = non-privileged state, which
-    also spares ObservationManager the cost of groups nothing consumes), and terminations switch to
-    the training set, which adds ``terminate_first_episode`` to stagger initial episodes across
-    envs. Both sets already terminate on success.
-    """
-
-    observations: ObservationsDepthAsymmetricCfg = ObservationsDepthAsymmetricCfg()
-    terminations: TerminationsSuccessTerminationCfg = TerminationsSuccessTerminationCfg()
 
 
 @configclass
@@ -3921,82 +3160,6 @@ class Ur5eRobotiq2f85RelCartesianOSCTrainGrayscaleAsymmetricFastRenderCfg(
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamAsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainGrayscaleAsymmetricFastRenderCfg
-):
-    """Speed ablation: the FastRender grayscale asymmetric task with side + wrist cameras only.
-
-    Identical to the parent in every other respect (dynamics, rewards, terminations, no-DR events,
-    FastRender settings), so a throughput comparison against it isolates the camera count. The front
-    camera is dropped from the scene, not merely from the observation, so its render cost is
-    actually saved.
-
-    Actor obs is (3, 2, 84, 84) = 42,336 vs 63,504; expert buffers are therefore not interchangeable
-    with the 3-camera task.
-    """
-
-    scene: RlStateGrayscale2CamSceneCfg = RlStateGrayscale2CamSceneCfg(
-        num_envs=32, env_spacing=1.5, replicate_physics=False
-    )
-    observations: ObservationsGrayscale2CamAsymmetricCfg = ObservationsGrayscale2CamAsymmetricCfg()
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistAsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamAsymmetricFastRenderCfg
-):
-    """Speed ablation stacked on the 2-camera task: single-frame images, no visual history.
-
-    Shares the 2-camera scene, so render cost is unchanged from its parent -- the difference is
-    purely observation size (14,112 vs 42,336), which drives replay-buffer memory and the
-    host->device sample transfer. Comparing this against its parent isolates the cost of image
-    history; comparing the parent against the 3-camera task isolates camera count.
-    """
-
-    observations: ObservationsGrayscale2CamNoHistAsymmetricCfg = ObservationsGrayscale2CamNoHistAsymmetricCfg()
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistLowResAsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistAsymmetricFastRenderCfg
-):
-    """Third rung of the speed ablation: 2 cameras, no history, rendered at 112x84.
-
-    Only the render resolution changes from the parent -- same cameras, same poses, same FOV, same
-    84x84 observation. So this isolates rasterization cost, and unlike the earlier rungs it discards
-    no information the policy sees (the extra pixels were being thrown away by the downsample).
-
-    Observation dim stays 14,112, so buffers are dimensionally interchangeable with the parent task,
-    though the images differ slightly (less pre-downsample detail).
-    """
-
-    scene: RlStateGrayscale2CamLowResSceneCfg = RlStateGrayscale2CamLowResSceneCfg(
-        num_envs=32, env_spacing=1.5, replicate_physics=False
-    )
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistLowResObs32AsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistLowResAsymmetricFastRenderCfg
-):
-    """Fourth rung: 2 cameras, no history, 112x84 render, downsampled to 32x32.
-
-    Only ``output_size`` changes from the parent, so render cost is identical and the delta is
-    entirely in observation size -- 2,048 vs 14,112 elements. Expect the win in ``buffer/sample_H2D``
-    and buffer memory, not in ``rollout/env_step``.
-
-    Note the render is still 112x84 for a 32x32 observation, which is now 9x more pixels than are
-    consumed. Dropping the render to ~44x33 would be the natural companion change, but is kept
-    separate so this rung measures downsampling alone.
-    """
-
-    observations: ObservationsGrayscale2CamNoHistObs32AsymmetricCfg = (
-        ObservationsGrayscale2CamNoHistObs32AsymmetricCfg()
-    )
-
-
-
-@configclass
 class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleAsymmetricFastRenderCfg(
     Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleAsymmetricCfg
 ):
@@ -4015,94 +3178,42 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleAsymmetricFastRenderC
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscale2CamNoHistLowResObs32AsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleAsymmetricFastRenderCfg
-):
-    """Collection env matching the fully-ablated vision task: 2 cameras, no history, 112x84 -> 32x32.
-
-    Pairs with ``...TrainGrayscale2CamNoHistLowResObs32AsymmetricFastRenderCfg``. Inherits that
-    task's dynamics, sparse scaled rewards, no-DR events and FastRender settings from the grayscale
-    asymmetric collection env, and swaps in the ablated scene and observation set, so a buffer
-    recorded here is on-distribution for training there.
-
-    Renderer parity matters as much as observation parity: both sides are FastRender and both render
-    at 112x84, so the student never sees a domain gap between the recorded images and the ones it
-    trains against.
-    """
-
-    scene: RlStateGrayscale2CamLowResSceneCfg = RlStateGrayscale2CamLowResSceneCfg(
-        num_envs=32, env_spacing=1.5, replicate_physics=False
-    )
-    observations: ObservationsDataCollectionGrayscale2CamNoHistObs32AsymmetricCfg = (
-        ObservationsDataCollectionGrayscale2CamNoHistObs32AsymmetricCfg()
-    )
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistLowResObs64AsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistLowResAsymmetricFastRenderCfg
-):
-    """2 cameras, no history, 112x84 render, downsampled to 64x64.
-
-    Only ``output_size`` changes from the parent, so render cost is identical and the delta is
-    entirely in observation size -- 8,192 elements against the parent's 14,112 and Obs32's 2,048.
-    """
-
-    observations: ObservationsGrayscale2CamNoHistObs64AsymmetricCfg = (
-        ObservationsGrayscale2CamNoHistObs64AsymmetricCfg()
-    )
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscale2CamNoHistLowResObs64AsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleAsymmetricFastRenderCfg
-):
-    """Collection env matching the 64x64 vision task: 2 cameras, no history, 112x84 -> 64x64.
-
-    Both sides are FastRender and both render at 112x84, so the student never sees a domain gap
-    between recorded images and the ones it trains against.
-    """
-
-    scene: RlStateGrayscale2CamLowResSceneCfg = RlStateGrayscale2CamLowResSceneCfg(
-        num_envs=32, env_spacing=1.5, replicate_physics=False
-    )
-    observations: ObservationsDataCollectionGrayscale2CamNoHistObs64AsymmetricCfg = (
-        ObservationsDataCollectionGrayscale2CamNoHistObs64AsymmetricCfg()
-    )
-
-
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscale2CamNoHistLowResAsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleAsymmetricFastRenderCfg
-):
-    """Collection env matching the 84x84 vision task (the LowRes rung, no Obs suffix).
-
-    Pairs with ``...TrainGrayscale2CamNoHistLowResAsymmetricFastRenderCfg``, which already existed;
-    this fills in its missing collection counterpart.
-    """
-
-    scene: RlStateGrayscale2CamLowResSceneCfg = RlStateGrayscale2CamLowResSceneCfg(
-        num_envs=32, env_spacing=1.5, replicate_physics=False
-    )
-    observations: ObservationsDataCollectionGrayscale2CamNoHistAsymmetricCfg = (
-        ObservationsDataCollectionGrayscale2CamNoHistAsymmetricCfg()
-    )
-
-
-@configclass
 class Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistObs126AsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistAsymmetricFastRenderCfg
+    Ur5eRobotiq2f85RelCartesianOSCTrainGrayscaleAsymmetricFastRenderCfg
 ):
-    """2 cameras, no history, 168x126 render downsampled to 126x126.
+    """The FastRender asymmetric task with side + wrist cameras only, single-frame images, 168x126
+    render downsampled to 126x126.
 
-    Inherits the 168x126 two-camera scene unchanged and overrides only ``output_size``, so render
-    cost matches the 84x84 non-LowRes rung and the delta is entirely observation size: 31,752
-    elements against that rung's 14,112.
+    The front camera is dropped from the scene, not merely from the observation, so its render cost
+    is actually saved. Actor obs is (1, 2, 126, 126) = 31,752 vs the parent's (3, 3, 84, 84) = 63,504;
+    expert buffers are therefore not interchangeable with the 3-camera task.
     """
 
+    scene: RlStateGrayscale2CamSceneCfg = RlStateGrayscale2CamSceneCfg(
+        num_envs=32, env_spacing=1.5, replicate_physics=False
+    )
     observations: ObservationsGrayscale2CamNoHistObs126AsymmetricCfg = (
         ObservationsGrayscale2CamNoHistObs126AsymmetricCfg()
     )
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCEvalGrayscale2CamNoHistObs126AsymmetricFastRenderCfg(
+    Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistObs126AsymmetricFastRenderCfg
+):
+    """Eval env for the 126x126 vision task: 2 cameras, no history, 168x126 render -> 126x126.
+
+    Inherits the training env so scene, observation groups and renderer are byte-identical -- a
+    checkpoint's encoder/actor/critic only load against the exact shapes they trained on, and the
+    renderer is part of the observation distribution, so evaluating FastRender weights under full
+    photorealism would measure a domain gap rather than the policy.
+
+    The only change is terminations: ``TerminationsEvalCfg`` drops ``first_episode_termination``,
+    which cuts every env's first episode short to decorrelate rollouts during training and would
+    otherwise depress the first reported success rate here.
+    """
+
+    terminations: TerminationsEvalCfg = TerminationsEvalCfg()
 
 
 @configclass
@@ -4111,8 +3222,7 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscale2CamNoHistObs126Asymm
 ):
     """Collection env matching the 126x126 vision task: 2 cameras, no history, 168x126 -> 126x126.
 
-    Scene is pinned to the two-camera 168x126 rig rather than the LowRes 112x84 one, matching the
-    training task; both sides are FastRender, so the student sees no domain gap between recorded
+    Scene is the two-camera 168x126 rig, matching the training task; both sides are FastRender, so the student sees no domain gap between recorded
     images and the ones it trains against.
     """
 
@@ -4163,25 +3273,6 @@ class Ur5eRobotiq2f85RelCartesianOSCEvalGrayscaleAsymmetricFastRenderCfg(
 
 
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalGrayscale2CamNoHistLowResObs32AsymmetricFastRenderCfg(
-    Ur5eRobotiq2f85RelCartesianOSCTrainGrayscale2CamNoHistLowResObs32AsymmetricFastRenderCfg
-):
-    """Eval env for the fully-ablated vision task: 2 cameras, no history, 112x84 render -> 32x32.
-
-    Inherits the training env so scene, observation groups and renderer are byte-identical -- a
-    checkpoint's encoder/actor/critic only load against the exact shapes they trained on, and the
-    renderer is part of the observation distribution, so evaluating FastRender weights under full
-    photorealism would measure a domain gap rather than the policy.
-
-    The only change is terminations: ``TerminationsEvalCfg`` drops ``first_episode_termination``,
-    which cuts every env's first episode short to decorrelate rollouts during training and would
-    otherwise depress the first reported success rate here.
-    """
-
-    terminations: TerminationsEvalCfg = TerminationsEvalCfg()
-
-
-@configclass
 class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleFastRenderCfg(
     Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleCfg
 ):
@@ -4211,8 +3302,8 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionGrayscaleFastRenderCfg(
 
 # Data-collection configuration: PPO expert acts from its own obs, records `critic_no_priv`
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCDataCollectionRewardScalingSparseNoPrivilegedObsCfg(
-    Ur5eRobotiq2f85RlStateDataCollectionRewardScalingSparseNoPrivilegedObsCfg
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeDataCollectionCfg(
+    Ur5eRobotiq2f85RlStateOffPolicyRecipeDataCollectionCfg
 ):
     """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
 
@@ -4220,16 +3311,24 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionRewardScalingSparseNoPrivilege
     actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
 
 
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeSymT4DataCollectionCfg(
+    Ur5eRobotiq2f85RelCartesianOSCOffPolicyRecipeDataCollectionCfg
+):
+    """Source-task expert-buffer collection with the tensor groups added (expert still acts from ``policy``)."""
+
+    observations: ObservationsDataCollectionSymT4Cfg = ObservationsDataCollectionSymT4Cfg()
+
+
 # Data-collection configuration for the Stage-2 FINETUNE task: PPO expert acts from its own obs and
 # records `critic_no_priv`, but under finetune dynamics rather than Stage-1 ones.
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg(
-    Ur5eRobotiq2f85RlStateDataCollectionRewardScalingSparseNoPrivilegedObsCfg
+    Ur5eRobotiq2f85RlStateOffPolicyRecipeDataCollectionCfg
 ):
-    """Records expert transitions for
-    ``Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsEvalCfg``.
+    """Records expert transitions under the Stage-2 finetune dynamics.
 
-    Same Stage-2 setup as that config -- explicit actuator, ``FinetuneEvalEventCfg`` and the Eval
+    Same Stage-2 setup as the finetune eval -- explicit actuator, ``FinetuneEvalEventCfg`` and the Eval
     action -- so the recorded transitions come from the dynamics the finetune task actually trains
     under. ``FinetuneEvalEventCfg`` uses the ``*_fixed`` sysid / OSC-gain randomizers, i.e. the fully
     ramped (scale_progress=1) gains, and the base pins ``curriculum = NoCurriculumsCfg``, so nothing
@@ -4249,50 +3348,52 @@ class Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTe
         self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
 
-# Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
 @configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalNoDRCfg(Ur5eRobotiq2f85RlStateEvalCfg):
-    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRecipeYandaSysidDataCollectionCfg(
+    Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
+):
+    """The finetune data-collection config minus the ``success`` termination, with the robot USD
+    (and thus sysid metadata.yaml) sourced from yandabao/uwlab-assets.
+    """
 
-    events: TrainEvalEventNoDRCfg = TrainEvalEventNoDRCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
+    terminations: TerminationsEvalNoSuccessCfg = TerminationsEvalNoSuccessCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        _use_yanda_peg_and_hole(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRecipeYandaSysidDataCollectionSuccessTerminationCfg(
+    Ur5eRobotiq2f85RelCartesianOSCDataCollectionFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
+):
+    """The finetune data-collection config (success termination kept, so episodes end at insertion
+    instead of dwelling in the success state to time-out) with the robot USD and peg/hole assets
+    sourced from yandabao/uwlab-assets. Pair with play.py --success_to_truncation to record the
+    success-caused done as a truncation (bootstrapped) in the replay buffer.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85_YANDA_SYSID.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        _use_yanda_peg_and_hole(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCFinetuneRecipeYandaSysidSymT4DataCollectionCfg(
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneRecipeYandaSysidDataCollectionSuccessTerminationCfg
+):
+    """Yanda sys-id expert-buffer collection with the tensor groups added (expert still acts from ``policy``)."""
+
+    observations: ObservationsDataCollectionSymT4Cfg = ObservationsDataCollectionSymT4Cfg()
+
 
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalNoDR_6bdbe5e_Cfg(Ur5eRobotiq2f85RlStateEvalCfg):
-    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
-
-    events: TrainEvalEventNoDR_6bdbe5e_Cfg = TrainEvalEventNoDR_6bdbe5e_Cfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalEasyCfg(Ur5eRobotiq2f85RlStateEvalEasyCfg):
-    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
-
-    events: TrainEvalEasyEventCfg = TrainEvalEasyEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalEasyNoDRCfg(Ur5eRobotiq2f85RlStateEvalEasyCfg):
-    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
-
-    events: TrainEvalEasyEventNoDRCfg = TrainEvalEasyEventNoDRCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
 # Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCEvalFinetuneDynamicsCfg(Ur5eRobotiq2f85RlStateCfg):
-    """Eval after Stage 1: implicit actuator, soft gains, large action scale, no sysid DR."""
-
-    events: TrainEvalEventWithDynamicsGapCfg = TrainEvalEventWithDynamicsGapCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCAction = Ur5eRobotiq2f85RelativeOSCAction()
-
-
+# Evaluation configuration (after Stage 1: implicit actuator, soft gains, no sysid DR)
 # Evaluation configuration (after Stage 2: explicit actuator, stiff gains, fixed sysid)
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
@@ -4307,15 +3408,3 @@ class Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg(Ur5eRobotiq2f85RlStateCfg):
 
 
 # Finetune configuration with scaled sparse rewards, success termination and a non-privileged critic
-@configclass
-class Ur5eRobotiq2f85RelCartesianOSCFinetuneRewardScalingSuccessTerminationSparseNoPrivilegedObsEvalCfg(
-    Ur5eRobotiq2f85RlStateRewardScalingSuccessTerminationSparseNoPrivilegedObsCfg
-):
-    """Off-policy finetune: Stage 2 events/curriculum on top of the scaled-sparse, no-privileged-obs base."""
-
-    events: FinetuneEvalEventCfg = FinetuneEvalEventCfg()
-    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")

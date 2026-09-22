@@ -119,7 +119,7 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.assets import retrieve_file_path
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 from vecenv_wrapper import HolosomaVecEnvWrapper
 
@@ -149,6 +149,172 @@ def _broadcast_env0_state_to_all(env_wrapper) -> None:
         return node[0:1].expand(n, *node.shape[1:]).contiguous()  # env 0 → all envs
 
     unwrapped.reset_to(broadcast_env0(state), env_ids=None, is_relative=True)
+
+
+# ---------------------------------------------------------------------------
+# Plot rendering (formerly eval_critic_plots.py)
+# ---------------------------------------------------------------------------
+import os  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+
+def render_group(d: dict, output_path: str, peg_xy_path: str, q_traj_path: str | None,
+                 peg_xlim, peg_ylim, ckpt_name: str) -> None:
+    """Render Q-vs-MC (``output_path``), peg x-y trajectories (``peg_xy_path``) and, if
+    ``q_traj_path`` is given, the leader env's Q vs return-to-go chart, for one reset group.
+
+    ``d`` keys (numpy): q_dists/qt_dists [C, atoms], q_support/centers [atoms], bin_width, v_min,
+    v_max, alpha, soft_mc/reward_mc/entropy_mc [n], mc_pmf [atoms], term_counts [3], term_type [n],
+    peg_traj [T, n, 2], peghole_xy [2], q_lead/g_lead/act_lead [T], q_ppo_lead [T] or None,
+    reset_idx, n_g, lead.
+    """
+    q_dists, qt_dists, q_support, centers = d["q_dists"], d["qt_dists"], d["q_support"], d["centers"]
+    soft_mc, reward_mc, entropy_mc = d["soft_mc"], d["reward_mc"], d["entropy_mc"]
+    term_counts = [int(c) for c in d["term_counts"]]
+    n_g, reset_idx, lead = int(d["n_g"]), int(d["reset_idx"]), int(d["lead"])
+    v_min, v_max, alpha, bin_width = float(d["v_min"]), float(d["v_max"]), float(d["alpha"]), float(d["bin_width"])
+    peg_traj, peghole_xy = d["peg_traj"], d["peghole_xy"]
+
+    # ---- Q vs total soft MC return (top), reward / entropy / terminations (bottom) ----
+    num_critics = q_dists.shape[0]
+    fig = plt.figure(figsize=(15, 8))
+    ax_main = fig.add_subplot(2, 1, 1)
+    ax_rew = fig.add_subplot(2, 3, 4)
+    ax_ent = fig.add_subplot(2, 3, 5)
+    ax_term = fig.add_subplot(2, 3, 6)
+    ax_main.bar(centers, d["mc_pmf"], width=bin_width * 0.9, alpha=0.35,
+                label="Soft MC return (reward + entropy)", color="tab:orange")
+    online_colors = ["tab:blue", "tab:cyan", "tab:green", "tab:olive"]
+    target_colors = ["tab:red", "tab:pink", "tab:purple", "tab:brown"]
+    for c in range(num_critics):
+        q_exp_c = float(np.sum(q_dists[c] * q_support))
+        ax_main.plot(centers, q_dists[c], color=online_colors[c % len(online_colors)],
+                     lw=1.8, label=f"Q online[{c}]  E={q_exp_c:.2f}")
+        qt_exp_c = float(np.sum(qt_dists[c] * q_support))
+        ax_main.plot(centers, qt_dists[c], color=target_colors[c % len(target_colors)],
+                     lw=1.5, ls="--", label=f"Bellman target y[{c}] (s1,π(a1))  E={qt_exp_c:.2f}")
+    q_exp_mean = float(np.mean([np.sum(q_dists[c] * q_support) for c in range(num_critics)]))
+    ax_main.axvline(soft_mc.mean(), color="tab:orange", ls=":", lw=2, label=f"MC mean={soft_mc.mean():.2f}")
+    ax_main.axvline(q_exp_mean, color="tab:blue", ls=":", lw=2, label=f"E[Q] mean={q_exp_mean:.2f}")
+    ax_main.set_xlabel("Return")
+    ax_main.set_ylabel("Probability")
+    ax_main.set_title(
+        f"Q (online + target, per critic) vs soft MC return — iter {reset_idx} | "
+        f"soft MC mean={soft_mc.mean():.3f}  n={n_g}  (α={alpha:.4f})"
+    )
+    ax_main.legend(fontsize=8)
+    ax_main.set_xlim(v_min, v_max)
+    ax_rew.hist(reward_mc, bins=40, color="tab:green", alpha=0.8)
+    ax_rew.set_title(f"Reward component  mean={reward_mc.mean():.3f}  std={reward_mc.std():.3f}")
+    ax_rew.set_xlabel("Discounted reward return")
+    ax_rew.set_ylabel("Count")
+    ax_ent.hist(entropy_mc, bins=40, color="tab:purple", alpha=0.8)
+    ax_ent.set_title(f"Entropy bonus  mean={entropy_mc.mean():.3f}  std={entropy_mc.std():.3f}")
+    ax_ent.set_xlabel("Discounted −α·logπ return")
+    ax_ent.set_ylabel("Count")
+    term_labels = ["abnormal", "failure", "success"]
+    ax_term.bar(term_labels, term_counts, color=["tab:red", "tab:gray", "tab:green"])
+    for i, c in enumerate(term_counts):
+        ax_term.text(i, c, str(c), ha="center", va="bottom", fontsize=8)
+    ax_term.set_title(f"Terminations  (success {term_counts[2]}/{n_g} = {term_counts[2] / n_g:.1%})")
+    ax_term.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=100)
+    plt.close(fig)
+
+    # ---- Peg x-y trajectories: one line per env on a shared workspace canvas ----
+    fig2, ax2 = plt.subplots(figsize=(8, 8))
+    max_lines = 256
+    env_ids_plot = np.arange(n_g) if n_g <= max_lines else np.linspace(0, n_g - 1, max_lines).astype(int)
+    term_np = d["term_type"]
+    succ_ids = [e for e in env_ids_plot if term_np[e] == 2]
+    fail_ids = [e for e in env_ids_plot if term_np[e] != 2]
+    for ids, colour in ((fail_ids, "tab:red"), (succ_ids, "tab:green")):
+        for e in ids:
+            ax2.plot(peg_traj[:, e, 0], peg_traj[:, e, 1], color=colour, lw=0.5, alpha=0.35)
+    ax2.plot([], [], color="tab:green", lw=1.5, label=f"success ({len(succ_ids)})")
+    ax2.plot([], [], color="tab:red", lw=1.5, label=f"failure ({len(fail_ids)})")
+    end_xy = []
+    for e in env_ids_plot:
+        valid = np.flatnonzero(~np.isnan(peg_traj[:, e, 0]))
+        if valid.size:
+            end_xy.append(peg_traj[valid[-1], e])
+    if end_xy:
+        end_xy = np.asarray(end_xy)
+        ax2.scatter(end_xy[:, 0], end_xy[:, 1], color="gold", s=18, zorder=6,
+                    edgecolors="black", linewidths=0.3, label="end")
+    ax2.scatter(peghole_xy[0], peghole_xy[1], marker="*", color="black", s=250, zorder=8, label="peghole")
+    ax2.scatter(peg_traj[0, 0, 0], peg_traj[0, 0, 1], color="tab:blue", s=60, zorder=9,
+                edgecolors="white", linewidths=0.5, label="start (s0)")
+    ax2.set_xlim(peg_xlim)
+    ax2.set_ylim(peg_ylim)
+    ax2.set_aspect("equal")
+    ax2.set_xlabel("x (env-local, m)")
+    ax2.set_ylabel("y (env-local, m)")
+    ax2.set_title(
+        f"{ckpt_name}\n"
+        f"success {term_counts[2]}/{n_g} = {term_counts[2] / n_g:.1%}"
+        f"  —  iter {reset_idx}  ({len(env_ids_plot)}/{n_g} envs plotted, T={peg_traj.shape[0]})",
+        fontsize=10,
+    )
+    ax2.legend(loc="upper right", fontsize=8)
+    fig2.tight_layout()
+    fig2.savefig(peg_xy_path, dpi=100)
+    plt.close(fig2)
+
+    if q_traj_path is None:
+        return
+    # ---- Leader env: critic Q vs soft return-to-go over the trajectory ----
+    q0_plot, g0_plot = d["q_lead"].copy(), d["g_lead"].copy()
+    inact0 = ~d["act_lead"].astype(bool)
+    q0_plot[inact0] = np.nan
+    g0_plot[inact0] = np.nan
+    ts = np.arange(q0_plot.shape[0])
+    fig3, ax3 = plt.subplots(figsize=(11, 6))
+    ax3.plot(ts, q0_plot, color="tab:blue", lw=2.0, label="Q(s_t, a_t) (critic)")
+    ax3.plot(ts, g0_plot, color="tab:orange", lw=2.0, ls="--", label="soft return-to-go G_t (MC)")
+    q_ppo_lead = d.get("q_ppo_lead")
+    if q_ppo_lead is not None and np.ndim(q_ppo_lead) > 0:
+        q_ppo0_plot = np.array(q_ppo_lead, dtype=float)
+        q_ppo0_plot[inact0] = np.nan
+        ax3.plot(ts, q_ppo0_plot, color="tab:green", lw=2.0, ls=":", label="Q(s_t, a*_ppo)")
+    ax3.set_xlabel("timestep t")
+    ax3.set_ylabel("value")
+    ax3.set_ylim(0, v_max)
+    ax3.set_title(f"env {lead}: critic Q vs MC return-to-go — iter {reset_idx}  (MC={soft_mc[0]:.2f})")
+    ax3.legend(fontsize=9)
+    fig3.tight_layout()
+    fig3.savefig(q_traj_path, dpi=100)
+    plt.close(fig3)
+
+
+def save_reset_scatter(reset_records: list[dict], out_path: str, title_prefix: str = "") -> None:
+    """3D scatter of each reset's initial peg xyz colored by its success rate (RdYlGn, 0..1)."""
+    xyz = np.array([r["init_peg_xyz"] for r in reset_records])
+    rates = np.array([r["success_rate"] for r in reset_records])
+    hole = np.array(reset_records[0]["peghole_xyz"])
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    sc = ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=rates, cmap="RdYlGn", vmin=0.0, vmax=1.0, s=22, alpha=0.85)
+    ax.scatter(hole[0], hole[1], hole[2], c="blue", s=200, marker="*", label="peghole (env 0)", zorder=10)
+    fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.1, label=f"success rate over {reset_records[0]['n_env']} trajectories")
+    ax.set_xlabel("x (m, env-local)")
+    ax.set_ylabel("y (m, env-local)")
+    ax.set_zlabel("z (m, env-local)")
+    ax.set_title(
+        f"{title_prefix}Per-reset success rate  ({len(reset_records)} resets, mean {rates.mean():.1%}, "
+        f"min {rates.min():.0%}, max {rates.max():.0%})"
+    )
+    ax.legend(loc="best")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -196,65 +362,98 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    try:
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp.utils import describe_assembly_assets
+
+        print(describe_assembly_assets(env_cfg))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[assembly] could not describe peg/hole assets: {exc}")
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
-    env = HolosomaVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    is_fastsac = agent_cfg.class_name == "OnPolicyRunner" and hasattr(agent_cfg, "actor_obs_keys")
+    env = (HolosomaVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions) if is_fastsac
+           else RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions))
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
 
     # create runner and load checkpoint
-    runner = FastSACAgent(env, agent_cfg, log_dir=None, device=agent_cfg.device)
-    runner.setup()
-    runner.load(resume_path)
-
     device = env.unwrapped.device
 
-    # Optional PPO expert overlay: pi_ppo(s)'s per-dim Gaussian, plotted alongside the FastSAC
-    # actor's action density in the --video composite. Needs its own registered agent config
-    # (obs groups, network sizes) to build a matching ActorCritic before loading the checkpoint.
-    ppo_policy = None
-    if args_cli.ppo_checkpoint:
-        ppo_task_name = (args_cli.ppo_task or args_cli.task).split(":")[-1]
-        ppo_agent_cfg = load_cfg_from_registry(ppo_task_name, "rsl_rl_cfg_entry_point")
-        ppo_agent_cfg = cli_args.sanitize_rsl_rl_cfg(ppo_agent_cfg)
-        ppo_resume_path = retrieve_file_path(args_cli.ppo_checkpoint)
-        print(f"[INFO]: Loading PPO expert checkpoint from: {ppo_resume_path}")
-        ppo_runner = OnPolicyRunner(env, ppo_agent_cfg.to_dict(), log_dir=None, device=device)
-        ppo_runner.load(ppo_resume_path)
-        ppo_policy = ppo_runner.alg.policy
-        ppo_policy.eval()
+    if not is_fastsac:
+        # PPO / OnPolicyRunner checkpoint: per-reset outcome machinery only; critic diagnostics
+        # are zeroed (no distributional Q to compare).
+        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner.load(resume_path)
+        _ppo_act = runner.get_inference_policy_stochastic(device=device)
+        actor = qnet = qnet_target = obs_normalizer = critic_obs_normalizer = None
+        ppo_policy = None
+        obs_normalization = False
+        print("[eval_critic] OnPolicyRunner checkpoint: critic diagnostics disabled (stochastic inference policy)")
+    else:
+        _ppo_act = None
+        # Eval never samples from the online replay buffer; keep setup() from allocating the full
+        # buffer_size x num_envs training buffer (OOM at thousands of envs).
+        agent_cfg.buffer_size = 1
+        # Eval never steps optimizers; skipping their restore also tolerates checkpoints saved
+        # under a different AMP setting (empty GradScaler state fails load_state_dict).
+        agent_cfg.reset_optimizers = True
+        runner = FastSACAgent(env, agent_cfg, log_dir=None, device=agent_cfg.device)
+        runner.setup()
+        runner.load(resume_path)
 
-    # Access the raw pieces so we can (a) stochastically sample from the actor and
-    # (b) read the categorical Q-distribution rather than a scalar Q value.
-    actor = runner.actor.to(device)
-    qnet = runner.qnet.to(device)
-    qnet_target = runner.qnet_target.to(device)
-    obs_normalizer = runner.obs_normalizer.to(device)
-    critic_obs_normalizer = runner.critic_obs_normalizer.to(device)
-    actor.eval()
-    qnet.eval()
-    qnet_target.eval()
-    obs_normalizer.eval()
-    critic_obs_normalizer.eval()
+        device = env.unwrapped.device
 
-    actor_obs_keys = agent_cfg.actor_obs_keys
-    critic_obs_keys = agent_cfg.critic_obs_keys
+        # Optional PPO expert overlay: pi_ppo(s)'s per-dim Gaussian, plotted alongside the FastSAC
+        # actor's action density in the --video composite. Needs its own registered agent config
+        # (obs groups, network sizes) to build a matching ActorCritic before loading the checkpoint.
+        ppo_policy = None
+        if args_cli.ppo_checkpoint:
+            ppo_task_name = (args_cli.ppo_task or args_cli.task).split(":")[-1]
+            ppo_agent_cfg = load_cfg_from_registry(ppo_task_name, "rsl_rl_cfg_entry_point")
+            ppo_agent_cfg = cli_args.sanitize_rsl_rl_cfg(ppo_agent_cfg)
+            ppo_resume_path = retrieve_file_path(args_cli.ppo_checkpoint)
+            print(f"[INFO]: Loading PPO expert checkpoint from: {ppo_resume_path}")
+            ppo_runner = OnPolicyRunner(env, ppo_agent_cfg.to_dict(), log_dir=None, device=device)
+            ppo_runner.load(ppo_resume_path)
+            ppo_policy = ppo_runner.alg.policy
+            ppo_policy.eval()
+
+        # Access the raw pieces so we can (a) stochastically sample from the actor and
+        # (b) read the categorical Q-distribution rather than a scalar Q value.
+        actor = runner.actor.to(device)
+        qnet = runner.qnet.to(device)
+        qnet_target = runner.qnet_target.to(device)
+        obs_normalizer = runner.obs_normalizer.to(device)
+        critic_obs_normalizer = runner.critic_obs_normalizer.to(device)
+        actor.eval()
+        qnet.eval()
+        qnet_target.eval()
+        obs_normalizer.eval()
+        critic_obs_normalizer.eval()
+
+    actor_obs_keys = agent_cfg.actor_obs_keys if is_fastsac else ["policy"]
+    critic_obs_keys = agent_cfg.critic_obs_keys if is_fastsac else ["policy"]
 
     # Distributional Q-network support (categorical over atoms in [v_min, v_max])
-    v_min = float(qnet.v_min)
-    v_max = float(qnet.v_max)
-    num_atoms = int(qnet.num_atoms)
-    q_support = qnet.q_support.detach().cpu().numpy()  # [num_atoms]
+    if is_fastsac:
+        v_min = float(qnet.v_min)
+        v_max = float(qnet.v_max)
+        num_atoms = int(qnet.num_atoms)
+        q_support = qnet.q_support.detach().cpu().numpy()  # [num_atoms]
+    else:
+        v_min, v_max, num_atoms = 0.0, 1.0, 51
+        q_support = np.linspace(v_min, v_max, num_atoms)
 
     edges = np.linspace(v_min, v_max, num_atoms + 1)
     centers = 0.5 * (edges[:-1] + edges[1:])
     bin_width = (v_max - v_min) / num_atoms
 
     GAMMA = args_cli.gamma
-    obs_normalization = runner.obs_normalization
+    obs_normalization = runner.obs_normalization if is_fastsac else False
     # SAC temperature: the critic predicts SOFT returns (reward plus discounted −α·logπ entropy
     # bonus on future actions), so the MC return must include the same entropy bonus to be comparable.
-    alpha = float(runner.log_alpha.exp().detach())
+    alpha = float(runner.log_alpha.exp().detach()) if is_fastsac else 0.0
 
     import matplotlib.pyplot as plt
 
@@ -264,9 +463,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # change-of-variables. Otherwise (this checkpoint: use_tanh=False) the action IS the raw
     # Normal(mean, std), no transform.
     n_act = env.num_actions
-    use_tanh = bool(getattr(actor, "use_tanh", True))
-    action_scale = actor.action_scale.detach().cpu().numpy()  # [n_act]
-    action_bias = actor.action_bias.detach().cpu().numpy()    # [n_act]
+    use_tanh = bool(getattr(actor, "use_tanh", True)) if is_fastsac else False
+    action_scale = actor.action_scale.detach().cpu().numpy() if is_fastsac else np.ones(n_act)
+    action_bias = actor.action_bias.detach().cpu().numpy() if is_fastsac else np.zeros(n_act)
     x_grid_fixed = np.linspace(-50, 50, 800)  # fixed real-unit grid, used directly in the non-tanh case
     _Z_EPS = 1e-4
     z_grid = np.linspace(-1 + _Z_EPS, 1 - _Z_EPS, 200)  # normalized grid, mapped per-dim (tanh case)
@@ -296,18 +495,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     n_env = env.num_envs
     print(f"[INFO] Running with num_envs={n_env}, γ={GAMMA}, v_min={v_min}, v_max={v_max}, num_atoms={num_atoms}")
 
-    # Warm up physics before measuring: the very first reset after app launch leaves assets in
-    # their raw spawn pose (not yet physics-settled). _broadcast_env0_state_to_all would copy that
-    # unsettled env_0 pose to every env, contaminating the first episode's rewards. Step the policy
-    # briefly and discard, so the first *measured* reset produces a settled env_0 state.
-    # warm_obs, _ = env.reset()
-    # for _ in range(30):
-    #     with torch.inference_mode():
-    #         wa = torch.cat([warm_obs[k] for k in actor_obs_keys], dim=-1)
-    #         wa = obs_normalizer(wa, update=False) if obs_normalization else wa
-    #         wa, _ = actor.get_actions_and_log_probs(wa)
-    #     warm_obs, _, _, _ = env.step(wa)
-
     scene = env.unwrapped.scene
 
     def peg_local_xy():
@@ -316,9 +503,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         p = scene["insertive_object"].data.root_pos_w[:, :2]
         return (p - scene.env_origins[:, :2]).detach().cpu().numpy()
 
+    def peg_local_xyz():
+        # Peg x-y-z in each env's local frame; recorded alongside the x-y history for spread analyses.
+        p = scene["insertive_object"].data.root_pos_w[:, :3]
+        return (p - scene.env_origins[:, :3]).detach().cpu().numpy()
+
     def per_env_q(obs_dict, actions):
         # Scalar critic value Q(s,a) per env: expected value of the categorical dist, averaged
         # over the critic ensemble. Returns [n_env].
+        if qnet is None:
+            return torch.zeros(n_env, device=device)
         co = torch.cat([obs_dict[k] for k in critic_obs_keys], dim=-1)
         nco = critic_obs_normalizer(co, update=False) if obs_normalization else co
         return qnet.get_value(torch.softmax(qnet(nco, actions), dim=-1)).mean(dim=0)
@@ -328,25 +522,54 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _has_success_term = "success" in _term_names
     _has_abnormal_term = "abnormal_robot" in _term_names
     print(f"[eval_critic] termination terms: {_term_names}")
-    if not _has_success_term:
-        print("[eval_critic] WARNING: no 'success' termination term; nothing will be counted as a success.")
 
-    def classify_terminations(term_type, dones, extras, was_active):
+    # Tasks without a `success` termination (the *-Sparse-*-v0 family) never end an episode on
+    # success, so every episode times out and a termination-only rule files them all as failures.
+    # play.py handles this by reading ProgressContext's instantaneous success flag each step and
+    # counting an episode as a success if ANY step satisfied it. Do the same here.
+    # ProgressContext.success is defined as `orientation_aligned & position_aligned`, which is the
+    # exact expression play.py accumulates -- and is weaker than the `success` TERMINATION term,
+    # which additionally requires the continuous-success counter to reach its threshold.
+    try:
+        _progress_ctx = env.unwrapped.reward_manager.get_term_cfg("progress_context").func
+    except Exception as exc:  # noqa: BLE001 - task simply may not define the term
+        _progress_ctx = None
+        print(f"[eval_critic] no `progress_context` reward term ({exc}); ever-success unavailable.")
+    _has_ever_success = _progress_ctx is not None and hasattr(_progress_ctx, "success")
+    if _has_ever_success:
+        print("[eval_critic] success = ProgressContext.success ever true during the episode "
+              "(matches play.py); timeouts are NOT automatically failures.")
+    if not _has_success_term and not _has_ever_success:
+        print("[eval_critic] WARNING: no 'success' termination term and no ProgressContext; "
+              "nothing will be counted as a success.")
+
+    def accumulate_success(ever_success):
+        """OR this step's instantaneous ProgressContext success flag into the per-env episode flag.
+
+        Must be called after EVERY ``env.step`` -- including for envs that terminate on this step,
+        whose success would otherwise be lost when the env auto-resets.
+        """
+        if not _has_ever_success:
+            return
+        ever_success |= _progress_ctx.success.to(device).bool()
+
+    def classify_terminations(term_type, dones, extras, was_active, ever_success):
         """Bucket envs terminating for the first time this step.
 
-        0 = abnormal robot, 1 = failure (timeout / anything else), 2 = success.
+        0 = abnormal robot, 1 = failure, 2 = success.
 
         Per-term flags come off the TerminationManager rather than being inferred from
-        ``time_outs``. ``success`` is itself a termination term here, so a successful episode ends
-        with time_out=False -- the previous ``~time_out -> abnormal`` rule filed every success as an
-        abnormal robot, and only counted a success if it coincided with a timeout. Truncations are
-        always failures in this task: running out of time is never a success.
+        ``time_outs``. An episode counts as a success if EITHER the `success` termination fired
+        (tasks that terminate on success) OR the ProgressContext success condition was met at any
+        point during the episode (tasks that do not). Without the second clause a task with no
+        success termination scores 0% by construction, since every episode necessarily times out.
         """
         newly = was_active & dones.bool()
         if not bool(newly.any()):
             return
         zeros = torch.zeros(n_env, dtype=torch.bool, device=device)
         succ = term_mgr.get_term("success").to(device).bool() if _has_success_term else zeros
+        succ = succ | ever_success
         abnormal = term_mgr.get_term("abnormal_robot").to(device).bool() if _has_abnormal_term else zeros
         # Default any new termination to failure, then let the specific causes override. Success is
         # applied last so it wins if it coincides with a timeout or an abnormal flag.
@@ -355,6 +578,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         term_type[newly & succ] = 2
 
     base_seed = args_cli.seed if args_cli.seed is not None else 42
+
+    import json
+
+    plot_shared = {"q_support": q_support, "centers": centers, "bin_width": bin_width,
+                   "v_min": v_min, "v_max": v_max, "alpha": alpha}
+
+    # Per-reset summary (initial peg xyz, peghole xyz, outcome counts), rewritten to JSON every
+    # iteration so a partial run is still usable; feeds the success-rate scatter after the loop.
+    reset_records = []
+    reset_records_path = os.path.join(plots_dir, "reset_success_rates.json")
 
     iteration = 0
     while simulation_app.is_running():
@@ -373,10 +606,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # iterations; a mismatch on iter 0 confirms the unsettled-spawn transient).
         ins_pos0 = env.unwrapped.scene["insertive_object"].data.root_pos_w[0].detach().cpu().numpy()
         print(f"[iter {iteration}] env0 insertive_object pos @ s0: {ins_pos0}")
-
-        output_path = os.path.join(plots_dir, f"iter{iteration:04d}_q_vs_mc.png")
-        peg_xy_path = os.path.join(plots_dir, f"iter{iteration:04d}_peg_xy.png")
-        q_traj_path = os.path.join(plots_dir, f"iter{iteration:04d}_q_over_traj.png")
+        init_peg_xyz_all = (
+            env.unwrapped.scene["insertive_object"].data.root_pos_w - env.unwrapped.scene.env_origins
+        ).detach().cpu().numpy()
+        peghole_xyz_all = (
+            env.unwrapped.scene["receptive_object"].data.root_pos_w - env.unwrapped.scene.env_origins
+        ).detach().cpu().numpy()
         video_envs = args_cli.video_envs
         video_paths = {e: os.path.join(plots_dir, f"iter{iteration:04d}_env{e}.mp4") for e in video_envs}
 
@@ -399,6 +634,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Record peg x-y trajectory per env; terminated envs get NaN so their line stops (no
         # jump to the auto-reset position). Peghole (receptive_object) is shared across envs (broadcast).
         peg_xy_hist = [peg_local_xy()]  # s0 (all envs active, shared start)
+        peg_xyz_hist = [peg_local_xyz()]
 
         # Per-step trajectory buffers for the Q-vs-return-to-go plot: critic value Q(s_t,a_t),
         # reward r_t and entropy bonus (both masked to envs active going into the step), and the
@@ -420,63 +656,84 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # ---- 2. Stochastic action at s0 + record Q distribution ----
         with torch.inference_mode():
-            actor_obs_0 = torch.cat([obs[k] for k in actor_obs_keys], dim=-1)
-            critic_obs_0 = torch.cat([obs[k] for k in critic_obs_keys], dim=-1)
+            if not is_fastsac:
+                actions_0 = _ppo_act(obs)
+                q_probs = torch.zeros(1, n_env, num_atoms, device=device)
+                q0_scalar = torch.zeros(n_env, device=device)
+                mean_0 = log_std_0 = None
+            else:
+                actor_obs_0 = torch.cat([obs[k] for k in actor_obs_keys], dim=-1)
+                critic_obs_0 = torch.cat([obs[k] for k in critic_obs_keys], dim=-1)
 
-            norm_actor_obs_0 = obs_normalizer(actor_obs_0, update=False) if obs_normalization else actor_obs_0
-            norm_critic_obs_0 = (
-                critic_obs_normalizer(critic_obs_0, update=False) if obs_normalization else critic_obs_0
-            )
+                norm_actor_obs_0 = (
+                    obs_normalizer(actor_obs_0, update=False) if obs_normalization else actor_obs_0
+                )
+                norm_critic_obs_0 = (
+                    critic_obs_normalizer(critic_obs_0, update=False) if obs_normalization else critic_obs_0
+                )
 
-            # Deterministic initial action: the policy mean (tanh-squashed), no sampling noise.
-            actions_0, mean_0, log_std_0 = actor(norm_actor_obs_0)
-            if args_cli.video:
-                mean_traj.append(mean_0[video_idx].detach())
-                logstd_traj.append(log_std_0[video_idx].detach())
-                action_traj.append(actions_0[video_idx].detach())
+                # Deterministic initial action: the policy mean (tanh-squashed), no sampling noise.
+                actions_0, mean_0, log_std_0 = actor(norm_actor_obs_0)
+                actions_0 = actions_0.float()
+                if args_cli.video:
+                    mean_traj.append(mean_0[video_idx].detach())
+                    logstd_traj.append(log_std_0[video_idx].detach())
+                    action_traj.append(actions_0[video_idx].detach())
+                    if ppo_policy is not None:
+                        ppo_policy.act(obs)  # populates ppo_policy.action_mean / .action_std
+                        ppo_mean_traj.append(ppo_policy.action_mean[video_idx].detach())
+                        ppo_std_traj.append(ppo_policy.action_std[video_idx].detach())
                 if ppo_policy is not None:
-                    ppo_policy.act(obs)  # populates ppo_policy.action_mean / .action_std
-                    ppo_mean_traj.append(ppo_policy.action_mean[video_idx].detach())
-                    ppo_std_traj.append(ppo_policy.action_std[video_idx].detach())
-            if ppo_policy is not None:
-                a_star_0 = ppo_policy.act_inference(obs)
-                q_ppo_traj.append(per_env_q(obs, a_star_0))
+                    a_star_0 = ppo_policy.act_inference(obs)
+                    q_ppo_traj.append(per_env_q(obs, a_star_0))
 
-            # Raw distributional logits at (s0, a0): [num_critics, batch, num_atoms]. Keep each
-            # critic separate (no ensemble averaging); average only over envs (shared s0).
-            q_logits = qnet(norm_critic_obs_0, actions_0)
-            q_dists = torch.softmax(q_logits, dim=-1).mean(dim=1).cpu().numpy()    # [num_critics, num_atoms]
-            q0_scalar = qnet.get_value(torch.softmax(q_logits, dim=-1)).mean(dim=0)  # [n_env] Q(s0,a0)
+                # Raw distributional logits at (s0, a0): [num_critics, batch, num_atoms]. Keep each
+                # critic separate (no ensemble averaging); average only over envs (shared s0).
+                q_logits = qnet(norm_critic_obs_0, actions_0)
+                q_probs = torch.softmax(q_logits, dim=-1)                                # [num_critics, n_env, num_atoms]
+                q0_scalar = qnet.get_value(torch.softmax(q_logits, dim=-1)).mean(dim=0)  # [n_env] Q(s0,a0)
 
-        # Termination bucket per env: -1 not-yet, 0 abnormal, 1 timeout-no-success, 2 timeout-success.
+        # Termination bucket per env: -1 not-yet, 0 abnormal, 1 failure, 2 success.
         term_type = torch.full((n_env,), -1, device=device, dtype=torch.long)
         all_active = torch.ones(n_env, dtype=torch.bool, device=device)
+        # Sticky per-episode success flag. Each iteration is exactly one episode per env (all envs
+        # are reset above and rolled out until every one terminates), so this is cleared per
+        # iteration rather than per done.
+        ever_success = torch.zeros(n_env, dtype=torch.bool, device=device)
 
         # ---- 3a. First rollout step (contributes r_0 at γ^0=1; NO entropy bonus on a_0,
         #         matching the soft target which only bonuses future actions a_{t>=1}) ----
         q_traj.append(q0_scalar)                                                # Q(s_0, a_0)
         new_obs, rew, dones, extras = env.step(actions_0)
+        accumulate_success(ever_success)
 
-        # ---- Bootstrapped Bellman target y = r_0 + γ(1-d)[Qtarget(s1,a1) − α·logπ(a1|s1)],
-        #      matching FastSACAgent._update_main exactly (fast_sac_agent.py) — NOT the target
-        #      network evaluated at (s0, a0), which is what a naive Q(s0,a0) comparison would give.
-        with torch.inference_mode():
-            actor_obs_1 = torch.cat([new_obs[k] for k in actor_obs_keys], dim=-1)
-            critic_obs_1 = torch.cat([new_obs[k] for k in critic_obs_keys], dim=-1)
-            norm_actor_obs_1 = obs_normalizer(actor_obs_1, update=False) if obs_normalization else actor_obs_1
-            norm_critic_obs_1 = (
-                critic_obs_normalizer(critic_obs_1, update=False) if obs_normalization else critic_obs_1
-            )
-            next_actions_1, next_log_probs_1 = actor.get_actions_and_log_probs(norm_actor_obs_1)
-            bootstrap_0 = (~dones.bool()).float()
-            discount_0 = torch.full((n_env,), GAMMA, device=device, dtype=rew.dtype)
-            target_reward_arg = rew - discount_0 * bootstrap_0 * alpha * next_log_probs_1
-            target_dist = qnet_target.projection(
-                norm_critic_obs_1, next_actions_1, target_reward_arg, bootstrap_0, discount_0
-            )
-            qt_dists = target_dist.mean(dim=1).cpu().numpy()  # [num_critics, num_atoms]
+        if not is_fastsac:
+            qt_probs = torch.zeros(1, n_env, num_atoms, device=device)
+        else:
+            # ---- Bootstrapped Bellman target y = r_0 + γ(1-d)[Qtarget(s1,a1) − α·logπ(a1|s1)],
+            #      matching FastSACAgent._update_main exactly (fast_sac_agent.py) — NOT the target
+            #      network evaluated at (s0, a0), which is what a naive Q(s0,a0) comparison would give.
+            with torch.inference_mode():
+                actor_obs_1 = torch.cat([new_obs[k] for k in actor_obs_keys], dim=-1)
+                critic_obs_1 = torch.cat([new_obs[k] for k in critic_obs_keys], dim=-1)
+                norm_actor_obs_1 = (
+                    obs_normalizer(actor_obs_1, update=False) if obs_normalization else actor_obs_1
+                )
+                norm_critic_obs_1 = (
+                    critic_obs_normalizer(critic_obs_1, update=False) if obs_normalization else critic_obs_1
+                )
+                next_actions_1, next_log_probs_1 = actor.get_actions_and_log_probs(norm_actor_obs_1)
+                next_actions_1 = next_actions_1.float()
+                next_log_probs_1 = next_log_probs_1.float()
+                bootstrap_0 = (~dones.bool()).float()
+                discount_0 = torch.full((n_env,), GAMMA, device=device, dtype=rew.dtype)
+                target_reward_arg = rew - discount_0 * bootstrap_0 * alpha * next_log_probs_1
+                target_dist = qnet_target.projection(
+                    norm_critic_obs_1, next_actions_1, target_reward_arg, bootstrap_0, discount_0
+                )
+                qt_probs = target_dist  # [num_critics, n_env, num_atoms]
 
-        classify_terminations(term_type, dones, extras, all_active)
+        classify_terminations(term_type, dones, extras, all_active, ever_success)
         active_mask = ~dones.bool()                                             # envs not yet terminated
         reward_returns = rew.clone()                                           # Σ γ^t r_t, seeded with r_0
         entropy_returns = torch.zeros(n_env, device=device, dtype=rew.dtype)   # Σ_{t>=1} γ^t (−α logπ(a_t|s_t))
@@ -487,6 +744,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         obs = new_obs
         xy = peg_local_xy(); xy[(~active_mask).detach().cpu().numpy()] = np.nan
         peg_xy_hist.append(xy)
+        peg_xyz_hist.append(np.where(np.isnan(xy[:, :1]), np.nan, peg_local_xyz()))
         if args_cli.video:
             capture_video_frames(frames, env_alive)
             for e in video_envs:
@@ -496,10 +754,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         while active_mask.any():
             print(f"{torch.sum(active_mask)} active envs remaining")
             with torch.inference_mode():
-                actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=-1)
-                norm_actor_obs = obs_normalizer(actor_obs, update=False) if obs_normalization else actor_obs
-                actions, log_probs = actor.get_actions_and_log_probs(norm_actor_obs)
-                q_t = per_env_q(obs, actions)                                   # Q(s_t, a_t)
+                if not is_fastsac:
+                    actions = _ppo_act(obs)
+                    log_probs = torch.zeros(n_env, device=device)
+                    q_t = torch.zeros(n_env, device=device)
+                    actor_obs = None
+                else:
+                    actor_obs = torch.cat([obs[k] for k in actor_obs_keys], dim=-1)
+                if is_fastsac:
+                    norm_actor_obs = (
+                        obs_normalizer(actor_obs, update=False) if obs_normalization else actor_obs
+                    )
+                    actions, log_probs = actor.get_actions_and_log_probs(norm_actor_obs)
+                    actions = actions.float()
+                    log_probs = log_probs.float()
+                    q_t = per_env_q(obs, actions)                                   # Q(s_t, a_t)
                 if args_cli.video:
                     _, mean_t, log_std_t = actor(norm_actor_obs)
                     mean_traj.append(mean_t[video_idx].detach())
@@ -514,7 +783,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     q_ppo_traj.append(per_env_q(obs, a_star_t))
             was_active = active_mask.clone()
             new_obs, rew, dones, extras = env.step(actions)
-            classify_terminations(term_type, dones, extras, was_active)
+            accumulate_success(ever_success)
+            classify_terminations(term_type, dones, extras, was_active, ever_success)
             # Accumulate reward and entropy bonus separately, both discounted by γ^t and gated to
             # envs still active going into this step. Entropy bonus is −α·logπ(a_t|s_t).
             print(f"Average reward: {torch.mean(rew[active_mask])}")
@@ -534,6 +804,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs = new_obs
             xy = peg_local_xy(); xy[(~active_mask).detach().cpu().numpy()] = np.nan
             peg_xy_hist.append(xy)
+            peg_xyz_hist.append(np.where(np.isnan(xy[:, :1]), np.nan, peg_local_xyz()))
             if args_cli.video:
                 capture_video_frames(frames, env_alive)
                 for e in video_envs:
@@ -542,128 +813,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         reward_mc = reward_returns.detach().cpu().numpy()   # [n_env]  discounted reward return
         entropy_mc = entropy_returns.detach().cpu().numpy()  # [n_env]  discounted entropy-bonus return
         soft_mc = reward_mc + entropy_mc                     # [n_env]  total soft return (comparable to Q)
-
-        # ---- 4. Bin total soft MC return onto the Q support as a proper normalized histogram
-        #         (PMF summing to 1), clipping to the support so all envs are counted. ----
-        counts, _ = np.histogram(np.clip(soft_mc, v_min, v_max), bins=edges)
-        total = counts.sum()
-        mc_pmf = counts / total if total > 0 else counts.astype(np.float64)
-
-        # Termination breakdown: abnormal robot / timeout-no-success / timeout-success.
-        term_counts = [int((term_type == k).sum()) for k in (0, 1, 2)]
-
-        # ---- 5. Plot: Q vs total soft MC return (top), reward / entropy / terminations (bottom) ----
-        num_critics = q_dists.shape[0]
-        fig = plt.figure(figsize=(15, 8))
-        ax_main = fig.add_subplot(2, 1, 1)
-        ax_rew = fig.add_subplot(2, 3, 4)
-        ax_ent = fig.add_subplot(2, 3, 5)
-        ax_term = fig.add_subplot(2, 3, 6)
-
-        # MC soft return as filled bars; each online/target critic distribution as an overlaid line.
-        ax_main.bar(
-            centers, mc_pmf, width=bin_width * 0.9, alpha=0.35,
-            label="Soft MC return (reward + entropy)", color="tab:orange",
-        )
-        online_colors = ["tab:blue", "tab:cyan", "tab:green", "tab:olive"]
-        target_colors = ["tab:red", "tab:pink", "tab:purple", "tab:brown"]
-        for c in range(num_critics):
-            q_exp_c = float(np.sum(q_dists[c] * q_support))
-            ax_main.plot(
-                centers, q_dists[c], color=online_colors[c % len(online_colors)],
-                lw=1.8, label=f"Q online[{c}]  E={q_exp_c:.2f}",
-            )
-            qt_exp_c = float(np.sum(qt_dists[c] * q_support))
-            ax_main.plot(
-                centers, qt_dists[c], color=target_colors[c % len(target_colors)],
-                lw=1.5, ls="--", label=f"Bellman target y[{c}] (s1,π(a1))  E={qt_exp_c:.2f}",
-            )
-        # Vertical markers at the means so the mean-vs-shape relationship is explicit.
-        q_exp_mean = float(np.mean([np.sum(q_dists[c] * q_support) for c in range(num_critics)]))
-        ax_main.axvline(soft_mc.mean(), color="tab:orange", ls=":", lw=2, label=f"MC mean={soft_mc.mean():.2f}")
-        ax_main.axvline(q_exp_mean, color="tab:blue", ls=":", lw=2, label=f"E[Q] mean={q_exp_mean:.2f}")
-        ax_main.set_xlabel("Return")
-        ax_main.set_ylabel("Probability")
-        ax_main.set_title(
-            f"Q (online + target, per critic) vs soft MC return — iter {iteration} | "
-            f"soft MC mean={soft_mc.mean():.3f}  n={n_env}  (α={alpha:.4f})"
-        )
-        ax_main.legend(fontsize=8)
-        ax_main.set_xlim(v_min, v_max)
-
-        ax_rew.hist(reward_mc, bins=40, color="tab:green", alpha=0.8)
-        ax_rew.set_title(f"Reward component  mean={reward_mc.mean():.3f}  std={reward_mc.std():.3f}")
-        ax_rew.set_xlabel("Discounted reward return")
-        ax_rew.set_ylabel("Count")
-
-        ax_ent.hist(entropy_mc, bins=40, color="tab:purple", alpha=0.8)
-        ax_ent.set_title(f"Entropy bonus  mean={entropy_mc.mean():.3f}  std={entropy_mc.std():.3f}")
-        ax_ent.set_xlabel("Discounted −α·logπ return")
-        ax_ent.set_ylabel("Count")
-
-        term_labels = ["abnormal", "failure\n(timeout)", "success"]
-        ax_term.bar(term_labels, term_counts, color=["tab:red", "tab:gray", "tab:green"])
-        for i, c in enumerate(term_counts):
-            ax_term.text(i, c, str(c), ha="center", va="bottom", fontsize=8)
-        ax_term.set_title(f"Terminations  (success {term_counts[2]}/{n_env} = {term_counts[2] / n_env:.1%})")
-        ax_term.set_ylabel("Count")
-
-        fig.tight_layout()
-        fig.savefig(output_path, dpi=100)
-        plt.close(fig)
-
-        # ---- 6. Peg x-y trajectories: one line per env on a shared workspace canvas ----
-        peg_traj = np.stack(peg_xy_hist, axis=0)  # [T, n_env, 2], NaN after each env terminates
-        fig2, ax2 = plt.subplots(figsize=(8, 8))
-        # Subsample envs for legibility if there are many.
-        max_lines = 256
-        env_ids_plot = np.arange(n_env) if n_env <= max_lines else np.linspace(0, n_env - 1, max_lines).astype(int)
-        # Colour each trajectory by its outcome (term_type 2 == timeout with success), and mark
-        # where it ended. Successes are drawn last so the (usually rarer) green lines sit on top.
-        term_np = term_type.detach().cpu().numpy()
-        succ_ids = [e for e in env_ids_plot if term_np[e] == 2]
-        fail_ids = [e for e in env_ids_plot if term_np[e] != 2]
-        for ids, colour in ((fail_ids, "tab:red"), (succ_ids, "tab:green")):
-            for e in ids:
-                ax2.plot(peg_traj[:, e, 0], peg_traj[:, e, 1], color=colour, lw=0.5, alpha=0.35)
-        # Legend proxies: one entry per outcome rather than one per line.
-        ax2.plot([], [], color="tab:green", lw=1.5, label=f"success ({len(succ_ids)})")
-        ax2.plot([], [], color="tab:red", lw=1.5, label=f"failure ({len(fail_ids)})")
-
-        # Final peg position per env: last non-NaN sample, since each env's line stops at its own
-        # termination step rather than at T.
-        end_xy = []
-        for e in env_ids_plot:
-            valid = np.flatnonzero(~np.isnan(peg_traj[:, e, 0]))
-            if valid.size:
-                end_xy.append(peg_traj[valid[-1], e])
-        if end_xy:
-            end_xy = np.asarray(end_xy)
-            ax2.scatter(end_xy[:, 0], end_xy[:, 1], color="gold", s=18, zorder=6,
-                        edgecolors="black", linewidths=0.3, label="end")
-        # Shared start (all envs broadcast to the same s0) and peghole target. The peghole marker is
-        # black rather than red now that red means a failed trajectory.
-        ax2.scatter(peghole_xy[0], peghole_xy[1], marker="*", color="black", s=250, zorder=8, label="peghole")
-        ax2.scatter(peg_traj[0, 0, 0], peg_traj[0, 0, 1], color="tab:blue", s=60, zorder=9,
-                    edgecolors="white", linewidths=0.5, label="start (s0)")
-        # Fixed bounds so every plot shares the same scale (tune via --peg_xlim / --peg_ylim).
-        ax2.set_xlim(args_cli.peg_xlim)
-        ax2.set_ylim(args_cli.peg_ylim)
-        ax2.set_aspect("equal")
-        ax2.set_xlabel("x (env-local, m)")
-        ax2.set_ylabel("y (env-local, m)")
-        # Success rate is over ALL n_env, not just the plotted subset: env_ids_plot is subsampled
-        # above when n_env > max_lines, so counting green lines would understate it.
-        ax2.set_title(
-            f"{ckpt_name}\n"
-            f"success {term_counts[2]}/{n_env} = {term_counts[2] / n_env:.1%}"
-            f"  —  iter {iteration}  ({len(env_ids_plot)}/{n_env} envs plotted, T={peg_traj.shape[0]})",
-            fontsize=10,
-        )
-        ax2.legend(loc="upper right", fontsize=8)
-        fig2.tight_layout()
-        fig2.savefig(peg_xy_path, dpi=100)
-        plt.close(fig2)
 
         # ---- 7. Q(s_t,a_t) vs soft return-to-go G_t over the trajectory, a few representative envs ----
         q_arr = torch.stack(q_traj)      # [T, n_env]  critic value at each step
@@ -694,28 +843,64 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             q_ppo_arr = torch.stack(q_ppo_traj)  # [T, n_env]  Q(s_t, a*_ppo) — same critic, expert action
             q_ppo0 = q_ppo_arr[:, 0].cpu().numpy()
 
-        if not args_cli.video:
-            # ---- 7. Static Q vs return-to-go chart (env 0) ----
-            q0_plot, g0_plot = q0.copy(), g0.copy()
-            inact0 = ~act_arr[:, 0].cpu().numpy()
-            q0_plot[inact0] = np.nan
-            g0_plot[inact0] = np.nan
-            fig3, ax3 = plt.subplots(figsize=(11, 6))
-            ax3.plot(ts, q0_plot, color="tab:blue", lw=2.0, label="Q(s_t, a_t) (critic)")
-            ax3.plot(ts, g0_plot, color="tab:orange", lw=2.0, ls="--", label="soft return-to-go G_t (MC)")
-            if ppo_policy is not None:
-                q_ppo0_plot = q_ppo0.copy()
-                q_ppo0_plot[inact0] = np.nan
-                ax3.plot(ts, q_ppo0_plot, color="tab:green", lw=2.0, ls=":", label="Q(s_t, a*_ppo)")
-            ax3.set_xlabel("timestep t")
-            ax3.set_ylabel("value")
-            ax3.set_ylim(0, v_max)
-            ax3.set_title(f"env 0: critic Q vs MC return-to-go — iter {iteration}  (MC={soft_mc[0]:.2f})")
-            ax3.legend(fontsize=9)
-            fig3.tight_layout()
-            fig3.savefig(q_traj_path, dpi=100)
-            plt.close(fig3)
-        else:
+        peg_traj = np.stack(peg_xy_hist, axis=0)  # [T, n_env, 2], NaN after each env terminates
+        peg_traj_xyz = np.stack(peg_xyz_hist, axis=0)  # [T, n_env, 3], same NaN masking
+
+        # ---- Per-reset analysis: all envs share s0, so bins / plots / records cover every env. ----
+        lead = 0
+        reset_idx = iteration
+        n_g = n_env
+        output_path = os.path.join(plots_dir, f"iter{reset_idx:04d}_q_vs_mc.png")
+        peg_xy_path = os.path.join(plots_dir, f"iter{reset_idx:04d}_peg_xy.png")
+        q_traj_path = os.path.join(plots_dir, f"iter{reset_idx:04d}_q_over_traj.png")
+        term_type_g = term_type
+        soft_mc_g, reward_mc_g, entropy_mc_g = soft_mc, reward_mc, entropy_mc
+        q_dists_g = q_probs.mean(dim=1).cpu().numpy()    # [num_critics, num_atoms]
+        qt_dists_g = qt_probs.mean(dim=1).cpu().numpy()  # [num_critics, num_atoms]
+        peg_traj_g = peg_traj
+        peg_traj_xyz_g = peg_traj_xyz
+        init_peg_xyz = init_peg_xyz_all[0]
+        peghole_xyz = peghole_xyz_all[0]
+        peghole_xy = peghole_xyz[:2]
+
+        # ---- 4. Bin total soft MC return onto the Q support as a proper normalized histogram
+        #         (PMF summing to 1), clipping to the support so all envs are counted. ----
+        counts, _ = np.histogram(np.clip(soft_mc_g, v_min, v_max), bins=edges)
+        total = counts.sum()
+        mc_pmf = counts / total if total > 0 else counts.astype(np.float64)
+
+        # Termination breakdown: abnormal robot / timeout-no-success / timeout-success.
+        term_counts = [int((term_type_g == k).sum()) for k in (0, 1, 2)]
+        reset_records.append({
+            "iteration": reset_idx,
+            "seed": seed_i,
+            "init_peg_xyz": [float(v) for v in init_peg_xyz],
+            "peghole_xyz": [float(v) for v in peghole_xyz],
+            "n_env": int(n_g),
+            "abnormal": term_counts[0],
+            "failure": term_counts[1],
+            "success": term_counts[2],
+            "success_rate": term_counts[2] / n_g,
+        })
+        with open(reset_records_path, "w") as f:
+            json.dump(reset_records, f, indent=1)
+
+        gd = {
+            "q_dists": q_dists_g, "qt_dists": qt_dists_g,
+            "soft_mc": soft_mc_g, "reward_mc": reward_mc_g, "entropy_mc": entropy_mc_g, "mc_pmf": mc_pmf,
+            "term_counts": np.array(term_counts), "term_type": term_type_g.detach().cpu().numpy(),
+            "peg_traj": peg_traj_g, "peg_traj_xyz": peg_traj_xyz_g, "peghole_xy": peghole_xy,
+            "q_lead": q_arr[:, lead].cpu().numpy(), "g_lead": G[:, lead].cpu().numpy(),
+            "act_lead": act_arr[:, lead].cpu().numpy(),
+            "q_ppo_lead": q_ppo_arr[:, lead].cpu().numpy() if ppo_policy is not None else None,
+            "reset_idx": reset_idx, "n_g": n_g, "lead": lead,
+        }
+        render_group({**gd, **plot_shared}, output_path, peg_xy_path,
+                     None if args_cli.video else q_traj_path,
+                     args_cli.peg_xlim, args_cli.peg_ylim, ckpt_name)
+
+        term_counts = [int((term_type == k).sum()) for k in (0, 1, 2)]
+        if args_cli.video:
             # ---- 8. Composite video per requested env: render (top) + progressively-revealed
             #         Q-vs-return-to-go chart (middle) + per-dim action-density row (bottom) ----
             import io
@@ -836,15 +1021,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 imageio.mimsave(video_paths[e], composite, fps=fps)
                 print(f"[iter {iteration:04d}] saved composite env {e} video ({len(composite)} frames) → {video_paths[e]}")
 
-        q_exp_online = float(np.mean([np.sum(q_dists[c] * q_support) for c in range(num_critics)]))
+        q_exp_online = float(np.mean([np.sum(q_probs[c].mean(dim=0).cpu().numpy() * q_support) for c in range(q_probs.shape[0])]))
         video_summary = ", ".join(str(p) for p in video_paths.values()) if args_cli.video else q_traj_path
         print(
             f"[iter {iteration:04d}] soft MC mean={soft_mc.mean():.4f}  reward mean={reward_mc.mean():.4f}  "
             f"entropy mean={entropy_mc.mean():.4f}  E[Q online mean]={q_exp_online:.4f}  "
-            f"term[abnormal/to-nosucc/to-succ]={term_counts}  → {output_path}, {peg_xy_path}, "
+            f"term[abnormal/fail/success]={term_counts}  → {output_path}, {peg_xy_path}, "
             f"{video_summary}"
         )
         iteration += 1
+
+
+    if reset_records:
+        out_path = os.path.join(plots_dir, "reset_success_rate_xyz.png")
+        save_reset_scatter(reset_records, out_path)
+        print(f"[eval_critic] Saved per-reset success-rate scatter to: {out_path}")
 
     env.close()
 

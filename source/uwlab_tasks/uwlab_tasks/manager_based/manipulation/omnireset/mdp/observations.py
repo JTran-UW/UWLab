@@ -16,6 +16,44 @@ from uwlab_tasks.manager_based.manipulation.omnireset.assembly_keypoints import 
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
 
 
+def asset_pose_in_gc_goal_frame(
+    env: ManagerBasedEnv,
+    target: str = "insertive_object",
+    ee_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="wrist_3_link"),
+    event_term_name: str = "reset_from_reset_states",
+    rotation_repr: str = "axis_angle",
+):
+    """Current pose of an asset expressed in the frame of its GCMRM-sampled goal pose.
+
+    ``target`` selects the asset: a rigid object name (its root pose vs the goal root pose), or
+    ``"ee"`` (the ``ee_asset_cfg`` body vs the FK-derived goal EE pose). Goal poses are env-relative
+    in ``goal_state``; env origins are added before the frame subtraction.
+    """
+    goal_state = env.event_manager.get_term_cfg(event_term_name).func.goal_state
+
+    if target == "ee":
+        goal_pose = goal_state["articulation"]["robot"]["ee_pose"]
+        ee_asset: Articulation = env.scene[ee_asset_cfg.name]
+        body_idx = 0 if isinstance(ee_asset_cfg.body_ids, slice) else ee_asset_cfg.body_ids
+        current_pos = ee_asset.data.body_link_pos_w[:, body_idx].view(-1, 3)
+        current_quat = ee_asset.data.body_link_quat_w[:, body_idx].view(-1, 4)
+    else:
+        goal_pose = goal_state["rigid_object"][target]["root_pose"]
+        asset: RigidObject = env.scene[target]
+        current_pos = asset.data.root_pos_w
+        current_quat = asset.data.root_quat_w
+
+    goal_pos_w = goal_pose[:, :3] + env.scene.env_origins
+    pos_b, quat_b = math_utils.subtract_frame_transforms(goal_pos_w, goal_pose[:, 3:7], current_pos, current_quat)
+
+    if rotation_repr == "axis_angle":
+        return torch.cat([pos_b, math_utils.axis_angle_from_quat(quat_b)], dim=1)
+    elif rotation_repr == "quat":
+        return torch.cat([pos_b, quat_b], dim=1)
+    else:
+        raise ValueError(f"Invalid rotation_repr: {rotation_repr}. Must be one of: 'quat', 'axis_angle'")
+
+
 def target_asset_pose_in_root_asset_frame(
     env: ManagerBasedEnv,
     target_asset_cfg: SceneEntityCfg,
@@ -23,6 +61,10 @@ def target_asset_pose_in_root_asset_frame(
     target_asset_offset=None,
     root_asset_offset=None,
     rotation_repr: str = "quat",
+    target_pos_bias_w=None,
+    target_pos_override_w: torch.Tensor | None = None,
+    root_pos_bias_w=None,
+    target_local_rot=None,
 ):
     target_asset: RigidObject | Articulation = env.scene[target_asset_cfg.name]
     root_asset: RigidObject | Articulation = env.scene[root_asset_cfg.name]
@@ -32,8 +74,22 @@ def target_asset_pose_in_root_asset_frame(
 
     target_pos = target_asset.data.body_link_pos_w[:, target_body_idx].view(-1, 3)
     target_quat = target_asset.data.body_link_quat_w[:, target_body_idx].view(-1, 4)
+    if target_pos_override_w is not None:
+        target_pos = target_pos_override_w
+    if target_pos_bias_w is not None:
+        target_pos = target_pos + torch.as_tensor(target_pos_bias_w, dtype=target_pos.dtype, device=target_pos.device)
+    if target_local_rot is not None:
+        # Rotate the target about its OWN axes (axis-angle, rad) before projection: the observation of a
+        # physically rotated target, e.g. a symmetry-equivalent peg orientation.
+        aa = torch.as_tensor(target_local_rot, dtype=target_quat.dtype, device=target_quat.device)
+        if aa.abs().sum() > 0:
+            angle = aa.norm()
+            q_local = math_utils.quat_from_angle_axis(angle.view(1), (aa / angle).view(1, 3)).expand(target_quat.shape[0], 4)
+            target_quat = math_utils.quat_mul(target_quat, q_local)
     root_pos = root_asset.data.body_link_pos_w[:, root_body_idx].view(-1, 3)
     root_quat = root_asset.data.body_link_quat_w[:, root_body_idx].view(-1, 4)
+    if root_pos_bias_w is not None:
+        root_pos = root_pos + torch.as_tensor(root_pos_bias_w, dtype=root_pos.dtype, device=root_pos.device)
 
     if root_asset_offset is not None:
         root_pos, root_quat = root_asset_offset.combine(root_pos, root_quat)
@@ -49,6 +105,245 @@ def target_asset_pose_in_root_asset_frame(
         return torch.cat([target_pos_b, target_quat_b], dim=1)
     else:
         raise ValueError(f"Invalid rotation_repr: {rotation_repr}. Must be one of: 'quat', 'axis_angle'")
+
+
+def target_asset_pose_in_root_asset_frame_with_gap(
+    env: ManagerBasedEnv,
+    target_asset_cfg: SceneEntityCfg,
+    root_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_asset_offset=None,
+    root_asset_offset=None,
+    rotation_repr: str = "quat",
+    pos_noise_std: float | None = None,
+    rot_noise_std: float | None = None,
+    pos_bias=None,
+    rot_bias=None,
+    world_pos_bias=None,
+    root_world_pos_bias=None,
+    target_local_rot=None,
+) -> torch.Tensor:
+    """``target_asset_pose_in_root_asset_frame`` with optional observation-gap corruption.
+
+    Two kinds of corruption, each on the position (m) and rotation (axis-angle, rad) parts:
+
+    * ``pos_noise_std`` / ``rot_noise_std``: zero-mean additive gaussian noise, resampled every
+      step. None or <= 0 disables.
+    * ``pos_bias`` / ``rot_bias``: a fixed constant additive offset -- a scalar (added to every
+      component) or a 3-sequence (per-component). None or all-zero adds nothing. Applied in the
+      OBSERVATION's own frame (the root asset frame).
+    * ``world_pos_bias``: a fixed 3-sequence offset added to the target asset's WORLD position
+      before the frame projection -- one physical miscalibration, consistently rotated into every
+      observation frame that uses this term.
+    * ``root_world_pos_bias``: same, applied to the ROOT (frame-defining) asset's world position --
+      e.g. a miscalibrated peghole pose for the peg-in-peghole-frame term.
+
+    Defaults (None here; 0.0 / [0,0,0] in the task cfgs so scalar and list CLI overrides pass
+    ``update_class_from_dict``'s type check) are a clean passthrough, so swapping this in for the
+    plain function leaves the task unchanged, and the knobs are hydra-overridable, e.g.::
+
+        env.observations.policy.insertive_asset_pose.params.pos_noise_std=0.005
+        env.observations.policy.insertive_asset_pose.params.pos_bias=[0.01,0,0]
+
+    Any rotation knob requires ``rotation_repr='axis_angle'`` (additive corruption of a
+    quaternion is not well-defined).
+    """
+    rot_gap_active = (rot_noise_std is not None and rot_noise_std > 0.0) or (
+        rot_bias is not None and torch.as_tensor(rot_bias).abs().sum() > 0
+    )
+    if rot_gap_active and rotation_repr != "axis_angle":
+        raise ValueError("Rotation noise/bias requires rotation_repr='axis_angle'.")
+
+    if world_pos_bias is not None and not any(float(v) != 0.0 for v in world_pos_bias):
+        world_pos_bias = None
+    if root_world_pos_bias is not None and not any(float(v) != 0.0 for v in root_world_pos_bias):
+        root_world_pos_bias = None
+    obs = target_asset_pose_in_root_asset_frame(
+        env, target_asset_cfg, root_asset_cfg, target_asset_offset, root_asset_offset, rotation_repr,
+        target_pos_bias_w=world_pos_bias, root_pos_bias_w=root_world_pos_bias, target_local_rot=target_local_rot,
+    )
+    if pos_noise_std is not None and pos_noise_std > 0.0:
+        obs[:, :3] += torch.randn_like(obs[:, :3]) * pos_noise_std
+    if rot_noise_std is not None and rot_noise_std > 0.0:
+        obs[:, 3:6] += torch.randn_like(obs[:, 3:6]) * rot_noise_std
+    if pos_bias is not None:
+        obs[:, :3] += torch.as_tensor(pos_bias, dtype=obs.dtype, device=obs.device)
+    if rot_bias is not None:
+        obs[:, 3:6] += torch.as_tensor(rot_bias, dtype=obs.dtype, device=obs.device)
+    return obs
+
+
+class target_asset_pose_in_root_asset_frame_with_gap_and_hold(ManagerTermBase):
+    """``..._with_gap`` plus a stale-pose "hold" gap: each env step, an env that is not already
+    holding starts a hold with probability ``hold_prob``; for the next ``hold_steps`` env steps the
+    target's observed WORLD position is frozen at its snapshot and re-projected into the observation
+    frame every step (rotation and the root frame stay live) -- a pose estimator republishing a
+    stale estimate. Terms sharing the same ``hold_group`` (default: all peg terms) share one hold
+    state, so a single perception dropout corrupts them consistently. Holds clear on episode reset.
+
+    ``hold_prob=0.0`` / ``hold_steps=0`` (the defaults) make this a bit-identical passthrough of
+    ``target_asset_pose_in_root_asset_frame_with_gap``; all of that function's knobs are accepted
+    and applied on top (the world-bias is applied to the held position too).
+    """
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        group = cfg.params.get("hold_group", "peg_pose_hold")
+        states = env.__dict__.setdefault("_obs_pose_hold_states", {})
+        if group not in states:
+            states[group] = {
+                "held_pos": torch.zeros(env.num_envs, 3, device=env.device),
+                "remaining": torch.zeros(env.num_envs, dtype=torch.long, device=env.device),
+                "last_step": -1,
+            }
+        self._state = states[group]
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = slice(None)
+        self._state["remaining"][env_ids] = 0
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        target_asset_cfg: SceneEntityCfg,
+        root_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        target_asset_offset=None,
+        root_asset_offset=None,
+        rotation_repr: str = "quat",
+        pos_noise_std: float | None = None,
+        rot_noise_std: float | None = None,
+        pos_bias=None,
+        rot_bias=None,
+        world_pos_bias=None,
+        root_world_pos_bias=None,
+        hold_prob: float = 0.0,
+        hold_steps: int = 0,
+        hold_group: str = "peg_pose_hold",
+        target_local_rot=None,
+    ) -> torch.Tensor:
+        target_asset = env.scene[target_asset_cfg.name]
+        tb = 0 if isinstance(target_asset_cfg.body_ids, slice) else target_asset_cfg.body_ids
+        cur_pos = target_asset.data.body_link_pos_w[:, tb].view(-1, 3)
+
+        override = None
+        if hold_prob > 0.0 and hold_steps > 0:
+            st = self._state
+            if env.common_step_counter != st["last_step"]:
+                st["last_step"] = env.common_step_counter
+                active = st["remaining"] > 0
+                st["remaining"][active] -= 1
+                start = ~active & (torch.rand(env.num_envs, device=env.device) < hold_prob)
+                st["remaining"][start] = hold_steps
+                st["held_pos"][start] = cur_pos[start]
+            held = self._state["remaining"] > 0
+            if held.any():
+                override = torch.where(held.unsqueeze(1), self._state["held_pos"], cur_pos)
+
+        if world_pos_bias is not None and not any(float(v) != 0.0 for v in world_pos_bias):
+            world_pos_bias = None
+        if root_world_pos_bias is not None and not any(float(v) != 0.0 for v in root_world_pos_bias):
+            root_world_pos_bias = None
+        obs = target_asset_pose_in_root_asset_frame(
+            env, target_asset_cfg, root_asset_cfg, target_asset_offset, root_asset_offset, rotation_repr,
+            target_pos_bias_w=world_pos_bias, target_pos_override_w=override, root_pos_bias_w=root_world_pos_bias,
+            target_local_rot=target_local_rot,
+        )
+        if pos_noise_std is not None and pos_noise_std > 0.0:
+            obs[:, :3] += torch.randn_like(obs[:, :3]) * pos_noise_std
+        if rot_noise_std is not None and rot_noise_std > 0.0:
+            obs[:, 3:6] += torch.randn_like(obs[:, 3:6]) * rot_noise_std
+        if pos_bias is not None:
+            obs[:, :3] += torch.as_tensor(pos_bias, dtype=obs.dtype, device=obs.device)
+        if rot_bias is not None:
+            obs[:, 3:6] += torch.as_tensor(rot_bias, dtype=obs.dtype, device=obs.device)
+        return obs
+
+
+class SymmetricPegObs(ManagerTermBase):
+    """Symmetry-invariant, continuous peg observations for a rectangular (4-yaw x flip symmetric) peg.
+
+    ``mode`` selects the feature (see ``mdp/symmetric_obs.py`` for the math and its unit tests):
+
+    * ``"segment_in_gripper"`` [9]: peg centre in the wrist frame + peg axis as an unoriented line.
+    * ``"segment_in_hole"``    [9]: same, in the hole's CANONICAL assembled frame (all 8 fits give the
+      same frame origin/axis, so the zero vector == inserted).
+    * ``"hole_sym"``           [5]: hole canonical-frame position in the wrist frame (3) + hole yaw in
+      the robot base frame as (cos 4psi, sin 4psi) (2).
+    * ``"spin_in_hole"``       [2]: peg spin about its axis relative to the hole, modulo 90 deg,
+      flip-invariant, weighted to vanish smoothly where undefined.
+    * ``"spin_in_gripper"``    [2]: the same relative to the wrist frame (finger/flat alignment).
+    * ``"tensor4_in_hole"``    [18]: peg centre in the hole ROOT frame (3) + the degree-4 tensor
+      ``u^4 + v^4`` of the peg's face normals in that frame (15): invariant to the 8 symmetries,
+      smooth, and complete (its partial trace is ``I - d d^T``, the axis).
+    * ``"tensor4_in_gripper"`` [18]: the same in the wrist frame.
+
+    Nothing here exposes which of the 8 symmetric labels the peg carries, and every feature is
+    continuous in the peg pose (no canonical-representative jumps).
+    """
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils as _utils
+
+        self.peg: RigidObject = env.scene[cfg.params.get("peg_cfg", SceneEntityCfg("insertive_object")).name]
+        self.hole: RigidObject = env.scene[cfg.params.get("hole_cfg", SceneEntityCfg("receptive_object")).name]
+        wrist_cfg: SceneEntityCfg = cfg.params.get("wrist_cfg", SceneEntityCfg("robot", body_names="wrist_3_link"))
+        wrist_cfg.resolve(env.scene)
+        self.robot: Articulation = env.scene[wrist_cfg.name]
+        self.wrist_idx = 0 if isinstance(wrist_cfg.body_ids, slice) else wrist_cfg.body_ids[0]
+        meta = _utils.read_metadata_from_usd_directory(self.hole.cfg.spawn.usd_path)
+        off = _utils.get_assembled_offsets(meta)[0]  # canonical assembled frame of the hole
+        self._off_pos = torch.tensor(off["pos"], dtype=torch.float32, device=env.device)
+        self._off_quat = torch.tensor(off["quat"], dtype=torch.float32, device=env.device)
+
+    def _hole_frame(self):
+        n = self.hole.data.root_pos_w.shape[0]
+        return math_utils.combine_frame_transforms(
+            self.hole.data.root_pos_w, self.hole.data.root_quat_w, self._off_pos.expand(n, 3), self._off_quat.expand(n, 4)
+        )
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        mode: str,
+        peg_cfg: SceneEntityCfg = SceneEntityCfg("insertive_object"),
+        hole_cfg: SceneEntityCfg = SceneEntityCfg("receptive_object"),
+        wrist_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="wrist_3_link"),
+    ) -> torch.Tensor:
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp import symmetric_obs as so
+
+        peg_pos, peg_quat = self.peg.data.root_pos_w, self.peg.data.root_quat_w
+        if mode == "segment_in_gripper":
+            w_pos = self.robot.data.body_link_pos_w[:, self.wrist_idx]
+            w_quat = self.robot.data.body_link_quat_w[:, self.wrist_idx]
+            return so.segment_features(peg_pos, peg_quat, w_pos, w_quat)
+        if mode == "segment_in_hole":
+            h_pos, h_quat = self._hole_frame()
+            return so.segment_features(peg_pos, peg_quat, h_pos, h_quat)
+        if mode == "spin_in_hole":
+            h_pos, h_quat = self._hole_frame()
+            return so.spin_features(peg_pos, peg_quat, h_pos, h_quat)
+        if mode == "spin_in_gripper":
+            w_pos = self.robot.data.body_link_pos_w[:, self.wrist_idx]
+            w_quat = self.robot.data.body_link_quat_w[:, self.wrist_idx]
+            return so.spin_features(peg_pos, peg_quat, w_pos, w_quat)
+        if mode == "hole_sym":
+            h_pos, h_quat = self._hole_frame()
+            w_pos = self.robot.data.body_link_pos_w[:, self.wrist_idx]
+            w_quat = self.robot.data.body_link_quat_w[:, self.wrist_idx]
+            pos_in_wrist, _ = math_utils.subtract_frame_transforms(w_pos, w_quat, h_pos, h_quat)
+            _, hole_in_base = math_utils.subtract_frame_transforms(
+                self.robot.data.root_pos_w, self.robot.data.root_quat_w, h_pos, h_quat
+            )
+            return torch.cat([pos_in_wrist, so.yaw_mod90_features(hole_in_base)], dim=-1)
+        if mode == "tensor4_in_hole":
+            # hole ROOT frame (same reference as insertive_asset_in_receptive_asset_frame): drop-in replacement
+            return so.tensor4_pose_features(peg_pos, peg_quat, self.hole.data.root_pos_w, self.hole.data.root_quat_w)
+        if mode == "tensor4_in_gripper":
+            w_pos = self.robot.data.body_link_pos_w[:, self.wrist_idx]
+            w_quat = self.robot.data.body_link_quat_w[:, self.wrist_idx]
+            return so.tensor4_pose_features(peg_pos, peg_quat, w_pos, w_quat)
+        raise ValueError(f"SymmetricPegObs: unknown mode '{mode}'")
 
 
 class target_asset_pose_in_root_asset_frame_with_metadata(ManagerTermBase):
@@ -160,7 +455,10 @@ def get_mass(
     asset_cfg: SceneEntityCfg,
 ):
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    return asset.root_physx_view.get_masses().view(env.num_envs, -1)
+    masses = asset.root_physx_view.get_masses().view(env.num_envs, -1)
+    if not isinstance(asset_cfg.body_ids, slice):
+        masses = masses[:, asset_cfg.body_ids]
+    return masses
 
 
 def get_joint_friction(

@@ -30,6 +30,9 @@ class TaskCommandCfg(TaskDependentCommandCfg):
 
     receptive_asset_cfg: SceneEntityCfg = MISSING
 
+    expand_symmetric_offsets: bool = False
+    """Expand a single metadata assembled offset into the 8 rectangular-peg poses (4 yaws x flip)."""
+
 
 @configclass
 class TaskCommandReachingCfg(TaskDependentCommandCfg):

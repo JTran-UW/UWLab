@@ -51,7 +51,7 @@ python scripts/reinforcement_learning/holosoma/eval_critic.py \
 
 Inspect replay buffer
 ```
-python scripts/reinforcement_learning/holosoma/inspect_replay_buffer.py fast_sac_transitions.pt --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Easy-OffPolicy-v0
+python scripts/reinforcement_learning/cleanrl/cleanrl/inspect_replay_buffer.py stats fast_sac_transitions.pt --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Easy-OffPolicy-v0
 ```
 
 Train reaching PPO
