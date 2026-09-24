@@ -30,13 +30,12 @@ PYTORCH_INDEX_URL = ["https://download.pytorch.org/whl/cu118"]
 # Extra dependencies for RL agents
 # Pinned to a commit, not a branch: an unpinned git dependency makes a rebuild
 # silently install a different API than the one this code was written against.
-# Must be a commit on UW-Lab/rsl_rl that carries both the rsl-rl >= 5.0 API that
-# Isaac Lab 3.0's isaaclab_rl requires and the gSDE distribution
-# (GSDEGaussianDistribution) -- the vendor/leggedrobotics mirror has the API but
-# not gSDE. Bump together with the Isaac Lab commit pinned in uwlab.sh.
-# TODO(port): point back at UW-Lab/rsl_rl once port_rsl_rl_5 is merged there.
+# Must be a commit on UW-Lab/rsl_rl with the rsl-rl >= 5.0 API that Isaac Lab 3.0's
+# isaaclab_rl requires, including HeteroscedasticGaussianDistribution (rsl-rl 5.3).
+# Bump together with the Isaac Lab commit pinned in uwlab.sh.
+# TODO(port): point back at UW-Lab/rsl_rl once UW-Lab/rsl_rl#6 is merged there.
 RSL_RL_REPO = "https://github.com/JTran-UW/rsl_rl.git"
-RSL_RL_COMMIT = "f2c944d524f853e906ce493540cfc76e54cc50ea"  # port_rsl_rl_5
+RSL_RL_COMMIT = "16012ab06ac24ca6a56e75e77cfb60552e1ad51a"  # bump_rsl_rl_5_3 (UW-Lab/rsl_rl#6)
 EXTRAS_REQUIRE = {
     "rsl-rl": [
         f"rsl-rl-lib @ git+{RSL_RL_REPO}@{RSL_RL_COMMIT}",

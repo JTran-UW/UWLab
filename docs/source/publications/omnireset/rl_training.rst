@@ -480,6 +480,12 @@ Reproduce our training results from scratch.
 
       .. note::
 
+         On Isaac Lab 3.0 this task plateaus at about 62-65% end-of-episode success on all three
+         seeds, well below the other tasks (90-99%). Expect a lower final success rate than
+         for the other tasks.
+
+      .. note::
+
          **Skip directly to Step 4** if you want to train an RL policy with our pre-generated reset state datasets. Only run Steps 1-3 if you want to generate your own.
 
       **Step 1: Collect Partial Assemblies** (~30 seconds)

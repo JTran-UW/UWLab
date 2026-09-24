@@ -24,7 +24,7 @@ UWLAB_ASSETS_METADATA = toml.load(os.path.join(UWLAB_ASSETS_EXT_DIR, "config", "
 UWLAB_CLOUD_ASSETS_REPO = "https://huggingface.co/datasets/UW-Lab/uwlab-assets"
 """HuggingFace dataset repository holding the cloud assets."""
 
-UWLAB_CLOUD_ASSETS_REVISION = "8892962cdaad159de4efc331af0ac1bf7f192d0b"  # branch isaaclab3
+UWLAB_CLOUD_ASSETS_REVISION = "5ea494fdd7eac242c0ba147fe6508c68abc898ac"  # branch isaaclab3
 """Pinned commit of :data:`UWLAB_CLOUD_ASSETS_REPO`.
 
 Pinned rather than a branch name so that asset changes on HuggingFace are opt-in: bump this
