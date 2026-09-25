@@ -289,7 +289,7 @@ class CameraAligner:
         print("--- Paste into data_collection_rgb_cfg.py ---")
         print("--- (same values for BOTH TiledCameraCfg.OffsetCfg AND BaseRGBEventCfg) ---")
         print(f"    pos=({self.pos[0]:.7f}, {self.pos[1]:.7f}, {self.pos[2]:.7f}),")
-        print(f"    rot=({self.rot[0]:.8f}, {self.rot[1]:.8f}, {self.rot[2]:.8f}, {self.rot[3]:.8f}),")
+        print(f"    rot=({self.rot[1]:.8f}, {self.rot[2]:.8f}, {self.rot[3]:.8f}, {self.rot[0]:.8f}),  # (x, y, z, w)")
         print(f"    focal_length={fl:.2f}")
         print("=" * 60 + "\n")
 

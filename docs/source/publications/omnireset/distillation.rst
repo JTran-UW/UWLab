@@ -28,67 +28,7 @@ Then install the dependencies into your UWLab conda environment (required even i
    cd <parent_dir>/diffusion_policy
    conda activate env_uwlab
    python -m pip install -e .
-   python -m pip install dill hydra-core omegaconf zarr einops "diffusers<0.37" wandb accelerate
-
-----
-
-Quick Start: Evaluate Pretrained RGB Policies
-----------------------------------------------
-
-Download our pretrained vision policy checkpoints and evaluate immediately. All commands in this section run in ``env_uwlab`` from the UWLab directory.
-
-.. tab-set::
-
-   .. tab-item:: Peg Insertion
-
-      .. code:: bash
-
-         wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/distilled_rgb_policies/peg_distilled_rgb.ckpt
-
-         python scripts_v2/tools/eval_distilled_policy.py \
-             --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-Play-v0 \
-             --checkpoint peg_distilled_rgb.ckpt \
-             --num_envs 32 \
-             --num_trajectories 100 \
-             --headless \
-             --enable_cameras \
-             --save_video \
-             env.scene.insertive_object=peg \
-             env.scene.receptive_object=peghole
-
-   .. tab-item:: Leg Twisting
-
-      .. code:: bash
-
-         wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/distilled_rgb_policies/leg_distilled_rgb.ckpt
-
-         python scripts_v2/tools/eval_distilled_policy.py \
-             --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-Play-v0 \
-             --checkpoint leg_distilled_rgb.ckpt \
-             --num_envs 32 \
-             --num_trajectories 100 \
-             --headless \
-             --enable_cameras \
-             --save_video \
-             env.scene.insertive_object=fbleg \
-             env.scene.receptive_object=fbtabletop
-
-   .. tab-item:: Drawer Assembly
-
-      .. code:: bash
-
-         wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/distilled_rgb_policies/drawer_distilled_rgb.ckpt
-
-         python scripts_v2/tools/eval_distilled_policy.py \
-             --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-Play-v0 \
-             --checkpoint drawer_distilled_rgb.ckpt \
-             --num_envs 32 \
-             --num_trajectories 100 \
-             --headless \
-             --enable_cameras \
-             --save_video \
-             env.scene.insertive_object=fbdrawerbottom \
-             env.scene.receptive_object=fbdrawerbox
+   python -m pip install dill hydra-core omegaconf zarr einops "diffusers<0.37" wandb accelerate pandas
 
 ----
 
@@ -106,7 +46,7 @@ Collect Demonstrations
 
 **Step 1 — Export the expert policy**
 
-Run ``play.py`` on a **Stage 2** (finetuned) checkpoint to export a JIT-traced ``policy.pt``. You can finetune your own (see :doc:`sim2real`) or download a pre-finetuned checkpoint from the :ref:`finetuned checkpoints <use-finetuned-checkpoints>` section.
+Run ``play.py`` on a **Stage 2** (finetuned) checkpoint to export a JIT-traced ``policy.pt``. You can finetune your own (see :doc:`sim2real`).
 
 .. code:: bash
 

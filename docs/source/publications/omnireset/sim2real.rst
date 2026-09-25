@@ -16,7 +16,7 @@ Pipeline overview
 
 2. **System identification** — Collect chirp on real robot, run CMA-ES in UWLab, verify fit, write sysid params to metadata, teleop to verify.
 
-3. **Finetune** — Select best Stage-1 checkpoint, finetune with ADR, evaluate. Or use our pre-finetuned checkpoints (next section) if your setup matches ours.
+3. **Finetune** — Select best Stage-1 checkpoint, finetune with ADR, evaluate.
 
 4. **Camera & hardware setup** — Mount cameras (D415/D435/D455), print task objects, calibrate camera extrinsics.
 
@@ -200,7 +200,7 @@ To tune gains if the arm lags or stalls, add ``--osc_kp_pos`` and ``--osc_kp_rot
 Select Best Checkpoint & Finetune with ADR
 --------------------------------------------
 
-Either run the pipeline below or use our pre-finetuned checkpoints (next section) if your setup matches ours. Some policies transfer better than others. As an offline proxy, evaluate candidate checkpoints under action noise and pick the one with the highest success rate, then finetune it with `ADR (Automatic Domain Randomization) <https://arxiv.org/abs/1910.07113>`__. Finetuning uses the identified sysid parameters as the center of a randomization range that ADR automatically expands, producing a policy robust to real-world variation.
+Some policies transfer better than others. As an offline proxy, evaluate candidate checkpoints under action noise and pick the one with the highest success rate, then finetune it with `ADR (Automatic Domain Randomization) <https://arxiv.org/abs/1910.07113>`__. Finetuning uses the identified sysid parameters as the center of a randomization range that ADR automatically expands, producing a policy robust to real-world variation.
 
 ADR shifts the training distribution from zero friction, armature, and motor delay toward a randomization band around the sys-id'd values. OSC gains increase to compensate for higher friction. Action scale is reduced over the curriculum to slow the policy down for safer real-world transfer.
 
@@ -380,148 +380,6 @@ All commands below run in the ``env_uwlab`` environment from the UWLab directory
            - .. figure:: ../../../source/_static/publications/omnireset/finetune_drawer_curriculum_seeds_walltime.jpg
                 :width: 100%
                 :alt: Drawer finetune curriculum over wall clock time
-
-----
-
-.. _use-finetuned-checkpoints:
-
-Use our finetuned checkpoints
------------------------------
-
-Pre-finetuned for our robot calibration and sys-id'd parameters. If your setup is similar, you can download and run these instead of finetuning yourself.
-
-All commands below run in ``env_uwlab`` from the UWLab directory.
-
-.. tab-set::
-
-   .. tab-item:: Peg Insertion
-
-      .. tab-set::
-
-         .. tab-item:: Seed 42
-
-            .. code:: bash
-
-               wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/state_based_experts_finetuned/peg_state_rl_expert_finetuned_seed42.pt
-
-               python scripts/reinforcement_learning/rsl_rl/play.py \
-                   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0 \
-                   --num_envs 1 \
-                   --checkpoint peg_state_rl_expert_finetuned_seed42.pt \
-                   env.scene.insertive_object=peg \
-                   env.scene.receptive_object=peghole
-
-         .. tab-item:: Seed 0
-
-            .. code:: bash
-
-               wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/state_based_experts_finetuned/peg_state_rl_expert_finetuned_seed0.pt
-
-               python scripts/reinforcement_learning/rsl_rl/play.py \
-                   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0 \
-                   --num_envs 1 \
-                   --checkpoint peg_state_rl_expert_finetuned_seed0.pt \
-                   env.scene.insertive_object=peg \
-                   env.scene.receptive_object=peghole
-
-         .. tab-item:: Seed 1
-
-            .. code:: bash
-
-               wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/state_based_experts_finetuned/peg_state_rl_expert_finetuned_seed1.pt
-
-               python scripts/reinforcement_learning/rsl_rl/play.py \
-                   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0 \
-                   --num_envs 1 \
-                   --checkpoint peg_state_rl_expert_finetuned_seed1.pt \
-                   env.scene.insertive_object=peg \
-                   env.scene.receptive_object=peghole
-
-   .. tab-item:: Leg Twisting
-
-      .. tab-set::
-
-         .. tab-item:: Seed 42
-
-            .. code:: bash
-
-               wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/state_based_experts_finetuned/leg_state_rl_expert_finetuned_seed42.pt
-
-               python scripts/reinforcement_learning/rsl_rl/play.py \
-                   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0 \
-                   --num_envs 1 \
-                   --checkpoint leg_state_rl_expert_finetuned_seed42.pt \
-                   env.scene.insertive_object=fbleg \
-                   env.scene.receptive_object=fbtabletop
-
-         .. tab-item:: Seed 0
-
-            .. code:: bash
-
-               wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/state_based_experts_finetuned/leg_state_rl_expert_finetuned_seed0.pt
-
-               python scripts/reinforcement_learning/rsl_rl/play.py \
-                   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0 \
-                   --num_envs 1 \
-                   --checkpoint leg_state_rl_expert_finetuned_seed0.pt \
-                   env.scene.insertive_object=fbleg \
-                   env.scene.receptive_object=fbtabletop
-
-         .. tab-item:: Seed 1
-
-            .. code:: bash
-
-               wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/state_based_experts_finetuned/leg_state_rl_expert_finetuned_seed1.pt
-
-               python scripts/reinforcement_learning/rsl_rl/play.py \
-                   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0 \
-                   --num_envs 1 \
-                   --checkpoint leg_state_rl_expert_finetuned_seed1.pt \
-                   env.scene.insertive_object=fbleg \
-                   env.scene.receptive_object=fbtabletop
-
-   .. tab-item:: Drawer Assembly
-
-      .. tab-set::
-
-         .. tab-item:: Seed 42
-
-            .. code:: bash
-
-               wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/state_based_experts_finetuned/drawer_state_rl_expert_finetuned_seed42.pt
-
-               python scripts/reinforcement_learning/rsl_rl/play.py \
-                   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0 \
-                   --num_envs 1 \
-                   --checkpoint drawer_state_rl_expert_finetuned_seed42.pt \
-                   env.scene.insertive_object=fbdrawerbottom \
-                   env.scene.receptive_object=fbdrawerbox
-
-         .. tab-item:: Seed 0
-
-            .. code:: bash
-
-               wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/state_based_experts_finetuned/drawer_state_rl_expert_finetuned_seed0.pt
-
-               python scripts/reinforcement_learning/rsl_rl/play.py \
-                   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0 \
-                   --num_envs 1 \
-                   --checkpoint drawer_state_rl_expert_finetuned_seed0.pt \
-                   env.scene.insertive_object=fbdrawerbottom \
-                   env.scene.receptive_object=fbdrawerbox
-
-         .. tab-item:: Seed 1
-
-            .. code:: bash
-
-               wget https://huggingface.co/datasets/UW-Lab/uwlab-assets/resolve/main/Policies/OmniReset/state_based_experts_finetuned/drawer_state_rl_expert_finetuned_seed1.pt
-
-               python scripts/reinforcement_learning/rsl_rl/play.py \
-                   --task OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Finetune-Play-v0 \
-                   --num_envs 1 \
-                   --checkpoint drawer_state_rl_expert_finetuned_seed1.pt \
-                   env.scene.insertive_object=fbdrawerbottom \
-                   env.scene.receptive_object=fbdrawerbox
 
 ----
 
@@ -720,8 +578,9 @@ Update the ``TiledCameraCfg`` entries (``front_camera``, ``side_camera``, ``wris
 .. caution::
 
    Since the Isaac Lab 3.0 bump, every ``rot`` / ``base_rotation`` in these configs is a quaternion in
-   ``(x, y, z, w)`` order. ``2_get_isaacsim_extrinsics.py`` in the diffusion_policy repo prints the 2.x
-   ``(w, x, y, z)`` order, so move the first element to the end before pasting (or convert with
+   ``(x, y, z, w)`` order. ``align_cameras.py`` prints its ``rot`` in that order. ``2_get_isaacsim_extrinsics.py``
+   in the diffusion_policy repo prints the 2.x ``(w, x, y, z)`` order, so move the first element to the end
+   before pasting its output (or convert with
    ``isaaclab.utils.math.convert_quat(q, to="xyzw")``). A quaternion pasted in the old order is a
    different camera pose, not an error.
 
