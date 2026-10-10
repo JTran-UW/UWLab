@@ -487,6 +487,25 @@ class grasp_sampling_event(ManagerTermBase):
         gripper_asset.set_joint_velocity_target(zero_joint_vel, env_ids=env_ids)
 
 
+def _global_gravity_setter():
+    """Return a function that sets the global gravity vector on the active physics backend."""
+    sim = sim_utils.SimulationContext.instance()
+    try:
+        from isaaclab_newton.physics import NewtonCfg, NewtonManager
+    except ImportError:
+        NewtonCfg = None
+    if NewtonCfg is not None and isinstance(sim.cfg.physics, NewtonCfg):
+        from newton import ModelFlags
+
+        def set_gravity(gravity):
+            NewtonManager._model.set_gravity(gravity)
+            NewtonManager.add_model_change(ModelFlags.MODEL_PROPERTIES)
+
+        return set_gravity
+    view = sim.physics_sim_view
+    return lambda gravity: view.set_gravity(carb.Float3(*gravity))
+
+
 class global_physics_control_event(ManagerTermBase):
     """Event class for global gravity and force/torque control based on synchronized timesteps."""
 
@@ -505,11 +524,11 @@ class global_physics_control_event(ManagerTermBase):
         )
         self.force_torque_asset_cfgs = cfg.params.get("force_torque_asset_cfgs", [])
         self.force_torque_magnitude = cfg.params.get("force_torque_magnitude", 0.005)
-        self.physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
+        self._set_gravity = _global_gravity_setter()
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         """Called when environments reset - disable gravity for positioning."""
-        self.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
+        self._set_gravity((0.0, 0.0, 0.0))
         self.gravity_enabled = False
 
     def __call__(
@@ -532,10 +551,10 @@ class global_physics_control_event(ManagerTermBase):
         ).any()
 
         if should_enable_gravity and not self.gravity_enabled:
-            self.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, -9.81))
+            self._set_gravity((0.0, 0.0, -9.81))
             self.gravity_enabled = True
         elif not should_enable_gravity and self.gravity_enabled:
-            self.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
+            self._set_gravity((0.0, 0.0, 0.0))
             self.gravity_enabled = False
         else:
             pass
@@ -2465,3 +2484,24 @@ class implicit_to_explicit_swap(ManagerTermBase):
             return {"actuator_swapped": False, "scale_progress": self._sysid_term.scale_progress}
 
         return self._do_swap(env)
+
+
+def set_newton_equality_solref(
+    env: ManagerBasedEnv, env_ids: torch.Tensor | None, timeconst: float, dampratio: float = 1.0
+) -> None:
+    """Set the MuJoCo ``solref`` of every equality constraint (mimic joints, loop closures) on Newton's MuJoCo-Warp.
+
+    The default 20 ms time constant lets the Robotiq four-bar yield under grip load. Newton backend only.
+    """
+    import warp as wp
+    from isaaclab_newton.physics import NewtonManager
+
+    sources = (
+        NewtonManager._solver.mjw_model.eq_solref,
+        getattr(getattr(NewtonManager._model, "mujoco", None), "eq_solref", None),
+    )
+    for array in sources:
+        if array is not None:
+            values = wp.to_torch(array)
+            values[..., 0] = timeconst
+            values[..., 1] = dampratio

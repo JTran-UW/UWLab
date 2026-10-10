@@ -34,6 +34,14 @@ assets and compatible state checkpoints live on ``isaaclab3``; ``main`` keeps th
 
 UWLAB_CLOUD_ASSETS_DIR = f"{UWLAB_CLOUD_ASSETS_REPO}/resolve/{UWLAB_CLOUD_ASSETS_REVISION}"
 
+UWLAB_NEWTON_ASSETS_REPO = "https://huggingface.co/datasets/jtran-uw/uwlab-assets"
+"""HuggingFace dataset repository holding assets corrected for the Newton backend."""
+
+UWLAB_NEWTON_ASSETS_REVISION = "91ffd0b12b79bbb590507f1f7080ea07d28c11a8"  # branch newton
+"""Pinned commit of :data:`UWLAB_NEWTON_ASSETS_REPO`; its assets load on Newton and are unchanged on PhysX."""
+
+UWLAB_NEWTON_ASSETS_DIR = f"{UWLAB_NEWTON_ASSETS_REPO}/resolve/{UWLAB_NEWTON_ASSETS_REVISION}"
+
 
 def _extract_revision_and_relative_path(url: str) -> tuple[str, str]:
     """Split a HuggingFace resolve URL into ``(revision, repo-relative path)``.
