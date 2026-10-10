@@ -31,6 +31,13 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.a
 )
 
 from ... import mdp as task_mdp
+from .physics_presets import (
+    OmniResetPhysicsCfg,
+    newton_equality_solref_event,
+    object_spawn_cfg,
+    omnireset_dataset_dir,
+    peghole_usd_path,
+)
 
 
 @configclass
@@ -41,7 +48,7 @@ class RlStateSceneCfg(InteractiveSceneCfg):
 
     insertive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=sim_utils.UsdFileCfg(
+        spawn=object_spawn_cfg(
             usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -58,7 +65,7 @@ class RlStateSceneCfg(InteractiveSceneCfg):
     receptive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/ReceptiveObject",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd",
+            usd_path=peghole_usd_path(),
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=4,
@@ -115,6 +122,8 @@ class BaseEventCfg:
     """
 
     robot_wrist_armature = None
+
+    newton_equality_solref = newton_equality_solref_event()
 
     # mode: startup (randomize dynamics)
     robot_material = EventTerm(
@@ -242,7 +251,7 @@ class TrainEventCfg(BaseEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
+            "dataset_dir": omnireset_dataset_dir(),
             "reset_types": [
                 "ObjectAnywhereEEAnywhere",
                 "ObjectRestingEEGrasped",
@@ -263,7 +272,7 @@ class TrainEvalEventCfg(BaseEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
+            "dataset_dir": omnireset_dataset_dir(),
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
@@ -307,7 +316,7 @@ class FinetuneEvalEventCfg(BaseEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
+            "dataset_dir": omnireset_dataset_dir(),
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
@@ -619,7 +628,7 @@ class NoCurriculumsCfg:
 def make_insertive_object(usd_path: str):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=sim_utils.UsdFileCfg(
+        spawn=object_spawn_cfg(
             usd_path=usd_path,
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -668,7 +677,7 @@ variants = {
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareTableTop/square_table_top.usd"
         ),
         "fbdrawerbox": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd"),
-        "peghole": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"),
+        "peghole": make_receptive_object(peghole_usd_path()),
         "plate": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Plate/plate.usd"),
         "cube": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/ReceptiveCube/receptive_cube.usd"),
         "wall": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Wall/wall.usd"),
@@ -712,6 +721,7 @@ class Ur5eRobotiq2f85RlStateCfg(ManagerBasedRLEnvCfg):
             gpu_max_rigid_patch_count=2**23,
             gpu_collision_stack_size=2**31,
         )
+        self.sim.physics = OmniResetPhysicsCfg(default=self.sim.physics)
 
         self.sim.use_newton_actuators = False
 

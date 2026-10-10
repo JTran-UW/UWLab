@@ -20,6 +20,7 @@ from isaaclab_physx.physics import PhysxCfg
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 
 from ... import mdp as task_mdp
+from .physics_presets import OmniResetPhysicsCfg, object_spawn_cfg, peghole_usd_path
 
 OBJECT_SPAWN_HEIGHT = 0.5
 
@@ -30,7 +31,7 @@ class PartialAssembliesSceneCfg(InteractiveSceneCfg):
 
     insertive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=sim_utils.UsdFileCfg(
+        spawn=object_spawn_cfg(
             usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -48,7 +49,7 @@ class PartialAssembliesSceneCfg(InteractiveSceneCfg):
     receptive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/ReceptiveObject",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd",
+            usd_path=peghole_usd_path(),
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=4,
@@ -193,7 +194,7 @@ class PartialAssembliesActionsCfg:
 def make_insertive_object(usd_path: str):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=sim_utils.UsdFileCfg(
+        spawn=object_spawn_cfg(
             usd_path=usd_path,
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -242,7 +243,7 @@ variants = {
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareTableTop/square_table_top.usd"
         ),
         "fbdrawerbox": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd"),
-        "peghole": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"),
+        "peghole": make_receptive_object(peghole_usd_path()),
         "plate": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Plate/plate.usd"),
         "cube": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/ReceptiveCube/receptive_cube.usd"),
         "wall": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Wall/wall.usd"),
@@ -285,6 +286,7 @@ class PartialAssembliesCfg(ManagerBasedRLEnvCfg):
             gpu_max_rigid_patch_count=2**23,
             gpu_collision_stack_size=2**31,
         )
+        self.sim.physics = OmniResetPhysicsCfg(default=self.sim.physics)
         self.sim.use_newton_actuators = False
 
         # Render settings

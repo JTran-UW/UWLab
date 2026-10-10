@@ -24,6 +24,20 @@ __version__ = UWLAB_TASKS_METADATA["package"]["version"]
 
 from isaaclab_tasks.utils import import_packages
 
+from uwlab.utils.newton import (
+    patch_disable_gravity_gravcomp,
+    patch_fixed_base_root_pose_write,
+    patch_joint_velocity_limits,
+    patch_substep_external_wrench,
+    patch_triangle_pairs_per_env,
+)
+
+patch_fixed_base_root_pose_write()
+patch_disable_gravity_gravcomp()
+patch_joint_velocity_limits()
+patch_substep_external_wrench()
+patch_triangle_pairs_per_env()
+
 # The blacklist is used to prevent importing configs from sub-packages
 _BLACKLIST_PKGS = ["utils", ".mdp"]
 # Import all configs in this package

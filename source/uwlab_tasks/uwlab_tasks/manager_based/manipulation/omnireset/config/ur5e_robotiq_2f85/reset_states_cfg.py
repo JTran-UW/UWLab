@@ -27,6 +27,13 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.a
 )
 
 from ... import mdp as task_mdp
+from .physics_presets import (
+    OmniResetPhysicsCfg,
+    newton_equality_solref_event,
+    object_spawn_cfg,
+    omnireset_dataset_dir,
+    peghole_usd_path,
+)
 
 
 @configclass
@@ -37,7 +44,7 @@ class ResetStatesSceneCfg(InteractiveSceneCfg):
 
     insertive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=sim_utils.UsdFileCfg(
+        spawn=object_spawn_cfg(
             usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -55,7 +62,7 @@ class ResetStatesSceneCfg(InteractiveSceneCfg):
     receptive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/ReceptiveObject",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd",
+            usd_path=peghole_usd_path(),
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=4,
@@ -107,6 +114,8 @@ class ResetStatesSceneCfg(InteractiveSceneCfg):
 @configclass
 class ResetStatesBaseEventCfg:
     """Configuration for randomization."""
+
+    newton_equality_solref = newton_equality_solref_event()
 
     # startup: low friction to avoid slip
     reset_robot_material = EventTerm(
@@ -237,7 +246,7 @@ class ObjectRestingEEGraspedEventCfg(ResetStatesBaseEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
+            "dataset_dir": omnireset_dataset_dir(),
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
         },
@@ -247,7 +256,7 @@ class ObjectRestingEEGraspedEventCfg(ResetStatesBaseEventCfg):
         func=task_mdp.reset_end_effector_from_grasp_dataset,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
+            "dataset_dir": omnireset_dataset_dir(),
             "fixed_asset_cfg": SceneEntityCfg("insertive_object"),
             "robot_ik_cfg": SceneEntityCfg(
                 "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
@@ -290,7 +299,7 @@ class ObjectAnywhereEEGraspedEventCfg(ResetStatesBaseEventCfg):
         func=task_mdp.reset_end_effector_from_grasp_dataset,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
+            "dataset_dir": omnireset_dataset_dir(),
             "fixed_asset_cfg": SceneEntityCfg("insertive_object"),
             "robot_ik_cfg": SceneEntityCfg(
                 "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
@@ -314,7 +323,7 @@ class ObjectPartiallyAssembledEEAnywhereEventCfg(ResetStatesBaseEventCfg):
         func=task_mdp.reset_insertive_object_from_partial_assembly_dataset,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
+            "dataset_dir": omnireset_dataset_dir(),
             "insertive_object_cfg": SceneEntityCfg("insertive_object"),
             "receptive_object_cfg": SceneEntityCfg("receptive_object"),
             "pose_range_b": {
@@ -355,7 +364,7 @@ class ObjectPartiallyAssembledEEGraspedEventCfg(ResetStatesBaseEventCfg):
         func=task_mdp.reset_insertive_object_from_partial_assembly_dataset,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
+            "dataset_dir": omnireset_dataset_dir(),
             "insertive_object_cfg": SceneEntityCfg("insertive_object"),
             "receptive_object_cfg": SceneEntityCfg("receptive_object"),
             "pose_range_b": {
@@ -373,7 +382,7 @@ class ObjectPartiallyAssembledEEGraspedEventCfg(ResetStatesBaseEventCfg):
         func=task_mdp.reset_end_effector_from_grasp_dataset,
         mode="reset",
         params={
-            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
+            "dataset_dir": omnireset_dataset_dir(),
             "fixed_asset_cfg": SceneEntityCfg("insertive_object"),
             "robot_ik_cfg": SceneEntityCfg(
                 "robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"], body_names="robotiq_base_link"
@@ -454,7 +463,7 @@ class ResetStatesRewardsCfg:
 def make_insertive_object(usd_path: str):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=sim_utils.UsdFileCfg(
+        spawn=object_spawn_cfg(
             usd_path=usd_path,
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -503,7 +512,7 @@ variants = {
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareTableTop/square_table_top.usd"
         ),
         "fbdrawerbox": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd"),
-        "peghole": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"),
+        "peghole": make_receptive_object(peghole_usd_path()),
         "plate": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Plate/plate.usd"),
         "cube": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/ReceptiveCube/receptive_cube.usd"),
         "wall": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Wall/wall.usd"),
@@ -546,6 +555,7 @@ class UR5eRobotiq2f85ResetStatesCfg(ManagerBasedRLEnvCfg):
             gpu_max_rigid_patch_count=2**23,
             gpu_collision_stack_size=2**31,
         )
+        self.sim.physics = OmniResetPhysicsCfg(default=self.sim.physics)
         self.sim.use_newton_actuators = False
 
         # Render settings
