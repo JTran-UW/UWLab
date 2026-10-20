@@ -315,3 +315,50 @@ def binary_force_contact(
     force_norm = torch.norm(sensor.data.force.torch[:, body_idx], dim=-1)  # (N,)
     contact = (force_norm > force_threshold).float()
     return contact.unsqueeze(-1)  # (N, 1)
+
+
+class SymmetricPoseObs(ManagerTermBase):
+    """Pose of an object in a reference frame, the same for every orientation its symmetry declares identical-looking.
+
+    Output: position in the reference frame (3) + ``symmetry.orientation_features`` of its orientation there (6 with no
+    symmetry, 15 for a 4-fold + flip object such as the peg, 18 for a 4-fold object without flip such as the peg hole).
+    The symmetry comes from the ``symmetry`` param if given, else the ``symmetry`` block of the object's metadata.yaml.
+    """
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp import symmetry
+
+        target_cfg: SceneEntityCfg = cfg.params["target_asset_cfg"]
+        self.target: RigidObject = env.scene[target_cfg.name]
+        override = cfg.params.get("symmetry")
+        if override is not None:
+            self.symmetry = symmetry.read_symmetry({"symmetry": override})
+        else:
+            self.symmetry = symmetry.read_symmetry(utils.read_metadata_from_usd_directory(self.target.cfg.spawn.usd_path))
+
+    def __call__(
+        self, env: ManagerBasedEnv, target_asset_cfg: SceneEntityCfg, root_asset_cfg: SceneEntityCfg, symmetry=None
+    ) -> torch.Tensor:
+        from uwlab_tasks.manager_based.manipulation.omnireset.mdp import symmetry as sym_utils
+
+        root: RigidObject | Articulation = env.scene[root_asset_cfg.name]
+        root_idx = 0 if isinstance(root_asset_cfg.body_ids, slice) else root_asset_cfg.body_ids[0]
+        pos, quat = math_utils.subtract_frame_transforms(
+            root.data.body_link_pos_w.torch[:, root_idx],
+            root.data.body_link_quat_w.torch[:, root_idx],
+            self.target.data.body_link_pos_w.torch[:, 0],
+            self.target.data.body_link_quat_w.torch[:, 0],
+        )
+        return torch.cat([pos, sym_utils.orientation_features(quat, self.symmetry)], dim=-1)
+
+
+def position_difference_in_frame(
+    env: ManagerBasedEnv, target_asset_cfg: SceneEntityCfg, origin_asset_cfg: SceneEntityCfg, frame_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """Target root position minus origin root position, expressed in the frame of ``frame_cfg`` (e.g. the wrist)."""
+    frame: RigidObject | Articulation = env.scene[frame_cfg.name]
+    idx = 0 if isinstance(frame_cfg.body_ids, slice) else frame_cfg.body_ids[0]
+    target_pos = env.scene[target_asset_cfg.name].data.body_link_pos_w.torch[:, 0]
+    origin_pos = env.scene[origin_asset_cfg.name].data.body_link_pos_w.torch[:, 0]
+    return math_utils.quat_apply_inverse(frame.data.body_link_quat_w.torch[:, idx], target_pos - origin_pos)
