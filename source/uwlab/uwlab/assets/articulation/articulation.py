@@ -19,7 +19,12 @@ import isaaclab.utils.string as string_utils
 import omni.log
 from isaaclab.actuators import ActuatorBase, ActuatorBaseCfg, ImplicitActuator
 from isaaclab.utils.types import ArticulationActions
-from pxr import PhysxSchema, UsdPhysics
+from pxr import UsdPhysics
+
+try:
+    from pxr import PhysxSchema
+except ImportError:  # kitless runtime
+    PhysxSchema = None
 
 from ..asset_base import AssetBase
 from .articulation_data import ArticulationData

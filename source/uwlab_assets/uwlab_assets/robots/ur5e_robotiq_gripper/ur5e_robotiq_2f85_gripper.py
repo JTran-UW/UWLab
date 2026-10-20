@@ -19,7 +19,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import DelayedPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
-from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+from uwlab_assets import UWLAB_NEWTON_ASSETS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,15 @@ def spawn_ur5e_without_physics_materials(prim_path, cfg, translation=None, orien
     PhysX 110 allocates a PxMaterial per env per USD material (107 shared them), so the pair hits the
     hard 64K cap at 32768 envs; ``robot_material`` overwrites the finger friction at startup anyway.
     """
-    from pxr import PhysxSchema, Sdf, Usd, UsdPhysics, UsdShade
+    from pxr import Sdf, Usd, UsdPhysics, UsdShade
+
+    material_apis = [UsdPhysics.MaterialAPI]
+    try:
+        from pxr import PhysxSchema
+
+        material_apis.append(PhysxSchema.PhysxMaterialAPI)
+    except ImportError:  # kitless runtime
+        pass
 
     prim = sim_utils.spawn_from_usd(prim_path, cfg, translation, orientation)
     roots = sim_utils.find_matching_prims(prim_path) or [prim]
@@ -49,7 +57,7 @@ def spawn_ur5e_without_physics_materials(prim_path, cfg, translation=None, orien
         material_paths = {
             str(child.GetPath())
             for child in Usd.PrimRange(root)
-            if child.HasAPI(UsdPhysics.MaterialAPI) or child.HasAPI(PhysxSchema.PhysxMaterialAPI)
+            if any(child.HasAPI(api) for api in material_apis)
         }
         if not material_paths:
             continue
@@ -101,10 +109,46 @@ UR5E_EFFORT_LIMITS = {
     "wrist_3_joint": 28.0,
 }
 
+# PhysX articulation order; reset datasets and trained policies index joints in this order on every backend.
+UR5E_JOINT_ORDER = (
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+    "finger_joint",
+    "right_outer_knuckle_joint",
+    "right_inner_knuckle_joint",
+    "left_inner_knuckle_joint",
+    "right_inner_finger_knuckle_joint",
+    "left_inner_finger_knuckle_joint",
+)
+
+UR5E_BODY_ORDER = (
+    "base_link",
+    "shoulder_link",
+    "upper_arm_link",
+    "forearm_link",
+    "wrist_1_link",
+    "wrist_2_link",
+    "wrist_3_link",
+    "robotiq_base_link",
+    "left_outer_knuckle",
+    "right_outer_knuckle",
+    "right_inner_knuckle",
+    "left_inner_knuckle",
+    "left_outer_finger",
+    "right_outer_finger",
+    "right_inner_finger",
+    "left_inner_finger",
+)
+
+
 UR5E_ARTICULATION = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         func=spawn_ur5e_without_physics_materials,
-        usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibrated/ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd",
+        usd_path=f"{UWLAB_NEWTON_ASSETS_DIR}/Robots/UniversalRobots/Ur5e2f85RobotiqGripperCalibratedNewton/ur5e_robotiq_gripper_d415_mount_safety_calibrated.usd",
         activate_contact_sensors=False,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=True,
@@ -116,12 +160,38 @@ UR5E_ARTICULATION = ArticulationCfg(
     ),
     init_state=ArticulationCfg.InitialStateCfg(pos=(0, 0, 0), rot=(0, 0, 0, 1), joint_pos=UR5E_DEFAULT_JOINT_POS),
     soft_joint_pos_limit_factor=1,
+    joint_ordering=UR5E_JOINT_ORDER,
+    body_ordering=UR5E_BODY_ORDER,
 )
+
+# PhysX articulation order of the gripper-only asset; grasp datasets index joints by name, this keeps any positional
+# use consistent across backends.
+ROBOTIQ_2F85_JOINT_ORDER = (
+    "finger_joint",
+    "right_outer_knuckle_joint",
+    "right_inner_knuckle_joint",
+    "left_inner_knuckle_joint",
+    "right_inner_finger_knuckle_joint",
+    "left_inner_finger_knuckle_joint",
+)
+
+ROBOTIQ_2F85_BODY_ORDER = (
+    "robotiq_base_link",
+    "left_outer_knuckle",
+    "right_outer_knuckle",
+    "right_inner_knuckle",
+    "left_inner_knuckle",
+    "left_outer_finger",
+    "right_outer_finger",
+    "right_inner_finger",
+    "left_inner_finger",
+)
+
 
 ROBOTIQ_2F85 = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/RobotiqGripper",
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Robots/UniversalRobots/2f85RobotiqGripperCalibrated/robotiq_2f85_gripper_calibrated.usd",
+        usd_path=f"{UWLAB_NEWTON_ASSETS_DIR}/Robots/UniversalRobots/2f85RobotiqGripperCalibratedNewton/robotiq_2f85_gripper_calibrated.usd",
         activate_contact_sensors=False,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=True,
@@ -144,6 +214,8 @@ ROBOTIQ_2F85 = ArticulationCfg(
         ),
     },
     soft_joint_pos_limit_factor=1,
+    joint_ordering=ROBOTIQ_2F85_JOINT_ORDER,
+    body_ordering=ROBOTIQ_2F85_BODY_ORDER,
 )
 
 EXPLICIT_UR5E_ROBOTIQ_2F85 = UR5E_ARTICULATION.copy()  # type: ignore

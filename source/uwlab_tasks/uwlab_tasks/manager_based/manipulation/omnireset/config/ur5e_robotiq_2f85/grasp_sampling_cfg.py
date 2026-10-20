@@ -22,6 +22,7 @@ import uwlab_assets.robots.ur5e_robotiq_gripper as ur5e_robotiq_gripper
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
 
 from ... import mdp as task_mdp
+from .physics_presets import OmniResetPhysicsCfg, newton_equality_solref_event, newton_material_event, object_spawn_cfg
 
 OBJECT_SPAWN_HEIGHT = 0.5
 
@@ -34,7 +35,7 @@ class GraspSamplingSceneCfg(InteractiveSceneCfg):
 
     object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object",
-        spawn=sim_utils.UsdFileCfg(
+        spawn=object_spawn_cfg(
             usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -65,6 +66,12 @@ class GraspSamplingSceneCfg(InteractiveSceneCfg):
 @configclass
 class GraspSamplingEventCfg:
     """Configuration for grasp sampling randomization."""
+
+    newton_equality_solref = newton_equality_solref_event()
+
+    # same ranges as the RL task's robot / insertive-object materials
+    newton_robot_material = newton_material_event("robot", (0.3, 1.2), (0.2, 1.0))
+    newton_object_material = newton_material_event("object", (1.0, 2.0), (0.9, 1.9))
 
     reset_object_position = EventTerm(
         func=task_mdp.reset_root_state_uniform,
@@ -153,7 +160,7 @@ class GraspSamplingRewardsCfg:
 def make_object(usd_path: str):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=sim_utils.UsdFileCfg(
+        spawn=object_spawn_cfg(
             usd_path=usd_path,
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -215,6 +222,7 @@ class Robotiq2f85GraspSamplingCfg(ManagerBasedRLEnvCfg):
             gpu_max_rigid_patch_count=2**23,
             gpu_collision_stack_size=2**31,
         )
+        self.sim.physics = OmniResetPhysicsCfg(default=self.sim.physics)
         self.sim.use_newton_actuators = False
 
         # Render settings

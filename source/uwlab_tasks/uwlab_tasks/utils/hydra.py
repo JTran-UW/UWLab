@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import functools
+import sys
 from collections.abc import Callable, Mapping
 
 try:
@@ -18,11 +19,23 @@ except ImportError:
 from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg
 from isaaclab.envs.utils.spaces import replace_env_cfg_spaces_with_strings, replace_strings_with_env_cfg_spaces
 from isaaclab.utils import replace_slices_with_strings, replace_strings_with_slices
+from isaaclab_tasks.utils.hydra import resolve_presets
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
 
 
+def split_presets(args: list[str]) -> tuple[tuple[str, ...], list[str]]:
+    """Separate ``presets=a,b`` selections from the remaining Hydra overrides."""
+    selected, remaining = [], []
+    for arg in args:
+        if arg.startswith("presets="):
+            selected += [name for name in arg.split("=", 1)[1].split(",") if name]
+        else:
+            remaining.append(arg)
+    return tuple(selected), remaining
+
+
 def register_task_to_hydra(
-    task_name: str, agent_cfg_entry_point: str
+    task_name: str, agent_cfg_entry_point: str, presets: tuple[str, ...] = ()
 ) -> tuple[ManagerBasedRLEnvCfg | DirectRLEnvCfg, dict]:
     """Register the task configuration to the Hydra configuration store.
 
@@ -32,15 +45,19 @@ def register_task_to_hydra(
     Args:
         task_name: The name of the task.
         agent_cfg_entry_point: The entry point key to resolve the agent's configuration file.
+        presets: Selected :class:`~isaaclab_tasks.utils.hydra.PresetCfg` alternatives (e.g. ``("newton_mjwarp",)``);
+            every other preset resolves to its ``default``.
 
     Returns:
         A tuple containing the parsed environment and agent configuration objects.
     """
     # load the configurations
-    env_cfg = load_cfg_from_registry(task_name, "env_cfg_entry_point")
+    env_cfg = resolve_presets(load_cfg_from_registry(task_name, "env_cfg_entry_point"), presets)
     agent_cfg = None
     if agent_cfg_entry_point:
         agent_cfg = load_cfg_from_registry(task_name, agent_cfg_entry_point)
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = resolve_presets(agent_cfg, presets)
     # replace gymnasium spaces with strings because OmegaConf does not support them.
     # this must be done before converting the env configs to dictionary to avoid internal reinterpretations
     env_cfg = replace_env_cfg_spaces_with_strings(env_cfg)
@@ -77,8 +94,10 @@ def hydra_task_config(task_name: str, agent_cfg_entry_point: str) -> Callable:
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            # ``presets=`` is resolved on the config objects, not by Hydra
+            presets, sys.argv[1:] = split_presets(sys.argv[1:])
             # register the task to Hydra
-            env_cfg, agent_cfg = register_task_to_hydra(task_name.split(":")[-1], agent_cfg_entry_point)
+            env_cfg, agent_cfg = register_task_to_hydra(task_name.split(":")[-1], agent_cfg_entry_point, presets)
 
             # define the new Hydra main function
             @hydra.main(config_path=None, config_name=task_name.split(":")[-1], version_base="1.3")
@@ -138,19 +157,20 @@ def hydra_task_compose(task_name: str, agent_cfg_entry_point: str, hydra_args: l
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            presets, overrides = split_presets(list(hydra_args))
             # register the task to Hydra
-            env_cfg, agent_cfg = register_task_to_hydra(task_name.split(":")[-1], agent_cfg_entry_point)
+            env_cfg, agent_cfg = register_task_to_hydra(task_name.split(":")[-1], agent_cfg_entry_point, presets)
 
             # Initialize Hydra programmatically
             with initialize(config_path=None, version_base="1.3"):
                 # Compose the configuration
-                hydra_cfg = compose(config_name=task_name, overrides=hydra_args)
+                hydra_cfg = compose(config_name=task_name, overrides=overrides)
                 # convert to a native dictionary
                 hydra_cfg = OmegaConf.to_container(hydra_cfg, resolve=True)
                 # replace string with slices because OmegaConf does not support slices
                 hydra_cfg = replace_strings_with_slices(hydra_cfg)
                 # update the group configs with Hydra command line arguments
-                runtime_args = {term.split("=")[0]: term.split("=")[1] for term in hydra_args}
+                runtime_args = {term.split("=")[0]: term.split("=")[1] for term in overrides}
                 resolve_hydra_group_runtime_override(env_cfg, agent_cfg, hydra_cfg, runtime_args)
                 # update the configs with the Hydra command line arguments
                 env_cfg.from_dict(hydra_cfg["env"])
