@@ -17,7 +17,8 @@ from isaaclab.utils import configclass
 
 from ... import mdp as task_mdp
 
-from .rl_state_cfg import Ur5eRobotiq2f85RelCartesianOSCTrainCfg
+from .physics_presets import joint_pos_obs
+from .rl_state_cfg import POSE_OBS_CLIP, Ur5eRobotiq2f85RelCartesianOSCTrainCfg
 
 # Rectangular peg: 4 identical yaws about its long axis, and the same end over end. The hole is 4-fold, no flip.
 PEG_SYMMETRY = {"axis": [0.0, 0.0, 1.0], "order": 4, "flip": True}
@@ -29,7 +30,7 @@ class SymmetryObsCfg(ObsGroup):
     """67-D per frame x 5 history = 335-D."""
 
     prev_actions = ObsTerm(func=task_mdp.last_action)
-    joint_pos = ObsTerm(func=task_mdp.joint_pos)
+    joint_pos = joint_pos_obs()
     end_effector_pose = ObsTerm(
         func=task_mdp.target_asset_pose_in_root_asset_frame,
         params={
@@ -37,6 +38,7 @@ class SymmetryObsCfg(ObsGroup):
             "root_asset_cfg": SceneEntityCfg("robot"),
             "rotation_repr": "axis_angle",
         },
+        clip=POSE_OBS_CLIP,
     )
     insertive_asset_pose = ObsTerm(
         func=task_mdp.SymmetricPoseObs,
@@ -45,6 +47,7 @@ class SymmetryObsCfg(ObsGroup):
             "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
             "symmetry": PEG_SYMMETRY,
         },
+        clip=POSE_OBS_CLIP,
     )
     receptive_asset_pose = ObsTerm(
         func=task_mdp.SymmetricPoseObs,
@@ -53,6 +56,7 @@ class SymmetryObsCfg(ObsGroup):
             "root_asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
             "symmetry": HOLE_SYMMETRY,
         },
+        clip=POSE_OBS_CLIP,
     )
     insertive_minus_receptive_position = ObsTerm(
         func=task_mdp.position_difference_in_frame,
@@ -61,6 +65,7 @@ class SymmetryObsCfg(ObsGroup):
             "origin_asset_cfg": SceneEntityCfg("receptive_object"),
             "frame_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
         },
+        clip=POSE_OBS_CLIP,
     )
 
     def __post_init__(self):

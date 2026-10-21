@@ -33,6 +33,9 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.a
 from ... import mdp as task_mdp
 from .physics_presets import (
     OmniResetPhysicsCfg,
+    abnormal_robot_penalty,
+    abnormal_robot_termination,
+    joint_pos_obs,
     newton_equality_solref_event,
     object_spawn_cfg,
     omnireset_dataset_dir,
@@ -387,7 +390,7 @@ class ObservationsCfg:
 
         prev_actions = ObsTerm(func=task_mdp.last_action)
 
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        joint_pos = joint_pos_obs()
 
         end_effector_pose = ObsTerm(
             func=task_mdp.target_asset_pose_in_root_asset_frame,
@@ -440,7 +443,7 @@ class ObservationsCfg:
 
         prev_actions = ObsTerm(func=task_mdp.last_action)
 
-        joint_pos = ObsTerm(func=task_mdp.joint_pos)
+        joint_pos = joint_pos_obs()
 
         end_effector_pose = ObsTerm(
             func=task_mdp.target_asset_pose_in_root_asset_frame,
@@ -558,7 +561,7 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
     )
 
-    abnormal_robot = RewTerm(func=task_mdp.abnormal_robot_state, weight=-100.0)
+    abnormal_robot = abnormal_robot_penalty()
 
     # task rewards
 
@@ -593,7 +596,7 @@ class TerminationsCfg:
 
     time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
 
-    abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
+    abnormal_robot = abnormal_robot_termination()
 
 
 @configclass

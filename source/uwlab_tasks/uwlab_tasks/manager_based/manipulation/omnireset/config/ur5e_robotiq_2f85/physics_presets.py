@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import isaaclab.sim as sim_utils
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonShapeCfg
 from isaaclab_physx.physics import PhysxCfg
@@ -24,6 +27,9 @@ from ... import mdp as task_mdp
 
 NEWTON_CONVEX_HULL_ASSETS = ("Props/Custom/Peg/peg.usd",)
 """Assets whose convex hull is their exact shape; Newton collides them as convex hulls instead of triangle meshes."""
+
+NEWTON_JOINT_POS_OBS_CLIP = (-6.3, 6.3)
+"""Joint-angle obs clip on Newton (the UR5e range is +-2*pi): caps solver blow-ups before they reach the normalizer."""
 
 
 @configclass
@@ -112,4 +118,29 @@ def peghole_usd_path():
     return preset(
         default=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd",
         newton_mjwarp=f"{UWLAB_NEWTON_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd",
+    )
+
+
+def joint_pos_obs():
+    """Joint positions; clipped on Newton only, where rare solver blow-ups reach 1e7 rad."""
+    return preset(
+        default=ObsTerm(func=task_mdp.joint_pos),
+        newton_mjwarp=ObsTerm(func=task_mdp.joint_pos, clip=NEWTON_JOINT_POS_OBS_CLIP),
+    )
+
+
+def abnormal_robot_penalty():
+    """-100 on an abnormal robot; on Newton also on non-finite or exploded joint states."""
+    return preset(
+        default=RewTerm(func=task_mdp.abnormal_robot_state, weight=-100.0),
+        newton_mjwarp=RewTerm(func=task_mdp.abnormal_robot_state_or_blowup, weight=-100.0),
+    )
+
+
+def abnormal_robot_termination():
+    """Terminate an abnormal robot; on Newton also non-finite or exploded joint states (Newton never trips 2x the
+    velocity limit, so the PhysX check alone never fires there)."""
+    return preset(
+        default=DoneTerm(func=task_mdp.abnormal_robot_state),
+        newton_mjwarp=DoneTerm(func=task_mdp.abnormal_robot_state_or_blowup),
     )
