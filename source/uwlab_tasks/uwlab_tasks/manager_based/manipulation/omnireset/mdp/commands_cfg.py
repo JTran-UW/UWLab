@@ -29,3 +29,12 @@ class TaskCommandCfg(TaskDependentCommandCfg):
     insertive_asset_cfg: SceneEntityCfg = MISSING
 
     receptive_asset_cfg: SceneEntityCfg = MISSING
+
+    symmetric_success: bool = False
+    """Score success at the best-aligned symmetric version of the assembly instead of the single assembled offset."""
+
+    insertive_symmetry: dict | None = None
+    """Symmetry of the insertive object (``symmetry`` block format); None reads it from the object's metadata."""
+
+    receptive_symmetry: dict | None = None
+    """Symmetry of the receptive object (``symmetry`` block format); None reads it from the object's metadata."""

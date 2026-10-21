@@ -77,6 +77,13 @@ class ObservationsSymmetryCfg:
 
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCSymmetryTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTrainCfg):
-    """``...-State-v0`` (uniform over the 4 reset types) with symmetry-invariant observations."""
+    """``...-State-v0`` (uniform over the 4 reset types) with symmetry-invariant observations and success."""
 
     observations: ObservationsSymmetryCfg = ObservationsSymmetryCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # success at any of the 8 identical-looking peg poses, matching the flip-invariant observations
+        self.commands.task_command.symmetric_success = True
+        self.commands.task_command.insertive_symmetry = PEG_SYMMETRY
+        self.commands.task_command.receptive_symmetry = HOLE_SYMMETRY

@@ -141,9 +141,9 @@ class ProgressContext(ManagerTermBase):
             )
         )
         # yaw could be different
-        e_x, e_y, _ = math_utils.euler_xyz_from_quat(insertive_asset_in_receptive_asset_frame_quat)
-        self.euler_xy_distance[:] = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
-        self.xyz_distance[:] = torch.norm(insertive_asset_in_receptive_asset_frame_pos, dim=1)
+        self.xyz_distance[:], self.euler_xy_distance[:] = task_command.alignment_error(
+            insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat
+        )
         self.position_aligned[:] = self.xyz_distance < success_position_threshold
         self.orientation_aligned[:] = self.euler_xy_distance < success_orientation_threshold
         self.success[:] = self.orientation_aligned & self.position_aligned

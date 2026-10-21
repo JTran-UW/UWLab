@@ -17,7 +17,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import CommandTerm
 
 from ..assembly_keypoints import Offset
-from . import utils
+from . import symmetry, utils
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -99,6 +99,15 @@ class TaskCommand(TaskDependentCommand):
         )
         self.success_position_threshold: float = receptive_meta.get("success_thresholds").get("position")
         self.success_orientation_threshold: float = receptive_meta.get("success_thresholds").get("orientation")
+        self.symmetry_groups = None
+        if cfg.symmetric_success:
+            ins_sym = symmetry.read_symmetry({"symmetry": cfg.insertive_symmetry} if cfg.insertive_symmetry else insertive_meta)
+            rec_sym = symmetry.read_symmetry({"symmetry": cfg.receptive_symmetry} if cfg.receptive_symmetry else receptive_meta)
+            self.symmetry_groups = (symmetry.symmetry_group(ins_sym).to(self.device), symmetry.symmetry_group(rec_sym).to(self.device))
+            self.receptive_offset_tensors = (
+                torch.tensor(self.receptive_asset_offset.pos, device=self.device),
+                torch.tensor(self.receptive_asset_offset.quat, device=self.device),
+            )
 
         self.metrics["average_rot_align_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["average_pos_align_error"] = torch.zeros(self.num_envs, device=self.device)
@@ -146,13 +155,20 @@ class TaskCommand(TaskDependentCommand):
                 insertive_asset_alignment_quat_w,
             )
         )
-        e_x, e_y, _ = math_utils.euler_xyz_from_quat(insertive_asset_in_receptive_asset_frame_quat)
-        self.euler_xy_distance[:] = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
-        self.xyz_distance[:] = torch.norm(insertive_asset_in_receptive_asset_frame_pos, dim=1)
+        self.xyz_distance[:], self.euler_xy_distance[:] = self.alignment_error(
+            insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat
+        )
         self.position_aligned[:] = self.xyz_distance < self.success_position_threshold
         self.orientation_aligned[:] = self.euler_xy_distance < self.success_orientation_threshold
         self.metrics["average_rot_align_error"][:] = self.euler_xy_distance
         self.metrics["average_pos_align_error"][:] = self.xyz_distance
+
+    def alignment_error(self, rel_pos: torch.Tensor, rel_quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Position error and |roll| + |pitch| (yaw ignored) of the insertive alignment frame in the receptive one."""
+        if self.symmetry_groups is not None:
+            return symmetry.symmetric_alignment_error(rel_pos, rel_quat, self.receptive_offset_tensors, *self.symmetry_groups)
+        e_x, e_y, _ = math_utils.euler_xyz_from_quat(rel_quat)
+        return torch.norm(rel_pos, dim=1), math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
 
     def _resample_command(self, env_ids: Sequence[int]):
         super()._resample_command(env_ids)

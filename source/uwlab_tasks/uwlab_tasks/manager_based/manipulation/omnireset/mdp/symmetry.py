@@ -43,6 +43,61 @@ def read_symmetry(metadata: dict) -> dict | None:
     return {"axis": [a / norm for a in axis], "order": order, "flip": bool(sym.get("flip", False))}
 
 
+def _axes(sym: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """The symmetry axis ``a`` and the flip axis ``u`` perpendicular to it (object x, or y if ``a`` is x)."""
+    a = torch.tensor(sym["axis"], dtype=torch.float32)
+    u = torch.tensor([1.0, 0.0, 0.0]) if abs(sym["axis"][0]) < 0.9 else torch.tensor([0.0, 1.0, 0.0])
+    u = u - torch.dot(u, a) * a
+    return a, u / u.norm()
+
+
+def symmetry_group(sym: dict | None) -> torch.Tensor:
+    """[K, 4] rotations (object frame) that map the object onto itself, identity first: the spins, then each flipped."""
+    if sym is None:
+        return torch.tensor([[0.0, 0.0, 0.0, 1.0]])
+    a, u = _axes(sym)
+    n = sym["order"]
+    angles = torch.arange(n, dtype=torch.float32) * (2.0 * math.pi / n)
+    group = math_utils.quat_from_angle_axis(angles, a.expand(n, 3))
+    if sym["flip"]:
+        flip = math_utils.quat_from_angle_axis(torch.tensor([math.pi]), u[None]).expand(n, 4)
+        group = torch.cat([group, math_utils.quat_mul(group, flip)])
+    return group
+
+
+def symmetric_alignment_error(
+    rel_pos: torch.Tensor,
+    rel_quat: torch.Tensor,
+    receptive_offset: tuple[torch.Tensor, torch.Tensor],
+    insertive_group: torch.Tensor,
+    receptive_group: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Position error [N] and |roll| + |pitch| [N] of the best-aligned symmetric version of an assembly.
+
+    ``rel_pos``/``rel_quat`` [N, 3]/[N, 4]: the insertive alignment frame in the receptive alignment frame.
+    ``receptive_offset``: the receptive alignment offset (pos [3], quat [4]) in its object frame, about which
+    ``receptive_group`` acts (``insertive_group`` acts in the insertive alignment frame). Yaw is ignored, as in the
+    single-offset check, and the position error is taken at the version with the smallest tilt.
+    """
+    off_p, off_q = (t.to(rel_pos) for t in receptive_offset)
+    h_inv = math_utils.quat_inv(receptive_group.to(rel_pos))
+    k_h, k_g, n = h_inv.shape[0], insertive_group.shape[0], rel_pos.shape[0]
+    # receptive alignment frame of version h, expressed in the nominal one: off^-1 * h^-1 * off
+    off_inv_q = math_utils.quat_inv(off_q)[None].expand(k_h, 4)
+    t_q = math_utils.quat_mul(math_utils.quat_mul(off_inv_q, h_inv), off_q[None].expand(k_h, 4))
+    t_p = math_utils.quat_apply(off_inv_q, math_utils.quat_apply(h_inv, off_p[None].expand(k_h, 3)) - off_p)
+    pos = t_p[None] + math_utils.quat_apply(t_q[None].expand(n, k_h, 4).reshape(-1, 4), rel_pos.repeat_interleave(k_h, 0)).view(n, k_h, 3)
+    quat = math_utils.quat_mul(t_q[None].expand(n, k_h, 4).reshape(-1, 4), rel_quat.repeat_interleave(k_h, 0))
+    quat = math_utils.quat_mul(
+        quat.repeat_interleave(k_g, 0), insertive_group.to(rel_pos).repeat(n * k_h, 1)
+    )
+    e_x, e_y, _ = math_utils.euler_xyz_from_quat(quat)
+    tilt = (math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()).view(n, k_h * k_g)
+    tilt, best = tilt.min(dim=1)
+    xyz = pos.norm(dim=-1).gather(1, (best // k_g)[:, None]).squeeze(1)
+    return xyz, tilt
+
+
 def tensor4_features(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """[N, 15]: unique components of ``u^{(x)4} + v^{(x)4}`` for unit vectors ``u``, ``v`` [N, 3].
 
@@ -71,10 +126,7 @@ def orientation_features(quat: torch.Tensor, sym: dict | None) -> torch.Tensor:
         return torch.cat([axis(torch.tensor([1.0, 0.0, 0.0])), axis(torch.tensor([0.0, 1.0, 0.0]))], dim=-1)
     if sym["order"] != 4:
         raise NotImplementedError(f"orientation features for symmetry order {sym['order']} are not implemented yet")
-    a = torch.tensor(sym["axis"], dtype=torch.float32)
-    u = torch.tensor([1.0, 0.0, 0.0]) if abs(sym["axis"][0]) < 0.9 else torch.tensor([0.0, 1.0, 0.0])
-    u = u - torch.dot(u, a) * a
-    u = u / u.norm()
+    a, u = _axes(sym)
     v = torch.linalg.cross(a, u)
     t4 = tensor4_features(axis(u), axis(v))
     return t4 if sym["flip"] else torch.cat([t4, axis(a)], dim=-1)
