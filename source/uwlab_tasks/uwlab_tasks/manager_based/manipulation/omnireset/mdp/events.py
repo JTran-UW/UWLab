@@ -39,6 +39,7 @@ from uwlab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActi
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
 
 from ..assembly_keypoints import Offset
+from .success_guided_sampler import SuccessGuidedSampler
 from .success_monitor_cfg import SuccessMonitorCfg
 
 
@@ -1115,6 +1116,55 @@ class MultiResetManager(ManagerTermBase):
 
         self.task_id = torch.randint(0, self.num_tasks, (self.num_envs,), device=self.device)
 
+        # Success Guided Sampling over all states of all reset types (global id = offset[type] + local index);
+        # probs act as the base measure. sgs_bypass=True falls back to the probs/uniform draw (used for eval).
+        self.state_offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=self.device), self.num_states.cumsum(0)])
+        self.state_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.state_type = torch.repeat_interleave(torch.arange(self.num_tasks, device=self.device), self.num_states)
+        self.sgs = None
+        self.sgs_bypass = False
+        # async_outcomes: push each env's success_once (SuccessLatch reward term) when it resets (PPO-style per-env
+        # episodes). uniform_monitor_every: every k-th env always samples uniformly and only logs success.
+        self.sgs_async = False
+        self.sgs_monitor = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        sgs_cfg = dict(cfg.params.get("sgs") or {})
+        if sgs_cfg:
+            self.sgs_async = bool(sgs_cfg.pop("async_outcomes", False))
+            every = int(sgs_cfg.pop("uniform_monitor_every", 0))
+            if every > 0:
+                self.sgs_monitor = torch.arange(self.num_envs, device=self.device) % every == 0
+                monitor_cfg = SuccessMonitorCfg(monitored_history_len=100, num_monitored_data=self.num_tasks, device=env.device)
+                self.monitor_success = monitor_cfg.class_type(monitor_cfg)
+            base = (self.probs / self.num_states.float())[self.state_type]
+            self.sgs = SuccessGuidedSampler(int(self.num_states.sum()), base_weights=base, device=self.device, **sgs_cfg)
+
+    def sgs_update(self, state_ids: torch.Tensor, outcomes: torch.Tensor) -> None:
+        if self.sgs is not None:
+            self.sgs.update(state_ids, outcomes)
+
+    def sgs_stats(self) -> dict[str, float]:
+        return {} if self.sgs is None else self.sgs.stats(self.state_type, self.num_tasks)
+
+    def _sgs_push_finished(self, env_ids: torch.Tensor) -> None:
+        latch = self._env.reward_manager.get_term_cfg("success_latch").func.latch
+        finished = self._env.episode_length_buf[env_ids] > 0
+        outcome = latch[env_ids]
+        monitor = self.sgs_monitor[env_ids]
+        push = finished & ~monitor
+        if push.any():
+            self.sgs.update(self.state_id[env_ids][push], outcome[push])
+        if "log" not in self._env.extras:
+            self._env.extras["log"] = {}
+        watched = finished & monitor
+        if watched.any():
+            self.monitor_success.success_update(self.task_id[env_ids][watched], outcome[watched].float())
+            rates = self.monitor_success.get_success_rate()
+            for k in range(self.num_tasks):
+                if self.probs[k] > 0:
+                    self._env.extras["log"][f"Metrics/uniform_success_once_task_{k}"] = rates[k].item()
+        self._env.extras["log"].update(self.sgs_stats())
+        latch[env_ids] = False
+
     def __call__(
         self,
         env: ManagerBasedEnv,
@@ -1123,6 +1173,7 @@ class MultiResetManager(ManagerTermBase):
         reset_types: list[str],
         probs: list[float],
         success: str | None = None,
+        sgs: dict | None = None,
     ) -> None:
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self._env.device)
@@ -1147,8 +1198,18 @@ class MultiResetManager(ManagerTermBase):
             ep_lengths = self._env.episode_length_buf[env_ids].float()
             self._env.extras["log"]["Metrics/mean_episode_length"] = ep_lengths.mean().item()
 
-        # Sample which dataset to use for each environment
+        if self.sgs is not None and self.sgs_async:
+            self._sgs_push_finished(env_ids)
+
+        # Sample which dataset (and state) to use for each environment; monitor envs always sample from probs
         dataset_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+        global_ids = None
+        if self.sgs is not None and not self.sgs_bypass:
+            use = ~self.sgs_monitor[env_ids]
+            if use.any():
+                global_ids = torch.full((len(env_ids),), -1, dtype=torch.long, device=self.device)
+                global_ids[use] = self.sgs.sample(int(use.sum()))
+                dataset_indices[use] = self.state_type[global_ids[use]]
         self.task_id[env_ids] = dataset_indices
 
         # Process each dataset's environments
@@ -1161,6 +1222,11 @@ class MultiResetManager(ManagerTermBase):
             state_indices = torch.randint(
                 0, self.num_states[dataset_idx], (len(current_env_ids),), device=self._env.device
             )
+            if global_ids is not None:
+                g = global_ids[mask]
+                picked = g >= 0
+                state_indices[picked] = g[picked] - self.state_offsets[dataset_idx]
+            self.state_id[current_env_ids] = state_indices + self.state_offsets[dataset_idx]
             states_to_reset_from = sample_from_nested_dict(self.datasets[dataset_idx], state_indices)
             self._reset_to(states_to_reset_from["initial_state"], env_ids=current_env_ids, is_relative=True)
 

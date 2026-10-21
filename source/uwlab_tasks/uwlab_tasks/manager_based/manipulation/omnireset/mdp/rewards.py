@@ -217,3 +217,20 @@ class collision_free(ManagerTermBase):
         collision_free = self.collision_analyzer(env, all_env_ids)
 
         return collision_free
+
+
+class SuccessLatch(ManagerTermBase):
+    """Zero reward; latches per-env success_once (peg aligned with the hole) for Success Guided Sampling.
+
+    Reward terms run before resets within a step, so the latch includes the final step of an episode.
+    ``MultiResetManager`` reads ``latch`` for the envs it resets and clears it.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+        cmd = env.command_manager.get_term("task_command")
+        self.latch |= cmd.orientation_aligned & cmd.position_aligned
+        return torch.zeros(env.num_envs, device=env.device)
