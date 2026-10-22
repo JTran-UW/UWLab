@@ -4,3 +4,4 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from .rl_cfg import BehaviorCloningCfg, OffPolicyAlgorithmCfg, RslRlFancyPpoAlgorithmCfg
+from .sac_cfg import RslRlOffPolicyRunnerCfg, RslRlSacActorCfg, RslRlSacAlgorithmCfg, RslRlSacCriticCfg
