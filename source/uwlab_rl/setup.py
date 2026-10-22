@@ -33,13 +33,20 @@ PYTORCH_INDEX_URL = ["https://download.pytorch.org/whl/cu118"]
 # Must be a commit on UW-Lab/rsl_rl with the rsl-rl >= 5.0 API that Isaac Lab 3.0's
 # isaaclab_rl requires, including HeteroscedasticGaussianDistribution (rsl-rl 5.3).
 # Bump together with the Isaac Lab commit pinned in uwlab.sh.
-# Released UW-Lab/rsl_rl integration after UW-Lab/rsl_rl#6 merged.
+# UW-Lab/rsl_rl#6 integration + upstream v5.4.2 (rsl-rl-flashsac requires rsl-rl-lib >= 5.4.2).
 RSL_RL_REPO = "https://github.com/UW-Lab/rsl_rl.git"
-RSL_RL_COMMIT = "2c3bf18001a5e2a78527e9ea368b7ea31700a2c5"  # uw-v5.4.1 (UW-Lab/rsl_rl#6)
+RSL_RL_COMMIT = "0e4a2fbef36f405269396a0c6af834bc716eca74"  # uw-v5.4.2
+# FlashSAC (https://arxiv.org/abs/2604.04539): algorithm layer on rsl-rl + Isaac Lab wrapper/cfgs.
+RSL_RL_FLASHSAC_REPO = "https://github.com/Holiday-Robot/rsl_rl_flashsac.git"
+RSL_RL_FLASHSAC_COMMIT = "9822b1b7e0b5cce45e7f79d6b3e2c169fa042faa"
 EXTRAS_REQUIRE = {
     "rsl-rl": [
         # Update this pin alongside compatible UWLab changes.
         f"rsl-rl-lib @ git+{RSL_RL_REPO}@{RSL_RL_COMMIT}",
+    ],
+    "flashsac": [
+        f"rsl-rl-lib @ git+{RSL_RL_REPO}@{RSL_RL_COMMIT}",
+        f"rsl-rl-flashsac @ git+{RSL_RL_FLASHSAC_REPO}@{RSL_RL_FLASHSAC_COMMIT}",
     ],
 }
 
