@@ -30,8 +30,8 @@ parser.add_argument("--action_scale", type=str, default="10.0", help="Policy act
 parser.add_argument("--no_clip", action="store_true", help="Store expert actions unclipped (for an unsquashed --no_tanh actor).")
 parser.add_argument("--state_group", type=str, default="vision_state", help="Observation group stored as the agent's low-dim state.")
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--expert_kind", type=str, choices=["rsl_rl", "legacy_mlp"], default="rsl_rl",
-                    help="legacy_mlp: pre-5.x rsl_rl checkpoint (model_state_dict with actor.* + actor_obs_normalizer.*), mean action.")
+parser.add_argument("--expert_kind", type=str, choices=["rsl_rl", "rsl_rl_sac", "legacy_mlp"], default="rsl_rl",
+                    help="rsl_rl_sac: rsl_rl SAC (OffPolicyRunner) checkpoint, e.g. the PushT FastSAC expert. legacy_mlp: pre-5.x rsl_rl checkpoint (model_state_dict with actor.* + actor_obs_normalizer.*), mean action.")
 parser.add_argument("--success_only", type=str, choices=["none", "strict", "lenient"], default="none",
                     help="Keep only episodes that succeeded (strict = task thresholds, lenient = 2.5 mm / 0.1 rad).")
 AppLauncher.add_app_launcher_args(parser)
@@ -56,6 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rsl_rl"))
 import cli_args  # noqa: E402
 from buffers import ImageReplayBuffer  # noqa: E402
+from push_t_vision_env import PushTVisionVecEnv, extend_episode_length  # noqa: E402
 from vision_env import IMAGE_KEYS, UWLabVisionVecEnv  # noqa: E402
 
 
@@ -83,18 +84,31 @@ def _legacy_mlp_policy(path: str, device):
 
 @hydra_task_compose(args_cli.task, args_cli.agent, hydra_args=remaining_args)
 def main(env_cfg, agent_cfg) -> None:
-    agent_cfg = cli_args.sanitize_rsl_rl_cfg(agent_cfg)
+    push_t = args_cli.task.startswith("PushT-")
+    if args_cli.expert_kind != "rsl_rl_sac":
+        agent_cfg = cli_args.sanitize_rsl_rl_cfg(agent_cfg)
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
+    if push_t:
+        extend_episode_length(env_cfg, args_cli.horizon)
     gym_env = gym.make(args_cli.task, cfg=env_cfg)
-    if args_cli.expert_kind == "rsl_rl":
+    if args_cli.expert_kind == "rsl_rl_sac":
+        from rsl_rl.runners import OffPolicyRunner
+        from uwlab_rl.rsl_rl.off_policy_vecenv_wrapper import RslRlOffPolicyVecEnvWrapper
+
+        agent_cfg.algorithm.replay_buffer_size = 8
+        runner = OffPolicyRunner(RslRlOffPolicyVecEnvWrapper(gym_env), agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner.load(retrieve_file_path(args_cli.checkpoint), load_cfg={"actor": True}, strict=True)
+        policy = runner.get_inference_policy(device=gym_env.unwrapped.device)
+    elif args_cli.expert_kind == "rsl_rl":
         runner = OnPolicyRunner(RslRlVecEnvWrapper(gym_env), agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         runner.load(retrieve_file_path(args_cli.checkpoint))
         policy = runner.get_inference_policy(device=gym_env.unwrapped.device)
     else:
         policy = _legacy_mlp_policy(retrieve_file_path(args_cli.checkpoint), gym_env.unwrapped.device)
     scale = [float(v) for v in args_cli.action_scale.split(",")] if "," in args_cli.action_scale else float(args_cli.action_scale)
-    env = UWLabVisionVecEnv(gym_env, args_cli.horizon, scale, args_cli.state_group)
+    env_cls = PushTVisionVecEnv if push_t else UWLabVisionVecEnv
+    env = env_cls(gym_env, args_cli.horizon, scale, args_cli.state_group)
     device, n = env.device, env.num_envs
     size = n * args_cli.horizon * args_cli.num_rounds
     rgb_shape = env.single_observation_space["rgb"].shape
@@ -125,9 +139,10 @@ def main(env_cfg, agent_cfg) -> None:
                 key = {"strict": "success_once", "lenient": "lenient_success_once"}.get(args_cli.success_only)
                 keep_rows.append(episode[key].bool() if key else torch.ones(n, dtype=torch.bool, device=device))
                 tid = infos["final_info"]["task_id"]
-                print("[collect]   by reset type (strict | lenient): " + ", ".join(
-                    f"{t}: {episode['success_once'][tid == t].mean().item():.3f} | {episode['lenient_success_once'][tid == t].mean().item():.3f} (n={int((tid == t).sum())})"
-                    for t in range(int(tid.max()) + 1) if (tid == t).any()), flush=True)
+                if not push_t:
+                    print("[collect]   by reset type (strict | lenient): " + ", ".join(
+                        f"{t}: {episode['success_once'][tid == t].mean().item():.3f} | {episode['lenient_success_once'][tid == t].mean().item():.3f} (n={int((tid == t).sum())})"
+                        for t in range(int(tid.max()) + 1) if (tid == t).any()), flush=True)
             rb.add(obs, real_next_obs, actions, rewards, terms)
             obs = next_obs
     assert rb.current_size == size and rb.step_num == 0 and rb.batch_start_episode == 0, "buffer must hold whole episodes"

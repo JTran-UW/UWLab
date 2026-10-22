@@ -78,6 +78,7 @@ parser.add_argument("--freeze_encoder", action="store_true")
 parser.add_argument("--expert_buffer", type=str, default=None)
 parser.add_argument("--expert_ratio", type=float, default=0.2)
 parser.add_argument("--aug_pad", type=int, default=0)
+parser.add_argument("--blank_images", action="store_true", help="Debug: zero all images (online and expert).")
 parser.add_argument("--sgs", action="store_true", help="Success Guided Sampling over all reset states (arXiv 2610.12465).")
 parser.add_argument("--sgs_target", type=float, default=0.5)
 parser.add_argument("--sgs_kappa", type=float, default=1.0)
@@ -87,6 +88,7 @@ parser.add_argument("--sgs_history", type=int, default=100)
 parser.add_argument("--sgs_empty_rate", type=float, default=0.5, help="Success estimate of a state with no outcomes yet.")
 parser.add_argument("--no_bf16", action="store_true")
 parser.add_argument("--no_compile", action="store_true")
+parser.add_argument("--no_channels_last", action="store_true")
 AppLauncher.add_app_launcher_args(parser)
 args, remaining_args = parser.parse_known_args()
 args.enable_cameras = True
@@ -114,6 +116,7 @@ from buffers import ImageReplayBuffer, cat_image_samples  # noqa: E402
 from networks.flashsac_actor import FlashSACActor  # noqa: E402
 from networks.flashsac_critic import FlashSACQNetwork  # noqa: E402
 from networks.flashsac_utils import FlashSACEncoder  # noqa: E402
+from push_t_vision_env import PushTVisionVecEnv, extend_episode_length  # noqa: E402
 from vision_env import IMAGE_KEYS, UWLabVisionVecEnv  # noqa: E402
 
 
@@ -189,6 +192,9 @@ def main(env_cfg, agent_cfg) -> None:
     env_cfg.seed = args.seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    push_t = args.task.startswith("PushT-")
+    if push_t:
+        extend_episode_length(env_cfg, args.horizon)
     if args.sgs:
         env_cfg.events.reset_from_reset_states.params["sgs"] = dict(
             history=args.sgs_history, target=args.sgs_target, kappa=args.sgs_kappa,
@@ -211,7 +217,9 @@ def main(env_cfg, agent_cfg) -> None:
         bc_runner.load(retrieve_file_path(args.bc_expert))
         bc_policy = bc_runner.get_inference_policy(device=gym_env.unwrapped.device)
         print(f"[bc] expert {args.bc_expert}, coef {args.bc_coef}", flush=True)
-    envs = UWLabVisionVecEnv(gym_env, args.horizon, args.action_scale, args.state_group)
+    env_cls = PushTVisionVecEnv if push_t else UWLabVisionVecEnv
+    envs = env_cls(gym_env, args.horizon, args.action_scale, args.state_group)
+    envs.blank_images = args.blank_images
     device = envs.device
     full_state_dim = envs.single_observation_space["state"].shape[-1]
     model_state_dim = args.model_state_dim or full_state_dim
@@ -223,6 +231,7 @@ def main(env_cfg, agent_cfg) -> None:
     def enc_in(o):
         return o if model_state_dim == full_state_dim else {"rgb": o["rgb"], "state": o["state"][..., :model_state_dim]}
     bf16, compile_nets, autotune = not args.no_bf16, not args.no_compile, not args.no_autotune
+    channels_last = bf16 and not args.no_channels_last
     training_freq = args.training_freq or args.num_envs
     grad_steps_per_iteration = int(training_freq * args.utd)
     steps_per_env = training_freq // args.num_envs
@@ -257,13 +266,14 @@ def main(env_cfg, agent_cfg) -> None:
     )
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    encoder = FlashSACEncoder(net_space, image_embed_dim=args.image_embed_dim, state_embed_dim=args.state_embed_dim, channels_last=bf16).to(device)
-    target_encoder = FlashSACEncoder(net_space, image_embed_dim=args.image_embed_dim, state_embed_dim=args.state_embed_dim, channels_last=bf16).to(device)
+    encoder = FlashSACEncoder(net_space, image_embed_dim=args.image_embed_dim, state_embed_dim=args.state_embed_dim, channels_last=channels_last).to(device)
+    target_encoder = FlashSACEncoder(net_space, image_embed_dim=args.image_embed_dim, state_embed_dim=args.state_embed_dim, channels_last=channels_last).to(device)
     target_encoder.load_state_dict(encoder.state_dict())
     if bf16:
         torch.backends.cudnn.benchmark = True
-        for m in (encoder, target_encoder):
-            m.to(memory_format=torch.channels_last)
+        if channels_last:
+            for m in (encoder, target_encoder):
+                m.to(memory_format=torch.channels_last)
         for m in (encoder, target_encoder, qf1, qf2, qf1_target, qf2_target):
             bf16_forward(m)
     if args.freeze_encoder:
@@ -285,9 +295,9 @@ def main(env_cfg, agent_cfg) -> None:
         actor_obs_space = gym.spaces.Dict({"rgb": rgb_space, "state": gym.spaces.Box(-np.inf, np.inf, (1, args.actor_state_dim), np.float32)})
         actor_encoder = FlashSACEncoder(
             type("ActorObs", (), {"single_observation_space": actor_obs_space})(),
-            image_embed_dim=args.image_embed_dim, state_embed_dim=args.state_embed_dim, channels_last=bf16,
+            image_embed_dim=args.image_embed_dim, state_embed_dim=args.state_embed_dim, channels_last=channels_last,
         ).to(device)
-        if bf16:
+        if channels_last:
             actor_encoder.to(memory_format=torch.channels_last)
             bf16_forward(actor_encoder)
         actor_optimizer.add_param_group({"params": list(actor_encoder.parameters())})
@@ -425,7 +435,7 @@ def main(env_cfg, agent_cfg) -> None:
         os.replace(path + ".tmp", path)
         print(f"[flashsac_rgb] saved {path}", flush=True)
 
-    reset_types = env_cfg.events.reset_from_reset_states.params["reset_types"]
+    reset_types = [] if push_t else env_cfg.events.reset_from_reset_states.params["reset_types"]
 
     def per_type_success(final_info):
         s, tid = final_info["episode"]["success_once"].float(), final_info["task_id"]
@@ -505,6 +515,8 @@ def main(env_cfg, agent_cfg) -> None:
                 data = cat_image_samples(data, expert_rb.sample(n_expert))
             obs_all = {k: torch.cat([data.observations[k], data.next_observations[k]], dim=0) for k in data.observations}
             obs_all["rgb"] = random_shift(obs_all["rgb"], args.aug_pad)
+            if args.blank_images:
+                obs_all["rgb"] = torch.zeros_like(obs_all["rgb"])
             embed_all = encoder(enc_in(obs_all))
             data_embed = embed_all[: args.batch_size].detach()
             data_next_embed = embed_all[args.batch_size :].detach()
