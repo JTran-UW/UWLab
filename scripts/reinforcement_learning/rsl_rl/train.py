@@ -62,7 +62,7 @@ import importlib.metadata as metadata
 from packaging import version
 
 # check minimum supported rsl-rl version
-RSL_RL_VERSION = "5.4.1"
+RSL_RL_VERSION = "5.4.2"
 installed_version = metadata.version("rsl-rl-lib")
 if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
     cmd = [sys.executable, "-m", "pip", "install", "-e", "source/uwlab_rl[rsl-rl]"]
@@ -81,7 +81,7 @@ import os
 import torch
 from datetime import datetime
 
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from rsl_rl.runners import DistillationRunner, OffPolicyRunner, OnPolicyRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -123,7 +123,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     )
 
     # make config compatible with installed rsl-rl version
-    agent_cfg = cli_args.sanitize_rsl_rl_cfg(agent_cfg)
+    # the deprecation shim targets on-policy model cfgs; the off-policy (SAC) cfg is already in the 5.x layout
+    if agent_cfg.class_name != "OffPolicyRunner":
+        agent_cfg = cli_args.sanitize_rsl_rl_cfg(agent_cfg)
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -196,13 +198,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    if agent_cfg.class_name == "OffPolicyRunner":
+        from uwlab_rl.rsl_rl.off_policy_vecenv_wrapper import RslRlOffPolicyVecEnvWrapper
+
+        env = RslRlOffPolicyVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    else:
+        env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name == "OffPolicyRunner":
+        runner = OffPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
@@ -218,7 +227,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=agent_cfg.init_at_random_ep_len)
 
     # close the simulator
     env.close()
