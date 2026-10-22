@@ -149,6 +149,43 @@ gym.register(
 )
 
 
+# FlashSAC-RGB vision tasks: two 64x64 grayscale cameras + non-privileged state; the wrapper owns a fixed horizon
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision3Cam-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVision3CamCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+# the same tasks with the symmetric state expert's policy obs, for expert collection / BC
+for _name, _cls in (
+    ("Vision-SymExpert", "Ur5eRobotiq2f85RelCartesianOSCVisionSymCfg"),
+    ("Vision3Cam-SymExpert", "Ur5eRobotiq2f85RelCartesianOSCVision3CamSymCfg"),
+):
+    gym.register(
+        id=f"OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-{_name}-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:{_cls}",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        },
+    )
+
+
 # RGB environments for data collection and evaluation
 gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-RGB-DataCollection-v0",

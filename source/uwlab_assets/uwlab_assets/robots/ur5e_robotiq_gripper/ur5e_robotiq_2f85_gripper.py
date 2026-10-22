@@ -14,6 +14,7 @@ The following configurations are available:
 """
 
 import logging
+import os
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import DelayedPDActuatorCfg, ImplicitActuatorCfg
@@ -51,6 +52,14 @@ def spawn_ur5e_without_physics_materials(prim_path, cfg, translation=None, orien
 
     prim = sim_utils.spawn_from_usd(prim_path, cfg, translation, orientation)
     roots = sim_utils.find_matching_prims(prim_path) or [prim]
+    if os.environ.get("UWLAB_UR5E_DISABLE_DOMELIGHT") == "1":
+        from pxr import UsdLux
+
+        # the UR5e USD embeds a DomeLight: one full-scene light per env
+        for root in roots:
+            for child in Usd.PrimRange(root):
+                if child.HasAPI(UsdLux.LightAPI):
+                    child.SetActive(False)
     removed: list[str] = []
     for root in roots:
         stage = root.GetStage()

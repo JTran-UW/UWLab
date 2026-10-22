@@ -108,6 +108,8 @@ class TaskCommand(TaskDependentCommand):
                 torch.tensor(self.receptive_asset_offset.pos, device=self.device),
                 torch.tensor(self.receptive_asset_offset.quat, device=self.device),
             )
+            print(f"[task_command] symmetric success: {len(self.symmetry_groups[0])} insertive x "
+                  f"{len(self.symmetry_groups[1])} receptive symmetric versions", flush=True)
 
         self.metrics["average_rot_align_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["average_pos_align_error"] = torch.zeros(self.num_envs, device=self.device)

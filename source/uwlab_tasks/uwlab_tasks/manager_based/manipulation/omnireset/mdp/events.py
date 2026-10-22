@@ -1086,10 +1086,13 @@ class MultiResetManager(ManagerTermBase):
         for rt in reset_types:
             dataset_files.append(f"{dataset_dir}/Resets/{pair}/resets_{rt}.pt")
 
-        # Load all datasets
+        # Load all datasets; max_states (int or one per reset type) keeps a fixed random subset of each
+        max_states = cfg.params.get("max_states")
+        max_joint_vel = cfg.params.get("max_joint_vel")
+        subset_gen = torch.Generator().manual_seed(int(cfg.params.get("max_states_seed", 0)))
         self.datasets = []
         num_states = []
-        for dataset_file in dataset_files:
+        for i, dataset_file in enumerate(dataset_files):
             local_file_path = utils.safe_retrieve_file_path(dataset_file)
 
             # Check if local file exists (after potential download)
@@ -1098,8 +1101,18 @@ class MultiResetManager(ManagerTermBase):
 
             dataset = torch.load(local_file_path)
             _require_isaaclab3_dataset(dataset, dataset_file)
-            num_states.append(len(dataset["initial_state"]["articulation"]["robot"]["joint_position"]))
-            init_indices = torch.arange(num_states[-1], device=env.device)
+            n_all = len(dataset["initial_state"]["articulation"]["robot"]["joint_position"])
+            candidates = torch.arange(n_all)
+            if max_joint_vel is not None and float(max_joint_vel) > 0:
+                jv = torch.stack(list(dataset["initial_state"]["articulation"]["robot"]["joint_velocity"])).float()
+                candidates = candidates[jv.abs().amax(-1) <= float(max_joint_vel)]
+            cap = max_states[i] if isinstance(max_states, (list, tuple)) else max_states
+            if cap is not None and int(cap) < len(candidates):
+                candidates = candidates[torch.randperm(len(candidates), generator=subset_gen)[: int(cap)].sort().values]
+            init_indices = candidates.to(env.device)
+            num_states.append(len(init_indices))
+            print(f"[MultiResetManager] {reset_types[i]}: {num_states[-1]} of {n_all} states"
+                  + (f" (|joint vel| <= {max_joint_vel})" if max_joint_vel is not None and float(max_joint_vel) > 0 else ""), flush=True)
             self.datasets.append(sample_state_data_set(dataset, init_indices, env.device))
 
         # Normalize probabilities and store dataset lengths
@@ -1174,6 +1187,9 @@ class MultiResetManager(ManagerTermBase):
         probs: list[float],
         success: str | None = None,
         sgs: dict | None = None,
+        max_states: int | list[int] | None = None,
+        max_states_seed: int = 0,
+        max_joint_vel: float | None = None,
     ) -> None:
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self._env.device)

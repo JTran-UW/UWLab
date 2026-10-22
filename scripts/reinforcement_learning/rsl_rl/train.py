@@ -35,6 +35,11 @@ parser.add_argument(
     "--resume_path", type=str, default=None,
     help="Direct path to a checkpoint file to resume from (bypasses log directory search).",
 )
+parser.add_argument("--cameras", action="store_true", default=False, help="Enable camera sensors (vision tasks).")
+parser.add_argument(
+    "--resume_weights_only", action="store_true", default=False,
+    help="With --resume_path: load only actor/critic weights (fresh optimizer, iteration 0), e.g. for converted checkpoints.",
+)
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
@@ -43,6 +48,8 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.cameras:
+    args_cli.enable_cameras = True
 
 # always enable cameras to record video
 if args_cli.video:
@@ -211,7 +218,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path)
+        if args_cli.resume_weights_only:
+            runner.load(resume_path, load_cfg={"actor": True, "critic": True, "optimizer": False, "iteration": False})
+            ref = torch.load(resume_path, weights_only=False, map_location="cpu")["actor_state_dict"]["mlp.0.weight"]
+            got = runner.alg.get_policy().mlp[0].weight.detach().cpu()
+            print(f"[INFO]: weights-only load: actor mlp.0.weight sum {got.sum().item():.6f} (checkpoint {ref.sum().item():.6f})")
+            assert torch.equal(got, ref), "actor weights did not load"
+        else:
+            runner.load(resume_path)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
