@@ -49,4 +49,8 @@ def abnormal_robot_state_or_blowup(
     joint_pos, joint_vel = robot.data.joint_pos.torch, robot.data.joint_vel.torch
     non_finite = ~(torch.isfinite(joint_pos).all(dim=1) & torch.isfinite(joint_vel).all(dim=1))
     blowup = non_finite | (joint_pos.abs() > max_joint_pos).any(dim=1)
+    if blowup.any():
+        from uwlab.utils.newton import zero_non_finite_solver_data
+
+        zero_non_finite_solver_data(blowup)
     return abnormal_robot_state(env, asset_cfg) | blowup

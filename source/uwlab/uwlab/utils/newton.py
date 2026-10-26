@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from isaaclab.utils import configclass
@@ -17,6 +19,7 @@ _GRAVCOMP_PATCHED = False
 _VELOCITY_LIMIT_PATCHED = False
 _WRENCH_PATCHED = False
 _TRIANGLE_PAIRS_PATCHED = False
+_SOLVER_DATA_ARRAYS = None
 _WRENCH_ASSETS: list = []
 
 
@@ -222,3 +225,40 @@ def patch_triangle_pairs_per_env() -> None:
 
     NewtonManager._initialize_contacts = classmethod(_initialize_contacts)
     _TRIANGLE_PAIRS_PATCHED = True
+
+
+def _per_world_float_arrays(data, nworld: int, depth: int = 0) -> list[torch.Tensor]:
+    import warp as wp
+
+    out = []
+    for value in vars(data).values():
+        if isinstance(value, wp.array):
+            scalar = getattr(value.dtype, "_wp_scalar_type_", value.dtype)
+            if value.ndim >= 1 and value.shape[0] == nworld and scalar in (wp.float32, wp.float64):
+                out.append(wp.to_torch(value))
+        elif depth < 1 and hasattr(value, "__dict__") and "mujoco_warp" in type(value).__module__:
+            out.extend(_per_world_float_arrays(value, nworld, depth + 1))
+    return out
+
+
+def zero_non_finite_solver_data(env_mask: torch.Tensor) -> None:
+    """Zero non-finite MuJoCo-Warp data of the masked worlds (envs); a no-op off Newton/MuJoCo-Warp.
+
+    Newton's reset clears only the warm-start and applied-force buffers. After a solver blow-up, NaNs in the other
+    per-world ``mjw_data`` buffers survive the env reset and re-poison the next solve, so the world stays non-finite
+    (and is terminated) on every step for the rest of the run. Call it on blown-up envs before they reset.
+    """
+    global _SOLVER_DATA_ARRAYS
+    if os.environ.get("UWLAB_DISABLE_SOLVER_DATA_SANITIZE"):
+        return
+    from isaaclab_newton.physics import NewtonManager
+
+    solver = getattr(NewtonManager, "_solver", None)
+    data = getattr(solver, "mjw_data", None)
+    if data is None or getattr(solver, "use_mujoco_cpu", False):
+        return
+    if _SOLVER_DATA_ARRAYS is None or _SOLVER_DATA_ARRAYS[0] is not data:
+        _SOLVER_DATA_ARRAYS = (data, _per_world_float_arrays(data, data.nworld))
+    worlds = env_mask[: data.nworld]
+    for t in _SOLVER_DATA_ARRAYS[1]:
+        t.masked_fill_(worlds.view(-1, *([1] * (t.dim() - 1))) & ~torch.isfinite(t), 0.0)
