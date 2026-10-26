@@ -94,6 +94,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from uwlab_rl.env_guards import apply_newton_env_guards
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
@@ -197,6 +198,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    apply_newton_env_guards(env)
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
