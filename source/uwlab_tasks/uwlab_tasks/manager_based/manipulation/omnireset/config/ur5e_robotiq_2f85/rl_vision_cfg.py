@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import torch
 
+from isaaclab.managers import ManagerTermBase
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.utils.presets import MultiBackendRendererCfg
@@ -26,7 +28,11 @@ from ... import mdp as task_mdp
 from .physics_presets import joint_pos_obs
 from .rl_state_symmetry_cfg import HOLE_SYMMETRY, PEG_SYMMETRY, SymmetryObsCfg
 from .rl_camera_bench_cfg import _RGB_SCENE, _camera, _static_curtain, apply_isaac_rtx_settings_if_kit, grayscale_image
+from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85
+
+from .actions import Ur5eRobotiq2f85RelativeOSCEvalAction
 from .rl_state_cfg import (
+    FinetuneEvalEventCfg,
     POSE_OBS_CLIP,
     ObservationsCfg,
     RlStateSceneCfg,
@@ -179,6 +185,459 @@ class Ur5eRobotiq2f85RelCartesianOSCVisionSymCfg(Ur5eRobotiq2f85RelCartesianOSCV
     observations: VisionSymObservationsCfg = VisionSymObservationsCfg()
 
 
+def stacked_gray_image(env, sensor_cfgs: list[SceneEntityCfg]) -> torch.Tensor:
+    """(N, n_cams, H, W) grayscale in 0..255, rounded so uint8 replay storage is exact."""
+    return torch.cat([grayscale_image(env, c) for c in sensor_cfgs], dim=-1).permute(0, 3, 1, 2).mul(255.0).round()
+
+
+@configclass
+class VisionStackedImageObsCfg(ObsGroup):
+    """Front and wrist cameras as one channel-first image, the rsl_rl FlashSAC-RGB input."""
+
+    image = ObsTerm(
+        func=stacked_gray_image,
+        params={"sensor_cfgs": [SceneEntityCfg("front_camera"), SceneEntityCfg("wrist_camera")]},
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+@configclass
+class VisionFlashSACObservationsCfg(VisionSymObservationsCfg):
+    camera: VisionImageObsCfg | None = None
+    image: VisionStackedImageObsCfg = VisionStackedImageObsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACCfg(Ur5eRobotiq2f85RelCartesianOSCVisionSymCfg):
+    """Vision task for rsl_rl FlashSAC-RGB: ``image`` + 25-D ``vision_state`` for the agent, the symmetric expert's
+    ``policy`` obs for collection, and the env's own 160-step time-out (per-env resets, so frames re-render on reset)."""
+
+    observations: VisionFlashSACObservationsCfg = VisionFlashSACObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.terminations.time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
+        self.episode_length_s = VISION_HORIZON * self.sim.dt * self.decimation
+        self.num_rerenders_on_reset = 1
+        self.commands.task_command.symmetric_success = True
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACFinetuneCfg(Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACCfg):
+    """Sysid finetune of the pixel FlashSAC policy at the final Stage-2 setting from the start (no ADR / curriculum):
+    explicit arm actuator, the eval OSC action (end-of-curriculum scales and gains), fixed full-range sysid + delay and
+    OSC-gain randomization (``FinetuneEvalEventCfg`` terms), all four reset types."""
+
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        apply_max_sysid(self)
+
+
+def apply_max_sysid(cfg) -> None:
+    """Final Stage-2 dynamics without a curriculum: explicit arm actuator + fixed full-range sysid/delay and OSC-gain
+    randomization. Pair with the eval OSC action (``Ur5eRobotiq2f85RelativeOSCEvalAction``)."""
+    cfg.scene.robot = EXPLICIT_UR5E_ROBOTIQ_2F85.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    fixed = FinetuneEvalEventCfg()
+    cfg.events.randomize_arm_sysid = fixed.randomize_arm_sysid
+    cfg.events.randomize_osc_gains = fixed.randomize_osc_gains
+
+
+DINO_RES = 112
+DINO3_RES = 128
+DINO_MODEL_DIR = "/workspace/uwlab/checkpoints/dinov2"
+DINO3_MODEL_DIR = "/workspace/uwlab/checkpoints/dinov3"
+TIMM_DIR = "/workspace/uwlab/_timm"
+
+
+class dino_features(ManagerTermBase):
+    """Frozen DINO features per camera (RGB, normalized): a global token + a ``pool_grid`` x ``pool_grid`` average of
+    the spatial features (0 = global only), concatenated over cameras.
+
+    ``backend="hf"``: a transformers DINOv2 folder (global = CLS). ``backend="timm"``: a folder named after the timm
+    pretrained tag (e.g. ``vit_small_patch16_dinov3.lvd1689m``) holding ``model.safetensors``; ViTs drop their prefix
+    (CLS + register) tokens from the grid, ConvNeXts use the final feature map and its mean as the global token.
+    """
+
+    def __init__(self, cfg: ObsTerm, env):
+        super().__init__(cfg, env)
+        import os
+        import sys
+
+        path, self.backend = cfg.params["model_path"], cfg.params.get("backend", "hf")
+        if self.backend == "hf":
+            from transformers import Dinov2Model
+
+            self.model = Dinov2Model.from_pretrained(path, torch_dtype=torch.bfloat16)
+            mean, std, dim = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225), self.model.config.hidden_size
+        else:
+            if os.path.isdir(TIMM_DIR) and TIMM_DIR not in sys.path:
+                sys.path.insert(0, TIMM_DIR)
+            import timm
+
+            arch = os.path.basename(path.rstrip("/")).split(".")[0]
+            self.model = timm.create_model(
+                arch, pretrained=True, num_classes=0, pretrained_cfg_overlay=dict(file=os.path.join(path, "model.safetensors"))
+            ).to(torch.bfloat16)
+            mean, std, dim = self.model.pretrained_cfg["mean"], self.model.pretrained_cfg["std"], self.model.num_features
+        self.model = self.model.to(env.device).eval().requires_grad_(False)
+        self.mean = torch.tensor(mean, device=env.device).view(1, 3, 1, 1)
+        self.std = torch.tensor(std, device=env.device).view(1, 3, 1, 1)
+        print(f"[dino] {path} ({self.backend}): dim {dim}, pool_grid {cfg.params['pool_grid']}", flush=True)
+
+    def _global_and_grid(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B, D) global token and (B, D, g, g) spatial features."""
+        if self.backend == "hf":
+            h = self.model(pixel_values=x).last_hidden_state.float()
+            g = x.shape[-1] // self.model.config.patch_size
+            return h[:, 0], h[:, 1 : 1 + g * g].reshape(h.shape[0], g, g, -1).permute(0, 3, 1, 2)
+        h = self.model.forward_features(x).float()
+        if h.ndim == 4:
+            return h.mean(dim=(2, 3)), h
+        prefix = self.model.num_prefix_tokens
+        g = int(round((h.shape[1] - prefix) ** 0.5))
+        return h[:, 0], h[:, prefix:].reshape(h.shape[0], g, g, -1).permute(0, 3, 1, 2)
+
+    @torch.no_grad()
+    def __call__(self, env, sensor_cfgs: list[SceneEntityCfg], model_path: str, pool_grid: int, chunk: int = 2048,
+                 backend: str = "hf"):
+        feats = []
+        for sensor_cfg in sensor_cfgs:
+            rgb = env.scene.sensors[sensor_cfg.name].data.output["rgb"][..., :3].float().div(255.0).permute(0, 3, 1, 2)
+            x = ((rgb - self.mean) / self.std).to(torch.bfloat16)
+            out = []
+            for i in range(0, x.shape[0], chunk):
+                glob, grid = self._global_and_grid(x[i : i + chunk])
+                parts = [glob]
+                if pool_grid > 0:
+                    parts.append(torch.nn.functional.adaptive_avg_pool2d(grid, pool_grid).flatten(2).transpose(1, 2).flatten(1))
+                out.append(torch.cat(parts, dim=-1))
+            feats.append(torch.cat(out, dim=0))
+        return torch.cat(feats, dim=-1)
+
+
+@configclass
+class VisionDinoObsCfg(ObsGroup):
+    features = ObsTerm(
+        func=dino_features,
+        params={
+            "sensor_cfgs": [SceneEntityCfg("front_camera"), SceneEntityCfg("wrist_camera")],
+            "model_path": f"{DINO_MODEL_DIR}/small",
+            "pool_grid": 2,
+        },
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+@configclass
+class VisionDinoObservationsCfg(VisionSymObservationsCfg):
+    camera: VisionImageObsCfg | None = None
+    dino: VisionDinoObsCfg = VisionDinoObsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDinoCfg(Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACCfg):
+    """Vision-FlashSAC with frozen DINOv2 features instead of pixels: RGB 112x112 front + wrist cameras -> ``dino``,
+    plus ``vision_state`` with a 3-frame history (75-D)."""
+
+    observations: VisionDinoObservationsCfg = VisionDinoObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        for cam in (self.scene.front_camera, self.scene.wrist_camera):
+            cam.height = cam.width = DINO_RES
+        for term in ("prev_actions", "joint_pos", "end_effector_pose"):
+            getattr(self.observations.vision_state, term).history_length = 3
+
+
+OOD_VISUAL_EVENTS = (
+    "randomize_wrist_mount_appearance", "randomize_inner_finger_appearance", "randomize_insertive_object_appearance",
+    "randomize_receptive_object_appearance", "randomize_table_appearance", "randomize_curtain_left_appearance",
+    "randomize_curtain_back_appearance", "randomize_curtain_right_appearance", "randomize_sky_light",
+    "randomize_front_camera", "randomize_front_camera_focal_length", "randomize_wrist_camera",
+    "randomize_wrist_camera_focal_length",
+)
+
+
+class _render_only_visual_appearance(task_mdp.randomize_visual_appearance_multiple_meshes):
+    """The OmniPBR appearance randomizer for render-only eval on replicated Newton envs: its replicate_physics guard
+    protects PhysX property parsing, which material edits seen only by RTX do not touch. Static scene decorations
+    (``AssetBaseCfg`` curtains) are looked up as their cfg, so they get an ``asset.cfg`` shim for the prim path."""
+
+    def __init__(self, cfg, env):
+        import types
+
+        name = cfg.params["asset_cfg"].name
+        extras = env.scene._extras
+        static = name in extras and not hasattr(extras[name], "cfg")
+        if static:
+            extras[name] = types.SimpleNamespace(cfg=extras[name])
+        replicate = env.cfg.scene.replicate_physics
+        env.cfg.scene.replicate_physics = False
+        try:
+            super().__init__(cfg, env)
+        finally:
+            env.cfg.scene.replicate_physics = replicate
+            if static:
+                extras[name] = extras[name].cfg
+        import re
+
+        import omni.replicator.core as rep
+
+        import isaaclab.sim as sim_utils
+
+        stage = sim_utils.SimulationContext.instance().stage
+        prims = rep.functional.get.prims(path_pattern=self.prim_path_pattern, stage=stage)
+        self._prim_env = [int(m.group(1)) if (m := re.search(r"/env_(\d+)/", str(p.GetPath()))) else -1 for p in prims]
+        assert len(self._prim_env) == len(self._shader_prims), "mesh / material count mismatch"
+        self._all_shader_prims = list(self._shader_prims)
+
+    def __call__(
+        self,
+        env,
+        env_ids,
+        event_name: str,
+        asset_cfg: SceneEntityCfg,
+        texture_paths: list[str] | None = None,
+        texture_config_path: str | None = None,
+        mesh_names: list[str] = [],
+        texture_prob: float = 1.0,
+        colors: list[tuple[float, float, float]] | dict[str, tuple[float, float]] | None = None,
+        diffuse_tint_range: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None,
+        texture_scale_range: tuple[float, float] | None = None,
+        roughness_range: tuple[float, float] | None = None,
+        metallic_range: tuple[float, float] | None = None,
+        specular_range: tuple[float, float] | None = None,
+        per_env: bool = False,
+    ):
+        """With ``per_env``, only the meshes of ``env_ids`` are re-randomized (the base class redraws every env's)."""
+        kwargs = dict(
+            texture_paths=texture_paths, texture_config_path=texture_config_path, mesh_names=mesh_names,
+            texture_prob=texture_prob, colors=colors, diffuse_tint_range=diffuse_tint_range,
+            texture_scale_range=texture_scale_range, roughness_range=roughness_range, metallic_range=metallic_range,
+            specular_range=specular_range,
+        )
+        if not per_env or env_ids is None or not hasattr(self, "_all_shader_prims"):
+            return super().__call__(env, env_ids, event_name, asset_cfg, **kwargs)
+        ids = set(env_ids.tolist())
+        self._shader_prims = [p for p, e in zip(self._all_shader_prims, self._prim_env) if e in ids]
+        try:
+            return super().__call__(env, env_ids, event_name, asset_cfg, **kwargs)
+        finally:
+            self._shader_prims = self._all_shader_prims
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDinoOODCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDinoCfg):
+    """Eval-only: the DINO task as trained plus the OmniReset RGB OOD visual randomization (``OODRGBEventCfg``: AmbientCG
+    textures/colors on robot mount, fingers, peg, hole, table and curtains, OOD HDRI dome light, camera pose/focal
+    jitter). USD-material/light edits only render under RTX (``presets=...,rtx``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_ood_visual_events(self)
+
+
+def add_ood_visual_events(cfg, source: str = "ood", cameras: bool = True) -> None:
+    """Add the OmniReset RGB visual randomization (render-only, RTX) to a DINO cfg: ``source="ood"`` is the eval set
+    (``OODRGBEventCfg``, AmbientCG), ``"train"`` the training set (``RGBEventCfg``, Poly Haven / vMaterials + HDRIs)."""
+    from .data_collection_rgb_cfg import OODRGBEventCfg, RGBEventCfg
+
+    events = OODRGBEventCfg() if source == "ood" else RGBEventCfg()
+    for name in OOD_VISUAL_EVENTS:
+        if not cameras and "camera" in name:
+            continue
+        term = getattr(events, name)
+        if term.func is task_mdp.randomize_visual_appearance_multiple_meshes:
+            term.func = _render_only_visual_appearance
+        setattr(cfg.events, name, term)
+    if cameras:
+        # same +-15% focal jitter as the RGB eval, around our zoomed front camera (26.4) instead of 13.2
+        cfg.events.randomize_front_camera_focal_length.params["focal_length_range"] = (22.4, 30.4)
+
+
+def add_train_visual_events(cfg, per_episode: bool = False, hdri_interval_s: float = 160.0) -> None:
+    """The in-distribution RGB visual randomization without camera jitter, on a fixed subset of the training textures /
+    HDRIs (RTX keeps them all resident, and the full sets do not fit 24 GB).
+
+    The data-collection terms redraw every env's materials every 4 s, so appearance changes mid-episode. With
+    ``per_episode`` each env's meshes are redrawn only on its own reset; the dome light is one light for all envs, so
+    it moves to a single global timer of ``hdri_interval_s`` (160 s = 10 episodes)."""
+    from pathlib import Path
+
+    add_ood_visual_events(cfg, source="train", cameras=False)
+    res = Path(__file__).parent / "resources"
+    for name in OOD_VISUAL_EVENTS:
+        term = getattr(cfg.events, name, None)
+        if term is None:
+            continue
+        if "texture_config_path" in term.params:
+            term.params["texture_config_path"] = str(res / "texture_paths_train_subset150.yaml")
+        if per_episode and term.func is _render_only_visual_appearance:
+            term.mode = "reset"
+            term.interval_range_s = None
+            term.params["per_env"] = True
+    sky = cfg.events.randomize_sky_light
+    sky.params["hdri_config_path"] = str(res / "hdri_paths_train_subset100.yaml")
+    if per_episode:
+        sky.interval_range_s = (hdri_interval_s, hdri_interval_s)
+        sky.is_global_time = True
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3Cfg(Ur5eRobotiq2f85RelCartesianOSCVisionDinoCfg):
+    """The DINO task with RGB 128x128 cameras and a timm DINOv3 backbone (ViT-S/16 by default; 8x8 patches)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        for cam in (self.scene.front_camera, self.scene.wrist_camera):
+            cam.height = cam.width = DINO3_RES
+        self.observations.dino.features.params["backend"] = "timm"
+        self.observations.dino.features.params["model_path"] = f"{DINO3_MODEL_DIR}/vit_small_patch16_dinov3.lvd1689m"
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3FinetuneCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3Cfg):
+    """The DINOv3 task at max sysid (see ``Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACFinetuneCfg``)."""
+
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        apply_max_sysid(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3VisRandCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3Cfg):
+    """DINOv3 training task with the in-distribution RGB visual randomization (textures/colors on robot mount, fingers,
+    peg, hole, table, curtains + HDRI dome light); RTX only. Camera pose/focal jitter is left out."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_train_visual_events(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3OODCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3Cfg):
+    """Eval-only: the DINOv3 task plus the OOD visual randomization of ``Ur5eRobotiq2f85RelCartesianOSCVisionDinoOODCfg``."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_ood_visual_events(self)
+
+
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCVision3CamSymCfg(Ur5eRobotiq2f85RelCartesianOSCVision3CamCfg):
     observations: Vision3CamSymObservationsCfg = Vision3CamSymObservationsCfg()
+
+
+WRIST_SIDE = ("side_camera", "wrist_camera")
+WRIST_SIDE_FRONT = ("front_camera", "side_camera", "wrist_camera")
+
+
+def use_cameras(cfg, names: tuple[str, ...]) -> None:
+    """Agent image / DINO input from ``names`` in order; the side camera matches the wrist camera's resolution and an
+    unused front camera is removed (the front camera keeps its unzoomed 13.2 focal length)."""
+    side = cfg.scene.side_camera
+    side.height, side.width = cfg.scene.wrist_camera.height, cfg.scene.wrist_camera.width
+    side.renderer_cfg = MultiBackendRendererCfg(isaacsim_rtx=side.renderer_cfg)
+    if "front_camera" not in names:
+        cfg.scene.front_camera = None
+    term = cfg.observations.dino.features if getattr(cfg.observations, "dino", None) else cfg.observations.image.image
+    term.params["sensor_cfgs"] = [SceneEntityCfg(n) for n in names]
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideCfg(Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACCfg):
+    """Pixel FlashSAC task on the side + wrist cameras (no front camera)."""
+
+    scene: Vision3CamSceneCfg = Vision3CamSceneCfg(num_envs=1024, env_spacing=1.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        use_cameras(self, WRIST_SIDE)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideFrontCfg(Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACCfg):
+    """Pixel FlashSAC task on the unzoomed front + side + wrist cameras."""
+
+    scene: Vision3CamSceneCfg = Vision3CamSceneCfg(num_envs=1024, env_spacing=1.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        use_cameras(self, WRIST_SIDE_FRONT)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3Cfg):
+    """DINOv3 task on the side + wrist cameras (no front camera)."""
+
+    scene: Vision3CamSceneCfg = Vision3CamSceneCfg(num_envs=1024, env_spacing=1.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        use_cameras(self, WRIST_SIDE)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideFrontCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3Cfg):
+    """DINOv3 task on the unzoomed front + side + wrist cameras."""
+
+    scene: Vision3CamSceneCfg = Vision3CamSceneCfg(num_envs=1024, env_spacing=1.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        use_cameras(self, WRIST_SIDE_FRONT)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidCfg(Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideCfg):
+    """Pixel side + wrist task at max sysid (see ``Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACFinetuneCfg``)."""
+
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        apply_max_sysid(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidVisRandCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidCfg
+):
+    """The side + wrist max-sysid task with the in-distribution RGB visual randomization (``add_train_visual_events``);
+    RTX only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_train_visual_events(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidVisRandEpCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidCfg
+):
+    """The side + wrist max-sysid task with the visual randomization redrawn once per episode per env
+    (``add_train_visual_events(per_episode=True)``); RTX only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_train_visual_events(self, per_episode=True)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACOODCfg(Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACCfg):
+    """Eval-only: the pixel FlashSAC task plus the OOD visual randomization of
+    ``Ur5eRobotiq2f85RelCartesianOSCVisionDinoOODCfg``; RTX only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_ood_visual_events(self)

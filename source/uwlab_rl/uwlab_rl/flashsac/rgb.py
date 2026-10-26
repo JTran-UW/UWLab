@@ -20,10 +20,10 @@ from tensordict import TensorDict
 from isaaclab.utils import configclass
 from rsl_rl.utils import resolve_obs_groups
 from rsl_rl_flashsac.models import FlashSACActor, FlashSACCritic
-from rsl_rl_flashsac.storage import MemoryEfficientTorchUniformBuffer, TorchUniformBuffer
 from rsl_rl_flashsac.utils import resolve_callable
 
 from .demo_mixing import FlashSACDemo, FlashSACDemoAlgorithmCfg
+from .storage import PerGroupDtypeMemoryEfficientBuffer, PerGroupDtypeTorchUniformBuffer, parse_storage_dtypes
 
 FEATURE_GROUP = "feature"
 
@@ -315,9 +315,9 @@ class FlashSACRGB(FlashSACDemo):
         ).to(device)
 
         buffer_class = (
-            MemoryEfficientTorchUniformBuffer
+            PerGroupDtypeMemoryEfficientBuffer
             if alg_cfg.get("buffer_optimize_memory_usage", True)
-            else TorchUniformBuffer
+            else PerGroupDtypeTorchUniformBuffer
         )
         obs_dtype = alg_cfg.get("buffer_obs_dtype")
         replay_buffer = buffer_class(
@@ -329,7 +329,7 @@ class FlashSACRGB(FlashSACDemo):
             min_length=alg_cfg.get("buffer_min_length", 10_000),
             sample_batch_size=alg_cfg.get("mini_batch_size", 1024),
             device=alg_cfg.get("buffer_device") or device,
-            obs_storage_dtype=getattr(torch, obs_dtype) if obs_dtype is not None else None,
+            obs_storage_dtype=parse_storage_dtypes(obs_dtype),
             store_groups=sorted({image_group, state_group}),
         )
         if alg_cfg.get("learning_rate_decay_steps") is None:

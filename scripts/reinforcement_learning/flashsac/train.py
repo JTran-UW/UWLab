@@ -31,6 +31,13 @@ parser.add_argument("--logger", type=str, default=None, choices={"tensorboard", 
 parser.add_argument("--log_project_name", type=str, default=None, help="W&B project (default: experiment name).")
 parser.add_argument("--resume_path", type=str, default=None, help="Checkpoint to resume training from.")
 parser.add_argument(
+    "--reset_action_scaling", action="store_true", default=False,
+    help="With --resume_path: re-apply the env's current action bounds to the loaded actor (finetune with new bounds).",
+)
+parser.add_argument(
+    "--buffer_device", type=str, default=None, help="Replay buffer storage device, e.g. cpu (default: training device)."
+)
+parser.add_argument(
     "--log_dir_name", type=str, default=None, help="Fixed run dir under the experiment (instead of a timestamp)."
 )
 AppLauncher.add_app_launcher_args(parser)
@@ -60,6 +67,7 @@ import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
 from isaaclab_flashsac.rl_cfg import FlashSACRunnerCfg
 from isaaclab_flashsac.wrapper import FlashSACVecEnvWrapper
+from uwlab_rl.flashsac import make_flashsac_env
 from rsl_rl_flashsac.runners import OffPolicyRunner
 
 from uwlab_tasks.utils.hydra import hydra_task_config
@@ -84,6 +92,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: FlashSACRunnerCfg):
         agent_cfg.run_name = args_cli.run_name
     if args_cli.device is not None:
         agent_cfg.device = args_cli.device
+    if args_cli.buffer_device is not None:
+        agent_cfg.algorithm.buffer_device = args_cli.buffer_device
     if args_cli.logger == "wandb":
         agent_cfg.logger = {
             "class_name": "WandbLogWriter",
@@ -111,11 +121,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: FlashSACRunnerCfg):
     env_cfg.log_dir = log_dir
 
     env = gym.make(args_cli.task, cfg=env_cfg)
-    env = FlashSACVecEnvWrapper(
-        env,
-        clip_actions=agent_cfg.clip_actions,
-        action_bound=agent_cfg.action_bound,
-        action_bound_scale=agent_cfg.action_bound_scale,
+    env = make_flashsac_env(
+        env, FlashSACVecEnvWrapper, agent_cfg.clip_actions, agent_cfg.action_bound, agent_cfg.action_bound_scale
     )
 
     runner = OffPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
@@ -124,6 +131,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: FlashSACRunnerCfg):
         resume_path = retrieve_file_path(args_cli.resume_path)
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
         runner.load(resume_path)
+        if args_cli.reset_action_scaling:
+            old_scale = runner.alg.actor.action_scale.detach().clone()
+            runner.alg.actor.set_action_scaling(env.action_bias.to(runner.alg.actor.action_scale.device),
+                                                env.action_scale.to(runner.alg.actor.action_scale.device))
+            print(f"[INFO] Actor action scaling reset: {old_scale.tolist()} -> {runner.alg.actor.action_scale.tolist()}")
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)

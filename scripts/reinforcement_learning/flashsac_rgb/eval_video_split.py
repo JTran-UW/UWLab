@@ -3,7 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""One deterministic episode on many envs; write videos of the first N successful and N failed episodes, played back to back."""
+"""One deterministic episode on many envs; write videos of the first N successful and N failed episodes (or, with --first,
+of the first N episodes), played back to back. Policy settings (tanh, log-std bounds, action scale, state group) come from
+the checkpoint's saved config."""
 
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ parser.add_argument("--out_prefix", type=str, required=True, help="Writes <prefi
 parser.add_argument("--num_envs", type=int, default=96)
 parser.add_argument("--n_show", type=int, default=10)
 parser.add_argument("--horizon", type=int, default=160)
-parser.add_argument("--action_scale", type=float, default=20.0)
+parser.add_argument("--first", type=int, default=0, help="If > 0: one video of the first N episodes in env order, any outcome.")
 parser.add_argument("--seed", type=int, default=7)
 AppLauncher.add_app_launcher_args(parser)
 args, remaining_args = parser.parse_known_args()
@@ -61,16 +63,30 @@ def main(env_cfg, agent_cfg) -> None:
         data_types=["rgb"], spawn=sim_utils.PinholeCameraCfg(focal_length=13.20), renderer_cfg=NewtonWarpRendererCfg(),
     )
     reset_types = env_cfg.events.reset_from_reset_states.params["reset_types"]
-    envs = UWLabVisionVecEnv(gym.make(args.task, cfg=env_cfg), args.horizon, args.action_scale, "vision_state")
+    scale = str(cfg.get("action_scale", "20.0"))
+    action_scale = [float(v) for v in scale.split(",")] if "," in scale else float(scale)
+    state_group = cfg.get("state_group", "vision_state")
+    envs = UWLabVisionVecEnv(gym.make(args.task, cfg=env_cfg), args.horizon, action_scale, state_group)
     device = envs.device
     act_shape = envs.single_action_space.shape
+    full_state_dim = envs.single_observation_space["state"].shape[-1]
+    model_state_dim = cfg.get("model_state_dim") or full_state_dim
+    net_space = type("NetObs", (), {"single_observation_space": gym.spaces.Dict({
+        "rgb": envs.single_observation_space["rgb"],
+        "state": gym.spaces.Box(-np.inf, np.inf, (1, model_state_dim), np.float32)})})()
+
+    def enc_in(o):
+        return o if model_state_dim == full_state_dim else {"rgb": o["rgb"], "state": o["state"][..., :model_state_dim]}
+
     actor = FlashSACActor(envs, input_dim=cfg["image_embed_dim"] + cfg["state_embed_dim"], action_scale=torch.ones(act_shape),
-                          action_bias=torch.zeros(act_shape), use_tanh=True).to(device)
+                          action_bias=torch.zeros(act_shape), use_tanh=not cfg.get("no_tanh", False),
+                          log_std_min=cfg.get("log_std_min", -10.0), log_std_max=cfg.get("log_std_max", 2.0)).to(device)
     actor.load_state_dict(ckpt["actor"])
-    encoder = FlashSACEncoder(envs, image_embed_dim=cfg["image_embed_dim"], state_embed_dim=cfg["state_embed_dim"]).to(device)
+    encoder = FlashSACEncoder(net_space, image_embed_dim=cfg["image_embed_dim"], state_embed_dim=cfg["state_embed_dim"]).to(device)
     encoder.load_state_dict(ckpt["encoder"])
     actor.eval()
-    print(f"[split_video] {args.checkpoint} (step {ckpt.get('global_step')})", flush=True)
+    print(f"[split_video] {args.checkpoint} (step {ckpt.get('global_step')}): state {state_group} -> {model_state_dim}-D,"
+          f" tanh {not cfg.get('no_tanh', False)}, action scale {action_scale}", flush=True)
 
     overview = envs.env.scene.sensors["overview_camera"]
     obs, _ = envs.reset()
@@ -78,7 +94,7 @@ def main(env_cfg, agent_cfg) -> None:
     ov_frames, cam_frames, succ_t = [], [], np.full(args.num_envs, -1)
     with torch.no_grad():
         for t in range(args.horizon):
-            actions = actor.get_action(encoder(obs), training=False)[2]
+            actions = actor.get_action(encoder(enc_in(obs)), training=False)[2]
             obs_next, _, _, _, infos = envs.step(actions)
             shown = infos["final_observation"] if "final_info" in infos else obs_next
             ov = overview.data.output["rgb"]
@@ -95,7 +111,9 @@ def main(env_cfg, agent_cfg) -> None:
             print(f"[split_video] {rt}: {success[m].sum()}/{m.sum()} succeeded", flush=True)
     print(f"[split_video] overall {success.mean():.3f} over {args.num_envs} envs", flush=True)
 
-    for label, pick in (("success", np.flatnonzero(success)), ("failure", np.flatnonzero(~success))):
+    picks = (("seq", np.arange(args.first)),) if args.first > 0 else (
+        ("success", np.flatnonzero(success)), ("failure", np.flatnonzero(~success)))
+    for label, pick in picks:
         pick = pick[: args.n_show]
         if len(pick) == 0:
             print(f"[split_video] no {label} episodes", flush=True)
@@ -106,16 +124,18 @@ def main(env_cfg, agent_cfg) -> None:
         for n, i in enumerate(pick):
             title = Image.new("RGB", (OV_W + CAM, OV_H))
             d = ImageDraw.Draw(title)
-            d.text((20, OV_H // 2 - 20), f"{label} {n + 1}/{len(pick)}: env {i}, reset {names[task_id[i]]}", fill=(255, 255, 255))
+            d.text((20, OV_H // 2 - 20), f"episode {n + 1}/{len(pick)}: env {i}, reset {names[task_id[i]]}", fill=(255, 255, 255))
             if success[i]:
                 d.text((20, OV_H // 2), f"success at t={succ_t[i] + 1}", fill=(0, 255, 0))
+            else:
+                d.text((20, OV_H // 2), "no success", fill=(255, 80, 80))
             frames += [np.asarray(title)] * 10
             for t in range(args.horizon):
                 cams = [np.repeat(np.asarray(Image.fromarray(cam_frames[t][i, ..., c]).resize((CAM, CAM), Image.NEAREST))[..., None], 3, -1)
                         for c in range(cam_frames[t].shape[-1])]
                 frame = Image.fromarray(np.concatenate([ov_frames[t][i], np.concatenate(cams, axis=0)[:OV_H]], axis=1))
                 d = ImageDraw.Draw(frame)
-                d.text((6, 6), f"{label} {n + 1}/{len(pick)}  env {i}  {names[task_id[i]]}  t={t + 1}", fill=(255, 255, 0))
+                d.text((6, 6), f"episode {n + 1}/{len(pick)}  env {i}  {names[task_id[i]]}  t={t + 1}", fill=(255, 255, 0))
                 if 0 <= succ_t[i] <= t:
                     d.text((6, 20), f"SUCCESS @ t={succ_t[i] + 1}", fill=(0, 255, 0))
                 for c, key in enumerate(cam_keys):

@@ -18,7 +18,12 @@ from isaaclab.utils import configclass
 from ... import mdp as task_mdp
 
 from .physics_presets import joint_pos_obs
-from .rl_state_cfg import POSE_OBS_CLIP, Ur5eRobotiq2f85RelCartesianOSCTrainCfg
+from .rl_state_cfg import (
+    POSE_OBS_CLIP,
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneCfg,
+    Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg,
+    Ur5eRobotiq2f85RelCartesianOSCTrainCfg,
+)
 
 # Rectangular peg: 4 identical yaws about its long axis, and the same end over end. The hole is 4-fold, no flip.
 PEG_SYMMETRY = {"axis": [0.0, 0.0, 1.0], "order": 4, "flip": True}
@@ -88,7 +93,34 @@ class Ur5eRobotiq2f85RelCartesianOSCSymmetryTrainCfg(Ur5eRobotiq2f85RelCartesian
 
     def __post_init__(self):
         super().__post_init__()
-        # success at any of the 8 identical-looking peg poses, matching the flip-invariant observations
-        self.commands.task_command.symmetric_success = True
-        self.commands.task_command.insertive_symmetry = PEG_SYMMETRY
-        self.commands.task_command.receptive_symmetry = HOLE_SYMMETRY
+        set_symmetric_success(self)
+
+
+def set_symmetric_success(cfg) -> None:
+    """Success at any of the 8 identical-looking peg poses, matching the flip-invariant observations."""
+    cfg.commands.task_command.symmetric_success = True
+    cfg.commands.task_command.insertive_symmetry = PEG_SYMMETRY
+    cfg.commands.task_command.receptive_symmetry = HOLE_SYMMETRY
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCSymmetryFinetuneCfg(Ur5eRobotiq2f85RelCartesianOSCFinetuneCfg):
+    """``...-State-Finetune-v0`` (Stage 2: explicit actuator, ADR sysid + OSC gains, action-scale curriculum) with
+    symmetry-invariant observations and success."""
+
+    observations: ObservationsSymmetryCfg = ObservationsSymmetryCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        set_symmetric_success(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCSymmetryFinetuneEvalCfg(Ur5eRobotiq2f85RelCartesianOSCFinetuneEvalCfg):
+    """``...-State-Finetune-Play-v0`` (fixed sysid + OSC gains at full range, eval action term) with symmetry obs."""
+
+    observations: ObservationsSymmetryCfg = ObservationsSymmetryCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        set_symmetric_success(self)

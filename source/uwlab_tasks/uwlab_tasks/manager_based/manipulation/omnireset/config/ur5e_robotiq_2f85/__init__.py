@@ -105,6 +105,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_symmetry_cfg:Ur5eRobotiq2f85RelCartesianOSCSymmetryTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACStateRunnerCfg",
     },
 )
 
@@ -115,6 +116,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_sgs_cfg:Ur5eRobotiq2f85RelCartesianOSCSymmetrySGSTrainCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACStateRunnerCfg",
     },
 )
 
@@ -124,6 +126,26 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.rl_state_cfg:Ur5eRobotiq2f85RelCartesianOSCFinetuneCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Symmetry-Finetune-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_symmetry_cfg:Ur5eRobotiq2f85RelCartesianOSCSymmetryFinetuneCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Symmetry-Finetune-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_symmetry_cfg:Ur5eRobotiq2f85RelCartesianOSCSymmetryFinetuneEvalCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
     },
 )
@@ -185,6 +207,183 @@ for _name, _cls in (
         },
     )
 
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGBRunnerCfg",
+        "flashsac_rgb_4096_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096RunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Finetune-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACFinetuneCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDinoCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino-OOD-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDinoOODCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-Finetune-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDino3FinetuneCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoSysidRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-VisRand-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDino3VisRandCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-OOD-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDino3OODCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDino3Cfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096RunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSideFront-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideFrontCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096RunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-WristSide-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-WristSideFront-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideFrontCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-VisRandEp-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidVisRandEpCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-VisRand-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidVisRandCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-OOD-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACOODCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096RunnerCfg",
+    },
+)
 
 # RGB environments for data collection and evaluation
 gym.register(

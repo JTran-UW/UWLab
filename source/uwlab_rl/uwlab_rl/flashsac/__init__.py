@@ -5,5 +5,6 @@
 
 """UW Lab extensions to FlashSAC (Holiday-Robot/rsl_rl_flashsac)."""
 
+from .action_bounds import make_flashsac_env  # noqa: F401
 from .demo_mixing import FlashSACDemo, FlashSACDemoAlgorithmCfg  # noqa: F401
 from .rgb import FlashSACRGB, FlashSACRGBAlgorithmCfg  # noqa: F401
