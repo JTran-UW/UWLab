@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from isaaclab.utils import configclass
@@ -47,19 +48,38 @@ class UnitLinear(nn.Linear):
 
 class PixelStateEncoder(nn.Module):
     """ManiSkill FlashSAC-RGB encoder: 4x (3x3 conv + ReLU + maxpool) -> 1x1 conv + ReLU -> unit linear to
-    ``image_embed_dim``; state -> unit linear to ``state_embed_dim``; output = concat (no activation)."""
+    ``image_embed_dim``; state -> unit linear to ``state_embed_dim``; output = concat (no activation).
+    ``num_cameras`` > 1 splits the stacked image channels into one conv stack per camera (flattened outputs concatenated);
+    ``width`` multiplies every conv's channel count."""
 
-    def __init__(self, image_shape: tuple[int, int, int], state_dim: int, image_embed_dim: int, state_embed_dim: int):
+    def __init__(
+        self,
+        image_shape: tuple[int, int, int],
+        state_dim: int,
+        image_embed_dim: int,
+        state_embed_dim: int,
+        num_cameras: int = 1,
+        width: float = 1.0,
+    ):
         super().__init__()
-        c, h, _ = image_shape
-        layers: list[nn.Module] = []
-        for i, (cin, cout) in enumerate(((c, 16), (16, 32), (32, 64), (64, 64))):
-            pool = max(h // 32, 1) if i == 0 else 2
-            layers += [UnitConv2d(cin, cout, 3, padding=1), nn.ReLU(), nn.MaxPool2d(pool)]
-        layers += [UnitConv2d(64, 64, 1), nn.ReLU(), nn.Flatten()]
-        self.conv = nn.Sequential(*layers)
+        c, h, w = image_shape
+        assert c % num_cameras == 0, f"{c} image channels do not split into {num_cameras} cameras"
+        self.num_cameras = num_cameras
+
+        def conv_stack(cin: int) -> nn.Sequential:
+            layers: list[nn.Module] = []
+            for i, cout in enumerate(max(1, round(c * width)) for c in (16, 32, 64, 64)):
+                pool = max(h // 32, 1) if i == 0 else 2
+                layers += [UnitConv2d(cin, cout, 3, padding=1), nn.ReLU(), nn.MaxPool2d(pool)]
+                cin = cout
+            return nn.Sequential(*layers, UnitConv2d(cin, max(1, round(64 * width)), 1), nn.ReLU(), nn.Flatten())
+
+        if num_cameras == 1:
+            self.conv = conv_stack(c)
+        else:
+            self.convs = nn.ModuleList(conv_stack(c // num_cameras) for _ in range(num_cameras))
         with torch.no_grad():
-            flat = self.conv(torch.zeros(1, *image_shape)).shape[-1]
+            flat = self._conv(torch.zeros(1, c, h, w)).shape[-1]
         self.image_fc = UnitLinear(flat, image_embed_dim, bias=False)
         self.state_fc = UnitLinear(state_dim, state_embed_dim, bias=False)
         self.out_dim = image_embed_dim + state_embed_dim
@@ -71,8 +91,13 @@ class PixelStateEncoder(nn.Module):
             if m is not self and hasattr(m, "normalize_parameters"):
                 m.normalize_parameters()
 
+    def _conv(self, image: torch.Tensor) -> torch.Tensor:
+        if self.num_cameras == 1:
+            return self.conv(image)
+        return torch.cat([conv(x) for conv, x in zip(self.convs, image.chunk(self.num_cameras, dim=1))], dim=-1)
+
     def forward(self, image: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        return torch.cat([self.image_fc(self.conv(image / 255.0)), self.state_fc(state)], dim=-1)
+        return torch.cat([self.image_fc(self._conv(image / 255.0)), self.state_fc(state)], dim=-1)
 
 
 class StateOnlyEncoder(nn.Module):
@@ -102,10 +127,18 @@ class FlashSACRGB(FlashSACDemo):
         image_embed_dim: int = 256,
         state_embed_dim: int = 64,
         encoder_type: str = "pixel",
+        encoder_num_cameras: int = 1,
+        encoder_width: float = 1.0,
         encoder_lr_scale: float = 1.0,
+        aux_group: str = "",
+        aux_head: str = "linear",
+        aux_hidden_dim: int = 256,
+        aux_weight: float = 1.0,
+        aux_dim: int = 0,
+        policy_ema: float = 0.0,
         **kwargs,
     ):
-        del image_embed_dim, state_embed_dim, encoder_type  # consumed by construct_algorithm
+        del state_embed_dim, encoder_type, encoder_num_cameras, encoder_width  # consumed by construct_algorithm
         super().__init__(*args, **kwargs)
         self.encoder = encoder.to(self.device)
         self.target_encoder = copy.deepcopy(self.encoder).requires_grad_(False)
@@ -123,6 +156,26 @@ class FlashSACRGB(FlashSACDemo):
                 self.encoder_optimizer, lr_lambda=self.critic_scheduler.lr_lambdas[0]
             )
         assert not self.use_amp, "FlashSACRGB keeps fp32 (use_amp=False)"
+        # auxiliary state prediction: a head on the image embedding regresses the (running-normalized) aux_group obs
+        self.aux_group, self.aux_weight, self.image_embed_dim = aux_group, aux_weight, image_embed_dim
+        self.aux_head = self.aux_optimizer = None
+        if aux_group:
+            assert aux_head in ("linear", "mlp"), f"aux_head must be 'linear' or 'mlp', got {aux_head!r}"
+            self.aux_head = (
+                nn.Linear(image_embed_dim, aux_dim)
+                if aux_head == "linear"
+                else nn.Sequential(nn.Linear(image_embed_dim, aux_hidden_dim), nn.ReLU(), nn.Linear(aux_hidden_dim, aux_dim))
+            ).to(self.device)
+            self.aux_optimizer = torch.optim.Adam(self.aux_head.parameters(), lr=self.critic_optimizer.param_groups[0]["initial_lr"])
+            self.aux_mean = torch.zeros(aux_dim, device=self.device)
+            self.aux_m2 = torch.zeros(aux_dim, device=self.device)
+            self.aux_count = torch.zeros((), device=self.device)
+        # EMA copy of the policy (actor + encoder, incl. BatchNorm stats), updated after every gradient update
+        self.policy_ema = policy_ema
+        self.ema_actor = self.ema_encoder = None
+        if policy_ema > 0.0:
+            self.ema_actor = copy.deepcopy(self.actor).requires_grad_(False)
+            self.ema_encoder = copy.deepcopy(self.encoder).requires_grad_(False)
 
     # -- features --------------------------------------------------------------------------------------------------
     def _encode(self, obs: TensorDict, encoder: nn.Module) -> torch.Tensor:
@@ -164,7 +217,7 @@ class FlashSACRGB(FlashSACDemo):
     def update(self) -> dict:
         if not self.replay_buffer.can_sample():
             return {}
-        sums = {"actor": 0.0, "critic": 0.0, "temperature": 0.0, "entropy": 0.0}
+        sums = {"actor": 0.0, "critic": 0.0, "temperature": 0.0, "entropy": 0.0, "aux": 0.0}
         num_actor_updates = 0
         gamma_n = self.gamma**self.n_steps
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -191,8 +244,9 @@ class FlashSACRGB(FlashSACDemo):
                 sums["entropy"] += entropy.item()
                 num_actor_updates += 1
 
+            aux_target = obs[self.aux_group].float() if self.aux_group else None
             sums["critic"] += self._update_critic_rgb(
-                online_all, target_all, next_feat, actions, rewards, terminated, gamma_n
+                online_all, target_all, next_feat, actions, rewards, terminated, gamma_n, aux_target
             ).item()
             with torch.no_grad():
                 self._ema_update()
@@ -200,13 +254,41 @@ class FlashSACRGB(FlashSACDemo):
                     torch._foreach_lerp_(
                         list(self.target_encoder.parameters()), list(self.encoder.parameters()), self.encoder_ema
                     )
+                if self.ema_actor is not None:
+                    self._policy_ema_update()
             self.update_step += 1
-        return {
+        losses = {
             "actor": sums["actor"] / max(num_actor_updates, 1),
             "critic": sums["critic"] / num_updates,
             "temperature": sums["temperature"] / max(num_actor_updates, 1),
             "entropy": sums["entropy"] / max(num_actor_updates, 1),
         }
+        if self.aux_group:
+            losses["aux_state"] = self._aux_loss_sum / num_updates
+            self._aux_loss_sum = 0.0
+        return losses
+
+    @torch.no_grad()
+    def _policy_ema_update(self) -> None:
+        for ema, live in ((self.ema_actor, self.actor), (self.ema_encoder, self.encoder)):
+            torch._foreach_lerp_(list(ema.parameters()), list(live.parameters()), self.policy_ema)
+            for e, b in zip(ema.buffers(), live.buffers()):
+                if e.is_floating_point():
+                    e.lerp_(b, self.policy_ema)
+                else:
+                    e.copy_(b)
+
+    @torch.no_grad()
+    def _aux_normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize aux targets by running (Welford, all batches seen) mean / std, updated with this batch."""
+        n = x.shape[0]
+        mean, var = x.mean(0), x.var(0, unbiased=False)
+        total = self.aux_count + n
+        delta = mean - self.aux_mean
+        self.aux_mean += delta * n / total
+        self.aux_m2 += var * n + delta.square() * self.aux_count * n / total
+        self.aux_count = total
+        return (x - self.aux_mean) / (self.aux_m2 / self.aux_count).sqrt().clamp_min(1e-4)
 
     def _update_critic_rgb(
         self,
@@ -217,9 +299,11 @@ class FlashSACRGB(FlashSACDemo):
         rewards: torch.Tensor,
         terminated: torch.Tensor,
         gamma_n: float,
+        aux_target: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Holiday ``_update_critic`` with the target critic on target-encoder features and the online critic on online
-        (gradient-carrying) features; the critic loss also steps the encoder."""
+        (gradient-carrying) features; the critic loss (plus ``aux_weight`` x the aux state-prediction loss) also steps
+        the encoder."""
         with torch.no_grad():
             next_actions, next_log_probs = self._actor_sample(actor_next_obs, training=False)
             next_actions, next_log_probs = next_actions.clone(), next_log_probs.clone()
@@ -242,13 +326,22 @@ class FlashSACRGB(FlashSACDemo):
         _, pred_q_infos = self.critic.evaluate(online_all, act_all, training=True)
         pred_log_probs = torch.chunk(pred_q_infos["log_prob"], 2, dim=1)[0]
         critic_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1).mean()
+        loss = critic_loss
+        if aux_target is not None:
+            image_embed = online_all[: aux_target.shape[0], : self.image_embed_dim]
+            aux_loss = F.mse_loss(self.aux_head(image_embed), self._aux_normalize(aux_target))
+            loss = critic_loss + self.aux_weight * aux_loss
+            self._aux_loss_sum = getattr(self, "_aux_loss_sum", 0.0) + aux_loss.item()
+            self.aux_optimizer.zero_grad(set_to_none=True)
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         if self.encoder_optimizer is not None:
             self.encoder_optimizer.zero_grad(set_to_none=True)
-        critic_loss.backward()
+        loss.backward()
         self.critic_optimizer.step()
         self.critic_scheduler.step()
+        if aux_target is not None:
+            self.aux_optimizer.step()
         if self.encoder_optimizer is not None:
             self.encoder_optimizer.step()
             self.encoder_scheduler.step()
@@ -260,6 +353,8 @@ class FlashSACRGB(FlashSACDemo):
     def train_mode(self) -> None:
         super().train_mode()
         self.encoder.train()
+        if self.aux_head is not None:
+            self.aux_head.train()
 
     def eval_mode(self) -> None:
         super().eval_mode()
@@ -268,7 +363,14 @@ class FlashSACRGB(FlashSACDemo):
     def save(self) -> dict:
         saved = super().save()
         saved["encoder_state_dict"] = self.encoder.state_dict()
+        if self.aux_head is not None:
+            saved["aux_head_state_dict"] = self.aux_head.state_dict()
+            saved["aux_optimizer_state_dict"] = self.aux_optimizer.state_dict()
+            saved["aux_normalizer"] = {"mean": self.aux_mean, "m2": self.aux_m2, "count": self.aux_count}
         saved["target_encoder_state_dict"] = self.target_encoder.state_dict()
+        if self.ema_actor is not None:
+            saved["ema_actor_state_dict"] = self.ema_actor.state_dict()
+            saved["ema_encoder_state_dict"] = self.ema_encoder.state_dict()
         if self.encoder_optimizer is not None:
             saved["encoder_optimizer_state_dict"] = self.encoder_optimizer.state_dict()
             saved["encoder_scheduler_state_dict"] = self.encoder_scheduler.state_dict()
@@ -280,7 +382,18 @@ class FlashSACRGB(FlashSACDemo):
         if self.encoder_optimizer is not None and (load_cfg is None or load_cfg.get("optimizer", True)):
             self.encoder_optimizer.load_state_dict(loaded_dict["encoder_optimizer_state_dict"])
             self.encoder_scheduler.load_state_dict(loaded_dict["encoder_scheduler_state_dict"])
-        return super().load(loaded_dict, load_cfg, strict)
+        if self.aux_head is not None and "aux_head_state_dict" in loaded_dict:
+            self.aux_head.load_state_dict(loaded_dict["aux_head_state_dict"], strict=strict)
+            norm = loaded_dict["aux_normalizer"]
+            self.aux_mean, self.aux_m2, self.aux_count = (norm[k].to(self.device) for k in ("mean", "m2", "count"))
+            if load_cfg is None or load_cfg.get("optimizer", True):
+                self.aux_optimizer.load_state_dict(loaded_dict["aux_optimizer_state_dict"])
+        result = super().load(loaded_dict, load_cfg, strict)
+        if self.ema_actor is not None:
+            # resume the saved average, else start it from the loaded weights
+            self.ema_actor.load_state_dict(loaded_dict.get("ema_actor_state_dict", self.actor.state_dict()))
+            self.ema_encoder.load_state_dict(loaded_dict.get("ema_encoder_state_dict", self.encoder.state_dict()))
+        return result
 
     def get_policy(self) -> nn.Module:
         return _PixelPolicy(self)
@@ -303,6 +416,8 @@ class FlashSACRGB(FlashSACDemo):
                 obs[state_group].shape[-1],
                 alg_cfg.get("image_embed_dim", 256),
                 alg_cfg.get("state_embed_dim", 64),
+                num_cameras=alg_cfg.get("encoder_num_cameras", 1),
+                width=alg_cfg.get("encoder_width", 1),
             ).to(device)
         feature_obs = TensorDict(
             {FEATURE_GROUP: torch.zeros(obs.batch_size[0], encoder.out_dim)}, batch_size=obs.batch_size
@@ -330,8 +445,10 @@ class FlashSACRGB(FlashSACDemo):
             sample_batch_size=alg_cfg.get("mini_batch_size", 1024),
             device=alg_cfg.get("buffer_device") or device,
             obs_storage_dtype=parse_storage_dtypes(obs_dtype),
-            store_groups=sorted({image_group, state_group}),
+            store_groups=sorted({image_group, state_group} | ({alg_cfg["aux_group"]} if alg_cfg.get("aux_group") else set())),
         )
+        if alg_cfg.get("aux_group"):
+            alg_cfg["aux_dim"] = obs[alg_cfg["aux_group"]].shape[-1]
         if alg_cfg.get("learning_rate_decay_steps") is None:
             alg_cfg["learning_rate_decay_steps"] = (
                 int(cfg["max_iterations"]) * alg_cfg.get("num_learning_epochs", 1) * alg_cfg.get("num_mini_batches", 1)
@@ -367,6 +484,22 @@ class FlashSACRGBAlgorithmCfg(FlashSACDemoAlgorithmCfg):
     state_embed_dim: int = 64
     encoder_ema: float = 0.05
     encoder_type: str = "pixel"
+    """"pixel" (CNN + state projection) or "state" (debug bypass: the raw state input is the feature)."""
+    encoder_num_cameras: int = 1
+    """1 = one CNN over the channel-stacked cameras; N = a separate CNN per camera (channels split into N equal groups)."""
+    encoder_width: float = 1.0
+    """Channel multiplier for every conv layer (1 = 16/32/64/64 + 64; channels are rounded, so fractions work)."""
     encoder_lr_scale: float = 1.0
     """Encoder LR relative to the critic's; 0 freezes the encoder."""
-    """"pixel" (CNN + state projection) or "state" (debug bypass: the raw state input is the feature)."""
+    aux_group: str = ""
+    """Obs group of privileged state targets for an auxiliary state-prediction loss on the image embedding ("" = off).
+    The group is stored in the replay buffer (and must be in the expert buffer) but is never an actor / critic input."""
+    aux_head: str = "linear"
+    """Aux head: "linear", or "mlp" (two linear layers with ``aux_hidden_dim`` ReLU units)."""
+    aux_hidden_dim: int = 256
+    aux_weight: float = 1.0
+    """Weight of the aux MSE (on running-normalized targets) added to the critic loss; it also trains the encoder."""
+    policy_ema: float = 0.0
+    """Rate of an EMA copy of the policy (actor + encoder, incl. BatchNorm stats) updated after every gradient update and
+    saved as ``ema_actor_state_dict`` / ``ema_encoder_state_dict`` (0 = off). A frozen snapshot of the live policy can
+    be much worse than the continually updated one; the average is the policy to evaluate / deploy."""

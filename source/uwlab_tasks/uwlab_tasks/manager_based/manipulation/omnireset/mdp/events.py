@@ -5,6 +5,7 @@
 
 """Event functions for manipulation tasks."""
 
+import zlib
 import logging
 import numpy as np
 import os
@@ -48,10 +49,17 @@ def apply_isaac_rtx_settings(
     env_ids: torch.Tensor | None,
     settings: IsaacRtxRendererGlobalSettingsCfg,
 ):
-    """Apply process-global RTX settings during environment startup."""
+    """Apply process-global RTX settings during environment startup (``UWLAB_RTX_AA`` overrides the anti-aliasing mode)."""
+    if os.environ.get("UWLAB_RTX_AA"):
+        settings = settings.replace(antialiasing_mode=os.environ["UWLAB_RTX_AA"])
     if settings.antialiasing_mode is not None:
         sim_utils.enable_extension("omni.replicator.core")
     apply_isaac_rtx_global_settings(settings)
+    if settings.antialiasing_mode is not None:
+        import carb
+
+        print(f"[render_settings] antialiasing {settings.antialiasing_mode}: /rtx/post/aa/op="
+              f"{carb.settings.get_settings().get('/rtx/post/aa/op')}", flush=True)
 
 
 def configure_isaac_rtx(env_cfg: ManagerBasedEnvCfg, **settings: bool | str):
@@ -1576,8 +1584,8 @@ def randomize_tiled_cameras(
         new_pos = (base_position[0] + pos_delta_x, base_position[1] + pos_delta_y, base_position[2] + pos_delta_z)
 
         # === Randomize Rotation (Euler deltas in degrees, convert to radians) ===
-        # Convert base quaternion (w, x, y, z) to GfQuatf
-        base_quat = Gf.Quatf(base_rotation[0], Gf.Vec3f(base_rotation[1], base_rotation[2], base_rotation[3]))
+        # base quaternion is (x, y, z, w), the Isaac Lab 3.0 convention of the camera cfgs it mirrors
+        base_quat = Gf.Quatf(base_rotation[3], Gf.Vec3f(base_rotation[0], base_rotation[1], base_rotation[2]))
         base_rot = Gf.Rotation(base_quat)
 
         # Create delta rotation from Euler angles (ZYX order: yaw, pitch, roll)
@@ -2308,7 +2316,8 @@ class randomize_visual_appearance_multiple_meshes(ManagerTermBase):
 
         # Store texture paths and RNG
         self.texture_paths = texture_paths
-        unique_seed = hash(event_name) % (2**31)
+        # hash() is salted per process; crc32 + the env seed makes the draws reproducible across runs
+        unique_seed = (zlib.crc32(event_name.encode()) + int(env.cfg.seed or 0)) % (2**31)
         self.texture_rng = rep.rng.ReplicatorRNG(seed=unique_seed)
         self.prim_path_pattern = prim_path_pattern
 

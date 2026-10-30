@@ -35,6 +35,10 @@ parser.add_argument(
     help="With --resume_path: re-apply the env's current action bounds to the loaded actor (finetune with new bounds).",
 )
 parser.add_argument(
+    "--freeze_policy", action="store_true", default=False,
+    help="Diagnostic: collect rollouts and log metrics without any update (weights and BatchNorm stats stay fixed).",
+)
+parser.add_argument(
     "--buffer_device", type=str, default=None, help="Replay buffer storage device, e.g. cpu (default: training device)."
 )
 parser.add_argument(
@@ -143,6 +147,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: FlashSACRunnerCfg):
     # random initial episode lengths decorrelate resets across envs (training only), as in the official FlashSAC;
     # ManiSkill-parity cfgs set init_at_random_ep_len=False (all envs reset together)
     # on resume, train only the remaining iterations of the original budget
+    if args_cli.freeze_policy:
+        runner.alg.update = lambda: {}
     runner.learn(
         num_learning_iterations=max(agent_cfg.max_iterations - runner.current_learning_iteration, 0),
         init_at_random_ep_len=getattr(agent_cfg, "init_at_random_ep_len", True),

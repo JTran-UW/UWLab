@@ -71,3 +71,6 @@ tests/
 
 # Docker history
 .uw-lab-docker-history
+
+# run_in_sif.sh writable overlay / cache
+.sif_overlay/

@@ -91,7 +91,10 @@ def main(env_cfg, fs_cfg):
     obs = env.get_observations()
     buffer = None
     if not args.eval_only:
-        groups = sorted(set(fs_cfg.obs_groups["actor"]) | set(fs_cfg.obs_groups["critic"]))
+        groups = set(fs_cfg.obs_groups["actor"]) | set(fs_cfg.obs_groups["critic"])
+        # the aux state-prediction targets are stored too (FlashSACRGB's aux_group)
+        aux_group = getattr(fs_cfg.algorithm, "aux_group", "")
+        groups = sorted(groups | ({aux_group} if aux_group else set()))
         buffer = PerGroupDtypeTorchUniformBuffer(
             obs=obs,
             num_actions=env.num_actions,
@@ -174,7 +177,7 @@ def main(env_cfg, fs_cfg):
     if buffer is not None:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         buffer.save(args.output)
-        data = torch.load(args.output, weights_only=False)
+        data = torch.load(args.output, weights_only=False, mmap=True)  # mmap: no second in-RAM copy of the buffer
         data["metadata"] = {
             "task": args.task,
             "checkpoint": os.path.abspath(args.checkpoint),
@@ -188,7 +191,8 @@ def main(env_cfg, fs_cfg):
             "action_scale": action_scale.tolist(),
             "clipped_fraction": n_clipped / max(n_components, 1),
         }
-        torch.save(data, args.output)
+        torch.save(data, args.output + ".tmp")
+        os.replace(args.output + ".tmp", args.output)
         print(f"[expert] wrote {data['num_in_buffer']} transitions to {args.output}")
     env.close()
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 
 from isaaclab.managers import ManagerTermBase
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -491,6 +492,111 @@ def add_train_visual_events(cfg, per_episode: bool = False, hdri_interval_s: flo
         sky.is_global_time = True
 
 
+def add_full_visual_events(cfg, sky_intensity_range: tuple[float, float] = (1000.0, 4000.0), subset: bool = False) -> None:
+    """The original OmniReset RGB training randomization: full texture / HDRI sets redrawn every 4 s (``RGBEventCfg``)
+    plus the side and wrist camera pose / focal-length jitter on reset. ``sky_intensity_range`` rescales the HDRI dome
+    (the original range assumed the robot USD's per-env dome lights were on). ``subset`` swaps in the 150-texture / 100-HDRI
+    training subset (the full texture set can render no geometry in some RTX setups)."""
+    from .data_collection_rgb_cfg import RGBEventCfg
+
+    add_ood_visual_events(cfg, source="train", cameras=False)
+    cfg.events.randomize_sky_light.params["intensity_range"] = sky_intensity_range
+    if subset:
+        from pathlib import Path
+
+        res = Path(__file__).parent / "resources"
+        for name in OOD_VISUAL_EVENTS:
+            term = getattr(cfg.events, name, None)
+            if term is not None and "texture_config_path" in term.params:
+                term.params["texture_config_path"] = str(res / "texture_paths_train_subset150.yaml")
+        cfg.events.randomize_sky_light.params["hdri_config_path"] = str(res / "hdri_paths_train_subset100.yaml")
+    events = RGBEventCfg()
+    for name in ("randomize_side_camera", "randomize_side_camera_focal_length", "randomize_wrist_camera",
+                 "randomize_wrist_camera_focal_length"):
+        setattr(cfg.events, name, getattr(events, name))
+    # +-1 cm wrist translations that combine axes put the camera inside the gripper in ~4% of draws (black image);
+    # +-3 mm keeps every env clear
+    cfg.events.randomize_wrist_camera.params["position_deltas"] = {k: (-0.003, 0.003) for k in ("x", "y", "z")}
+
+
+# surfaces the RTX randomization re-textures, as Newton shape-label patterns under each env root
+WARP_COLOR_SURFACES = (
+    "Robot/robotiq_base_link/visuals/D415_to_Robotiq_Mount", "Robot/left_inner_finger/visuals/mesh_1",
+    "Robot/right_inner_finger/visuals/mesh_1", "InsertiveObject/visuals", "ReceptiveObject/visuals",
+    "Table/visuals/vention_mat", "CurtainLeft/geometry", "CurtainBack/geometry", "CurtainRight/geometry",
+)
+
+
+class randomize_newton_shape_colors(ManagerTermBase):
+    """Random solid colors on Newton visual shapes (``model.shape_color``): the part of the RGB randomization the Newton
+    Warp renderer can show (it has no textures, HDRI or PBR). One uniform color per matching shape and env."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._ids = None
+
+    def _shape_ids(self, env, patterns):
+        from isaaclab_newton.physics import NewtonManager
+
+        labels = list(NewtonManager.get_model().shape_label)
+        ids = []
+        for i in range(env.num_envs):
+            root = f"/World/envs/env_{i}/"
+            ids.append([s for s, label in enumerate(labels) if label.startswith(root) and any(label[len(root):].startswith(p) for p in patterns)])
+        assert ids[0] and all(len(x) == len(ids[0]) for x in ids), "shape-label patterns matched no / uneven shapes"
+        return torch.tensor(ids, device=env.device)
+
+    def __call__(self, env, env_ids, patterns=WARP_COLOR_SURFACES, color_range=(0.0, 1.0)):
+        import warp as wp
+        from isaaclab_newton.physics import NewtonManager
+
+        if self._ids is None:
+            self._ids = self._shape_ids(env, patterns)
+        env_ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids.to(env.device)
+        ids = self._ids[env_ids].reshape(-1)
+        colors = wp.to_torch(NewtonManager.get_model().shape_color)
+        colors[ids] = torch.empty(len(ids), 3, device=colors.device).uniform_(*color_range)
+
+
+class randomize_camera_world_pose(ManagerTermBase):
+    """Camera pose jitter through the sensor (``Camera.set_world_poses``), which every renderer sees: the USD-prim edit of
+    ``randomize_tiled_cameras`` never reaches Newton Warp, whose static cameras render from the pose cached at startup.
+    Deltas are applied to the startup world pose (positions in m, Euler angles in degrees)."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._base = None
+
+    def __call__(self, env, env_ids, sensor_name, position_deltas, euler_deltas):
+        import isaaclab.utils.math as math_utils
+
+        cam = env.scene.sensors[sensor_name]
+        if self._base is None:
+            pos, quat = cam.data.pos_w, cam.data.quat_w_opengl
+            self._base = ((pos.torch if hasattr(pos, "torch") else pos).clone(), (quat.torch if hasattr(quat, "torch") else quat).clone())
+        env_ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids.to(env.device)
+        n = len(env_ids)
+        u = lambda lo_hi: torch.empty(n, device=env.device).uniform_(*lo_hi)
+        pos = self._base[0][env_ids] + torch.stack([u(position_deltas[k]) for k in ("x", "y", "z")], -1)
+        rad = [torch.deg2rad(u(euler_deltas[k])) for k in ("roll", "pitch", "yaw")]
+        quat = math_utils.quat_mul(math_utils.quat_from_euler_xyz(*rad), self._base[1][env_ids])
+        cam.set_world_poses(pos, quat, env_ids=env_ids, convention="opengl")
+
+
+def add_warp_visual_events(cfg) -> None:
+    """The Warp-renderable part of ``add_full_visual_events``: random solid colors on the same surfaces (redrawn on
+    each reset and every 4 s) plus the side camera pose jitter set through the sensor. No textures, HDRI, focal or wrist
+    jitter (Warp has no env-map lighting, builds its camera rays once from env 0's focal length, and re-derives the
+    moving wrist camera's pose from the gripper link every step)."""
+    from .data_collection_rgb_cfg import RGBEventCfg
+
+    cfg.events.warp_colors_reset = EventTerm(func=randomize_newton_shape_colors, mode="reset")
+    cfg.events.warp_colors_interval = EventTerm(func=randomize_newton_shape_colors, mode="interval", interval_range_s=(4.0, 4.0))
+    side = RGBEventCfg().randomize_side_camera.params
+    cfg.events.randomize_side_camera = EventTerm(func=randomize_camera_world_pose, mode="reset", params={
+        "sensor_name": "side_camera", "position_deltas": side["position_deltas"], "euler_deltas": side["euler_deltas"]})
+
+
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCVisionDino3Cfg(Ur5eRobotiq2f85RelCartesianOSCVisionDinoCfg):
     """The DINO task with RGB 128x128 cameras and a timm DINOv3 backbone (ViT-S/16 by default; 8x8 patches)."""
@@ -588,6 +694,25 @@ class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideCfg(Ur5eRobotiq2f85RelCa
 
 
 @configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideWarpRandCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideCfg):
+    """DINOv3 side + wrist task with the Warp-renderable visual randomization (``add_warp_visual_events``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_warp_visual_events(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideVisRandCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideCfg):
+    """DINOv3 side + wrist task with the RTX visual randomization of the pixel finetunes (``add_full_visual_events``,
+    training subset); RTX only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_full_visual_events(self, subset=True)
+
+
+@configclass
 class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideFrontCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3Cfg):
     """DINOv3 task on the unzoomed front + side + wrist cameras."""
 
@@ -641,3 +766,194 @@ class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACOODCfg(Ur5eRobotiq2f85RelCarte
     def __post_init__(self):
         super().__post_init__()
         add_ood_visual_events(self)
+
+
+def stacked_rgb_image(env, sensor_cfgs: list[SceneEntityCfg]) -> torch.Tensor:
+    """(N, 3 * n_cams, H, W) RGB in 0..255, the colour counterpart of ``stacked_gray_image``."""
+    return torch.cat([env.scene.sensors[c.name].data.output["rgb"][..., :3].float() for c in sensor_cfgs], dim=-1).permute(
+        0, 3, 1, 2
+    )
+
+
+_SYM_OBS = SymmetryObsCfg()
+
+
+@configclass
+class VisionAuxStateObsCfg(ObsGroup):
+    """Auxiliary state-prediction targets (stored for the aux loss, never an actor / critic input): peg and hole poses
+    and the peg-minus-hole position, exactly as the symmetry expert sees them (wrist frame, symmetry-reduced)."""
+
+    insertive_asset_pose = _SYM_OBS.insertive_asset_pose.replace()
+    receptive_asset_pose = _SYM_OBS.receptive_asset_pose.replace()
+    insertive_minus_receptive_position = _SYM_OBS.insertive_minus_receptive_position.replace()
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+@configclass
+class VisionFlashSACAuxObservationsCfg(VisionFlashSACObservationsCfg):
+    aux_state: VisionAuxStateObsCfg = VisionAuxStateObsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidRGBCfg(Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidCfg):
+    """The side + wrist max-sysid pixel task with RGB instead of grayscale cameras (6 image channels)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.image.image.func = stacked_rgb_image
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxCfg(Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidCfg):
+    """The side + wrist max-sysid pixel task plus the ``aux_state`` group for the auxiliary state-prediction loss."""
+
+    observations: VisionFlashSACAuxObservationsCfg = VisionFlashSACAuxObservationsCfg()
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxVisRandFullCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxCfg
+):
+    """The side + wrist max-sysid aux task with the full original RGB randomization (``add_full_visual_events``); RTX
+    only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_full_visual_events(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxCfg
+):
+    """The side + wrist max-sysid aux task with RGB instead of grayscale cameras (6 image channels)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.image.image.func = stacked_rgb_image
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidRGBVisRandCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidRGBCfg
+):
+    """The side + wrist max-sysid RGB task with the original RGB randomization on the training subset
+    (``add_full_visual_events(subset=True)``: textures / HDRI every 4 s, side + wrist camera jitter); RTX only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_full_visual_events(self, subset=True)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBVisRandCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg
+):
+    """The side + wrist max-sysid aux RGB task with the original RGB randomization on the training subset
+    (``add_full_visual_events(subset=True)``); RTX only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_full_visual_events(self, subset=True)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBWarpRandCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg
+):
+    """The side + wrist max-sysid aux RGB task with the Warp-renderable visual randomization (``add_warp_visual_events``:
+    random surface colors + camera pose jitter), for Newton + Warp pretraining."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_warp_visual_events(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBWarpRandPerStepCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBWarpRandCfg
+):
+    """The WarpRand task with the Warp colours redrawn on every env step instead of every 4 s."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.warp_colors_interval.interval_range_s = (0.0, 0.0)
+
+
+def real2sim_matched_groups() -> dict:
+    """Yanda's real2sim matched appearance groups (base colours / materials of the real cell, newton-flow-distill d817fcc7)."""
+
+    def group(asset: str, color: tuple, roughness: float, **kwargs) -> dict:
+        return dict(asset=asset, color=color, roughness=roughness, **kwargs)
+
+    return {
+        "robot": dict(asset="robot", roughness=0.4, metallic=0.25, color_delta=0.015),
+        "table_frame": group("table", (0.018, 0.015, 0.019), 0.42, metallic=0.65, color_delta=0.008),
+        "tabletop": group("table", (0.30, 0.37, 0.30), 0.58, filter="vention_mat", texture=0),
+        "curtain_left": group("curtain_left", (0.68, 0.58, 0.48), 0.95, texture=1),
+        "curtain_back": group("curtain_back", (0.75, 0.65, 0.55), 0.95, texture=1),
+        "curtain_right": group("curtain_right", (0.75, 0.59, 0.56), 0.95, texture=1),
+        "insertive_object": group("insertive_object", (0.025, 0.17, 0.03), 0.5, texture=2, color_delta=0.015),
+        "receptive_object": group("receptive_object", (0.025, 0.17, 0.03), 0.5, texture=2, color_delta=0.015),
+        "mount": group("robot", (0.8, 0.68, 0.45), 0.7, filter="D415_to_Robotiq_Mount"),
+        "support": group("ur5_metal_support", (0.48, 0.45, 0.42), 0.38, metallic=0.7),
+    }
+
+
+def add_real2sim_appearance(cfg) -> None:
+    """Yanda's real2sim look on the policy cameras (newton-flow-distill ac0fa455): patched Newton-Warp renderer (GGX
+    materials with normal / roughness maps, shadows, matched textures, key + fill lights, precomputed studio IBL, ACES
+    tone mapping, camera response) and bounded per-reset appearance / exposure / white-balance / sensor-noise / IBL
+    jitter (``RandomizeMatchedAppearance``), plus the side camera pose jitter set through the sensor. Needs Newton 1.5.2."""
+    from pathlib import Path
+
+    from uwlab.utils.newton_warp_renderer_cfg import UWLabNewtonWarpRendererCfg
+
+    from ...mdp.real2sim_visual import RandomizeMatchedAppearance
+    from .data_collection_rgb_cfg import RGBEventCfg
+
+    tex = Path(__file__).parent / "resources" / "real2sim"
+    for name in ("side_camera", "wrist_camera"):
+        camera = getattr(cfg.scene, name)
+        camera.renderer_cfg = UWLabNewtonWarpRendererCfg(
+            texture_paths=tuple(str(tex / f"{n}.png") for n in ("smooth", "cloth", "printed")),
+            enable_patches=True, enable_textures=True, enable_shadows=True,
+            enable_pbr=True, enable_reflections=False, enable_dome_light=False,
+            enable_precomputed_ibl=True, create_default_light=False,
+            environment_paths=tuple(str(tex / f"studio_{n}.npy") for n in ("neutral", "warm", "cool")),
+            surface_maps={name: {kind: str(tex / f"{name}_{kind}.png") for kind in ("normal", "roughness")}
+                          for name in ("smooth", "cloth", "printed", "metal")},
+            tone_mapper="aces", exposure_range=(-0.2, 0.2), enable_camera_response=True,
+            ambient_sky=(0.65, 0.68, 0.72), ambient_ground=(0.24, 0.23, 0.22), ambient_intensity=0.7,
+            shadow_floor=0.15, samples_per_pixel=1, shadow_samples=1,
+        )
+        camera.update_latest_camera_pose = True
+    cfg.events.matched_appearance = EventTerm(
+        func=RandomizeMatchedAppearance, mode="reset", params={"groups": real2sim_matched_groups()}
+    )
+    side = RGBEventCfg().randomize_side_camera.params
+    cfg.events.randomize_side_camera = EventTerm(func=randomize_camera_world_pose, mode="reset", params={
+        "sensor_name": "side_camera", "position_deltas": side["position_deltas"], "euler_deltas": side["euler_deltas"]})
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg
+):
+    """The side + wrist max-sysid aux RGB task rendered with Yanda's real2sim Newton-Warp look (``add_real2sim_appearance``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_real2sim_appearance(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideReal2SimCfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideCfg):
+    """DINOv3 side + wrist task rendered with Yanda's real2sim Newton-Warp look (``add_real2sim_appearance``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_real2sim_appearance(self)

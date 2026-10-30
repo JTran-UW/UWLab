@@ -94,3 +94,13 @@ class OmniReset_FlashSACDinoSysidRunnerCfg(OmniReset_FlashSACDinoRunnerCfg):
     """The DINO recipe at max sysid: action bounds from the sysid-finetuned expert."""
 
     action_bound_scale = SYSID_EXPERT_P99_ACTION_BOUNDS
+
+
+@configclass
+class OmniReset_FlashSACRGB4096SysidAuxRunnerCfg(OmniReset_FlashSACRGB4096SysidRunnerCfg):
+    """The max-sysid pixel recipe plus the auxiliary state-prediction loss on the ``aux_state`` group (choose the head
+    and weight with ``agent.algorithm.aux_head=linear|mlp agent.algorithm.aux_weight=<w>``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.aux_group = "aux_state"

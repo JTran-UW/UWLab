@@ -331,6 +331,39 @@ gym.register(
 )
 
 gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-WristSide-Real2Sim-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideReal2SimCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-WristSide-VisRand-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideVisRandCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-WristSide-WarpRand-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideWarpRandCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDinoRunnerCfg",
+    },
+)
+
+gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-Dino3-WristSideFront-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -382,6 +415,105 @@ gym.register(
         "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACOODCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
         "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096RunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-RGB-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidRGBCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-VisRandFull-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxVisRandFullCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-RGB-VisRand-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidRGBVisRandCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-VisRand-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBVisRandCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-WarpRand-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBWarpRandCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-Real2Sim-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-WarpRandPerStep-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBWarpRandPerStepCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
     },
 )
 

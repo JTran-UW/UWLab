@@ -21,6 +21,7 @@ parser.add_argument("--num_envs", type=int, default=128)
 parser.add_argument("--rounds", type=int, default=8)
 parser.add_argument("--seed", type=int, default=7)
 parser.add_argument("--stochastic", action="store_true", help="Sample actions (FlashSACActor only) instead of the mean.")
+parser.add_argument("--use_ema", action="store_true", help="Evaluate the checkpoint's EMA policy (FlashSACRGB policy_ema).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 args_cli.enable_cameras = True
@@ -58,6 +59,11 @@ def main(env_cfg, agent_cfg):
     )
     runner = OffPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(args_cli.checkpoint, map_location=agent_cfg.device)
+    if args_cli.use_ema:
+        ckpt = torch.load(args_cli.checkpoint, map_location=agent_cfg.device, weights_only=False)
+        runner.alg.actor.load_state_dict(ckpt["ema_actor_state_dict"])
+        runner.alg.encoder.load_state_dict(ckpt["ema_encoder_state_dict"])
+        print("[eval_success] evaluating the EMA policy", flush=True)
     actor = runner.alg.get_policy().eval()
     env_units = isinstance(actor, _PixelPolicy)
 
@@ -88,6 +94,10 @@ def main(env_cfg, agent_cfg):
                 done_succ.append(succ[term].clone())
                 succ[term] = False
                 task_cur[term] = reset_term.task_id[term]
+    monitor = getattr(reset_term, "success_monitor", None)
+    if monitor is not None:
+        print(f"[eval_success] training-metric success monitor (last {monitor.monitored_history_len} per reset type): "
+              f"{[round(float(r), 3) for r in monitor.get_success_rate()]}", flush=True)
     rate_sps = args_cli.rounds * horizon * base.num_envs / (time.time() - t_start)
     print(f"[eval_success] rollout steps/s={rate_sps:.0f}", flush=True)
     tasks, wins = torch.cat(done_task).cpu(), torch.cat(done_succ).float().cpu()
@@ -98,6 +108,7 @@ def main(env_cfg, agent_cfg):
         return {"success": p, "n": n, "ci95": 1.96 * math.sqrt(p * (1 - p) / n) if n else float("nan")}
 
     result = {"checkpoint": args_cli.checkpoint, "task": args_cli.task, "hydra": hydra_args, "stochastic": args_cli.stochastic,
+              "use_ema": args_cli.use_ema,
               "overall": rate(torch.ones_like(wins, dtype=torch.bool)),
               "per_reset": {names[k]: rate(tasks == k) for k in range(len(names))}}
     os.makedirs(os.path.dirname(os.path.abspath(args_cli.out)), exist_ok=True)

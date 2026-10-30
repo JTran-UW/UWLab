@@ -18,8 +18,10 @@ from rsl_rl_flashsac.algorithms import FlashSAC
 class ExpertBuffer:
     """Fixed buffer saved by ``scripts/tools/collect_flashsac_expert_buffer.py`` (``TorchUniformBuffer.save``)."""
 
-    def __init__(self, path: str, device: str, n_step: int, gamma: float, groups: list[str]):
-        data = torch.load(path, map_location=device, weights_only=False)
+    def __init__(self, path: str, device: str, n_step: int, gamma: float, groups: list[str], mmap: bool = True):
+        # memory-map a CPU buffer: its pages are reclaimable page cache rather than process RAM
+        # (mmap=False reads it into RAM once: random reads from a network filesystem otherwise stall every update)
+        data = torch.load(path, map_location=device, weights_only=False, mmap=mmap and str(device) == "cpu")
         meta = data.get("metadata", {})
         for key, want in (("n_step", n_step), ("gamma", gamma), ("obs_groups", groups)):
             assert meta.get(key) == want, f"expert buffer {path}: {key} {meta.get(key)!r} != run's {want!r}"
@@ -53,7 +55,15 @@ class FlashSACDemo(FlashSAC):
     Rewards stay raw in both buffers and go through the same (online-statistics) reward normalizer.
     """
 
-    def __init__(self, *args, expert_buffer_path: str = "", expert_ratio: float = 0.0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        expert_buffer_path: str = "",
+        expert_ratio: float = 0.0,
+        expert_buffer_device: str = "",
+        expert_buffer_mmap: bool = True,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         assert 0.0 <= expert_ratio < 1.0, f"expert_ratio must be in [0, 1), got {expert_ratio}"
         self.expert_ratio = expert_ratio
@@ -62,7 +72,8 @@ class FlashSACDemo(FlashSAC):
             assert self.symmetry is None, "FlashSACDemo does not support symmetry augmentation"
             rb = self.replay_buffer
             self.expert_buffer = ExpertBuffer(
-                expert_buffer_path, rb._device, self.n_steps, self.gamma, sorted(rb._store_groups)
+                expert_buffer_path, expert_buffer_device or rb._device, self.n_steps, self.gamma, sorted(rb._store_groups),
+                mmap=expert_buffer_mmap,
             )
             self.num_expert = int(round(expert_ratio * rb._sample_batch_size))
             print(
@@ -89,3 +100,9 @@ class FlashSACDemoAlgorithmCfg(FlashSACAlgorithmCfg):
 
     expert_ratio: float = 0.2
     """Share of every mini-batch drawn from the expert buffer."""
+
+    expert_buffer_device: str = ""
+    """Device of the expert buffer ("" = the replay buffer's); on "cpu" each sample is moved to the GPU."""
+
+    expert_buffer_mmap: bool = True
+    """Memory-map a CPU expert buffer (low RSS) instead of reading it into RAM; use False on network filesystems."""
