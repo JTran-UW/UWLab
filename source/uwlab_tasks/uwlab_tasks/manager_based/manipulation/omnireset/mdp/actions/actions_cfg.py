@@ -49,6 +49,10 @@ class RelCartesianOSCActionCfg(ActionTermCfg):
     input_clip: tuple[float, float] | None = None
     """Optional symmetric clip range for scaled actions."""
 
+    pose_error_clip: tuple[float, float] = (0.0, 0.0)
+    """Per-component clip of the OSC pose error before the PD force: (position m, rotation rad); 0 disables that part.
+    The real UR5e controller uses (0.05, 0.3) (``osc_error_delta_pos`` / ``osc_error_delta_rot``)."""
+
     motion_stiffness: tuple[float, float, float, float, float, float] = (200.0, 200.0, 200.0, 3.0, 3.0, 3.0)
     """Task-space stiffness Kp for [x, y, z, rx, ry, rz]."""
 

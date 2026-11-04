@@ -24,6 +24,10 @@ parser.add_argument("--policy", type=str, default="mean", choices=["mean", "samp
                     help="mean: deterministic tanh(mean); sample: fresh Gaussian noise each step; train_act: the "
                     "algorithm's training-rollout act() (compiled actor, temporally correlated noise).")
 parser.add_argument("--video_envs", type=int, default=0, help="Film only the first K envs (0 = all); stats still cover every env.")
+parser.add_argument("--overview_size", type=str, default="", help="Overview camera resolution WxH (e.g. 1280x720), rendered and shown at that size.")
+parser.add_argument("--overview_eye", type=str, default="", help="Overview camera position x,y,z (m, env frame); with --overview_target.")
+parser.add_argument("--overview_target", type=str, default="", help="Point the overview camera looks at, x,y,z (m, env frame).")
+parser.add_argument("--overview_focal", type=float, default=13.20, help="Overview camera focal length (mm, 20.955 mm aperture).")
 parser.add_argument("--overview_scale", type=float, default=1.0, help="Render the overview camera at this fraction of 480x360 (upscaled in the video); 0 = no overview camera (videos show the policy cameras only, e.g. to keep training-time render memory).")
 parser.add_argument("--record_states", type=str, default="", help="Save the filmed envs' per-step robot joints and object poses (.pt).")
 parser.add_argument("--replay_states", type=str, default="", help="Kinematically replay a --record_states file (no physics) and film it.")
@@ -65,6 +69,8 @@ from uwlab_rl.flashsac.rgb import _PixelPolicy
 from uwlab_tasks.utils.hydra import hydra_task_config
 
 OV_H, OV_W = 360, 480
+if args_cli.overview_size:
+    OV_W, OV_H = (int(v) for v in args_cli.overview_size.lower().split("x"))
 if args_cli.tf32:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -82,7 +88,7 @@ def main(env_cfg, agent_cfg):
             offset=CameraCfg.OffsetCfg(
                 pos=(1.0770121, -0.1679045, 0.4486344), rot=(0.46613815, 0.25072644, 0.47107948, 0.70564552), convention="opengl"
             ),
-            data_types=["rgb"], spawn=sim_utils.PinholeCameraCfg(focal_length=13.20),
+            data_types=["rgb"], spawn=sim_utils.PinholeCameraCfg(focal_length=args_cli.overview_focal),
             renderer_cfg=(env_cfg.scene.front_camera or env_cfg.scene.wrist_camera).renderer_cfg,
         )
     image_term = getattr(getattr(env_cfg.observations, "image", None), "image", None)
@@ -142,6 +148,10 @@ def main(env_cfg, agent_cfg):
     n_vid = min(args_cli.video_envs or n, n)
     cmd = base.command_manager.get_term("task_command")
     overview = base.scene.sensors["overview_camera"] if args_cli.overview_scale > 0 else None
+    if overview is not None and args_cli.overview_eye:
+        vec = lambda s: torch.tensor([float(v) for v in s.split(",")], device=base.device)
+        origins = base.scene.env_origins
+        overview.set_world_poses_from_view(origins + vec(args_cli.overview_eye), origins + vec(args_cli.overview_target))
     extra_cams = [overview] if overview is not None else []
     reset_cfg = base.event_manager.get_term_cfg("reset_from_reset_states")
     obs = env.get_observations()

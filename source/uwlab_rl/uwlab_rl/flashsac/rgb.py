@@ -13,6 +13,8 @@ features; the target critic sees an EMA target encoder. Images are stored in the
 from __future__ import annotations
 
 import copy
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -189,6 +191,8 @@ class FlashSACRGB(FlashSACDemo):
         with torch.no_grad():
             feature = self._encode(obs, self.encoder)
         actions = super().act(self._feature_td(feature))
+        # the features carry no expert obs group, so the expert envs are applied here, on the raw obs
+        actions = self._apply_expert_envs(obs, actions)
         self._last_obs = obs  # the replay buffer stores raw pixels + state
         return actions
 
@@ -217,6 +221,10 @@ class FlashSACRGB(FlashSACDemo):
     def update(self) -> dict:
         if not self.replay_buffer.can_sample():
             return {}
+        check_every = int(os.environ.get("FLASHSAC_RGB_RANK_CHECK", "0")) if self.is_multi_gpu else 0
+        self._rgb_check_calls = getattr(self, "_rgb_check_calls", 0) + 1
+        if check_every and self._rgb_check_calls == 1:
+            self._rgb_rank_check("before_first_update")
         sums = {"actor": 0.0, "critic": 0.0, "temperature": 0.0, "entropy": 0.0, "aux": 0.0}
         num_actor_updates = 0
         gamma_n = self.gamma**self.n_steps
@@ -266,7 +274,97 @@ class FlashSACRGB(FlashSACDemo):
         if self.aux_group:
             losses["aux_state"] = self._aux_loss_sum / num_updates
             self._aux_loss_sum = 0.0
+        if self.is_multi_gpu:
+            self._sync_running_stats()
+        if check_every and self._rgb_check_calls % check_every == 0:
+            self._rgb_rank_check(f"after_update_call_{self._rgb_check_calls}")
+        if self.expert_buffer is not None:
+            losses["expert_ratio"] = self.num_expert / self.replay_buffer._sample_batch_size
         return losses
+
+    def _critic_side_parameters(self) -> list[torch.nn.Parameter]:
+        """Parameters stepped from the critic loss (+ aux loss): critic, trainable encoder, aux head."""
+        params = list(self.critic_parameters)
+        if self.encoder_optimizer is not None:
+            params += list(self.encoder.parameters())
+        if self.aux_head is not None:
+            params += list(self.aux_head.parameters())
+        return params
+
+    def _rgb_modules(self) -> list[nn.Module]:
+        mods = [self.encoder, self.target_encoder]
+        mods += [m for m in (self.aux_head, self.ema_actor, self.ema_encoder) if m is not None]
+        return mods
+
+    @torch.no_grad()
+    def _broadcast_rgb_state(self) -> None:
+        """Rank 0's encoder, target encoder, aux head (+ aux normalizer) and policy-EMA copies to every rank."""
+        tensors = [t for m in self._rgb_modules() for t in list(m.parameters()) + list(m.buffers())]
+        if self.aux_head is not None:
+            tensors += [self.aux_mean, self.aux_m2, self.aux_count]
+        if not tensors:
+            return
+        flat = torch.cat([t.reshape(-1).to(torch.float64) for t in tensors])
+        torch.distributed.broadcast(flat, src=0)
+        offset = 0
+        for t in tensors:
+            t.copy_(flat[offset : offset + t.numel()].view_as(t).to(t.dtype))
+            offset += t.numel()
+
+    def broadcast_parameters(self) -> None:
+        super().broadcast_parameters()
+        self._broadcast_rgb_state()
+
+    @torch.no_grad()
+    def _sync_running_stats(self) -> None:
+        super()._sync_running_stats()
+        if self.aux_head is not None:
+            stats = torch.cat([self.aux_mean, self.aux_m2, self.aux_count.reshape(1)])
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            stats /= self.gpu_world_size
+            n = self.aux_mean.numel()
+            self.aux_mean.copy_(stats[:n])
+            self.aux_m2.copy_(stats[n : 2 * n])
+            self.aux_count.copy_(stats[2 * n])
+        self._broadcast_rgb_state()
+
+    @torch.no_grad()
+    def _rgb_rank_check(self, tag: str) -> None:
+        """Diagnostic (FLASHSAC_RGB_RANK_CHECK=K, multi-GPU): per module, max |w - w_rank0| and ||w - w_rank0|| / ||w_rank0||,
+        then on rank 0's mini-batch the encoder-feature cosine, |Q - Q_rank0| and |a - a_rank0| of this rank's networks."""
+        dist = torch.distributed
+        mods = {"actor": self.actor, "temperature": self.temperature, "critic": self.critic.critic,
+                "critic_target": self.critic.critic_target, "encoder": self.encoder, "target_encoder": self.target_encoder}
+        if self.aux_head is not None:
+            mods["aux_head"] = self.aux_head
+        groups = {k: list(m.parameters()) for k, m in mods.items()}
+        groups["bn_running_stats"] = self._running_stat_buffers()
+        parts = []
+        for name, tensors in groups.items():
+            if not tensors:
+                continue
+            flat = torch.cat([t.reshape(-1).float() for t in tensors])
+            ref = flat.clone()
+            dist.broadcast(ref, src=0)
+            parts.append(f"{name}={float((flat - ref).abs().max()):.3e}/{float((flat - ref).norm() / ref.norm().clamp_min(1e-12)):.3e}")
+        batch = self._sample_batch()
+        n = 256
+        img = batch["observation"][self.image_group][:n].to(self.device).float().contiguous()
+        st = batch["observation"][self.state_group][:n].to(self.device).float().contiguous()
+        act = batch["action"][:n].to(self.device).float().contiguous()
+        for t in (img, st, act):
+            dist.broadcast(t, src=0)
+        feat = self.encoder(img, st)
+        q = self.critic.evaluate(feat, act, training=False)[0].mean(0)
+        a = torch.tanh(self.actor.get_mean_and_std(self.actor.flatten_obs(self._feature_td(feat)), training=False)[0])
+        ref_feat, ref_q, ref_a = feat.clone(), q.clone(), a.clone()
+        for t in (ref_feat, ref_q, ref_a):
+            dist.broadcast(t, src=0)
+        cos = float(F.cosine_similarity(feat, ref_feat, dim=-1).mean())
+        print(f"[rgb_rank_check] rank {self.gpu_global_rank} {tag} update_step {self.update_step} | max|dw|/rel_L2: "
+              + " ".join(parts)
+              + f" | same-batch: feat_cos {cos:.4f} |dQ| {float((q - ref_q).abs().mean()):.4e} (|Q| {float(ref_q.abs().mean()):.3f})"
+              + f" |da| {float((a - ref_a).abs().mean()):.4e}", flush=True)
 
     @torch.no_grad()
     def _policy_ema_update(self) -> None:
@@ -338,6 +436,8 @@ class FlashSACRGB(FlashSACDemo):
         if self.encoder_optimizer is not None:
             self.encoder_optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if self.is_multi_gpu:
+            self.reduce_parameters(self._critic_side_parameters())
         self.critic_optimizer.step()
         self.critic_scheduler.step()
         if aux_target is not None:

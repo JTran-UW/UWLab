@@ -40,7 +40,8 @@ from uwlab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActi
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
 
 from ..assembly_keypoints import Offset
-from .success_guided_sampler import SuccessGuidedSampler
+from .success_guided_sampler import OutcomeQueue, RollingMean, SuccessGuidedSampler, distributed_world
+from .visited_states import VisitedStateBuffer, build_tree, get_path, leaf_paths
 from .success_monitor_cfg import SuccessMonitorCfg
 
 
@@ -1151,13 +1152,56 @@ class MultiResetManager(ManagerTermBase):
         sgs_cfg = dict(cfg.params.get("sgs") or {})
         if sgs_cfg:
             self.sgs_async = bool(sgs_cfg.pop("async_outcomes", False))
-            every = int(sgs_cfg.pop("uniform_monitor_every", 0))
-            if every > 0:
-                self.sgs_monitor = torch.arange(self.num_envs, device=self.device) % every == 0
+            self.sgs_monitor_every = int(sgs_cfg.pop("uniform_monitor_every", 0))
+            if self.sgs_monitor_every > 0:
                 monitor_cfg = SuccessMonitorCfg(monitored_history_len=100, num_monitored_data=self.num_tasks, device=env.device)
                 self.monitor_success = monitor_cfg.class_type(monitor_cfg)
             base = (self.probs / self.num_states.float())[self.state_type]
             self.sgs = SuccessGuidedSampler(int(self.num_states.sum()), base_weights=base, device=self.device, **sgs_cfg)
+        # copy of what this term writes to extras["log"]: _reset_idx replaces that dict after the reset events run,
+        # so the reset_event_log curriculum term re-emits it
+        self.last_log: dict[str, float] = {}
+
+        # expert envs (every k-th env) execute a state expert's actions (FlashSACDemo.set_expert_envs reads this mask);
+        # their end-of-episode success is logged apart from the policy envs'
+        every = int(cfg.params.get("expert_env_every", 0) or 0)
+        self.expert_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if every > 0:
+            assert self.sgs is None or self.sgs_async, "expert envs with SGS need sgs.async_outcomes (per-env outcome filtering)"
+            self.expert_mask = torch.arange(self.num_envs, device=self.device) % every == 0
+        # SGS monitors: every k-th policy env (expert envs neither feed nor monitor the sampler)
+        if self.sgs is not None and getattr(self, "sgs_monitor_every", 0) > 0:
+            self.sgs_monitor[(~self.expert_mask).nonzero().flatten()[:: self.sgs_monitor_every]] = True
+        self.split_success = {
+            name: RollingMean(int(m.sum()), self.device)
+            for name, m in (("policy_env", ~self.expert_mask), ("expert_env", self.expert_mask))
+        } if every > 0 else {}
+        if self.split_success and bool(self.sgs_monitor.any()):  # uniform-reset policy envs: unbiased under SGS
+            self.split_success["monitor_env"] = RollingMean(int(self.sgs_monitor.sum()), self.device)
+
+        # visited states: policy-env states captured every step (capture_visited) as reset targets for expert envs
+        vcfg = dict(cfg.params.get("visited") or {})
+        self.visited = None
+        if vcfg:
+            self.visited_cfg = dict(capacity=1_310_720, capture_fraction=1.0, peg_box_margin_xy=0.15, peg_z_below=0.02,
+                                    peg_z_above=0.30, peg_speed_max=2.0, p_visited=0.0, min_fill=1000)
+            unknown = set(vcfg) - set(self.visited_cfg)
+            assert not unknown, f"unknown visited params {unknown}"
+            self.visited_cfg.update(vcfg)
+            self.visited_paths = leaf_paths(self.datasets[0]["initial_state"])
+            peg = torch.cat([d["initial_state"]["rigid_object"]["insertive_object"]["root_pose"][:, :3] for d in self.datasets])
+            c = self.visited_cfg
+            self.visited_peg_lo = peg.min(0).values - torch.tensor([c["peg_box_margin_xy"], c["peg_box_margin_xy"], c["peg_z_below"]], device=self.device)
+            self.visited_peg_hi = peg.max(0).values + torch.tensor([c["peg_box_margin_xy"], c["peg_box_margin_xy"], c["peg_z_above"]], device=self.device)
+            self.visited_rules = ("expert_env", "episode_start", "non_finite", "robot_abnormal", "peg_out_of_box",
+                                  "peg_fast", "succeeded", "subsampled")
+            self.visited_counts = torch.zeros(len(self.visited_rules) + 2, dtype=torch.long, device=self.device)  # + seen, kept
+            # reset source of each env's current episode (0 dataset, 1 visited) and the expert envs' success by source
+            self.reset_source = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self.last_visited_reset = None
+            n_exp = max(int(self.expert_mask.sum()), 1)
+            self.expert_success_by_source = {"dataset": RollingMean(n_exp, self.device), "visited": RollingMean(n_exp, self.device)}
+            self.visited_reset_rate = RollingMean(n_exp, self.device)
 
     def sgs_update(self, state_ids: torch.Tensor, outcomes: torch.Tensor) -> None:
         if self.sgs is not None:
@@ -1171,20 +1215,151 @@ class MultiResetManager(ManagerTermBase):
         finished = self._env.episode_length_buf[env_ids] > 0
         outcome = latch[env_ids]
         monitor = self.sgs_monitor[env_ids]
-        push = finished & ~monitor
-        if push.any():
-            self.sgs.update(self.state_id[env_ids][push], outcome[push])
+        push = finished & ~monitor & ~self.expert_mask[env_ids]
+        watched = finished & monitor
+        if distributed_world() > 1:
+            # applied on every rank by sgs_sync, pooled across ranks
+            self._sgs_queues()
+            self.sgs_queue.push(self.state_id[env_ids][push], outcome[push])
+            self.monitor_queue.push(self.task_id[env_ids][watched], outcome[watched])
+        else:
+            if push.any():
+                self.sgs.update(self.state_id[env_ids][push], outcome[push])
+            if watched.any():
+                self.monitor_success.success_update(self.task_id[env_ids][watched], outcome[watched].float())
+            self._sgs_log(bool(watched.any()))
+        latch[env_ids] = False
+
+    def _sgs_queues(self) -> None:
+        if getattr(self, "sgs_queue", None) is None:
+            self.sgs_queue, self.monitor_queue = OutcomeQueue(self.device), OutcomeQueue(self.device)
+
+    def _sgs_log(self, monitor_updated: bool) -> None:
         if "log" not in self._env.extras:
             self._env.extras["log"] = {}
-        watched = finished & monitor
-        if watched.any():
-            self.monitor_success.success_update(self.task_id[env_ids][watched], outcome[watched].float())
+        log = self.sgs_stats()
+        if monitor_updated:
             rates = self.monitor_success.get_success_rate()
-            for k in range(self.num_tasks):
-                if self.probs[k] > 0:
-                    self._env.extras["log"][f"Metrics/uniform_success_once_task_{k}"] = rates[k].item()
-        self._env.extras["log"].update(self.sgs_stats())
-        latch[env_ids] = False
+            log.update({f"Metrics/uniform_success_once_task_{k}": rates[k].item() for k in range(self.num_tasks) if self.probs[k] > 0})
+        self._env.extras["log"].update(log)
+        self.last_log.update(log)
+
+    def sgs_sync(self) -> None:
+        """Multi-GPU: pool every rank's queued outcomes and monitor results and apply them in rank order, so all ranks
+        keep identical samplers. A collective: called by the ``sgs_sync`` global-time interval event."""
+        if self.sgs is None or distributed_world() == 1:
+            return
+        self._sgs_queues()
+        ids, out = self.sgs_queue.flush()
+        if ids.numel():
+            self.sgs.update(ids, out)
+        tids, tout = self.monitor_queue.flush()
+        if tids.numel():
+            self.monitor_success.success_update(tids, tout.float())
+        self._sgs_log(tids.numel() > 0)
+
+    def _visited_scene_state(self) -> dict:
+        """The live scene state (relative to env origins) restricted to the reset datasets' leaves."""
+        full = self._env.scene.get_state(is_relative=True)
+        return build_tree(self.visited_paths, [_as_torch(get_path(full, p)).clone() for p in self.visited_paths])
+
+    def visited_rule_masks(self, state: dict) -> dict[str, torch.Tensor]:
+        """Per rule, the envs whose current state fails it (a state is kept only if it fails none)."""
+        env, c = self._env, self.visited_cfg
+        robot = env.scene["robot"]
+        q, qd = _as_torch(robot.data.joint_pos), _as_torch(robot.data.joint_vel)
+        qd_lim = _as_torch(robot.data.joint_vel_limits)
+        peg_pose = get_path(state, ("rigid_object", "insertive_object", "root_pose"))
+        peg_vel = get_path(state, ("rigid_object", "insertive_object", "root_velocity"))
+        finite = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        for p in self.visited_paths:
+            finite &= torch.isfinite(get_path(state, p)).flatten(1).all(dim=1)
+        cmd = env.command_manager.get_term("task_command")
+        return {
+            "expert_env": self.expert_mask.clone(),
+            "episode_start": env.episode_length_buf == 0,
+            "non_finite": ~finite,
+            "robot_abnormal": (q.abs() > 100.0).any(dim=1) | (qd.abs() > 2 * qd_lim).any(dim=1),
+            "peg_out_of_box": ((peg_pose[:, :3] < self.visited_peg_lo) | (peg_pose[:, :3] > self.visited_peg_hi)).any(dim=1),
+            "peg_fast": peg_vel[:, :3].norm(dim=1) > c["peg_speed_max"],
+            "succeeded": cmd.orientation_aligned & cmd.position_aligned,
+            "subsampled": torch.rand(self.num_envs, device=self.device) >= c["capture_fraction"],
+        }
+
+    def capture_visited(self) -> None:
+        """Store the current state of every policy env that passes all rules (interval event, every env step)."""
+        if self.visited is None and not getattr(self, "visited_cfg", None):
+            return
+        state = self._visited_scene_state()
+        if self.visited is None:
+            self.visited = VisitedStateBuffer(self.visited_cfg["capacity"], state, self.device)
+        fails = self.visited_rule_masks(state)
+        keep = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        for m in fails.values():
+            keep &= ~m
+        self.visited.push(state, keep, env_ids=torch.arange(self.num_envs, device=self.device),
+                          steps=self._env.episode_length_buf)
+        self.visited_counts += torch.stack([m.sum() for m in fails.values()]
+                                           + [torch.tensor(self.num_envs, device=self.device), keep.sum()])
+        seen = self.visited_counts[-2].clamp(min=1).float()
+        self.last_log.update({"visited/filled": float(self.visited.filled),
+                              "visited/kept_frac": (self.visited_counts[-1] / seen).item(),
+                              **{f"visited/fail_{r}_frac": (self.visited_counts[i] / seen).item()
+                                 for i, r in enumerate(self.visited_rules)}})
+
+    def _visited_reset_ids(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """The expert envs among ``env_ids`` that reset to a visited state (each with probability p_visited, once
+        the buffer holds min_fill states)."""
+        c = self.visited_cfg
+        none = env_ids[:0]
+        if self.visited is None or c["p_visited"] <= 0 or self.visited.filled < c["min_fill"]:
+            return none
+        cand = env_ids[self.expert_mask[env_ids]]
+        if cand.numel() == 0:
+            return none
+        return cand[torch.rand(cand.numel(), device=self.device) < c["p_visited"]]
+
+    def _log_success_by_source(self, env_ids: torch.Tensor) -> None:
+        """Expert-env success of the finishing episode, by how it started: the task_command alignment at reset time
+        (the finishing episode's last computed state; unlike the logged end_of_episode metric, no one-episode lag)."""
+        finished = self._env.episode_length_buf[env_ids] > 0
+        sel = finished & self.expert_mask[env_ids]
+        if not sel.any():
+            return
+        cmd = self._env.command_manager.get_term("task_command")
+        ids = env_ids[sel]
+        succ = (cmd.orientation_aligned & cmd.position_aligned)[ids].float()
+        src = self.reset_source[ids]
+        for name, code in (("dataset", 0), ("visited", 1)):
+            m = src == code
+            if m.any():
+                self.expert_success_by_source[name].push(succ[m])
+            mean = self.expert_success_by_source[name].mean()
+            if mean is not None:
+                self.last_log[f"Metrics/expert_env_from_{name}_success"] = mean
+        self.visited_reset_rate.push((src == 1).float())
+        self.last_log["visited/reset_frac"] = self.visited_reset_rate.mean()
+
+    def _log_split_success(self, env_ids: torch.Tensor) -> None:
+        """End-of-episode success of the policy envs, the expert envs and (with SGS) the uniform-reset monitor envs,
+        each a rolling mean over its last (number of envs in the group) finished episodes. Reads the task_command metric the env logs as
+        Metrics/task_command/end_of_episode_success_rate, before the command term resets it."""
+        cmd = self._env.command_manager.get_term("task_command")
+        finished = self._env.episode_length_buf[env_ids] > 0
+        values = cmd.metrics["end_of_episode_success_rate"][env_ids]
+        is_expert = self.expert_mask[env_ids]
+        log = {}
+        groups = [("policy_env", finished & ~is_expert), ("expert_env", finished & is_expert)]
+        if "monitor_env" in self.split_success:
+            groups.append(("monitor_env", finished & self.sgs_monitor[env_ids]))
+        for name, sel in groups:
+            rolling = self.split_success[name]
+            rolling.push(values[sel])
+            if rolling.filled:
+                log[f"Metrics/{name}_end_of_episode_success_rate"] = rolling.mean()
+        if log:
+            self._env.extras.setdefault("log", {}).update(log)
+            self.last_log.update(log)
 
     def __call__(
         self,
@@ -1198,25 +1373,33 @@ class MultiResetManager(ManagerTermBase):
         max_states: int | list[int] | None = None,
         max_states_seed: int = 0,
         max_joint_vel: float | None = None,
+        expert_env_every: int = 0,
+        visited: dict | None = None,
     ) -> None:
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self._env.device)
+        if self.split_success:
+            self._log_split_success(env_ids)
 
         # Log current data
         if success is not None:
             success_mask = torch.where(eval(success)[env_ids], 1.0, 0.0)
-            self.success_monitor.success_update(self.task_id[env_ids], success_mask)
+            train = ~self.expert_mask[env_ids]  # training envs only (visited starts are expert envs)
+            if train.any():
+                self.success_monitor.success_update(self.task_id[env_ids][train], success_mask[train])
 
             # Log metrics for each task
             success_rates = self.success_monitor.get_success_rate()
             if "log" not in self._env.extras:
                 self._env.extras["log"] = {}
             for task_idx in range(self.num_tasks):
-                self._env.extras["log"].update({
+                task_log = {
                     f"Metrics/task_{task_idx}_success_rate": success_rates[task_idx].item(),
                     f"Metrics/task_{task_idx}_prob": self.probs[task_idx].item(),
                     f"Metrics/task_{task_idx}_normalized_prob": self.probs[task_idx].item(),
-                })
+                }
+                self._env.extras["log"].update(task_log)
+                self.last_log.update(task_log)
 
             # Log episode length at reset
             ep_lengths = self._env.episode_length_buf[env_ids].float()
@@ -1225,38 +1408,51 @@ class MultiResetManager(ManagerTermBase):
         if self.sgs is not None and self.sgs_async:
             self._sgs_push_finished(env_ids)
 
-        # Sample which dataset (and state) to use for each environment; monitor envs always sample from probs
-        dataset_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
-        global_ids = None
-        if self.sgs is not None and not self.sgs_bypass:
-            use = ~self.sgs_monitor[env_ids]
-            if use.any():
-                global_ids = torch.full((len(env_ids),), -1, dtype=torch.long, device=self.device)
-                global_ids[use] = self.sgs.sample(int(use.sum()))
-                dataset_indices[use] = self.state_type[global_ids[use]]
-        self.task_id[env_ids] = dataset_indices
+        all_env_ids = env_ids
+        if getattr(self, "visited_cfg", None):
+            self._log_success_by_source(env_ids)
+            self.reset_source[env_ids] = 0
+            vis = self._visited_reset_ids(env_ids)
+            if vis.numel():
+                states, slots = self.visited.sample(vis.numel())
+                self._reset_to(states, env_ids=vis, is_relative=True)
+                self.reset_source[vis] = 1
+                self.last_visited_reset = (vis.clone(), slots.clone())
+                self.last_log["visited/src_step_mean"] = self.visited.src_step[slots].float().mean().item()
+                env_ids = env_ids[~torch.isin(env_ids, vis)]
+        if len(env_ids) > 0:
+            # Sample which dataset (and state) to use for each environment; monitor envs always sample from probs
+            dataset_indices = torch.multinomial(self.probs, len(env_ids), replacement=True)
+            global_ids = None
+            if self.sgs is not None and not self.sgs_bypass:
+                use = ~self.sgs_monitor[env_ids] & ~self.expert_mask[env_ids]
+                if use.any():
+                    global_ids = torch.full((len(env_ids),), -1, dtype=torch.long, device=self.device)
+                    global_ids[use] = self.sgs.sample(int(use.sum()))
+                    dataset_indices[use] = self.state_type[global_ids[use]]
+            self.task_id[env_ids] = dataset_indices
 
-        # Process each dataset's environments
-        for dataset_idx in range(self.num_tasks):
-            mask = dataset_indices == dataset_idx
-            if not mask.any():
-                continue
+            # Process each dataset's environments
+            for dataset_idx in range(self.num_tasks):
+                mask = dataset_indices == dataset_idx
+                if not mask.any():
+                    continue
 
-            current_env_ids = env_ids[mask]
-            state_indices = torch.randint(
-                0, self.num_states[dataset_idx], (len(current_env_ids),), device=self._env.device
-            )
-            if global_ids is not None:
-                g = global_ids[mask]
-                picked = g >= 0
-                state_indices[picked] = g[picked] - self.state_offsets[dataset_idx]
-            self.state_id[current_env_ids] = state_indices + self.state_offsets[dataset_idx]
-            states_to_reset_from = sample_from_nested_dict(self.datasets[dataset_idx], state_indices)
-            self._reset_to(states_to_reset_from["initial_state"], env_ids=current_env_ids, is_relative=True)
+                current_env_ids = env_ids[mask]
+                state_indices = torch.randint(
+                    0, self.num_states[dataset_idx], (len(current_env_ids),), device=self._env.device
+                )
+                if global_ids is not None:
+                    g = global_ids[mask]
+                    picked = g >= 0
+                    state_indices[picked] = g[picked] - self.state_offsets[dataset_idx]
+                self.state_id[current_env_ids] = state_indices + self.state_offsets[dataset_idx]
+                states_to_reset_from = sample_from_nested_dict(self.datasets[dataset_idx], state_indices)
+                self._reset_to(states_to_reset_from["initial_state"], env_ids=current_env_ids, is_relative=True)
 
         # Reset velocities
         robot: Articulation = self._env.scene["robot"]
-        robot.set_joint_velocity_target(torch.zeros_like(robot.data.joint_vel[env_ids]), env_ids=env_ids)
+        robot.set_joint_velocity_target(torch.zeros_like(robot.data.joint_vel[all_env_ids]), env_ids=all_env_ids)
 
     def _reset_to(
         self,
@@ -1326,6 +1522,26 @@ class MultiResetManager(ManagerTermBase):
         # write data to simulation to make sure initial state is set
         # this propagates the joint targets to the simulation
         self._env.scene.write_data_to_sim()
+
+
+def _as_torch(x):
+    return x.torch if hasattr(x, "torch") else x
+
+
+def capture_visited_states(env, env_ids, term_name: str = "reset_from_reset_states") -> None:
+    """Global-time interval event every env step: the reset event stores visited policy-env states."""
+    env.event_manager.get_term_cfg(term_name).func.capture_visited()
+
+
+def sgs_sync(env, env_ids, term_name: str = "reset_from_reset_states") -> None:
+    """Global-time interval event (same step on every rank): pools multi-GPU SGS outcomes; no-op on one GPU."""
+    env.event_manager.get_term_cfg(term_name).func.sgs_sync()
+
+
+def reset_event_log(env, env_ids, term_name: str = "reset_from_reset_states") -> dict[str, float] | None:
+    """Curriculum term: the last metrics the ``MultiResetManager`` reset event logged (logged as ``Curriculum/...``)."""
+    log = getattr(env.event_manager.get_term_cfg(term_name).func, "last_log", None)
+    return dict(log) if log else None
 
 
 def sample_state_data_set(episode_data: dict, idx: torch.Tensor, device: torch.device) -> dict:
@@ -2596,3 +2812,77 @@ def set_newton_equality_solref(
             values = wp.to_torch(array)
             values[..., 0] = timeconst
             values[..., 1] = dampratio
+
+
+class randomize_rigid_body_material(ManagerTermBase):
+    """Isaac Lab's material randomization; on Newton, writes straight into the model at the asset's colliding shapes.
+
+    With visual shapes in the Newton model (viewer, video or cameras), the asset view's shape binding is not contiguous
+    and the upstream Newton path silently drops every write, leaving USD friction on the colliders.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        from isaaclab.envs.mdp import events as isaaclab_events
+
+        if "newton" not in env.sim.physics_manager.__name__.lower():
+            self._delegate = isaaclab_events.randomize_rigid_body_material(cfg, env)
+            return
+        self._delegate = None
+        import re
+
+        from isaaclab_newton.physics.newton_manager import NewtonManager
+        from newton import ModelFlags, ShapeFlags
+
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        asset = env.scene[asset_cfg.name]
+        self._manager, self._notify = NewtonManager, ModelFlags.SHAPE_PROPERTIES
+        model = NewtonManager.get_model()
+        root = asset.cfg.prim_path.replace("{ENV_REGEX_NS}", "/World/envs/env_[^/]+")
+        pattern = re.compile(root + r"(/|$)")
+        bodies = asset_cfg.body_names
+        bodies = [bodies] if isinstance(bodies, str) else bodies
+        flags, world = model.shape_flags.numpy(), model.shape_world.numpy()
+        per_env: dict[int, list[int]] = {}
+        for i, label in enumerate(model.shape_label):
+            if not (int(flags[i]) & int(ShapeFlags.COLLIDE_SHAPES)) or not pattern.match(label):
+                continue
+            if bodies and not any(re.search(f"/{b}/", label) for b in bodies):
+                continue
+            per_env.setdefault(int(world[i]), []).append(i)
+        counts = {len(v) for v in per_env.values()}
+        if len(per_env) != env.num_envs or len(counts) != 1:
+            sample = [s for s in model.shape_label if asset_cfg.name.split("_")[0].lower() in s.lower()][:3]
+            raise RuntimeError(
+                f"randomize_rigid_body_material: uneven collider shapes for '{asset_cfg.name}': {counts}"
+                f" (pattern {pattern.pattern}, {model.shape_count} shapes, e.g. {sample})"
+            )
+        self._shape_ids = torch.tensor([per_env[e] for e in range(env.num_envs)], dtype=torch.long, device=env.device)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor | None,
+        static_friction_range: tuple[float, float],
+        dynamic_friction_range: tuple[float, float],
+        restitution_range: tuple[float, float],
+        num_buckets: int,
+        asset_cfg: SceneEntityCfg,
+        make_consistent: bool = False,
+    ):
+        if self._delegate is not None:
+            return self._delegate(
+                env, env_ids, static_friction_range, dynamic_friction_range, restitution_range, num_buckets,
+                asset_cfg, make_consistent,
+            )
+        import warp as wp
+
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+        ids = self._shape_ids[env_ids.to(env.device)]
+        model = self._manager.get_model()
+        mu = wp.to_torch(model.shape_material_mu)
+        restitution = wp.to_torch(model.shape_material_restitution)
+        mu[ids] = math_utils.sample_uniform(*static_friction_range, ids.shape, device=env.device)
+        restitution[ids] = math_utils.sample_uniform(*restitution_range, ids.shape, device=env.device)
+        self._manager.add_model_change(self._notify)

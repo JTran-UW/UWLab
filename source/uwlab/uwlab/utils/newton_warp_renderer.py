@@ -295,9 +295,11 @@ class UWLabNewtonWarpRenderer(NewtonWarpRenderer):
     def render(self, render_data):
         super().render(render_data)
         if self._patches and self._tone_mapper is not None:
-            inputs = [render_data.outputs.hdr_color_image, render_data.outputs.color_image, self._exposure]
+            # per-camera exposure / white balance when set on this camera's render data (several cameras share a renderer)
+            exposure = getattr(render_data, "uw_exposure", self._exposure)
+            inputs = [render_data.outputs.hdr_color_image, render_data.outputs.color_image, exposure]
             if self.cfg.enable_camera_response:
-                inputs += [self._white_balance, self._camera_response, self._response_frame]
+                inputs += [getattr(render_data, "uw_white_balance", self._white_balance), self._camera_response, self._response_frame]
                 self._response_frame += 1
             wp.launch(
                 self._tone_mapper,

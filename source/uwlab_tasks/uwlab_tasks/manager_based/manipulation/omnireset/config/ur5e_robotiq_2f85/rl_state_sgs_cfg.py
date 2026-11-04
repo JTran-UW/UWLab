@@ -7,13 +7,16 @@
 
 from __future__ import annotations
 
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
 from ... import mdp as task_mdp
 
+from .actions import Ur5eRobotiq2f85RelativeOSCEvalAction
 from .rl_state_cfg import Ur5eRobotiq2f85RelCartesianOSCTrainCfg
 from .rl_state_symmetry_cfg import Ur5eRobotiq2f85RelCartesianOSCSymmetryTrainCfg
+from .rl_vision_cfg import apply_max_sysid
 
 # Each env pushes its episode's success_once when it resets; every 16th env samples uniformly as an unbiased monitor.
 SGS_PPO = dict(history=100, target=0.5, kappa=1.0, temperature=2.0, eps=1e-4, empty_rate=0.5,
@@ -26,6 +29,7 @@ class Ur5eRobotiq2f85RelCartesianOSCSGSTrainCfg(Ur5eRobotiq2f85RelCartesianOSCTr
         super().__post_init__()
         self.events.reset_from_reset_states.params["sgs"] = dict(SGS_PPO)
         self.rewards.success_latch = RewTerm(func=task_mdp.SuccessLatch, weight=1.0)
+        self.events.sgs_sync = EventTerm(func=task_mdp.sgs_sync, mode="interval", interval_range_s=(1.0, 1.0), is_global_time=True)
 
 
 @configclass
@@ -36,3 +40,15 @@ class Ur5eRobotiq2f85RelCartesianOSCSymmetrySGSTrainCfg(Ur5eRobotiq2f85RelCartes
         super().__post_init__()
         self.events.reset_from_reset_states.params["sgs"] = dict(SGS_PPO)
         self.rewards.success_latch = RewTerm(func=task_mdp.SuccessLatch, weight=1.0)
+        self.events.sgs_sync = EventTerm(func=task_mdp.sgs_sync, mode="interval", interval_range_s=(1.0, 1.0), is_global_time=True)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCSymmetrySGSMaxSysidTrainCfg(Ur5eRobotiq2f85RelCartesianOSCSymmetrySGSTrainCfg):
+    """``...-State-Symmetry-SGS-v0`` trained directly at the final Stage-2 dynamics (max sysid, eval OSC action)."""
+
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        apply_max_sysid(self)

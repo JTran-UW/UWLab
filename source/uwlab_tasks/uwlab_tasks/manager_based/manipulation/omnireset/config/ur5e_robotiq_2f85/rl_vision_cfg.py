@@ -15,7 +15,9 @@ from __future__ import annotations
 import torch
 
 from isaaclab.managers import ManagerTermBase
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.sensors import CameraCfg
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -26,7 +28,7 @@ from isaaclab.utils import configclass
 from isaaclab_tasks.utils.presets import MultiBackendRendererCfg
 
 from ... import mdp as task_mdp
-from .physics_presets import joint_pos_obs
+from .physics_presets import arm_joint_pos_obs, joint_pos_obs
 from .rl_state_symmetry_cfg import HOLE_SYMMETRY, PEG_SYMMETRY, SymmetryObsCfg
 from .rl_camera_bench_cfg import _RGB_SCENE, _camera, _static_curtain, apply_isaac_rtx_settings_if_kit, grayscale_image
 from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85
@@ -583,6 +585,66 @@ class randomize_camera_world_pose(ManagerTermBase):
         cam.set_world_poses(pos, quat, env_ids=env_ids, convention="opengl")
 
 
+class randomize_camera_local_pose(ManagerTermBase):
+    """Camera mount (extrinsics) jitter on the sensor's parent-local offset, which an attached camera keeps as its link
+    moves (Newton sites compose the body pose with the local offset every step). Deltas apply to the startup local pose:
+    positions in m along the parent axes, or the camera's own axes (OpenGL: +x right, +y up, +z backward) when
+    ``camera_frame``; Euler angles in degrees about the camera's own axes."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._base = None
+
+    def __call__(self, env, env_ids, sensor_name, position_deltas, euler_deltas, camera_frame=False):
+        import isaaclab.utils.math as math_utils
+        import warp as wp
+
+        cam = env.scene.sensors[sensor_name]
+        view = cam._view
+        if self._base is None:
+            pos, quat = view.get_local_poses()
+            t = lambda a: (a.torch if hasattr(a, "torch") else wp.to_torch(a)).clone()
+            self._base = (t(pos), t(quat))
+        env_ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids.to(env.device)
+        n = len(env_ids)
+        u = lambda lo_hi: torch.empty(n, device=env.device).uniform_(*lo_hi)
+        delta = torch.stack([u(position_deltas[k]) for k in ("x", "y", "z")], -1)
+        if camera_frame:
+            delta = math_utils.quat_apply(self._base[1][env_ids], delta)
+        pos = self._base[0][env_ids] + delta
+        rad = [torch.deg2rad(u(euler_deltas[k])) for k in ("roll", "pitch", "yaw")]
+        quat = math_utils.quat_mul(self._base[1][env_ids], math_utils.quat_from_euler_xyz(*rad))
+        idx = wp.from_torch(env_ids.to(torch.int32).contiguous())
+        with view.xform_local_space_writer() as writer:
+            writer.set_poses(wp.from_torch(pos.contiguous(), dtype=wp.vec3f), wp.from_torch(quat.contiguous(), dtype=wp.vec4f), idx)
+        cam._update_poses(env_ids=idx, frame_op=0)
+
+
+class offset_newton_visual_shapes(ManagerTermBase):
+    """Shift visual-only Newton shapes (no collision) whose key contains ``pattern`` by ``dz`` (m) in their body frame,
+    once at the first reset; render-only, physics untouched."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._done = False
+
+    def __call__(self, env, env_ids, pattern, dz):
+        if self._done:
+            return
+        import newton
+        import warp as wp
+        from isaaclab_newton.physics.newton_manager import NewtonManager
+
+        model = NewtonManager.get_model()
+        keys = list(getattr(model, "shape_key", None) or getattr(model, "shape_label"))
+        flags = model.shape_flags.numpy()
+        ids = [i for i, k in enumerate(keys) if pattern in str(k)]
+        assert ids, f"no Newton shapes match {pattern!r}"
+        assert not any(flags[i] & int(newton.ShapeFlags.COLLIDE_SHAPES) for i in ids), f"{pattern!r} matches colliding shapes"
+        wp.to_torch(model.shape_transform)[torch.tensor(ids, device=env.device), 2] += dz
+        self._done = True
+
+
 def add_warp_visual_events(cfg) -> None:
     """The Warp-renderable part of ``add_full_visual_events``: random solid colors on the same surfaces (redrawn on
     each reset and every 4 s) plus the side camera pose jitter set through the sensor. No textures, HDRI, focal or wrist
@@ -939,6 +1001,69 @@ def add_real2sim_appearance(cfg) -> None:
         "sensor_name": "side_camera", "position_deltas": side["position_deltas"], "euler_deltas": side["euler_deltas"]})
 
 
+def add_real2sim_v3_appearance(cfg) -> None:
+    """``add_real2sim_appearance`` plus wider randomization: random colour and any of the three textures on the peg / hole,
+    tabletop and curtains (the three curtains share a draw), key light position, fill light direction, light colour
+    temperature (constant luminance) and intensity, and side + wrist camera extrinsics."""
+    add_real2sim_appearance(cfg)
+    obj = dict(probability=0.6, saturation=(0.3, 0.9), value=(0.12, 0.6), any_texture=True)
+    cfg.events.matched_appearance.params.update(
+        random_colors={
+            "insertive_object": obj, "receptive_object": obj,
+            "tabletop": dict(probability=0.5, saturation=(0.0, 0.6), value=(0.15, 0.7), any_texture=True),
+            **{c: dict(probability=0.5, saturation=(0.0, 0.7), value=(0.2, 0.85), any_texture=True, link="curtains")
+               for c in ("curtain_left", "curtain_back", "curtain_right")},
+        },
+        key_light_half_extent=(0.35, 0.5, 0.3), fill_light_cone_deg=30.0,
+        light_temperature_range=(5200.0, 9000.0), light_tint_delta=0.02,
+        key_strength_range=(0.5, 1.6), fill_strength_range=(0.3, 1.8),
+    )
+    cfg.events.randomize_side_camera.params["euler_deltas"] = {"pitch": (-5.0, 5.0), "yaw": (-5.0, 5.0), "roll": (-5.0, 5.0)}
+    # objects rest ~3 mm below the visual mat top under Newton (2.5 mm contact penetration + mat 0.5 mm above the collider)
+    cfg.events.lower_table_mat = EventTerm(func=offset_newton_visual_shapes, mode="reset",
+                                           params={"pattern": "/Table/visuals/vention_mat", "dz": -0.003})
+    cfg.events.randomize_wrist_camera = EventTerm(func=randomize_camera_local_pose, mode="reset", params={
+        "sensor_name": "wrist_camera", "camera_frame": True,
+        # camera axes: >1 mm backward (+z) or ~1 cm down puts the camera inside the D415 housing / mount
+        "position_deltas": {"x": (-0.006, 0.006), "y": (-0.006, 0.006), "z": (-0.006, 0.001)},
+        "euler_deltas": {"pitch": (-3.0, 3.0), "yaw": (-3.0, 3.0), "roll": (-3.0, 3.0)}})
+
+
+def apply_real_camera_calibration(cfg) -> None:
+    """Side + wrist cameras fitted to the real ur5e RealSenses (2026-10-30: sim posed at recorded real joint angles, gripper
+    silhouettes matched; side IoU 0.82-0.92, wrist 0.96). Focal lengths match square real crops centred on the principal
+    points (side 476 px, wrist 460 px of the 640x480 colour streams: no edge padding). Side offset includes the reset states'
+    mean robot-base offset (y -3.86 cm); jitter is narrowed around the calibrated poses."""
+    cfg.scene.side_camera.offset = CameraCfg.OffsetCfg(
+        pos=(0.8263, 0.5318, 0.2900), rot=(-0.32400, -0.77359, 0.50469, 0.20460), convention="ros")
+    cfg.scene.side_camera.spawn.focal_length = 27.053
+    cfg.scene.wrist_camera.offset = CameraCfg.OffsetCfg(
+        pos=(0.0320, -0.0062, -0.0583), rot=(0.35130, 0.35514, 0.61136, 0.61376), convention="ros")
+    cfg.scene.wrist_camera.spawn.focal_length = 28.03
+    cfg.events.randomize_side_camera.params.update(
+        position_deltas={"x": (-0.02, 0.02), "y": (-0.02, 0.02), "z": (-0.02, 0.02)},
+        euler_deltas={"pitch": (-2.0, 2.0), "yaw": (-2.0, 2.0), "roll": (-2.0, 2.0)})
+    cfg.events.randomize_wrist_camera.params.update(
+        position_deltas={"x": (-0.005, 0.005), "y": (-0.005, 0.005), "z": (-0.005, 0.005)},
+        euler_deltas={"pitch": (-2.0, 2.0), "yaw": (-2.0, 2.0), "roll": (-2.0, 2.0)})
+
+
+def add_real2sim_v4_appearance(cfg) -> None:
+    """``add_real2sim_v3_appearance`` matched to the real policy cameras' look: darker per-camera exposure, wide per-camera
+    white balance (real side camera warm, wrist camera blue), and softer key light (larger radius, lighter shadows)."""
+    add_real2sim_v3_appearance(cfg)
+    apply_real_camera_calibration(cfg)
+    cfg.events.matched_appearance.params.update(
+        camera_exposure_ranges={"side_camera": (-1.6, -0.3), "wrist_camera": (-1.9, -0.35)},
+        camera_white_balance_rb_ranges={"side_camera": (0.94, 2.07), "wrist_camera": (0.25, 0.57)},
+        key_light_radius_range=(0.08, 0.2),
+    )
+    for name in ("side_camera", "wrist_camera"):
+        renderer = getattr(cfg.scene, name).renderer_cfg
+        renderer.shadow_floor = 0.45
+        renderer.shadow_samples = 4  # soft key light: 1 sample per pixel speckles the penumbra
+
+
 @configclass
 class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimCfg(
     Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg
@@ -957,3 +1082,167 @@ class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideReal2SimCfg(Ur5eRobotiq2
     def __post_init__(self):
         super().__post_init__()
         add_real2sim_appearance(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV3Cfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg
+):
+    """The side + wrist max-sysid aux RGB task with the wider real2sim v3 randomization (``add_real2sim_v3_appearance``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_real2sim_v3_appearance(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideSysidReal2SimV3Cfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideCfg):
+    """DINOv3 side + wrist task at max sysid with the real2sim v3 randomization (``add_real2sim_v3_appearance``)."""
+
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        apply_max_sysid(self)
+        add_real2sim_v3_appearance(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4Cfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg
+):
+    """The side + wrist max-sysid aux RGB task with the real2sim v4 look (``add_real2sim_v4_appearance``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_real2sim_v4_appearance(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4ArmJointsCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4Cfg
+):
+    """Real2Sim v4 with OmniReset's distillation state: ``vision_state`` joint positions are the 6 arm joints only
+    (19-D: last action 7 + arm joints 6 + EE pose 6), no gripper joint angles."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.vision_state.joint_pos = arm_joint_pos_obs()
+
+
+def _reapply_event_term(env, env_ids, term_name: str) -> None:
+    """Re-apply another event term with its own params (same instance: for ``matched_appearance``, same bindings and
+    base colours)."""
+    term = env.event_manager.get_term_cfg(term_name)
+    term.func(env, env_ids, **term.params)
+
+
+def add_visual_rand_interval(cfg, interval_s: float) -> None:
+    """Also re-draw the v4 look and the side + wrist camera jitter every ``interval_s`` (0: every env step), on top of
+    the per-reset draws."""
+    cfg.events.matched_appearance_interval = EventTerm(
+        func=_reapply_event_term, mode="interval", interval_range_s=(interval_s, interval_s),
+        params={"term_name": "matched_appearance"})
+    for name in ("randomize_side_camera", "randomize_wrist_camera"):
+        term = getattr(cfg.events, name)
+        setattr(cfg.events, f"{name}_interval", EventTerm(
+            func=term.func, mode="interval", interval_range_s=(interval_s, interval_s), params=dict(term.params)))
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4ArmJointsVisRand4sCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4ArmJointsCfg
+):
+    """ArmJoints v4 with all visual randomization (look, lights, exposure/WB, camera jitter) re-drawn every 4 s."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_visual_rand_interval(self, 4.0)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4ArmJointsVisRandPerStepCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4ArmJointsCfg
+):
+    """ArmJoints v4 with all visual randomization re-drawn every env step (for expert-buffer collection)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        add_visual_rand_interval(self, 0.0)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4ExpertEnvsCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4Cfg
+):
+    """Real2Sim v4 aux RGB task where every 20th env (5%) executes the state expert (train with
+    ``agent.algorithm.expert_policy_checkpoint=<ckpt>``); policy-env and expert-env success are logged apart."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_from_reset_states.params["expert_env_every"] = 20
+        self.curriculum.reset_event_log = CurrTerm(func=task_mdp.reset_event_log)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4ExpertEnvsVisitedCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4ExpertEnvsCfg
+):
+    """Expert-env task that also records the policy envs' visited states every env step (reset targets for the expert
+    envs with probability ``reset_from_reset_states.params.visited.p_visited``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_from_reset_states.params["visited"] = dict(capacity=1_310_720, capture_fraction=1.0, p_visited=0.0)
+        step_dt = self.sim.dt * self.decimation
+        self.events.capture_visited_states = EventTerm(
+            func=task_mdp.capture_visited_states, mode="interval", interval_range_s=(step_dt, step_dt), is_global_time=True
+        )
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4SGSCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4Cfg
+):
+    """Real2Sim v4 aux RGB task with Success Guided Sampling over all reset states (H=10: ~6 outcomes/state/h at 4096
+    envs; every 16th env samples uniformly as an unbiased monitor)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_from_reset_states.params["sgs"] = dict(
+            history=10, target=0.5, kappa=1.0, temperature=2.0, eps=1e-4, empty_rate=0.5,
+            async_outcomes=True, uniform_monitor_every=16,
+        )
+        self.rewards.success_latch = RewTerm(func=task_mdp.SuccessLatch, weight=1.0)
+        self.curriculum.reset_event_log = CurrTerm(func=task_mdp.reset_event_log)
+        # multi-GPU: pool outcomes across ranks on a fixed shared timer (no-op on one GPU)
+        self.events.sgs_sync = EventTerm(func=task_mdp.sgs_sync, mode="interval", interval_range_s=(1.0, 1.0), is_global_time=True)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4SGSExpertEnvsVisitedCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBReal2SimV4ExpertEnvsVisitedCfg
+):
+    """Visited-state expert-env task with Success Guided Sampling for the policy envs (the SGS task's sampler, monitor
+    and sync); expert envs neither feed nor monitor the sampler and draw their dataset resets from probs."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_from_reset_states.params["sgs"] = dict(
+            history=10, target=0.5, kappa=1.0, temperature=2.0, eps=1e-4, empty_rate=0.5,
+            async_outcomes=True, uniform_monitor_every=16,
+        )
+        self.rewards.success_latch = RewTerm(func=task_mdp.SuccessLatch, weight=1.0)
+        self.events.sgs_sync = EventTerm(func=task_mdp.sgs_sync, mode="interval", interval_range_s=(1.0, 1.0), is_global_time=True)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideSysidReal2SimV4Cfg(Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideCfg):
+    """DINOv3 side + wrist task at max sysid with the real2sim v4 look (``add_real2sim_v4_appearance``)."""
+
+    actions: Ur5eRobotiq2f85RelativeOSCEvalAction = Ur5eRobotiq2f85RelativeOSCEvalAction()
+
+    def __post_init__(self):
+        super().__post_init__()
+        apply_max_sysid(self)
+        add_real2sim_v4_appearance(self)

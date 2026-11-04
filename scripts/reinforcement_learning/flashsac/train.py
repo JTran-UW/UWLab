@@ -25,6 +25,10 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment and agent.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL policy training iterations.")
+parser.add_argument("--lr_decay_iterations", type=int, default=None,
+                    help="Cosine LR decay length in iterations (default: max_iterations); the LR then holds learning_rate_end.")
+parser.add_argument("--lr_hold_iterations", type=int, default=None,
+                    help="Hold learning_rate_peak for this many iterations (replaces the warmup) before the cosine decay.")
 parser.add_argument("--experiment_name", type=str, default=None, help="Experiment folder under logs/flashsac.")
 parser.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
 parser.add_argument("--logger", type=str, default=None, choices={"tensorboard", "wandb"}, help="Logger to use.")
@@ -48,6 +52,8 @@ AppLauncher.add_app_launcher_args(parser)
 # Isaac Lab 3.0 reads ``enable_cameras`` from the launcher args but no longer registers the flag
 if not any("--enable_cameras" in a.option_strings for a in parser._actions):
     parser.add_argument("--enable_cameras", action="store_true", default=False, help="Enable camera sensors.")
+if not any("--distributed" in a.option_strings for a in parser._actions):
+    parser.add_argument("--distributed", action="store_true", default=False, help="One process per GPU (torch.distributed.run).")
 args_cli, hydra_args = parser.parse_known_args()
 
 # clear out sys.argv for Hydra
@@ -72,6 +78,7 @@ import uwlab_tasks  # noqa: F401
 from isaaclab_flashsac.rl_cfg import FlashSACRunnerCfg
 from isaaclab_flashsac.wrapper import FlashSACVecEnvWrapper
 from uwlab_rl.flashsac import make_flashsac_env
+from uwlab_rl.flashsac.expert_envs import attach_expert_envs
 from rsl_rl_flashsac.runners import OffPolicyRunner
 
 from uwlab_tasks.utils.hydra import hydra_task_config
@@ -90,6 +97,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: FlashSACRunnerCfg):
         agent_cfg.seed = args_cli.seed
     if args_cli.max_iterations is not None:
         agent_cfg.max_iterations = args_cli.max_iterations
+    if args_cli.lr_decay_iterations is not None:
+        alg = agent_cfg.algorithm
+        alg.learning_rate_decay_steps = (
+            args_cli.lr_decay_iterations * getattr(alg, "num_learning_epochs", 1) * getattr(alg, "num_mini_batches", 1)
+        )
+    if args_cli.lr_hold_iterations is not None:
+        alg = agent_cfg.algorithm
+        alg.learning_rate_init = alg.learning_rate_peak
+        alg.learning_rate_warmup_steps = (
+            args_cli.lr_hold_iterations * getattr(alg, "num_learning_epochs", 1) * getattr(alg, "num_mini_batches", 1)
+        )
     if args_cli.experiment_name is not None:
         agent_cfg.experiment_name = args_cli.experiment_name
     if args_cli.run_name is not None:
@@ -98,6 +116,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: FlashSACRunnerCfg):
         agent_cfg.device = args_cli.device
     if args_cli.buffer_device is not None:
         agent_cfg.algorithm.buffer_device = args_cli.buffer_device
+    if args_cli.distributed:
+        # one process per GPU (torch.distributed.run): own device, own env / init seed
+        agent_cfg.device = f"cuda:{app_launcher.local_rank}"
+        agent_cfg.seed = agent_cfg.seed + app_launcher.local_rank
     if args_cli.logger == "wandb":
         agent_cfg.logger = {
             "class_name": "WandbLogWriter",
@@ -140,6 +162,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: FlashSACRunnerCfg):
             runner.alg.actor.set_action_scaling(env.action_bias.to(runner.alg.actor.action_scale.device),
                                                 env.action_scale.to(runner.alg.actor.action_scale.device))
             print(f"[INFO] Actor action scaling reset: {old_scale.tolist()} -> {runner.alg.actor.action_scale.tolist()}")
+    # expert envs: a state expert drives the reset event's expert_env_every subset (agent.algorithm.expert_policy_checkpoint)
+    attach_expert_envs(runner, env, args_cli.task, agent_cfg.device)
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)

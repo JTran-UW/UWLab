@@ -80,6 +80,11 @@ class RelCartesianOSCAction(ActionTerm):
             self._input_clip = torch.tensor(cfg.input_clip, device=self.device, dtype=torch.float32)
         else:
             self._input_clip = None
+        clip_pos, clip_rot = cfg.pose_error_clip
+        self._error_clip = None
+        if clip_pos > 0 or clip_rot > 0:
+            self._error_clip = torch.tensor([clip_pos if clip_pos > 0 else float("inf")] * 3
+                                            + [clip_rot if clip_rot > 0 else float("inf")] * 3, device=self.device)
 
         # Buffers
         self._raw_actions = torch.zeros(self.num_envs, 6, device=self.device)
@@ -156,6 +161,8 @@ class RelCartesianOSCAction(ActionTerm):
         quat_error = math_utils.quat_mul(self._ee_quat_des, math_utils.quat_inv(ee_quat_b))
         axis_angle_error = math_utils.axis_angle_from_quat(quat_error)
         pose_error = torch.cat([pos_error, axis_angle_error], dim=-1)  # (N, 6)
+        if self._error_clip is not None:
+            pose_error = torch.clamp(pose_error, -self._error_clip, self._error_clip)
 
         # PD control: tau = J^T @ (Kp * err + Kd * (-vel))
         vel_error = -ee_vel

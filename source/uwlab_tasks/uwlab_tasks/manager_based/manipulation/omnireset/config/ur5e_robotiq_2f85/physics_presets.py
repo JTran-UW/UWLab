@@ -19,6 +19,7 @@ from isaaclab_physx.physics import PhysxCfg
 from isaaclab_tasks.utils import PresetCfg, preset
 
 from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR, UWLAB_NEWTON_ASSETS_DIR
+from uwlab_assets.robots.ur5e_robotiq_gripper.kinematics import ARM_JOINT_NAMES
 
 from uwlab.sim.spawners.from_files import UsdFileWithCollisionApproximationCfg
 from uwlab.utils.newton import UWLabNewtonCfg
@@ -126,6 +127,15 @@ def joint_pos_obs():
     return preset(
         default=ObsTerm(func=task_mdp.joint_pos),
         newton_mjwarp=ObsTerm(func=task_mdp.joint_pos, clip=NEWTON_JOINT_POS_OBS_CLIP),
+    )
+
+
+def arm_joint_pos_obs():
+    """``joint_pos_obs`` restricted to the 6 arm joints (no gripper joints), in ARM_JOINT_NAMES order."""
+    params = {"asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES, preserve_order=True)}
+    return preset(
+        default=ObsTerm(func=task_mdp.joint_pos, params=params),
+        newton_mjwarp=ObsTerm(func=task_mdp.joint_pos, params=params, clip=NEWTON_JOINT_POS_OBS_CLIP),
     )
 
 
