@@ -16,12 +16,10 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab_physx.physics import PhysxCfg
-from isaaclab_tasks.utils import preset
 
-from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR, UWLAB_JTRAN_ASSETS_DIR
 
 from ... import mdp as task_mdp
-from .physics_presets import OmniResetPhysicsCfg, object_spawn_cfg, peghole_usd_path
 
 OBJECT_SPAWN_HEIGHT = 0.5
 
@@ -32,8 +30,8 @@ class PartialAssembliesSceneCfg(InteractiveSceneCfg):
 
     insertive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=object_spawn_cfg(
-            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=4,
@@ -50,7 +48,7 @@ class PartialAssembliesSceneCfg(InteractiveSceneCfg):
     receptive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/ReceptiveObject",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=peghole_usd_path(),
+            usd_path=f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd",
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=4,
@@ -84,13 +82,13 @@ class PartialAssembliesSceneCfg(InteractiveSceneCfg):
 class PartialAssembliesEventCfg:
     """Configuration for partial assemblies randomization."""
 
-    # Low friction so that the object can move around; on Newton's pyramidal cone mu = 0 makes contacts rigid
+    # Low friction so that the object can around
     insertive_object_material = EventTerm(
         func=task_mdp.randomize_rigid_body_material,
         mode="startup",
         params={
-            "static_friction_range": preset(default=(0.0, 0.0), newton_mjwarp=(0.05, 0.05)),
-            "dynamic_friction_range": preset(default=(0.0, 0.0), newton_mjwarp=(0.05, 0.05)),
+            "static_friction_range": (0.0, 0.0),
+            "dynamic_friction_range": (0.0, 0.0),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 1,
             "asset_cfg": SceneEntityCfg("insertive_object"),
@@ -102,8 +100,8 @@ class PartialAssembliesEventCfg:
         func=task_mdp.randomize_rigid_body_material,
         mode="startup",
         params={
-            "static_friction_range": preset(default=(0.0, 0.0), newton_mjwarp=(0.05, 0.05)),
-            "dynamic_friction_range": preset(default=(0.0, 0.0), newton_mjwarp=(0.05, 0.05)),
+            "static_friction_range": (0.0, 0.0),
+            "dynamic_friction_range": (0.0, 0.0),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 1,
             "asset_cfg": SceneEntityCfg("receptive_object"),
@@ -195,7 +193,7 @@ class PartialAssembliesActionsCfg:
 def make_insertive_object(usd_path: str):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=object_spawn_cfg(
+        spawn=sim_utils.UsdFileCfg(
             usd_path=usd_path,
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -230,11 +228,17 @@ def make_receptive_object(usd_path: str):
 
 variants = {
     "scene.insertive_object": {
-        "fbleg": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
+        "fbleg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
         "fbdrawerbottom": make_insertive_object(
-            f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd"
+            f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd"
         ),
-        "peg": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"),
+        "fbroundleg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundLeg/round_leg.usd"),
+        "fbroundbase": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundBase/round_base.usd"),
+        "fblampbulb": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampBulb/lamp_bulb.usd"),
+        "fblamphood": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampHood/lamp_hood.usd"),
+        "fbdeskleg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/DeskLeg/desk_leg.usd"),
+        "fbstoolleg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/StoolLeg/stool_leg.usd"),
+        "peg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/Peg/peg.usd"),
         "cupcake": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/CupCake/cupcake.usd"),
         "cube": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/InsertiveCube/insertive_cube.usd"),
         "rectangle": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Rectangle/rectangle.usd"),
@@ -244,7 +248,13 @@ variants = {
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareTableTop/square_table_top.usd"
         ),
         "fbdrawerbox": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd"),
-        "peghole": make_receptive_object(peghole_usd_path()),
+        "fbroundtop": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundTableTop/round_table_top.usd"),
+        "fbroundtopleg": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundTableTopLeg/round_table_top_leg.usd"),
+        "fblampbase": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampBase/lamp_base.usd"),
+        "fblampbasebulb": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampBaseBulb/lamp_base_bulb.usd"),
+        "fbdesktop": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/DeskTop/desk_top.usd"),
+        "fbstoolseat": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/StoolSeat/stool_seat.usd"),
+        "peghole": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"),
         "plate": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Plate/plate.usd"),
         "cube": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/ReceptiveCube/receptive_cube.usd"),
         "wall": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Wall/wall.usd"),
@@ -287,7 +297,6 @@ class PartialAssembliesCfg(ManagerBasedRLEnvCfg):
             gpu_max_rigid_patch_count=2**23,
             gpu_collision_stack_size=2**31,
         )
-        self.sim.physics = OmniResetPhysicsCfg(default=self.sim.physics)
         self.sim.use_newton_actuators = False
 
         # Render settings

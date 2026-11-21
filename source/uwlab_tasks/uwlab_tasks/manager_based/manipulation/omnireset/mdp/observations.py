@@ -317,48 +317,55 @@ def binary_force_contact(
     return contact.unsqueeze(-1)  # (N, 1)
 
 
-class SymmetricPoseObs(ManagerTermBase):
-    """Pose of an object in a reference frame, the same for every orientation its symmetry declares identical-looking.
+class ObjectsPointCloud(ManagerTermBase):
+    """Points on several objects' collider meshes, posed every step, in a reference frame. Output (E, sum n, 4):
+    xyz plus a per-object label channel (e.g. -1 insertive, +1 receptive).
 
-    Output: position in the reference frame (3) + ``symmetry.orientation_features`` of its orientation there (6 with no
-    symmetry, 15 for a 4-fold + flip object such as the peg, 18 for a 4-fold object without flip such as the peg hole).
-    The symmetry comes from the ``symmetry`` param if given, else the ``symmetry`` block of the object's metadata.yaml.
+    A pool of ``pool_factor * num_points`` FPS points per object is sampled once; each env draws a random subset of
+    ``num_points`` and redraws it at every reset (``resample_on_reset``), so point order carries no fixed identity.
     """
 
     def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
-        from uwlab_tasks.manager_based.manipulation.omnireset.mdp import symmetry
-
-        target_cfg: SceneEntityCfg = cfg.params["target_asset_cfg"]
-        self.target: RigidObject = env.scene[target_cfg.name]
-        override = cfg.params.get("symmetry")
-        if override is not None:
-            self.symmetry = symmetry.read_symmetry({"symmetry": override})
-        else:
-            self.symmetry = symmetry.read_symmetry(utils.read_metadata_from_usd_directory(self.target.cfg.spawn.usd_path))
+        p = cfg.params
+        self.objects: list[RigidObject] = [env.scene[c.name] for c in p["object_cfgs"]]
+        self.labels = [float(v) for v in p["labels"]]
+        self.num_points = int(p.get("num_points", 64))
+        pool = self.num_points * int(p.get("pool_factor", 8))
+        self.ref_asset = env.scene[p.get("ref_cfg", SceneEntityCfg("robot")).name]
+        self.pools, self.idx = [], []
+        for obj in self.objects:
+            pattern = obj.cfg.prim_path.replace("{ENV_REGEX_NS}", ".*")
+            pts = utils.sample_object_point_cloud(num_envs=env.num_envs, num_points=pool, prim_path_pattern=pattern, device=str(env.device))
+            if pts is None:
+                raise ValueError(f"No colliders found to sample points on {obj.cfg.prim_path}")
+            pts = pts.expand(env.num_envs, -1, -1) if pts.shape[0] == 1 else pts
+            self.pools.append(pts)
+            self.idx.append(torch.rand(env.num_envs, pts.shape[1], device=env.device).argsort(dim=1)[:, : self.num_points])
+        self.label_tensor = torch.cat([torch.full((self.num_points, 1), lab, device=env.device) for lab in self.labels])
 
     def __call__(
-        self, env: ManagerBasedEnv, target_asset_cfg: SceneEntityCfg, root_asset_cfg: SceneEntityCfg, symmetry=None
+        self,
+        env: ManagerBasedEnv,
+        object_cfgs: list[SceneEntityCfg],
+        labels: list[float],
+        num_points: int = 64,
+        pool_factor: int = 8,
+        ref_cfg: SceneEntityCfg | None = None,
+        resample_on_reset: bool = True,
     ) -> torch.Tensor:
-        from uwlab_tasks.manager_based.manipulation.omnireset.mdp import symmetry as sym_utils
-
-        root: RigidObject | Articulation = env.scene[root_asset_cfg.name]
-        root_idx = 0 if isinstance(root_asset_cfg.body_ids, slice) else root_asset_cfg.body_ids[0]
-        pos, quat = math_utils.subtract_frame_transforms(
-            root.data.body_link_pos_w.torch[:, root_idx],
-            root.data.body_link_quat_w.torch[:, root_idx],
-            self.target.data.body_link_pos_w.torch[:, 0],
-            self.target.data.body_link_quat_w.torch[:, 0],
-        )
-        return torch.cat([pos, sym_utils.orientation_features(quat, self.symmetry)], dim=-1)
-
-
-def position_difference_in_frame(
-    env: ManagerBasedEnv, target_asset_cfg: SceneEntityCfg, origin_asset_cfg: SceneEntityCfg, frame_cfg: SceneEntityCfg
-) -> torch.Tensor:
-    """Target root position minus origin root position, expressed in the frame of ``frame_cfg`` (e.g. the wrist)."""
-    frame: RigidObject | Articulation = env.scene[frame_cfg.name]
-    idx = 0 if isinstance(frame_cfg.body_ids, slice) else frame_cfg.body_ids[0]
-    target_pos = env.scene[target_asset_cfg.name].data.body_link_pos_w.torch[:, 0]
-    origin_pos = env.scene[origin_asset_cfg.name].data.body_link_pos_w.torch[:, 0]
-    return math_utils.quat_apply_inverse(frame.data.body_link_quat_w.torch[:, idx], target_pos - origin_pos)
+        if resample_on_reset and hasattr(env, "episode_length_buf"):
+            reset = env.episode_length_buf == 0
+            if reset.any():
+                for k, pool in enumerate(self.pools):
+                    n = int(reset.sum())
+                    self.idx[k][reset] = torch.rand(n, pool.shape[1], device=pool.device).argsort(dim=1)[:, : self.num_points]
+        ref_pos, ref_quat = self.ref_asset.data.root_pos_w.torch, self.ref_asset.data.root_quat_w.torch
+        out = []
+        for obj, pool, idx in zip(self.objects, self.pools, self.idx):
+            local = torch.gather(pool, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
+            q = obj.data.root_quat_w.torch.unsqueeze(1).expand(-1, self.num_points, -1)
+            pts_w = math_utils.quat_apply(q, local) + obj.data.root_pos_w.torch.unsqueeze(1)
+            out.append(math_utils.quat_apply_inverse(ref_quat.unsqueeze(1).expand(-1, self.num_points, -1), pts_w - ref_pos.unsqueeze(1)))
+        pts = torch.cat(out, dim=1)
+        return torch.cat([pts, self.label_tensor.unsqueeze(0).expand(pts.shape[0], -1, -1)], dim=-1)

@@ -39,7 +39,7 @@ from uwlab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActi
 from uwlab_tasks.manager_based.manipulation.omnireset.mdp import utils
 
 from ..assembly_keypoints import Offset
-from .success_guided_sampler import SuccessGuidedSampler
+from .success_guided_sampler import OutcomeQueue, SuccessGuidedSampler, distributed_world
 from .success_monitor_cfg import SuccessMonitorCfg
 
 
@@ -488,25 +488,6 @@ class grasp_sampling_event(ManagerTermBase):
         gripper_asset.set_joint_velocity_target(zero_joint_vel, env_ids=env_ids)
 
 
-def _global_gravity_setter():
-    """Return a function that sets the global gravity vector on the active physics backend."""
-    sim = sim_utils.SimulationContext.instance()
-    try:
-        from isaaclab_newton.physics import NewtonCfg, NewtonManager
-    except ImportError:
-        NewtonCfg = None
-    if NewtonCfg is not None and isinstance(sim.cfg.physics, NewtonCfg):
-        from newton import ModelFlags
-
-        def set_gravity(gravity):
-            NewtonManager._model.set_gravity(gravity)
-            NewtonManager.add_model_change(ModelFlags.MODEL_PROPERTIES)
-
-        return set_gravity
-    view = sim.physics_sim_view
-    return lambda gravity: view.set_gravity(carb.Float3(*gravity))
-
-
 class global_physics_control_event(ManagerTermBase):
     """Event class for global gravity and force/torque control based on synchronized timesteps."""
 
@@ -525,11 +506,11 @@ class global_physics_control_event(ManagerTermBase):
         )
         self.force_torque_asset_cfgs = cfg.params.get("force_torque_asset_cfgs", [])
         self.force_torque_magnitude = cfg.params.get("force_torque_magnitude", 0.005)
-        self._set_gravity = _global_gravity_setter()
+        self.physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         """Called when environments reset - disable gravity for positioning."""
-        self._set_gravity((0.0, 0.0, 0.0))
+        self.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
         self.gravity_enabled = False
 
     def __call__(
@@ -552,10 +533,10 @@ class global_physics_control_event(ManagerTermBase):
         ).any()
 
         if should_enable_gravity and not self.gravity_enabled:
-            self._set_gravity((0.0, 0.0, -9.81))
+            self.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, -9.81))
             self.gravity_enabled = True
         elif not should_enable_gravity and self.gravity_enabled:
-            self._set_gravity((0.0, 0.0, 0.0))
+            self.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
             self.gravity_enabled = False
         else:
             pass
@@ -698,6 +679,21 @@ class reset_end_effector_from_grasp_dataset(ManagerTermBase):
         # Load and pre-compute grasp data for fast sampling
         self._load_and_precompute_grasps(env)
 
+        # Optional: sample only grasps whose approach points down (world z < down_approach_cos) for the current object
+        # pose; the reset success check rejects the others anyway (legs lying on the table: ~98% of uniform draws).
+        self.down_approach_cos: float | None = cfg.params.get("down_approach_cos")
+        if self.down_approach_cos is not None:
+            approach = utils.read_metadata_from_usd_directory(self.robot.cfg.spawn.usd_path)["gripper_approach_direction"]
+            approach = torch.tensor(approach, dtype=torch.float32, device=env.device)
+            self.grasp_approach_obj = math_utils.quat_apply(
+                self.rel_quaternions, approach.expand(len(self.rel_quaternions), 3)
+            )
+
+    def _down_grasp_mask(self, object_quat_w: torch.Tensor) -> torch.Tensor:
+        """(N, n_grasps) bool: grasp approach points down enough for the object at ``object_quat_w``."""
+        rot_z = math_utils.matrix_from_quat(object_quat_w)[:, 2, :]
+        return rot_z @ self.grasp_approach_obj.T < self.down_approach_cos
+
     def _compute_grasp_dataset_path(self) -> str:
         usd_path = self.fixed_asset.cfg.spawn.usd_path
         obj_name = utils.object_name_from_usd(usd_path)
@@ -769,6 +765,7 @@ class reset_end_effector_from_grasp_dataset(ManagerTermBase):
         robot_ik_cfg: SceneEntityCfg,
         gripper_cfg: SceneEntityCfg,
         pose_range_b: dict[str, tuple[float, float]] = dict(),
+        down_approach_cos: float | None = None,
     ) -> None:
         """Apply grasp poses to reset end effector."""
         # RigidObject asset
@@ -778,6 +775,11 @@ class reset_end_effector_from_grasp_dataset(ManagerTermBase):
         # Randomly sample grasp indices for each environment
         num_envs = len(env_ids)
         grasp_indices = torch.randint(0, len(self.rel_positions), (num_envs,), device=env.device)
+        if self.down_approach_cos is not None:
+            down_mask = self._down_grasp_mask(object_quat_w)
+            has_any = down_mask.any(dim=1)
+            if has_any.any():
+                grasp_indices[has_any] = torch.multinomial(down_mask[has_any].float(), 1).squeeze(1)
 
         # Use pre-computed tensors for sampled grasps
         sampled_rel_positions = self.rel_positions[grasp_indices]
@@ -858,6 +860,51 @@ class reset_insertive_object_from_partial_assembly_dataset(ManagerTermBase):
         # Load and pre-compute partial assembly data for fast sampling
         self._load_and_precompute_partial_assemblies(env)
 
+        frac = cfg.params.get("success_fraction")
+        self.success_fraction: float | None = frac if frac is not None and frac >= 0.0 else None
+        if self.success_fraction is not None:
+            self._split_by_success(env)
+
+        # receptive with several success targets: the dataset was recorded at targets[0]; spread each reset over the
+        # targets uniformly by mapping its pose through T_k * T_0^-1 (all in the receptive frame)
+        from . import symmetry
+
+        rec_meta = utils.read_metadata_from_usd_directory(self.receptive_object.cfg.spawn.usd_path)
+        offsets = symmetry.success_target_offsets(rec_meta)
+        self.target_maps = None
+        if len(offsets) > 1:
+            dev = env.device
+            tp = torch.tensor([p for p, _ in offsets], device=dev, dtype=torch.float32)
+            tq = torch.tensor([q for _, q in offsets], device=dev, dtype=torch.float32)
+            k = len(offsets)
+            t0_inv_q = math_utils.quat_inv(tq[:1]).expand(k, 4)
+            t0_inv_p = -math_utils.quat_apply(t0_inv_q, tp[:1].expand(k, 3))
+            self.target_maps = math_utils.combine_frame_transforms(tp, tq, t0_inv_p, t0_inv_q)
+            print(f"Partial assemblies: spreading resets evenly over {k} success targets")
+
+    def _split_by_success(self, env):
+        """Index the partial assemblies that already pass the task success check (symmetric, yaw ignored)."""
+        from . import symmetry
+
+        ins_meta = utils.read_metadata_from_usd_directory(self.insertive_object.cfg.spawn.usd_path)
+        rec_meta = utils.read_metadata_from_usd_directory(self.receptive_object.cfg.spawn.usd_path)
+        dev, n = env.device, len(self.rel_positions)
+        ip, iq = (torch.tensor(ins_meta["assembled_offset"][k], device=dev, dtype=torch.float32) for k in ("pos", "quat"))
+        rp, rq = (torch.tensor(rec_meta["assembled_offset"][k], device=dev, dtype=torch.float32) for k in ("pos", "quat"))
+        ins_p, ins_q = math_utils.combine_frame_transforms(self.rel_positions, self.rel_quaternions, ip.expand(n, 3), iq.expand(n, 4))
+        rel_p, rel_q = math_utils.subtract_frame_transforms(rp.expand(n, 3), rq.expand(n, 4), ins_p, ins_q)
+        groups = [symmetry.symmetry_group(symmetry.read_symmetry(m)).to(dev) for m in (ins_meta, rec_meta)]
+        thr = rec_meta["success_thresholds"]
+        xyz, tilt = symmetry.symmetric_alignment_error(rel_p, rel_q, (rp, rq), *groups, (thr["position"], thr["orientation"]))
+        seated = (xyz < thr["position"]) & (tilt < thr["orientation"])
+        self.seated_indices = torch.nonzero(seated).squeeze(1)
+        self.unseated_indices = torch.nonzero(~seated).squeeze(1)
+        if len(self.seated_indices) == 0 or len(self.unseated_indices) == 0:
+            raise ValueError(f"success_fraction needs both seated and unseated partial assemblies "
+                             f"({len(self.seated_indices)} seated of {n})")
+        print(f"Partial assemblies: {len(self.seated_indices)} of {n} already pass the success check; "
+              f"sampling them with probability {self.success_fraction}")
+
     def _compute_partial_assembly_dataset_path(self) -> str:
         insertive_usd_path = self.insertive_object.cfg.spawn.usd_path
         receptive_usd_path = self.receptive_object.cfg.spawn.usd_path
@@ -898,19 +945,35 @@ class reset_insertive_object_from_partial_assembly_dataset(ManagerTermBase):
         insertive_object_cfg: SceneEntityCfg,
         receptive_object_cfg: SceneEntityCfg,
         pose_range_b: dict[str, tuple[float, float]] = dict(),
+        success_fraction: float | None = None,
     ) -> None:
-        """Reset the insertive object from a partial assembly dataset."""
+        """Reset the insertive object from a partial assembly dataset.
+
+        ``success_fraction``: probability of drawing a partial assembly that already passes the success check
+        (the rest come from the others); None or negative draws uniformly.
+        """
         # Get receptive object pose (world coordinates)
         receptive_pos_w = self.receptive_object.data.root_pos_w.torch[env_ids]
         receptive_quat_w = self.receptive_object.data.root_quat_w.torch[env_ids]
 
         # Randomly sample partial assembly indices for each environment
         num_envs = len(env_ids)
-        assembly_indices = torch.randint(0, len(self.rel_positions), (num_envs,), device=env.device)
+        if self.success_fraction is None:
+            assembly_indices = torch.randint(0, len(self.rel_positions), (num_envs,), device=env.device)
+        else:
+            pick_seated = torch.rand(num_envs, device=env.device) < self.success_fraction
+            seated = self.seated_indices[torch.randint(0, len(self.seated_indices), (num_envs,), device=env.device)]
+            unseated = self.unseated_indices[torch.randint(0, len(self.unseated_indices), (num_envs,), device=env.device)]
+            assembly_indices = torch.where(pick_seated, seated, unseated)
 
         # Use pre-computed tensors for sampled partial assemblies
         sampled_rel_positions = self.rel_positions[assembly_indices]
         sampled_rel_quaternions = self.rel_quaternions[assembly_indices]
+        if self.target_maps is not None:
+            k = torch.randint(0, self.target_maps[0].shape[0], (num_envs,), device=env.device)
+            sampled_rel_positions, sampled_rel_quaternions = math_utils.combine_frame_transforms(
+                self.target_maps[0][k], self.target_maps[1][k], sampled_rel_positions, sampled_rel_quaternions
+            )
 
         # Vectorized transform to world coordinates: T_insertive_world = T_receptive_world * T_relative
         insertive_pos_w, insertive_quat_w = math_utils.combine_frame_transforms(
@@ -1151,19 +1214,47 @@ class MultiResetManager(ManagerTermBase):
         outcome = latch[env_ids]
         monitor = self.sgs_monitor[env_ids]
         push = finished & ~monitor
-        if push.any():
-            self.sgs.update(self.state_id[env_ids][push], outcome[push])
+        watched = finished & monitor
+        if distributed_world() > 1:
+            # applied on every rank by sgs_sync, pooled across ranks
+            self._sgs_queues()
+            self.sgs_queue.push(self.state_id[env_ids][push], outcome[push])
+            self.monitor_queue.push(self.task_id[env_ids][watched], outcome[watched])
+        else:
+            if push.any():
+                self.sgs.update(self.state_id[env_ids][push], outcome[push])
+            if watched.any():
+                self.monitor_success.success_update(self.task_id[env_ids][watched], outcome[watched].float())
+            self._sgs_log(bool(watched.any()))
+        latch[env_ids] = False
+
+    def _sgs_queues(self) -> None:
+        if getattr(self, "sgs_queue", None) is None:
+            self.sgs_queue, self.monitor_queue = OutcomeQueue(self.device), OutcomeQueue(self.device)
+
+    def _sgs_log(self, monitor_updated: bool) -> None:
         if "log" not in self._env.extras:
             self._env.extras["log"] = {}
-        watched = finished & monitor
-        if watched.any():
-            self.monitor_success.success_update(self.task_id[env_ids][watched], outcome[watched].float())
+        log = self.sgs_stats()
+        if monitor_updated and hasattr(self, "monitor_success"):
             rates = self.monitor_success.get_success_rate()
-            for k in range(self.num_tasks):
-                if self.probs[k] > 0:
-                    self._env.extras["log"][f"Metrics/uniform_success_once_task_{k}"] = rates[k].item()
-        self._env.extras["log"].update(self.sgs_stats())
-        latch[env_ids] = False
+            log.update({f"Metrics/uniform_success_once_task_{k}": rates[k].item() for k in range(self.num_tasks) if self.probs[k] > 0})
+        self._env.extras["log"].update(log)
+        self.last_log = {**getattr(self, "last_log", {}), **log}
+
+    def sgs_sync(self) -> None:
+        """Multi-GPU: pool every rank's queued outcomes and monitor results and apply them in rank order, so all ranks
+        keep identical samplers. A collective: called by the ``sgs_sync`` global-time interval event."""
+        if self.sgs is None or distributed_world() == 1:
+            return
+        self._sgs_queues()
+        ids, out = self.sgs_queue.flush()
+        if ids.numel():
+            self.sgs.update(ids, out)
+        tids, tout = self.monitor_queue.flush()
+        if tids.numel() and hasattr(self, "monitor_success"):
+            self.monitor_success.success_update(tids, tout.float())
+        self._sgs_log(tids.numel() > 0)
 
     def __call__(
         self,
@@ -1302,6 +1393,11 @@ class MultiResetManager(ManagerTermBase):
         # write data to simulation to make sure initial state is set
         # this propagates the joint targets to the simulation
         self._env.scene.write_data_to_sim()
+
+
+def sgs_sync(env, env_ids, term_name: str = "reset_from_reset_states") -> None:
+    """Global-time interval event (same step on every rank): pools multi-GPU SGS outcomes; no-op on one GPU."""
+    env.event_manager.get_term_cfg(term_name).func.sgs_sync()
 
 
 def sample_state_data_set(episode_data: dict, idx: torch.Tensor, device: torch.device) -> dict:
@@ -2550,24 +2646,3 @@ class implicit_to_explicit_swap(ManagerTermBase):
             return {"actuator_swapped": False, "scale_progress": self._sysid_term.scale_progress}
 
         return self._do_swap(env)
-
-
-def set_newton_equality_solref(
-    env: ManagerBasedEnv, env_ids: torch.Tensor | None, timeconst: float, dampratio: float = 1.0
-) -> None:
-    """Set the MuJoCo ``solref`` of every equality constraint (mimic joints, loop closures) on Newton's MuJoCo-Warp.
-
-    The default 20 ms time constant lets the Robotiq four-bar yield under grip load. Newton backend only.
-    """
-    import warp as wp
-    from isaaclab_newton.physics import NewtonManager
-
-    sources = (
-        NewtonManager._solver.mjw_model.eq_solref,
-        getattr(getattr(NewtonManager._model, "mujoco", None), "eq_solref", None),
-    )
-    for array in sources:
-        if array is not None:
-            values = wp.to_torch(array)
-            values[..., 0] = timeconst
-            values[..., 1] = dampratio

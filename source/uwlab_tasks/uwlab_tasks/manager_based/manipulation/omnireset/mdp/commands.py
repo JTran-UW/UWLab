@@ -108,6 +108,16 @@ class TaskCommand(TaskDependentCommand):
                 torch.tensor(self.receptive_asset_offset.pos, device=self.device),
                 torch.tensor(self.receptive_asset_offset.quat, device=self.device),
             )
+        # several success targets (receptive metadata ``success_targets: all``): success at the best-scoring one
+        offsets = symmetry.success_target_offsets(receptive_meta)
+        self.success_targets = None
+        if len(offsets) > 1:
+            self.success_targets = [
+                (torch.tensor(p, device=self.device), torch.tensor(q, device=self.device)) for p, q in offsets
+            ]
+            if self.symmetry_groups is None:
+                identity = symmetry.symmetry_group(None).to(self.device)
+                self.symmetry_groups = (identity, identity)
 
         self.metrics["average_rot_align_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["average_pos_align_error"] = torch.zeros(self.num_envs, device=self.device)
@@ -144,20 +154,32 @@ class TaskCommand(TaskDependentCommand):
         insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w = self.insertive_asset_offset.apply(
             self.insertive_asset
         )
-        receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self.receptive_asset_offset.apply(
-            self.receptive_asset
-        )
-        insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat = (
-            math_utils.subtract_frame_transforms(
-                receptive_asset_alignment_pos_w,
-                receptive_asset_alignment_quat_w,
+        if self.success_targets is not None:
+            ins_pos_r, ins_quat_r = math_utils.subtract_frame_transforms(
+                self.receptive_asset.data.root_pos_w.torch,
+                self.receptive_asset.data.root_quat_w.torch,
                 insertive_asset_alignment_pos_w,
                 insertive_asset_alignment_quat_w,
             )
-        )
-        self.xyz_distance[:], self.euler_xy_distance[:] = self.alignment_error(
-            insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat
-        )
+            self.xyz_distance[:], self.euler_xy_distance[:], _ = symmetry.multi_target_alignment_error(
+                ins_pos_r, ins_quat_r, self.success_targets, *self.symmetry_groups,
+                (self.success_position_threshold, self.success_orientation_threshold),
+            )
+        else:
+            receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self.receptive_asset_offset.apply(
+                self.receptive_asset
+            )
+            insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat = (
+                math_utils.subtract_frame_transforms(
+                    receptive_asset_alignment_pos_w,
+                    receptive_asset_alignment_quat_w,
+                    insertive_asset_alignment_pos_w,
+                    insertive_asset_alignment_quat_w,
+                )
+            )
+            self.xyz_distance[:], self.euler_xy_distance[:] = self.alignment_error(
+                insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat
+            )
         self.position_aligned[:] = self.xyz_distance < self.success_position_threshold
         self.orientation_aligned[:] = self.euler_xy_distance < self.success_orientation_threshold
         self.metrics["average_rot_align_error"][:] = self.euler_xy_distance
@@ -166,7 +188,10 @@ class TaskCommand(TaskDependentCommand):
     def alignment_error(self, rel_pos: torch.Tensor, rel_quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Position error and |roll| + |pitch| (yaw ignored) of the insertive alignment frame in the receptive one."""
         if self.symmetry_groups is not None:
-            return symmetry.symmetric_alignment_error(rel_pos, rel_quat, self.receptive_offset_tensors, *self.symmetry_groups)
+            return symmetry.symmetric_alignment_error(
+                rel_pos, rel_quat, self.receptive_offset_tensors, *self.symmetry_groups,
+                (self.success_position_threshold, self.success_orientation_threshold),
+            )
         e_x, e_y, _ = math_utils.euler_xyz_from_quat(rel_quat)
         return torch.norm(rel_pos, dim=1), math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
 
@@ -181,3 +206,41 @@ class TaskCommand(TaskDependentCommand):
 
     def _debug_vis_callback(self, event):
         pass
+
+
+class MultiStageTaskCommand(TaskCommand):
+    """``TaskCommand`` whose success requires every stage aligned: the primary insertive/receptive pair plus each
+    ``cfg.extra_stages`` pair (same thresholds, single offset, yaw ignored). ``position_aligned`` and
+    ``orientation_aligned`` hold the all-stage flag, so success metrics, ``SuccessLatch`` and SGS see full assembly."""
+
+    def __init__(self, cfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        self.stages = []
+        for s in cfg.extra_stages:
+            ins, rec = env.scene[s["insertive"]], env.scene[s["receptive"]]
+            io = s.get("insertive_offset") or utils.read_metadata_from_usd_directory(ins.cfg.spawn.usd_path)["assembled_offset"]
+            ro = s["receptive_offset"]
+            self.stages.append((ins, rec, Offset(pos=tuple(io["pos"]), quat=tuple(io["quat"])),
+                                Offset(pos=tuple(ro["pos"]), quat=tuple(ro["quat"]))))
+        self.stage_aligned = torch.zeros(len(self.stages) + 1, self.num_envs, dtype=torch.bool, device=self.device)
+        for k in range(len(self.stages) + 1):
+            self.metrics[f"end_of_episode_stage{k}_success_rate"] = torch.zeros(self.num_envs, device=self.device)
+
+    def _update_metrics(self):
+        reset_env = self._env.episode_length_buf == 0
+        for k in range(len(self.stages) + 1):
+            self.metrics[f"end_of_episode_stage{k}_success_rate"][reset_env] = self.stage_aligned[k][reset_env].float()
+        super()._update_metrics()
+        all_ok = self.orientation_aligned & self.position_aligned
+        self.stage_aligned[0] = all_ok
+        for k, (ins, rec, io, ro) in enumerate(self.stages):
+            ip, iq = io.apply(ins)
+            rp, rq = ro.apply(rec)
+            p, q = math_utils.subtract_frame_transforms(rp, rq, ip, iq)
+            e_x, e_y, _ = math_utils.euler_xyz_from_quat(q)
+            tilt = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
+            ok = (p.norm(dim=1) < self.success_position_threshold) & (tilt < self.success_orientation_threshold)
+            self.stage_aligned[k + 1] = ok
+            all_ok = all_ok & ok
+        self.position_aligned[:] = all_ok
+        self.orientation_aligned[:] = all_ok

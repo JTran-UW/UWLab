@@ -23,6 +23,8 @@ class TorchDatasetFileHandler(DatasetFileHandlerBase):
     Dataset file handler that saves data directly in torch format as a torch file.
     """
 
+    # RecorderManager flushes after every export; a full torch.save each time is quadratic in dataset size, and the
+    # recorders cannot resume from a partial file, so the dataset is written once, on close.
     def __init__(self):
         self._file_path: str | None = None
         self._episode_data: dict[str, Any] = {}
@@ -99,22 +101,22 @@ class TorchDatasetFileHandler(DatasetFileHandlerBase):
                 if key not in dest:
                     dest[key] = []
                 if store_data:
-                    dest[key].extend(src[key][-1:])  # Only take the last entry from src[key]
+                    dest[key].extend(t.cpu() if torch.is_tensor(t) else t for t in src[key][-1:])
 
     def load_episode(self, episode_name: str, device: str = "cpu") -> EpisodeData | None:
         """Load episode data from the file."""
         # Not applicable for this handler since we store aggregated data
         raise NotImplementedError("Load episode not supported for preprocessed format")
 
-    def flush(self):
-        """Flush any pending data to disk."""
-        if self._file_path and self._episode_data:
+    def flush(self, force: bool = False):
+        """Write the dataset to disk; only on ``force`` (from :meth:`close`)."""
+        if force and self._file_path and self._episode_data:
             # Stamp the quaternion convention; loaders refuse files without it.
             torch.save({**self._episode_data, "quat_convention": "xyzw"}, self._file_path)
 
     def close(self):
         """Close the dataset file handler."""
-        self.flush()
+        self.flush(force=True)
         self._episode_data = {}
         self._file_path = None
 

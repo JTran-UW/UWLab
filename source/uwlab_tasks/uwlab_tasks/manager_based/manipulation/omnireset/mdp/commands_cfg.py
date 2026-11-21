@@ -10,7 +10,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
-from .commands import TaskCommand, TaskDependentCommand
+from .commands import MultiStageTaskCommand, TaskCommand, TaskDependentCommand
 
 
 @configclass
@@ -38,3 +38,13 @@ class TaskCommandCfg(TaskDependentCommandCfg):
 
     receptive_symmetry: dict | None = None
     """Symmetry of the receptive object (``symmetry`` block format); None reads it from the object's metadata."""
+
+
+@configclass
+class MultiStageTaskCommandCfg(TaskCommandCfg):
+    class_type: type = MultiStageTaskCommand
+
+    extra_stages: list[dict] = []
+    """Further stages that must also be aligned for success: dicts with ``insertive`` and ``receptive`` scene names,
+    ``receptive_offset`` ({pos, quat} xyzw, in the receptive's frame) and optional ``insertive_offset`` (default: the
+    insertive's metadata ``assembled_offset``)."""

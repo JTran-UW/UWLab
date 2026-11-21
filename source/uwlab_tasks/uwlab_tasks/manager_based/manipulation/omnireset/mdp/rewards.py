@@ -95,10 +95,8 @@ class ProgressContext(ManagerTermBase):
             pos=tuple(insertive_meta.get("assembled_offset").get("pos")),
             quat=tuple(insertive_meta.get("assembled_offset").get("quat")),
         )
-        self.receptive_asset_offset = Offset(
-            pos=tuple(receptive_meta.get("assembled_offset").get("pos")),
-            quat=tuple(receptive_meta.get("assembled_offset").get("quat")),
-        )
+        receptive_offset = cfg.params.get("receptive_offset") or receptive_meta.get("assembled_offset")
+        self.receptive_asset_offset = Offset(pos=tuple(receptive_offset.get("pos")), quat=tuple(receptive_offset.get("quat")))
 
         self.orientation_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
         self.position_aligned = torch.zeros((env.num_envs), dtype=torch.bool, device=env.device)
@@ -122,6 +120,7 @@ class ProgressContext(ManagerTermBase):
         insertive_asset_cfg: SceneEntityCfg,
         receptive_asset_cfg: SceneEntityCfg,
         command_context: str = "task_command",
+        receptive_offset: dict | None = None,
     ) -> torch.Tensor:
         task_command: TaskCommand = env.command_manager.get_term(command_context)
         success_position_threshold = task_command.success_position_threshold
@@ -129,21 +128,33 @@ class ProgressContext(ManagerTermBase):
         insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w = self.insertive_asset_offset.apply(
             self.insertive_asset
         )
-        receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self.receptive_asset_offset.apply(
-            self.receptive_asset
-        )
-        insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat = (
-            math_utils.subtract_frame_transforms(
-                receptive_asset_alignment_pos_w,
-                receptive_asset_alignment_quat_w,
-                insertive_asset_alignment_pos_w,
-                insertive_asset_alignment_quat_w,
+        if task_command.success_targets is not None:  # several success targets: the best-scoring one
+            from . import symmetry
+
+            ins_pos_r, ins_quat_r = math_utils.subtract_frame_transforms(
+                self.receptive_asset.data.root_pos_w.torch, self.receptive_asset.data.root_quat_w.torch,
+                insertive_asset_alignment_pos_w, insertive_asset_alignment_quat_w,
             )
-        )
-        # yaw could be different
-        self.xyz_distance[:], self.euler_xy_distance[:] = task_command.alignment_error(
-            insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat
-        )
+            self.xyz_distance[:], self.euler_xy_distance[:], _ = symmetry.multi_target_alignment_error(
+                ins_pos_r, ins_quat_r, task_command.success_targets, *task_command.symmetry_groups,
+                (success_position_threshold, success_orientation_threshold),
+            )
+        else:
+            receptive_asset_alignment_pos_w, receptive_asset_alignment_quat_w = self.receptive_asset_offset.apply(
+                self.receptive_asset
+            )
+            insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat = (
+                math_utils.subtract_frame_transforms(
+                    receptive_asset_alignment_pos_w,
+                    receptive_asset_alignment_quat_w,
+                    insertive_asset_alignment_pos_w,
+                    insertive_asset_alignment_quat_w,
+                )
+            )
+            # yaw could be different
+            self.xyz_distance[:], self.euler_xy_distance[:] = task_command.alignment_error(
+                insertive_asset_in_receptive_asset_frame_pos, insertive_asset_in_receptive_asset_frame_quat
+            )
         self.position_aligned[:] = self.xyz_distance < success_position_threshold
         self.orientation_aligned[:] = self.euler_xy_distance < success_orientation_threshold
         self.success[:] = self.orientation_aligned & self.position_aligned
@@ -179,6 +190,12 @@ def success_reward(env: ManagerBasedRLEnv, context: str = "progress_context") ->
     orientation_aligned: torch.Tensor = getattr(context_term, "orientation_aligned")
     position_aligned: torch.Tensor = getattr(context_term, "position_aligned")
     return torch.where(orientation_aligned & position_aligned, 1.0, 0.0)
+
+
+def command_success_reward(env: ManagerBasedRLEnv, command_name: str = "task_command") -> torch.Tensor:
+    """1 while the task command reports success (for ``MultiStageTaskCommand``: every stage aligned)."""
+    cmd = env.command_manager.get_term(command_name)
+    return (cmd.orientation_aligned & cmd.position_aligned).float()
 
 
 def action_l2_clamped(env: ManagerBasedRLEnv) -> torch.Tensor:

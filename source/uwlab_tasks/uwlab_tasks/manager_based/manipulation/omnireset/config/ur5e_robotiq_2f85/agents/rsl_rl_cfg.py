@@ -66,6 +66,38 @@ class Base_PPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class RslRlPointNetModelCfg(RslRlMLPModelCfg):
+    """rsl_rl model whose (B, N, C) observation groups go through a PointNet set encoder."""
+
+    class_name: str = "uwlab_rl.rsl_rl.point_net_model:PointNetModel"
+    point_encoder_cfg: dict = {"hidden_dims": [64, 128, 256]}
+
+
+@configclass
+class PointCloud_PPORunnerCfg(Base_PPORunnerCfg):
+    """Base recipe with a PointNet actor on (proprio, point cloud) and a privileged state critic."""
+
+    obs_groups = {"actor": ["policy", "pointcloud"], "critic": ["critic"]}
+
+    def __post_init__(self):
+        a = self.actor
+        self.actor = RslRlPointNetModelCfg(
+            hidden_dims=a.hidden_dims, activation=a.activation, obs_normalization=a.obs_normalization,
+            distribution_cfg=dict(a.distribution_cfg),
+        )
+        # PointNet activations are ~0.6 MB/sample: 16 minibatches keep 31744 envs/GPU near 40 GB instead of ~150 GB
+        self.algorithm = self.algorithm.replace(num_mini_batches=16)
+
+
+@configclass
+class LongHorizon_PPORunnerCfg(Base_PPORunnerCfg):
+    """Base recipe with gamma 0.995 (20 s horizon) for multi-stage episodes."""
+
+    def __post_init__(self):
+        self.algorithm = self.algorithm.replace(gamma=0.995)
+
+
+@configclass
 class Base_DAggerRunnerCfg(Base_PPORunnerCfg):
     algorithm = RslRlFancyPpoAlgorithmCfg(
         value_loss_coef=1.0,

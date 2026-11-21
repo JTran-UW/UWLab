@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Object symmetry declarations and orientation features that are identical for every identical-looking pose.
+"""Object symmetry declarations and alignment errors scored at the best-matching identical-looking pose.
 
 .. code:: yaml
 
@@ -23,10 +23,6 @@ import torch
 
 import isaaclab.utils.math as math_utils
 
-# Unique index multisets of a symmetric rank-4 tensor in 3-D (15 entries): xxxx xxxy ... zzzz
-TENSOR4_INDEX = [(i, j, k, l) for i in range(3) for j in range(i, 3) for k in range(j, 3) for l in range(k, 3)]
-_I4 = torch.tensor(TENSOR4_INDEX)
-
 
 def read_symmetry(metadata: dict) -> dict | None:
     """The validated ``symmetry`` block of an asset's metadata, or None if the object declares none."""
@@ -40,7 +36,10 @@ def read_symmetry(metadata: dict) -> dict | None:
     order = int(sym.get("order", 1))
     if order < 1:
         raise NotImplementedError("symmetry.order must be >= 1 (continuous symmetry, order 0, is not supported yet)")
-    return {"axis": [a / norm for a in axis], "order": order, "flip": bool(sym.get("flip", False))}
+    flip = bool(sym.get("flip", False))
+    if order == 1 and not flip:
+        return None  # trivial group: same as declaring no symmetry
+    return {"axis": [a / norm for a in axis], "order": order, "flip": flip}
 
 
 def _axes(sym: dict) -> tuple[torch.Tensor, torch.Tensor]:
@@ -71,13 +70,16 @@ def symmetric_alignment_error(
     receptive_offset: tuple[torch.Tensor, torch.Tensor],
     insertive_group: torch.Tensor,
     receptive_group: torch.Tensor,
+    thresholds: tuple[float, float],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Position error [N] and |roll| + |pitch| [N] of the best-aligned symmetric version of an assembly.
 
     ``rel_pos``/``rel_quat`` [N, 3]/[N, 4]: the insertive alignment frame in the receptive alignment frame.
     ``receptive_offset``: the receptive alignment offset (pos [3], quat [4]) in its object frame, about which
     ``receptive_group`` acts (``insertive_group`` acts in the insertive alignment frame). Yaw is ignored, as in the
-    single-offset check, and the position error is taken at the version with the smallest tilt.
+    single-offset check. The version returned minimizes max(xyz / thresholds[0], tilt / thresholds[1]), so a pose
+    passes both thresholds iff some version does (a receptive group that moves the target, e.g. a tabletop's four
+    holes, must be chosen by position, not tilt).
     """
     off_p, off_q = (t.to(rel_pos) for t in receptive_offset)
     h_inv = math_utils.quat_inv(receptive_group.to(rel_pos))
@@ -93,40 +95,42 @@ def symmetric_alignment_error(
     )
     e_x, e_y, _ = math_utils.euler_xyz_from_quat(quat)
     tilt = (math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()).view(n, k_h * k_g)
-    tilt, best = tilt.min(dim=1)
-    xyz = pos.norm(dim=-1).gather(1, (best // k_g)[:, None]).squeeze(1)
-    return xyz, tilt
+    xyz = pos.norm(dim=-1).repeat_interleave(k_g, 1)
+    best = torch.maximum(xyz / thresholds[0], tilt / thresholds[1]).argmin(dim=1, keepdim=True)
+    return xyz.gather(1, best).squeeze(1), tilt.gather(1, best).squeeze(1)
 
 
-def tensor4_features(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """[N, 15]: unique components of ``u^{(x)4} + v^{(x)4}`` for unit vectors ``u``, ``v`` [N, 3].
+def success_target_offsets(receptive_meta: dict) -> list[tuple[list[float], list[float]]]:
+    """Receptive alignment offsets (pos, quat xyzw) that count as success: every ``targets`` entry when the metadata
+    says ``success_targets: all`` (e.g. a desk top whose 4 holes are not related by its symmetry), else just
+    ``assembled_offset``."""
+    if receptive_meta.get("success_targets") == "all" and receptive_meta.get("targets"):
+        return [(list(t["pos"]), list(t["quat"])) for t in receptive_meta["targets"]]
+    o = receptive_meta["assembled_offset"]
+    return [(list(o["pos"]), list(o["quat"]))]
 
-    With ``u``/``v`` the two face normals of a 4-fold object this is invariant to 90-degree spins (which swap them)
-    and flips (which negate them), and is a smooth function of the pose.
+
+def multi_target_alignment_error(
+    ins_pos_r: torch.Tensor,
+    ins_quat_r: torch.Tensor,
+    targets: list[tuple[torch.Tensor, torch.Tensor]],
+    insertive_group: torch.Tensor,
+    receptive_group: torch.Tensor,
+    thresholds: tuple[float, float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Best ``symmetric_alignment_error`` over several receptive targets.
+
+    ``ins_pos_r``/``ins_quat_r`` [N, 3]/[N, 4]: the insertive alignment frame in the receptive ROOT frame. Returns
+    position error [N], |roll| + |pitch| [N] and the index [N] of the target that scored best (by
+    max(xyz / pos_thr, tilt / ori_thr)).
     """
-    idx = _I4.to(u.device)
-    return u[:, idx].prod(dim=-1) + v[:, idx].prod(dim=-1)
-
-
-def orientation_features(quat: torch.Tensor, sym: dict | None) -> torch.Tensor:
-    """Continuous features of an orientation that are identical for every identical-looking version of it.
-
-    ``quat`` [N, 4] is the object's orientation in some reference frame. With ``u``, ``v`` the object's axes
-    perpendicular to its symmetry axis ``a`` (rotated into that frame):
-
-    * no symmetry: the first two columns of the rotation matrix [6];
-    * ``order: 4, flip: true``: ``u^4 + v^4`` [15];
-    * ``order: 4, flip: false``: the same plus the axis ``a`` [18], since the object is not the same upside down.
-    """
-
-    def axis(local: torch.Tensor) -> torch.Tensor:
-        return math_utils.quat_apply(quat, local.to(quat).expand(quat.shape[0], 3))
-
-    if sym is None:
-        return torch.cat([axis(torch.tensor([1.0, 0.0, 0.0])), axis(torch.tensor([0.0, 1.0, 0.0]))], dim=-1)
-    if sym["order"] != 4:
-        raise NotImplementedError(f"orientation features for symmetry order {sym['order']} are not implemented yet")
-    a, u = _axes(sym)
-    v = torch.linalg.cross(a, u)
-    t4 = tensor4_features(axis(u), axis(v))
-    return t4 if sym["flip"] else torch.cat([t4, axis(a)], dim=-1)
+    errs = []
+    for t_p, t_q in targets:
+        t_p, t_q = t_p.to(ins_pos_r), t_q.to(ins_pos_r)
+        n = ins_pos_r.shape[0]
+        rel_p, rel_q = math_utils.subtract_frame_transforms(t_p.expand(n, 3), t_q.expand(n, 4), ins_pos_r, ins_quat_r)
+        errs.append(symmetric_alignment_error(rel_p, rel_q, (t_p, t_q), insertive_group, receptive_group, thresholds))
+    xyz = torch.stack([e[0] for e in errs], dim=1)
+    tilt = torch.stack([e[1] for e in errs], dim=1)
+    best = torch.maximum(xyz / thresholds[0], tilt / thresholds[1]).argmin(dim=1, keepdim=True)
+    return xyz.gather(1, best).squeeze(1), tilt.gather(1, best).squeeze(1), best.squeeze(1)

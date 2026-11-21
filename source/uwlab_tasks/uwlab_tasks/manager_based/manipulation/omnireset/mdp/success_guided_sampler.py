@@ -10,6 +10,48 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.distributed as dist
+
+
+def distributed_world() -> int:
+    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+
+
+def gather_ragged(x: torch.Tensor) -> torch.Tensor:
+    """All-gather a 1-D tensor whose length differs per rank; the rank-ordered concatenation, identical on every rank."""
+    ws = dist.get_world_size()
+    n = torch.tensor([x.numel()], dtype=torch.long, device=x.device)
+    ns = [torch.zeros_like(n) for _ in range(ws)]
+    dist.all_gather(ns, n)
+    sizes = [int(k.item()) for k in ns]
+    if max(sizes) == 0:
+        return x[:0]
+    pad = torch.zeros(max(sizes), dtype=x.dtype, device=x.device)
+    pad[: x.numel()] = x
+    outs = [torch.zeros_like(pad) for _ in range(ws)]
+    dist.all_gather(outs, pad)
+    return torch.cat([o[:k] for o, k in zip(outs, sizes)])
+
+
+class OutcomeQueue:
+    """Multi-GPU SGS: each rank queues (key, outcome) pairs and ``flush`` pools every rank's queue in rank order.
+
+    ``flush`` is a collective: call it at the same step on every rank (a global-time interval event), never from a
+    reset event, which only runs on steps where that rank has resets.
+    """
+
+    def __init__(self, device: str | torch.device):
+        self.device = torch.device(device)
+        self.parts: list[torch.Tensor] = []
+
+    def push(self, keys: torch.Tensor, outcomes: torch.Tensor) -> None:
+        self.parts.append(keys.to(self.device, torch.long).flatten() * 2 + outcomes.to(self.device).long().flatten())
+
+    def flush(self) -> tuple[torch.Tensor, torch.Tensor]:
+        local = torch.cat(self.parts) if self.parts else torch.zeros(0, dtype=torch.long, device=self.device)
+        self.parts = []
+        pooled = gather_ragged(local)
+        return pooled // 2, (pooled % 2).bool()
 
 
 class SuccessGuidedSampler:

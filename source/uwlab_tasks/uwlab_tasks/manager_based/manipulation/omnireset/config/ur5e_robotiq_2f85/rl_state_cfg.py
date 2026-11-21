@@ -22,8 +22,9 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab_physx.physics import PhysxCfg
 
-from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR, UWLAB_JTRAN_ASSETS_DIR
 from uwlab_assets.robots.ur5e_robotiq_gripper import EXPLICIT_UR5E_ROBOTIQ_2F85, IMPLICIT_UR5E_ROBOTIQ_2F85
+from uwlab_assets.robots.ur5e_robotiq_gripper.ur5e_robotiq_2f85_gripper import spawn_ur5e_without_physics_materials
 
 from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.actions import (
     Ur5eRobotiq2f85RelativeOSCAction,
@@ -31,16 +32,6 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.a
 )
 
 from ... import mdp as task_mdp
-from .physics_presets import (
-    OmniResetPhysicsCfg,
-    abnormal_robot_penalty,
-    abnormal_robot_termination,
-    joint_pos_obs,
-    newton_equality_solref_event,
-    object_spawn_cfg,
-    omnireset_dataset_dir,
-    peghole_usd_path,
-)
 
 
 @configclass
@@ -51,8 +42,8 @@ class RlStateSceneCfg(InteractiveSceneCfg):
 
     insertive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=object_spawn_cfg(
-            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=4,
@@ -68,7 +59,7 @@ class RlStateSceneCfg(InteractiveSceneCfg):
     receptive_object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/ReceptiveObject",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=peghole_usd_path(),
+            usd_path=f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd",
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=4,
@@ -125,8 +116,6 @@ class BaseEventCfg:
     """
 
     robot_wrist_armature = None
-
-    newton_equality_solref = newton_equality_solref_event()
 
     # mode: startup (randomize dynamics)
     robot_material = EventTerm(
@@ -254,7 +243,7 @@ class TrainEventCfg(BaseEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": omnireset_dataset_dir(),
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
             "reset_types": [
                 "ObjectAnywhereEEAnywhere",
                 "ObjectRestingEEGrasped",
@@ -275,7 +264,7 @@ class TrainEvalEventCfg(BaseEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": omnireset_dataset_dir(),
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
@@ -319,7 +308,7 @@ class FinetuneEvalEventCfg(BaseEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": omnireset_dataset_dir(),
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
@@ -373,6 +362,8 @@ class CommandsCfg:
         resampling_time_range=(1e6, 1e6),
         insertive_asset_cfg=SceneEntityCfg("insertive_object"),
         receptive_asset_cfg=SceneEntityCfg("receptive_object"),
+        # success at any pose the objects' metadata symmetry makes identical-looking (canonical if none is declared)
+        symmetric_success=True,
     )
 
 
@@ -390,7 +381,7 @@ class ObservationsCfg:
 
         prev_actions = ObsTerm(func=task_mdp.last_action)
 
-        joint_pos = joint_pos_obs()
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
 
         end_effector_pose = ObsTerm(
             func=task_mdp.target_asset_pose_in_root_asset_frame,
@@ -443,7 +434,7 @@ class ObservationsCfg:
 
         prev_actions = ObsTerm(func=task_mdp.last_action)
 
-        joint_pos = joint_pos_obs()
+        joint_pos = ObsTerm(func=task_mdp.joint_pos)
 
         end_effector_pose = ObsTerm(
             func=task_mdp.target_asset_pose_in_root_asset_frame,
@@ -561,7 +552,7 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder.*", "elbow.*", "wrist.*"])},
     )
 
-    abnormal_robot = abnormal_robot_penalty()
+    abnormal_robot = RewTerm(func=task_mdp.abnormal_robot_state, weight=-100.0)
 
     # task rewards
 
@@ -596,7 +587,7 @@ class TerminationsCfg:
 
     time_out = DoneTerm(func=task_mdp.time_out, time_out=True)
 
-    abnormal_robot = abnormal_robot_termination()
+    abnormal_robot = DoneTerm(func=task_mdp.abnormal_robot_state)
 
 
 @configclass
@@ -640,10 +631,17 @@ class NoCurriculumsCfg:
     pass
 
 
-def make_insertive_object(usd_path: str):
+def spawn_usd_without_physics_materials(prim_path, cfg, translation=None, orientation=None, **kwargs):
+    """Spawn an object USD without its authored physics materials: PhysX creates one material per env per USD
+    material (at most 64K per process), and the startup material events set the object's friction anyway."""
+    return spawn_ur5e_without_physics_materials(prim_path, cfg, translation, orientation)
+
+
+def make_insertive_object(usd_path: str, strip_materials: bool = False):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=object_spawn_cfg(
+        spawn=sim_utils.UsdFileCfg(
+            func=spawn_usd_without_physics_materials if strip_materials else sim_utils.spawn_from_usd,
             usd_path=usd_path,
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -658,10 +656,11 @@ def make_insertive_object(usd_path: str):
     )
 
 
-def make_receptive_object(usd_path: str):
+def make_receptive_object(usd_path: str, strip_materials: bool = False):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/ReceptiveObject",
         spawn=sim_utils.UsdFileCfg(
+            func=spawn_usd_without_physics_materials if strip_materials else sim_utils.spawn_from_usd,
             usd_path=usd_path,
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -678,11 +677,17 @@ def make_receptive_object(usd_path: str):
 
 variants = {
     "scene.insertive_object": {
-        "fbleg": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
+        "fbleg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
         "fbdrawerbottom": make_insertive_object(
-            f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd"
+            f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd"
         ),
-        "peg": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"),
+        "fbroundleg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundLeg/round_leg.usd"),
+        "fbroundbase": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundBase/round_base.usd"),
+        "fblampbulb": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampBulb/lamp_bulb.usd"),
+        "fblamphood": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampHood/lamp_hood.usd"),
+        "fbdeskleg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/DeskLeg/desk_leg.usd"),
+        "fbstoolleg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/StoolLeg/stool_leg.usd"),
+        "peg": make_insertive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/Peg/peg.usd"),
         "cupcake": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/CupCake/cupcake.usd"),
         "cube": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/InsertiveCube/insertive_cube.usd"),
         "rectangle": make_insertive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Rectangle/rectangle.usd"),
@@ -692,7 +697,13 @@ variants = {
             f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareTableTop/square_table_top.usd"
         ),
         "fbdrawerbox": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBox/drawer_box.usd"),
-        "peghole": make_receptive_object(peghole_usd_path()),
+        "fbroundtop": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundTableTop/round_table_top.usd"),
+        "fbroundtopleg": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundTableTopLeg/round_table_top_leg.usd"),
+        "fblampbase": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampBase/lamp_base.usd"),
+        "fblampbasebulb": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampBaseBulb/lamp_base_bulb.usd"),
+        "fbdesktop": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/DeskTop/desk_top.usd"),
+        "fbstoolseat": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/StoolSeat/stool_seat.usd"),
+        "peghole": make_receptive_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/PegHole/peg_hole.usd"),
         "plate": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Plate/plate.usd"),
         "cube": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/ReceptiveCube/receptive_cube.usd"),
         "wall": make_receptive_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Wall/wall.usd"),
@@ -730,13 +741,14 @@ class Ur5eRobotiq2f85RlStateCfg(ManagerBasedRLEnvCfg):
             bounce_threshold_velocity=0.02,
             friction_offset_threshold=0.01,
             friction_correlation_distance=0.0005,
-            gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
+            # contact-heavy assets (drawer: 37 shapes) overflowed 2**23 contacts at 31744 envs/GPU and killed PhysX
+            gpu_found_lost_pairs_capacity=2**23,
+            gpu_found_lost_aggregate_pairs_capacity=2**23,
             gpu_total_aggregate_pairs_capacity=2**23,
-            gpu_max_rigid_contact_count=2**23,
-            gpu_max_rigid_patch_count=2**23,
+            gpu_max_rigid_contact_count=2**24,
+            gpu_max_rigid_patch_count=2**24,
             gpu_collision_stack_size=2**31,
         )
-        self.sim.physics = OmniResetPhysicsCfg(default=self.sim.physics)
 
         self.sim.use_newton_actuators = False
 

@@ -18,9 +18,10 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import JointWrenchSensorCfg, TiledCameraCfg
 from isaaclab.utils import configclass
 
+from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+
 from ... import mdp as task_mdp
 from .actions import Ur5eRobotiq2f85RelativeOSCEvalAction
-from .physics_presets import omnireset_dataset_dir
 from .rl_state_cfg import FinetuneEvalEventCfg, RlStateSceneCfg, Ur5eRobotiq2f85RlStateCfg
 
 
@@ -361,7 +362,7 @@ class RGBEventCfg(BaseRGBEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": omnireset_dataset_dir(),
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
@@ -377,7 +378,7 @@ class DataCollectionRGBEventCfg(RGBEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": omnireset_dataset_dir(),
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
             "reset_types": [
                 "ObjectAnywhereEEAnywhere",
                 "ObjectRestingEEGrasped",
@@ -796,7 +797,7 @@ class OODRGBEventCfg(BaseRGBEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": omnireset_dataset_dir(),
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
             "reset_types": ["ObjectAnywhereEEAnywhere"],
             "probs": [1.0],
             "success": "env.reward_manager.get_term_cfg('progress_context').func.success",
@@ -812,7 +813,7 @@ class DataCollectionOODRGBEventCfg(OODRGBEventCfg):
         func=task_mdp.MultiResetManager,
         mode="reset",
         params={
-            "dataset_dir": omnireset_dataset_dir(),
+            "dataset_dir": f"{UWLAB_CLOUD_ASSETS_DIR}/Datasets/OmniReset_isaaclab3",
             "reset_types": [
                 "ObjectAnywhereEEAnywhere",
                 "ObjectRestingEEGrasped",

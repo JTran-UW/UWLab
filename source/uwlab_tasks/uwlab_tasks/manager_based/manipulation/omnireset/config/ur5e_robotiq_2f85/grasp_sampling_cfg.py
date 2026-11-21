@@ -19,10 +19,9 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab_physx.physics import PhysxCfg
 
 import uwlab_assets.robots.ur5e_robotiq_gripper as ur5e_robotiq_gripper
-from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR
+from uwlab_assets import UWLAB_CLOUD_ASSETS_DIR, UWLAB_JTRAN_ASSETS_DIR
 
 from ... import mdp as task_mdp
-from .physics_presets import OmniResetPhysicsCfg, newton_equality_solref_event, newton_material_event, object_spawn_cfg
 
 OBJECT_SPAWN_HEIGHT = 0.5
 
@@ -35,8 +34,8 @@ class GraspSamplingSceneCfg(InteractiveSceneCfg):
 
     object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object",
-        spawn=object_spawn_cfg(
-            usd_path=f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/Peg/peg.usd",
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=4, solver_velocity_iteration_count=0, disable_gravity=False
@@ -67,11 +66,17 @@ class GraspSamplingSceneCfg(InteractiveSceneCfg):
 class GraspSamplingEventCfg:
     """Configuration for grasp sampling randomization."""
 
-    newton_equality_solref = newton_equality_solref_event()
-
-    # same ranges as the RL task's robot / insertive-object materials
-    newton_robot_material = newton_material_event("robot", (0.3, 1.2), (0.2, 1.0))
-    newton_object_material = newton_material_event("object", (1.0, 2.0), (0.9, 1.9))
+    # the reset-state collection's friction (else the gripper USD's friction-100 pads hold any grasp)
+    robot_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material, mode="startup",
+        params={"static_friction_range": (0.3, 0.3), "dynamic_friction_range": (0.2, 0.2), "restitution_range": (0.0, 0.0),
+                "num_buckets": 1, "asset_cfg": SceneEntityCfg("robot"), "make_consistent": True},
+    )
+    object_material = EventTerm(
+        func=task_mdp.randomize_rigid_body_material, mode="startup",
+        params={"static_friction_range": (0.3, 0.3), "dynamic_friction_range": (0.2, 0.2), "restitution_range": (0.0, 0.0),
+                "num_buckets": 1, "asset_cfg": SceneEntityCfg("object"), "make_consistent": True},
+    )
 
     reset_object_position = EventTerm(
         func=task_mdp.reset_root_state_uniform,
@@ -160,7 +165,7 @@ class GraspSamplingRewardsCfg:
 def make_object(usd_path: str):
     return RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/InsertiveObject",
-        spawn=object_spawn_cfg(
+        spawn=sim_utils.UsdFileCfg(
             usd_path=usd_path,
             scale=(1, 1, 1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -177,9 +182,15 @@ def make_object(usd_path: str):
 
 variants = {
     "scene.object": {
-        "fbleg": make_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
-        "fbdrawerbottom": make_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd"),
-        "peg": make_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Peg/peg.usd"),
+        "fbleg": make_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/SquareLeg/square_leg.usd"),
+        "fbdrawerbottom": make_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/DrawerBottom/drawer_bottom.usd"),
+        "fbroundleg": make_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundLeg/round_leg.usd"),
+        "fbroundbase": make_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/RoundBase/round_base.usd"),
+        "fblampbulb": make_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampBulb/lamp_bulb.usd"),
+        "fblamphood": make_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/LampHood/lamp_hood.usd"),
+        "fbdeskleg": make_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/DeskLeg/desk_leg.usd"),
+        "fbstoolleg": make_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/FurnitureBench/StoolLeg/stool_leg.usd"),
+        "peg": make_object(f"{UWLAB_JTRAN_ASSETS_DIR}/Props/Custom/Peg/peg.usd"),
         "cupcake": make_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/CupCake/cupcake.usd"),
         "cube": make_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/InsertiveCube/insertive_cube.usd"),
         "rectangle": make_object(f"{UWLAB_CLOUD_ASSETS_DIR}/Props/Custom/Rectangle/rectangle.usd"),
@@ -222,7 +233,6 @@ class Robotiq2f85GraspSamplingCfg(ManagerBasedRLEnvCfg):
             gpu_max_rigid_patch_count=2**23,
             gpu_collision_stack_size=2**31,
         )
-        self.sim.physics = OmniResetPhysicsCfg(default=self.sim.physics)
         self.sim.use_newton_actuators = False
 
         # Render settings

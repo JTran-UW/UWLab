@@ -52,6 +52,33 @@ def _load_mesh_tensors(prim):
     return verts, faces
 
 
+def _torch_sample_surface(verts_list: list[torch.Tensor], faces_list: list[torch.Tensor], n: int) -> torch.Tensor:
+    """(M, n, 3) points sampled uniformly by area on each mesh (pytorch3d ``sample_points_from_meshes`` equivalent)."""
+    out = []
+    for v, f in zip(verts_list, faces_list):
+        a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+        area = torch.linalg.cross(b - a, c - a).norm(dim=1)
+        tri = torch.multinomial(area.clamp_min(1e-12), n, replacement=True)
+        u, w = torch.rand(n, device=v.device), torch.rand(n, device=v.device)
+        s = u.sqrt()
+        out.append((1 - s)[:, None] * a[tri] + (s * (1 - w))[:, None] * b[tri] + (s * w)[:, None] * c[tri])
+    return torch.stack(out)
+
+
+def _torch_sample_farthest_points(points: torch.Tensor, K: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched farthest-point sampling from index 0 (pytorch3d ``sample_farthest_points`` equivalent): (B, K, 3), (B, K)."""
+    B, P, _ = points.shape
+    idx = torch.zeros(B, K, dtype=torch.long, device=points.device)
+    dist = torch.full((B, P), float("inf"), device=points.device)
+    rows = torch.arange(B, device=points.device)
+    last = torch.zeros(B, dtype=torch.long, device=points.device)
+    for k in range(1, K):
+        dist = torch.minimum(dist, (points - points[rows, last].unsqueeze(1)).square().sum(-1))
+        last = dist.argmax(dim=1)
+        idx[:, k] = last
+    return torch.gather(points, 1, idx.unsqueeze(-1).expand(-1, -1, 3)), idx
+
+
 def sample_object_point_cloud(
     num_envs: int,
     num_points: int,
@@ -93,13 +120,12 @@ def sample_object_point_cloud(
     try:
         from pytorch3d.ops import sample_farthest_points, sample_points_from_meshes
         from pytorch3d.structures import Meshes
-    except ImportError as exc:
-        raise ImportError(
-            "sample_object_point_cloud() requires pytorch3d, which is not installed. It is "
-            "optional and only needed by the collision analyzer used when generating datasets; "
-            "see the wheel table in uwlab_tasks/setup.py for the supported python/torch/CUDA "
-            "combinations."
-        ) from exc
+
+        def sample_surface(verts, faces, n):
+            return sample_points_from_meshes(Meshes(verts=verts, faces=faces), n)
+
+    except ImportError:  # e.g. aarch64 (no wheel; the source build fails to link): same algorithms in plain torch
+        sample_farthest_points, sample_surface = _torch_sample_farthest_points, _torch_sample_surface
 
     hasher = (
         rigid_object_hasher
@@ -115,16 +141,16 @@ def sample_object_point_cloud(
         # Pick env 0’s colliders
         mask_env0 = hasher.collider_prim_env_ids == 0
         verts_list, faces_list = zip(*[_load_mesh_tensors(p) for p, m in zip(hasher.collider_prims, mask_env0) if m])
-        meshes = Meshes(verts=[v.to(device) for v in verts_list], faces=[f.to(device) for f in faces_list])
         rel_tf = hasher.collider_prim_relative_transforms[mask_env0]
     else:
         # Build all envs's colliders
         verts_list, faces_list = zip(*[_load_mesh_tensors(p) for p in hasher.collider_prims])
-        meshes = Meshes(verts=[v.to(device) for v in verts_list], faces=[f.to(device) for f in faces_list])
         rel_tf = hasher.collider_prim_relative_transforms
+    verts_list = [v.to(device) for v in verts_list]
+    faces_list = [f.to(device) for f in faces_list]
     with temporary_seed(seed):
         # Uniform‐surface sample then scale to root
-        samp = sample_points_from_meshes(meshes, num_points * 2)
+        samp = sample_surface(verts_list, faces_list, num_points * 2)
         local, _ = sample_farthest_points(samp, K=num_points)
         t_rel, q_rel, s_rel = rel_tf[:, :3].unsqueeze(1), rel_tf[:, 3:7].unsqueeze(1), rel_tf[:, 7:].unsqueeze(1)
         # here is apply_forward not apply_inverse, because when mesh loaded, it is unscaled. But inorder to view it from

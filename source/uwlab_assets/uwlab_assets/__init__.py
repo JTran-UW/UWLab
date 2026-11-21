@@ -34,13 +34,13 @@ assets and compatible state checkpoints live on ``isaaclab3``; ``main`` keeps th
 
 UWLAB_CLOUD_ASSETS_DIR = f"{UWLAB_CLOUD_ASSETS_REPO}/resolve/{UWLAB_CLOUD_ASSETS_REVISION}"
 
-UWLAB_NEWTON_ASSETS_REPO = "https://huggingface.co/datasets/jtran-uw/uwlab-assets"
-"""HuggingFace dataset repository holding assets corrected for the Newton backend."""
+UWLAB_JTRAN_ASSETS_REPO = "https://huggingface.co/datasets/jtran-uw/uwlab-assets"
+"""HuggingFace dataset repository holding the peg, square leg, drawer, round table, stool, desk and lamp parts."""
 
-UWLAB_NEWTON_ASSETS_REVISION = "e55776463be1a6d2e3a3db5722e18da06841e2c6"  # branch newton
-"""Pinned commit of :data:`UWLAB_NEWTON_ASSETS_REPO`; its assets load on Newton and are unchanged on PhysX."""
+UWLAB_JTRAN_ASSETS_REVISION = "4e2f9e964b68aa0a83b130bd2928e9f482851aef"  # branch main
+"""Pinned commit of :data:`UWLAB_JTRAN_ASSETS_REPO`."""
 
-UWLAB_NEWTON_ASSETS_DIR = f"{UWLAB_NEWTON_ASSETS_REPO}/resolve/{UWLAB_NEWTON_ASSETS_REVISION}"
+UWLAB_JTRAN_ASSETS_DIR = f"{UWLAB_JTRAN_ASSETS_REPO}/resolve/{UWLAB_JTRAN_ASSETS_REVISION}"
 
 
 def _extract_revision_and_relative_path(url: str) -> tuple[str, str]:

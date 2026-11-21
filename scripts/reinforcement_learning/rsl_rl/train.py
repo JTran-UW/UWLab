@@ -94,7 +94,6 @@ from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
-from uwlab_rl.env_guards import apply_newton_env_guards
 
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
@@ -111,6 +110,18 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _reset_term(env):
+    """The reset-from-reset-states event term (holds the SGS sampler), or None for tasks without it."""
+    try:
+        return env.unwrapped.event_manager.get_term_cfg("reset_from_reset_states").func
+    except (AttributeError, ValueError, KeyError):
+        return None
+
+
+def _sgs_path(model_path: str) -> str:
+    return os.path.join(os.path.dirname(model_path), os.path.basename(model_path).replace("model_", "sgs_", 1))
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -198,7 +209,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-    apply_newton_env_guards(env)
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
@@ -209,11 +219,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
+    # Success Guided Sampling state (per-state outcome history) rides along with each checkpoint as sgs_<it>.pt
+    sgs = getattr(_reset_term(env), "sgs", None)
+    if sgs is not None:
+        _save = runner.save
+
+        def _save_with_sgs(path, *args, **kwargs):
+            _save(path, *args, **kwargs)
+            torch.save(sgs.state_dict(), _sgs_path(path))
+
+        runner.save = _save_with_sgs
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        if sgs is not None:
+            p = _sgs_path(resume_path)
+            if os.path.exists(p):
+                try:
+                    sgs.load_state_dict(torch.load(p, map_location=sgs.device, weights_only=False))
+                    print(f"[INFO]: Restored SGS state from: {p}")
+                except (RuntimeError, KeyError) as e:
+                    print(f"[WARN]: SGS state {p} not restored ({e}); sampler starts fresh")
+            else:
+                print(f"[INFO]: No SGS state next to the checkpoint ({p}); sampler starts fresh")
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

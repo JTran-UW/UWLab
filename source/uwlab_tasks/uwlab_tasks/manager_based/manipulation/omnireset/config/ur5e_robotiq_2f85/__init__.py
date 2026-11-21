@@ -99,22 +99,34 @@ gym.register(
 )
 
 gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Symmetry-v0",
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PointCloud-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.rl_state_symmetry_cfg:Ur5eRobotiq2f85RelCartesianOSCSymmetryTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.rl_state_pointcloud_cfg:Ur5eRobotiq2f85RelCartesianOSCPointCloudTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PointCloud_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:PointCloud_FlashSACRunnerCfg",
     },
 )
 
 gym.register(
-    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-Symmetry-SGS-v0",
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-PointCloud-SGS-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.rl_state_sgs_cfg:Ur5eRobotiq2f85RelCartesianOSCSymmetrySGSTrainCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.rl_state_pointcloud_cfg:Ur5eRobotiq2f85RelCartesianOSCPointCloudSGSTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:PointCloud_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:PointCloud_FlashSACRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-State-RoundMulti-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_state_multistage_cfg:Ur5eRobotiq2f85RelCartesianOSCRoundMultiTrainCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:LongHorizon_PPORunnerCfg",
     },
 )
 

@@ -45,7 +45,7 @@ def register_task_to_hydra(
     Args:
         task_name: The name of the task.
         agent_cfg_entry_point: The entry point key to resolve the agent's configuration file.
-        presets: Selected :class:`~isaaclab_tasks.utils.hydra.PresetCfg` alternatives (e.g. ``("newton_mjwarp",)``);
+        presets: Selected :class:`~isaaclab_tasks.utils.hydra.PresetCfg` alternatives (e.g. ``("my_preset",)``);
             every other preset resolves to its ``default``.
 
     Returns:

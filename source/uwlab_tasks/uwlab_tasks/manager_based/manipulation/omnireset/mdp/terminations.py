@@ -278,6 +278,15 @@ class check_reset_state_success(ManagerTermBase):
             )
             self.require_assembly_success = torch.rand(env.num_envs, device=env.device) < self.assembly_success_prob
             self._pending_reflip = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+            from . import symmetry
+
+            offsets = symmetry.success_target_offsets(receptive_meta)
+            self.assembly_targets = None
+            if len(offsets) > 1:  # assembled at any success target
+                self.assembly_targets = [
+                    (torch.tensor(p, device=env.device), torch.tensor(q, device=env.device)) for p, q in offsets
+                ]
+                self._identity_group = symmetry.symmetry_group(None).to(env.device)
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         super().reset(env_ids)
@@ -411,11 +420,23 @@ class check_reset_state_success(ManagerTermBase):
 
         if self.assembly_success_prob is not None:
             ins_pos_w, ins_quat_w = self.insertive_asset_offset.apply(self.insertive_asset)
-            rec_pos_w, rec_quat_w = self.receptive_asset_offset.apply(self.receptive_asset)
-            rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
-            e_x, e_y, _ = math_utils.euler_xyz_from_quat(rel_quat)
-            euler_xy_dist = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
-            xyz_dist = torch.norm(rel_pos, dim=1)
+            if self.assembly_targets is not None:
+                from . import symmetry
+
+                ins_pos_r, ins_quat_r = math_utils.subtract_frame_transforms(
+                    self.receptive_asset.data.root_pos_w.torch, self.receptive_asset.data.root_quat_w.torch,
+                    ins_pos_w, ins_quat_w,
+                )
+                xyz_dist, euler_xy_dist, _ = symmetry.multi_target_alignment_error(
+                    ins_pos_r, ins_quat_r, self.assembly_targets, self._identity_group, self._identity_group,
+                    (self.assembly_pos_threshold, self.assembly_ori_threshold),
+                )
+            else:
+                rec_pos_w, rec_quat_w = self.receptive_asset_offset.apply(self.receptive_asset)
+                rel_pos, rel_quat = math_utils.subtract_frame_transforms(rec_pos_w, rec_quat_w, ins_pos_w, ins_quat_w)
+                e_x, e_y, _ = math_utils.euler_xyz_from_quat(rel_quat)
+                euler_xy_dist = math_utils.wrap_to_pi(e_x).abs() + math_utils.wrap_to_pi(e_y).abs()
+                xyz_dist = torch.norm(rel_pos, dim=1)
             assembly_success = (xyz_dist < self.assembly_pos_threshold) & (euler_xy_dist < self.assembly_ori_threshold)
             assembly_match = torch.where(self.require_assembly_success, assembly_success, ~assembly_success)
             reset_success = reset_success & assembly_match

@@ -136,32 +136,35 @@ def main(env_cfg, agent_cfg) -> None:
 
     start_time = time.time()
 
-    while current_successful_reset_conditions < args_cli.num_reset_states:
-        # Step environment (this will evaluate grasps in parallel across environments)
-        _, _, terminated, truncated, _ = env.step(actions)
-        dones = terminated | truncated
-        done_idx = torch.where(dones)[0]
+    try:  # SIGINT (Ctrl-C, or `timeout -s INT`) stops early but still writes what was collected
+        while current_successful_reset_conditions < args_cli.num_reset_states:
+            # Step environment (this will evaluate grasps in parallel across environments)
+            _, _, terminated, truncated, _ = env.step(actions)
+            dones = terminated | truncated
+            done_idx = torch.where(dones)[0]
 
-        # Reset actions for environments that are done
-        if done_idx.numel() > 0 and not (
-            "ObjectAnywhereEEGrasped" in args_cli.task or "ObjectRestingEEGrasped" in args_cli.task
-        ):
-            actions[done_idx, -1] = (
-                torch.randint(0, 2, (done_idx.numel(),), device=env.device, dtype=torch.float32) * 2 - 1
-            )
+            # Reset actions for environments that are done
+            if done_idx.numel() > 0 and not (
+                "ObjectAnywhereEEGrasped" in args_cli.task or "ObjectRestingEEGrasped" in args_cli.task
+            ):
+                actions[done_idx, -1] = (
+                    torch.randint(0, 2, (done_idx.numel(),), device=env.device, dtype=torch.float32) * 2 - 1
+                )
 
-        # Update progress based on successful reset conditions
-        new_successful_count = env.recorder_manager.exported_successful_episode_count
-        if new_successful_count > current_successful_reset_conditions:
-            increment = new_successful_count - current_successful_reset_conditions
-            current_successful_reset_conditions = new_successful_count
-            pbar.update(increment)
+            # Update progress based on successful reset conditions
+            new_successful_count = env.recorder_manager.exported_successful_episode_count
+            if new_successful_count > current_successful_reset_conditions:
+                increment = new_successful_count - current_successful_reset_conditions
+                current_successful_reset_conditions = new_successful_count
+                pbar.update(increment)
 
-        # Count total reset conditions evaluated (sum across all environments)
-        num_reset_conditions_evaluated += dones.sum().item()
+            # Count total reset conditions evaluated (sum across all environments)
+            num_reset_conditions_evaluated += dones.sum().item()
 
-        if env.sim.is_stopped():
-            break
+            if env.sim.is_stopped():
+                break
+    except KeyboardInterrupt:
+        print("Interrupted: writing the reset states collected so far")
 
     pbar.close()
 
