@@ -31,6 +31,7 @@ import copy
 import json
 import os
 import shutil
+import time
 
 import gymnasium as gym
 import numpy as np
@@ -46,15 +47,45 @@ from uwlab_rl.flashsac import make_flashsac_env
 from uwlab_tasks.utils.hydra import hydra_task_config
 
 
-class ExportedPolicy(nn.Module):
-    """(image uint8 [B, C, H, W], state float [B, S]) -> deterministic action in env units: tanh(mean) * scale + bias."""
+class DinoFrontEnd(nn.Module):
+    """Frozen DINOv3 on the 0..255 channel-stacked cameras -> the token obs the policy was trained on, camera-major:
+    ``mode="patch"``: final patch tokens (``dino_patch_tokens``); ``mode="head"``: prefix + patch tokens after the first
+    ``split_block`` blocks (``dino_block_tokens``)."""
 
-    def __init__(self, encoder: nn.Module, actor: nn.Module):
+    def __init__(self, model_dir: str, mode: str, split_block: int, num_cameras: int):
         super().__init__()
-        self.encoder, self.actor = encoder, actor
+        from uwlab_rl.flashsac.rgb import load_timm_dino
+
+        self.model = load_timm_dino(model_dir).eval().requires_grad_(False)
+        self.mode, self.split_block, self.num_cameras = mode, split_block, num_cameras
+        cfg = self.model.pretrained_cfg
+        self.register_buffer("mean", torch.tensor(cfg["mean"]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor(cfg["std"]).view(1, 3, 1, 1))
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        from uwlab_rl.flashsac.rgb import dino_head_tokens
+
+        b = image.shape[0]
+        x = (image.float() / 255.0).unflatten(1, (self.num_cameras, 3)).flatten(0, 1)
+        x = (x - self.mean) / self.std
+        if self.mode == "patch":
+            t = self.model.forward_features(x)[:, self.model.num_prefix_tokens :]
+        else:
+            t = dino_head_tokens(self.model, x, self.split_block)
+        return t.unflatten(0, (b, self.num_cameras)).flatten(1, 2)
+
+
+class ExportedPolicy(nn.Module):
+    """(image uint8 [B, C, H, W], state float [B, S]) -> deterministic action in env units: tanh(mean) * scale + bias.
+    With ``front_end`` the encoder sees front_end(image) (frozen DINO tokens) instead of the image."""
+
+    def __init__(self, encoder: nn.Module, actor: nn.Module, front_end: nn.Module | None = None):
+        super().__init__()
+        self.encoder, self.actor, self.front_end = encoder, actor, front_end
 
     def forward(self, image: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        mean, _ = self.actor.get_mean_and_std(self.encoder(image.float(), state.float()), training=False)
+        x = self.front_end(image) if self.front_end is not None else image.float()
+        mean, _ = self.actor.get_mean_and_std(self.encoder(x, state.float()), training=False)
         return torch.tanh(mean) * self.actor.action_scale + self.actor.action_bias
 
 
@@ -82,6 +113,16 @@ def _jsonable(v):
 def main(env_cfg, agent_cfg):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
+    tok_term = getattr(getattr(env_cfg.observations, "dino_tokens", None), "tokens", None)
+    if tok_term is not None:
+        # token policies: no augmentation, and a raw-image group (the exported policy's input) next to the tokens
+        from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.rl_vision_cfg import (
+            VisionStackedImageObsCfg, stacked_rgb_image)
+
+        tok_term.params["image_aug"] = False
+        env_cfg.observations.image = VisionStackedImageObsCfg()
+        env_cfg.observations.image.image.func = stacked_rgb_image
+        env_cfg.observations.image.image.params["sensor_cfgs"] = list(tok_term.params["sensor_cfgs"])
     agent_cfg.algorithm.expert_buffer_path = ""
     agent_cfg.algorithm.replay_buffer_size = 4 * args_cli.num_envs
     agent_cfg.algorithm.buffer_min_length = args_cli.num_envs
@@ -97,7 +138,15 @@ def main(env_cfg, agent_cfg):
         _plain(alg.actor).load_state_dict(ckpt["ema_actor_state_dict"])
         _plain(alg.encoder).load_state_dict(ckpt["ema_encoder_state_dict"])
     img_g, st_g = alg.image_group, alg.state_group
-    policy = ExportedPolicy(_plain(alg.encoder), _plain(alg.actor)).eval()
+    front, front_spec, tok_g = None, None, None
+    if tok_term is not None:
+        mode = "head" if "split_block" in tok_term.params else "patch"
+        split = int(tok_term.params.get("split_block", 0))
+        front = DinoFrontEnd(tok_term.params["model_path"], mode, split, len(tok_term.params["sensor_cfgs"])).to(agent_cfg.device)
+        front_spec = {"type": "frozen DINOv3 (timm)", "model_path": tok_term.params["model_path"], "mode": mode,
+                      "split_block": split, "tokens_group": img_g, "note": "run inside policy_ts.pt; input is the raw image"}
+        tok_g, img_g = img_g, "image"
+    policy = ExportedPolicy(_plain(alg.encoder), _plain(alg.actor), front).eval()
     os.makedirs(args_cli.out_dir, exist_ok=True)
 
     # sim rollout with the original modules (eval mode, deterministic)
@@ -105,9 +154,14 @@ def main(env_cfg, agent_cfg):
     obs = env.get_observations()
     n = args_cli.save_envs
     rec = {"image": [], "state": [], "action_env": [], "action_norm": [], "reward": [], "done": []}
+    if tok_g is not None:
+        rec["action_env_env_tokens"] = []
     with torch.no_grad():
         for _ in range(args_cli.steps):
             a_env = policy(obs[img_g], obs[st_g])
+            if tok_g is not None:  # the training-time path: tokens from the env's own (bf16, GPU) DINO term
+                m, _ = policy.actor.get_mean_and_std(policy.encoder(obs[tok_g].float(), obs[st_g].float()), training=False)
+                rec["action_env_env_tokens"].append((torch.tanh(m) * policy.actor.action_scale + policy.actor.action_bias)[:n].cpu())
             a_norm = ((a_env - env.action_bias) / env.action_scale).clamp(-1.0, 1.0)
             rec["image"].append(obs[img_g][:n].to(torch.uint8).cpu())
             rec["state"].append(obs[st_g][:n].float().cpu())
@@ -131,7 +185,17 @@ def main(env_cfg, agent_cfg):
         out = reload(torch.from_numpy(rec["image"].reshape(T * n, *rec["image"].shape[2:])),
                      torch.from_numpy(rec["state"].reshape(T * n, -1))).numpy().reshape(T, n, -1)
     err = float(np.abs(out - rec["action_env"]).max())
+    err_env = float(np.abs(out - rec["action_env_env_tokens"]).max()) if tok_g is not None else None
     rec["action_env_torchscript_cpu"] = out
+    torch.set_num_threads(max(1, os.cpu_count() // 2))
+    x1 = (torch.from_numpy(rec["image"][0, :1]), torch.from_numpy(rec["state"][0, :1]))
+    with torch.no_grad():
+        for _ in range(5):
+            reload(*x1)
+        t0 = time.perf_counter()
+        for _ in range(30):
+            reload(*x1)
+    cpu_ms = (time.perf_counter() - t0) / 30 * 1000
     np.savez_compressed(os.path.join(args_cli.out_dir, "parity_rollout.npz"), **rec)
 
     # spec: obs terms, action term, scaling, timing, cameras
@@ -155,7 +219,8 @@ def main(env_cfg, agent_cfg):
         actions.append({"name": name, "class": type(term).__name__, "dim": int(term.action_dim),
                         "cfg": {k: _jsonable(getattr(c, k)) for k in c.__dataclass_fields__ if k not in ("class_type",)}})
     cams = {}
-    for cname in [s.name for s in getattr(getattr(env_cfg.observations, img_g), "image").params["sensor_cfgs"]] if hasattr(getattr(env_cfg.observations, img_g), "image") else []:
+    cam_group = getattr(env_cfg.observations, img_g)
+    for cname in [s.name for s in cam_group.image.params["sensor_cfgs"]] if hasattr(cam_group, "image") else []:
         cam = base.scene.sensors[cname]
         cc = cam.cfg
         robot = base.scene["robot"]
@@ -170,7 +235,10 @@ def main(env_cfg, agent_cfg):
         }
     spec = {
         "task": args_cli.task, "checkpoint": os.path.abspath(args_cli.checkpoint), "weights": "ema" if args_cli.use_ema else "live",
-        "policy": "action_env = tanh(mean(encoder(image / 255, state))) * action_scale + action_bias (deterministic)",
+        "policy": ("action_env = tanh(mean(encoder(front_end(image), state))) * action_scale + action_bias (deterministic)"
+                   if front is not None else "action_env = tanh(mean(encoder(image / 255, state))) * action_scale + action_bias (deterministic)"),
+        "encoder_type": getattr(agent_cfg.algorithm, "encoder_type", "pixel"), "front_end": front_spec,
+        "cpu_latency_ms_batch1": round(cpu_ms, 1), "cpu_threads": torch.get_num_threads(),
         "inputs": {"image": {"group": img_g, "dtype": "uint8", "shape": list(rec["image"].shape[2:])},
                    "state": {"group": st_g, "dtype": "float32", "shape": list(rec["state"].shape[2:])}},
         "observation_groups": groups, "action_terms": actions,
@@ -182,12 +250,15 @@ def main(env_cfg, agent_cfg):
         "cameras": cams,
         "robot_joint_names": list(base.scene["robot"].joint_names),
         "parity": {"steps": T, "envs": n, "max_abs_err_torchscript_cpu_vs_original": err,
+                   "max_abs_err_torchscript_cpu_vs_env_tokens_bf16": err_env,
                    "mean_reward": float(rec["reward"].mean()), "dones": int(rec["done"].sum())},
     }
     with open(os.path.join(args_cli.out_dir, "spec.json"), "w") as f:
         json.dump(spec, f, indent=2)
     shutil.copy(args_cli.checkpoint, os.path.join(args_cli.out_dir, "checkpoint.pt"))
-    print(f"[export] {ts_path}: parity max |TorchScript(cpu) - original| = {err:.2e} over {T} x {n}", flush=True)
+    print(f"[export] {ts_path}: parity max |TorchScript(cpu) - original| = {err:.2e} over {T} x {n}"
+          + (f"; vs the env's bf16 token path {err_env:.2e}" if err_env is not None else "")
+          + f"; CPU batch-1 forward {cpu_ms:.1f} ms ({torch.get_num_threads()} threads)", flush=True)
     env.close()
 
 

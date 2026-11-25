@@ -572,6 +572,105 @@ gym.register(
 )
 
 gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-RtxLook-ArmJoints-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-RtxLook-ArmJoints-VisRand4s-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-RtxLook-ArmJoints-VisRand4s-ExpertEnvs-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-RtxLook-ArmJoints-VisRand4s-ExpertEnvs-SGS-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-RtxLook-ArmJoints-VisRand4s-ExpertEnvs-SGS-ORLight-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSORLightCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACRGB4096SysidAuxRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-RtxLook-ArmJoints-VisRand4s-ExpertEnvs-SGS-Dino3MAP-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3MAPCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDino3MAPRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-RtxLook-ArmJoints-VisRand4s-ExpertEnvs-SGS-Dino3Tail-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3TailCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDino3TailRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-RtxLook-ArmJoints-VisRand4s-ExpertEnvs-SGS-Dino3Tail-ORLight-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3TailORLightCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDino3TailRunnerCfg",
+    },
+)
+
+gym.register(
+    id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-RtxLook-ArmJoints-VisRand4s-ExpertEnvs-SGS-Dino3Tail-ORLight-Holdout-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rl_vision_cfg:Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3TailORLightHoldoutCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_cfg:Base_PPORunnerCfg",
+        "flashsac_cfg_entry_point": f"{agents.__name__}.flashsac_cfg:OmniReset_FlashSACDino3TailRunnerCfg",
+    },
+)
+
+gym.register(
     id="OmniReset-Ur5eRobotiq2f85-RelCartesianOSC-Vision-FlashSAC-WristSide-Sysid-Aux-RGB-Real2SimV4-ArmJoints-VisRand4s-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

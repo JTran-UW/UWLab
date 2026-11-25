@@ -4,6 +4,8 @@
 # /workspace/uwlab and at its own path; the source/ packages come from the checkout via PYTHONPATH.
 # usage: SIF=<image.sif> bash scripts/tools/run_in_sif.sh --setup            # once: pinned rsl-rl-lib + rsl-rl-flashsac + imageio-ffmpeg into the overlay
 #        SIF=<image.sif> bash scripts/tools/run_in_sif.sh <script> <args...>  # e.g. scripts/reinforcement_learning/flashsac/eval_video.py ...
+# UWLAB_OPTIX_DEPS=<stock|r570> puts _optix_deps/<flavor> (scripts/tools/build_optix_deps.sh) first on PYTHONPATH for the
+# OptiX renderer backend; see README_optix_renderer.md.
 set -uo pipefail
 E=$(cd "$(dirname "$0")/../.." && pwd); SIF=${SIF:-$HOME/sif/uwlab_isaaclab31_cu130.sif}
 R=$E/.sif_overlay; mkdir -p "$R/cache" "$R/home" "$R/overlay/upper" "$R/overlay/work"
@@ -21,6 +23,10 @@ if [ "${1:-}" = "--setup" ]; then
         "https://github.com/$RR/archive/$RC.tar.gz" "https://github.com/$FR/archive/$FC.tar.gz" imageio-ffmpeg
 fi
 SCRIPT=${1:?script path relative to the repo}; shift
+if [ -n "${UWLAB_OPTIX_DEPS:-}" ]; then
+    [ -d "$E/_optix_deps/$UWLAB_OPTIX_DEPS/warp_optix" ] || { echo "[run_in_sif] missing _optix_deps/$UWLAB_OPTIX_DEPS: run scripts/tools/build_optix_deps.sh $UWLAB_OPTIX_DEPS"; exit 2; }
+    PYPATH=$W/_optix_deps/$UWLAB_OPTIX_DEPS:$PYPATH
+fi
 # apptainer --nv does not pass NVIDIA's NGX library (RTX DLSS/denoising) on every host's nvliblist
 NGX=""
 for f in /usr/lib/x86_64-linux-gnu/libnvidia-ngx.so.1 /usr/lib/x86_64-linux-gnu/libnvidia-ngx.so.*.*; do
@@ -32,4 +38,5 @@ exec apptainer exec --nv --containall $ENVS --overlay "$R/overlay" $NGX \
     --bind "$E":$W:rw --bind "$E":"$E":rw --bind "$R/cache":/tmp/isaaclab_cache:rw --bind /dev/shm:/hostshm \
     --home "$R/home":/root --pwd $W \
     --env TMPDIR=/tmp/isaaclab_cache --env UWLAB_PATH=$W --env OMNI_KIT_ACCEPT_EULA=YES --env PYTHONPATH="$PYPATH" \
+    --env OPTIX_CACHE_PATH=/tmp/isaaclab_cache/optix \
     "$SIF" /opt/venv/bin/python -u $W/$SCRIPT "$@"

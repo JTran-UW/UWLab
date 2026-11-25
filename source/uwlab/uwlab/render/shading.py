@@ -68,7 +68,7 @@ def environment(scene: SceneData, world: int, direction: wp.vec3f, fallback: wp.
     result = fallback
     index = scene.environment_ids[world]
     if index >= 0:
-        d = wp.normalize(direction)
+        d = wp.quat_rotate_inv(scene.environment_orientation[world], wp.normalize(direction))
         u = wp.atan2(d[1], d[0]) / (2.0 * wp.pi) + 0.5 + scene.environment_rotation[world]
         v = wp.acos(wp.clamp(d[2], -1.0, 1.0)) / wp.pi
         rgba = wp.texture_sample(scene.environment_data[index].texture, wp.vec2f(u, v), dtype=wp.vec4f)
@@ -97,7 +97,7 @@ def sample_environment(scene: SceneData, world: int, choice: float, jitter_u: fl
     theta = wp.pi * v
     phi = 2.0 * wp.pi * (u - 0.5 - scene.environment_rotation[world])
     sine = wp.sin(theta)
-    direction = wp.vec3f(sine * wp.cos(phi), sine * wp.sin(phi), wp.cos(theta))
+    direction = wp.quat_rotate(scene.environment_orientation[world], wp.vec3f(sine * wp.cos(phi), sine * wp.sin(phi), wp.cos(theta)))
     pdf = (
         scene.environment_probability[base + cell]
         * float(wp.static(ENV_SAMPLE_BINS))

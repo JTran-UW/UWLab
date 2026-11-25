@@ -12,6 +12,8 @@ the fixed horizon so every env's episode stays synchronized (required by the epi
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from isaaclab.managers import ManagerTermBase
@@ -254,7 +256,7 @@ DINO_RES = 112
 DINO3_RES = 128
 DINO_MODEL_DIR = "/workspace/uwlab/checkpoints/dinov2"
 DINO3_MODEL_DIR = "/workspace/uwlab/checkpoints/dinov3"
-TIMM_DIR = "/workspace/uwlab/_timm"
+TIMM_DIR = os.environ.get("UWLAB_TIMM_DIR", "/workspace/uwlab/_timm")
 
 
 class dino_features(ManagerTermBase):
@@ -321,6 +323,72 @@ class dino_features(ManagerTermBase):
                 out.append(torch.cat(parts, dim=-1))
             feats.append(torch.cat(out, dim=0))
         return torch.cat(feats, dim=-1)
+
+
+class dino_patch_tokens(dino_features):
+    """Frozen DINO patch tokens (prefix tokens dropped), (N, n_cams * g * g, D), camera-major in ``sensor_cfgs`` order.
+    ``image_aug`` applies ``OmniResetImageAugV2`` (one draw per image) to the RGB before the encoder."""
+
+    def __init__(self, cfg: ObsTerm, env):
+        super().__init__(cfg, env)
+        self.aug = None
+        if cfg.params.get("image_aug", False):
+            from uwlab_rl.flashsac.rgb import OmniResetImageAugV2
+
+            self.aug = OmniResetImageAugV2(
+                blur_kernel=cfg.params.get("blur_kernel", 3), blur_sigma=(0.1, cfg.params.get("blur_sigma_max", 0.6))
+            )
+
+    @torch.no_grad()
+    def __call__(self, env, sensor_cfgs: list[SceneEntityCfg], model_path: str, pool_grid: int = 0, chunk: int = 2048,
+                 backend: str = "timm", image_aug: bool = False, blur_kernel: int = 3, blur_sigma_max: float = 0.6):
+        n_cams = len(sensor_cfgs)
+        rgb = torch.cat([env.scene.sensors[c.name].data.output["rgb"][..., :3] for c in sensor_cfgs], dim=-1)
+        rgb = rgb.permute(0, 3, 1, 2).float()
+        if self.aug is not None:
+            rgb = self.aug(rgb).clamp(0.0, 255.0)
+        x = rgb.div(255.0).unflatten(1, (n_cams, 3)).flatten(0, 1)
+        x = ((x - self.mean) / self.std).to(torch.bfloat16)
+        out = [self._global_and_grid(x[i : i + chunk])[1].flatten(2).transpose(1, 2) for i in range(0, x.shape[0], chunk)]
+        return torch.cat(out, dim=0).unflatten(0, (-1, n_cams)).flatten(1, 2)
+
+
+class dino_block_tokens(dino_patch_tokens):
+    """Frozen DINO tokens (prefix + patches) after the first ``split_block`` blocks, (N, n_cams * (P + g * g), D),
+    camera-major: the cached input of the agent's ``dino_tail`` encoder. ``image_aug`` as ``dino_patch_tokens``."""
+
+    @torch.no_grad()
+    def __call__(self, env, sensor_cfgs: list[SceneEntityCfg], model_path: str, split_block: int = 10, pool_grid: int = 0,
+                 chunk: int = 2048, backend: str = "timm", image_aug: bool = False, blur_kernel: int = 3,
+                 blur_sigma_max: float = 0.6):
+        from uwlab_rl.flashsac.rgb import dino_head_tokens
+
+        n_cams = len(sensor_cfgs)
+        rgb = torch.cat([env.scene.sensors[c.name].data.output["rgb"][..., :3] for c in sensor_cfgs], dim=-1)
+        rgb = rgb.permute(0, 3, 1, 2).float()
+        if self.aug is not None:
+            rgb = self.aug(rgb).clamp(0.0, 255.0)
+        x = rgb.div(255.0).unflatten(1, (n_cams, 3)).flatten(0, 1)
+        x = ((x - self.mean) / self.std).to(torch.bfloat16)
+        out = [dino_head_tokens(self.model, x[i : i + chunk], split_block).float() for i in range(0, x.shape[0], chunk)]
+        return torch.cat(out, dim=0).unflatten(0, (-1, n_cams)).flatten(1, 2)
+
+
+@configclass
+class VisionDinoTokensObsCfg(ObsGroup):
+    tokens = ObsTerm(
+        func=dino_patch_tokens,
+        params={
+            "sensor_cfgs": [SceneEntityCfg("side_camera"), SceneEntityCfg("wrist_camera")],
+            "model_path": f"{DINO3_MODEL_DIR}/vit_small_patch16_dinov3.lvd1689m",
+            "backend": "timm",
+            "pool_grid": 0,
+        },
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
 
 
 @configclass
@@ -1044,7 +1112,9 @@ def apply_real_camera_calibration(cfg) -> None:
         position_deltas={"x": (-0.02, 0.02), "y": (-0.02, 0.02), "z": (-0.02, 0.02)},
         euler_deltas={"pitch": (-2.0, 2.0), "yaw": (-2.0, 2.0), "roll": (-2.0, 2.0)})
     cfg.events.randomize_wrist_camera.params.update(
-        position_deltas={"x": (-0.005, 0.005), "y": (-0.005, 0.005), "z": (-0.005, 0.005)},
+        # ±3 mm (±5 mm put the camera inside the D415 housing / mount: black or occluded wrist frames); camera-frame
+        # backward travel (+z) is the risky direction, so it is capped at 1 mm
+        position_deltas={"x": (-0.003, 0.003), "y": (-0.003, 0.003), "z": (-0.003, 0.001)},
         euler_deltas={"pitch": (-2.0, 2.0), "yaw": (-2.0, 2.0), "roll": (-2.0, 2.0)})
 
 
@@ -1246,3 +1316,217 @@ class Ur5eRobotiq2f85RelCartesianOSCVisionDino3WristSideSysidReal2SimV4Cfg(Ur5eR
         super().__post_init__()
         apply_max_sysid(self)
         add_real2sim_v4_appearance(self)
+
+
+class randomize_camera_focal_length_sensor(ManagerTermBase):
+    """Focal-length jitter on the sensor's intrinsic matrices, which the Newton renderer reads per world every frame
+    (the USD-attribute edit of ``randomize_camera_focal_length`` only reaches RTX)."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._base = None
+
+    def __call__(self, env, env_ids, sensor_name, focal_length_range):
+        import warp as wp
+
+        cam = env.scene.sensors[sensor_name]
+        k = wp.to_torch(cam.data.intrinsic_matrices.warp)
+        if self._base is None:
+            self._base = (k[:, 0, 0].clone(), k[:, 1, 1].clone(), float(cam.cfg.spawn.focal_length))
+        env_ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids.to(env.device)
+        scale = torch.empty(len(env_ids), device=env.device).uniform_(*focal_length_range) / self._base[2]
+        k[env_ids, 0, 0] = self._base[0][env_ids] * scale
+        k[env_ids, 1, 1] = self._base[1][env_ids] * scale
+
+
+def _redraw_rtx_look(env, env_ids, term_name: str) -> None:
+    """Interval redraw of the ``rtx_look`` term (its reset call only draws an env once, as the RTX task does)."""
+    term = env.event_manager.get_term_cfg(term_name)
+    term.func(env, env_ids, **{**term.params, "redraw": True})
+
+
+# The OmniReset RGB collection's lighting as it renders in RTX: the UR5e USD's per-env white dome lights dominate and the
+# HDRI sky light has no measurable effect (11-23: side brightness 90.7-90.9 over 12 HDRIs / intensities / orientations).
+# The twin match: a white dome of 8.5 (RTX dome / 1000 units) and no sky contribution, ACES at +0.45 stops.
+# matched to OmniReset rgb0 brightness quantiles: white ambient 0.5 + randomly oriented sky with shadow-casting suns
+OR_LIGHTING = {"dome": 0.5, "sky_random_orientation": True}
+OR_LIGHTING_RENDER = {"path_samples": 1, "path_sky_clamp": 5.0, "path_sun": True}
+
+
+def add_rtx_look(cfg, randomize: bool = False, interval_s: float | None = None, or_lighting: bool = False) -> None:
+    """The look of the RTX RealCam GlobalDome7k tasks on the UWLab Newton renderer, which also runs on GPUs without
+    RTX: one-bounce path lighting under a white dome (7000) plus the sky map (1000), OmniPBR materials, ACES at
+    +0.45 stops, and the real-fitted side + wrist cameras. ``randomize`` adds the RTX randomization
+    (``mdp.rtx_look.RandomizeRtxLook``: the same textures, HDRIs and ranges) and the camera pose / focal jitter, on
+    reset and every ``interval_s``."""
+    from pathlib import Path
+
+    from uwlab.utils.newton_warp_renderer_cfg import UWLabNewtonWarpRendererCfg
+
+    from ...mdp.rtx_look import RandomizeRtxLook
+
+    for name in ("side_camera", "wrist_camera"):
+        camera = getattr(cfg.scene, name)
+        camera.renderer_cfg = UWLabNewtonWarpRendererCfg(
+            enable_patches=True, enable_textures=True, enable_shadows=False, enable_pbr=True,
+            create_default_light=False, tone_mapper="aces", tone_blur=0.5, path_aa=4,
+            **{"path_samples": 1, "path_sky_clamp": 5.0, **(OR_LIGHTING_RENDER if or_lighting else {})},
+        )
+        camera.update_latest_camera_pose = True
+    params: dict = {"randomize": randomize, "redraw_on_reset": False, **(OR_LIGHTING if or_lighting else {})}
+    if randomize:
+        res = Path(__file__).parent / "resources"
+        params.update(
+            hdri_config_path=str(res / "hdri_paths_train_subset100.yaml"),
+            texture_config_path=str(res / "texture_paths_train_subset150.yaml"),
+        )
+    cfg.events.rtx_look = EventTerm(func=RandomizeRtxLook, mode="reset", params=params)
+    # objects rest ~3 mm below the visual mat top under Newton; without this the mat shows through the hole floor
+    cfg.events.lower_table_mat = EventTerm(func=offset_newton_visual_shapes, mode="reset",
+                                           params={"pattern": "/Table/visuals/vention_mat", "dz": -0.003})
+    cfg.events.randomize_side_camera = EventTerm(func=randomize_camera_world_pose, mode="reset", params={
+        "sensor_name": "side_camera", "position_deltas": {}, "euler_deltas": {}})
+    cfg.events.randomize_wrist_camera = EventTerm(func=randomize_camera_local_pose, mode="reset", params={
+        "sensor_name": "wrist_camera", "camera_frame": True, "position_deltas": {}, "euler_deltas": {}})
+    apply_real_camera_calibration(cfg)
+    if not randomize:
+        cfg.events.randomize_side_camera = None
+        cfg.events.randomize_wrist_camera = None
+        return
+    # the RealCam task's focal ranges, about the calibrated focal lengths
+    cfg.events.randomize_side_camera_focal_length = EventTerm(func=randomize_camera_focal_length_sensor, mode="reset", params={
+        "sensor_name": "side_camera", "focal_length_range": (25.053, 29.053)})
+    cfg.events.randomize_wrist_camera_focal_length = EventTerm(func=randomize_camera_focal_length_sensor, mode="reset", params={
+        "sensor_name": "wrist_camera", "focal_length_range": (27.03, 29.03)})
+    if interval_s is not None:
+        cfg.events.rtx_look_interval = EventTerm(
+            func=_redraw_rtx_look, mode="interval", interval_range_s=(interval_s, interval_s),
+            params={"term_name": "rtx_look"})
+        for name in ("randomize_side_camera", "randomize_wrist_camera"):
+            term = getattr(cfg.events, name)
+            setattr(cfg.events, f"{name}_interval", EventTerm(
+                func=term.func, mode="interval", interval_range_s=(interval_s, interval_s), params=dict(term.params)))
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg
+):
+    """The RTX RealCam GlobalDome7k look without visual randomization, on the Newton renderer (``add_rtx_look``);
+    19-D ArmJoints ``vision_state``."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.vision_state.joint_pos = arm_joint_pos_obs()
+        add_rtx_look(self)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBCfg
+):
+    """The Newton-renderer twin of the RTX ``VisRand-ArmJoints-RealCam-...-GlobalDome7k`` tasks: the RTX look with
+    its appearance, sky and camera randomization redrawn on reset and every 4 s."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.vision_state.joint_pos = arm_joint_pos_obs()
+        add_rtx_look(self, randomize=True, interval_s=4.0)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sCfg
+):
+    """The RtxLook VisRand4s twin where every 20th env (5%) executes the state expert (train with
+    ``agent.algorithm.expert_policy_checkpoint=<ckpt>``): the twin of ``...RealCam-ExpertEnvs-GlobalDome7k-NoDLAA``."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_from_reset_states.params["expert_env_every"] = 20
+        self.curriculum.reset_event_log = CurrTerm(func=task_mdp.reset_event_log)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsCfg
+):
+    """The RtxLook expert-envs twin with Success Guided Sampling over the policy envs' reset states (the Real2Sim v4
+    SGS settings, H=10; every 16th policy env samples uniformly as an unbiased monitor; outcomes pooled across ranks)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_from_reset_states.params["sgs"] = dict(
+            history=10, target=0.5, kappa=1.0, temperature=2.0, eps=1e-4, empty_rate=0.5,
+            async_outcomes=True, uniform_monitor_every=16,
+        )
+        self.rewards.success_latch = RewTerm(func=task_mdp.SuccessLatch, weight=1.0)
+        self.events.sgs_sync = EventTerm(func=task_mdp.sgs_sync, mode="interval", interval_range_s=(1.0, 1.0), is_global_time=True)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3MAPCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSCfg
+):
+    """The SGS twin with frozen DINOv3 ViT-S/16 patch tokens (``dino_tokens``, 2 x 64 x 384 at 128 px side + wrist) in
+    place of the image, for the map encoder. Image augmentation runs here, before DINO (eval: set
+    ``env.observations.dino_tokens.tokens.params.image_aug=false``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        for cam in (self.scene.side_camera, self.scene.wrist_camera):
+            cam.height = cam.width = DINO3_RES
+        self.observations.dino_tokens = VisionDinoTokensObsCfg()
+        self.observations.dino_tokens.tokens.params.update(
+            sensor_cfgs=list(self.observations.image.image.params["sensor_cfgs"]),
+            image_aug=True, blur_kernel=5, blur_sigma_max=1.15,
+        )
+        self.observations.image = None
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3TailCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3MAPCfg
+):
+    """The Dino3MAP twin with DINOv3 tokens after block 10 (prefix + patches, 2 x 69 x 384) for the ``dino_tail``
+    encoder, which trains the last 2 blocks."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.dino_tokens.tokens.func = dino_block_tokens
+        self.observations.dino_tokens.tokens.params["split_block"] = 10
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3TailORLightCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3TailCfg
+):
+    """Dino3Tail under the OmniReset-matched lighting (``OR_LIGHTING``: sky-lit, point-sun shadows)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.rtx_look.params.update(OR_LIGHTING)
+        for cam in (self.scene.side_camera, self.scene.wrist_camera):
+            cam.renderer_cfg = cam.renderer_cfg.replace(**OR_LIGHTING_RENDER)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSORLightCfg(
+    Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSCfg
+):
+    """The image-observation SGS task under the OmniReset-matched lighting (``OR_LIGHTING``)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.rtx_look.params.update(OR_LIGHTING)
+        for cam in (self.scene.side_camera, self.scene.wrist_camera):
+            cam.renderer_cfg = cam.renderer_cfg.replace(**OR_LIGHTING_RENDER)
+
+
+@configclass
+class Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3TailORLightHoldoutCfg(Ur5eRobotiq2f85RelCartesianOSCVisionFlashSACWristSideSysidAuxRGBRtxLookArmJointsVisRand4sExpertEnvsSGSDino3TailORLightCfg):
+    """Dino3Tail-ORLight with eval-only uniform-reset envs (every 8th policy env): plain / best-of-N / worst-of-N by Q."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_from_reset_states.params["sgs"].update(uniform_monitor_every=8, holdout_arms=True)

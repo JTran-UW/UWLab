@@ -63,5 +63,8 @@ def attach_expert_envs(runner, env, task: str, device: str) -> None:
         raise ValueError("expert_policy_checkpoint needs reset_from_reset_states.params.expert_env_every > 0")
     policy = load_expert_policy(env, task, alg.expert_policy_agent, checkpoint, device)
     alg.set_expert_envs(policy, mask.nonzero().flatten(), env.action_scale, env.action_bias)
+    arms = getattr(term, "holdout_arm", None)
+    if arms is not None and bool((arms >= 0).any()):
+        alg.set_holdout_arms(arms)
     print(f"[expert_envs] {int(mask.sum())}/{mask.numel()} envs execute {checkpoint} ({alg.expert_obs_group} obs)",
           flush=True)

@@ -49,6 +49,7 @@ Apply matching scene settings to each camera if they should share a renderer.
 | `enable_dome_light`, `dome_samples` | Brightness-weighted HDRI samples at each surface; optional visibility rays when shadows are enabled |
 | `enable_precomputed_ibl` | Precomputed diffuse irradiance and roughness-filtered GGX HDRI reflections; no per-pixel dome rays |
 | `material_overrides` | Shape-label regex to scalar material and texture-map settings |
+| `path_samples`, `path_aa`, `path_bounce`, `path_sky_clamp`, `path_filter_step` | One-bounce path lighting under a dome (see [Path lighting](#path-lighting)) |
 
 Color/HDR samples are averaged in linear light. Normals, albedo, segmentation,
 and depth describe the unjittered center sample. Exposure/tone mapping changes
@@ -120,6 +121,35 @@ and contact shadows. In the peg benchmark, the clearest tested compromise used
 one key light at intensity 2.0, HDRI intensity 0.25, +0.5 camera exposure stop,
 and no roughness map on the table/insertive object. The benchmark case is
 `ibl_hybrid_key2_exposure05` in `scripts/tools/benchmark_newton_features.py`.
+
+## Path lighting
+
+`path_samples > 0` replaces the ambient term, precomputed IBL, sampled dome and reflection rays by one-bounce path
+lighting: the look of a dome-lit scene in a path tracer (it was built to match Isaac Sim's RTX real-time path tracer,
+see [README_rtx_look.md](../../../../README_rtx_look.md)). It needs a tone mapper and works on both backends.
+
+- **Light**: a uniform dome of radiance `context.environment_ambient[world]` plus the world's environment map times
+  its intensity, clamped at `path_sky_clamp` (which removes suns). `renderer.set_environment(...)` sets them per world.
+- **Material**: OmniPBR layering. Diffuse `base * (1 - metallic)` under a GGX coat whose reflectivity is
+  `specular * (0.08 + 0.92 (1 - cos)^5)`, blended by `metallic` with a base-tinted GGX lobe. `Material.uv_scale > 0`
+  projects the albedo texture cubically in the shape's frame at that many repeats per metre (OmniPBR `project_uvw`).
+- **Rays**: per pixel `path_samples` cosine-weighted and `path_samples` visible-normal GGX directions. A ray that
+  escapes returns the dome. A ray that hits casts one cosine-weighted ray from the hit point: blocked, it returns
+  nothing; free, it returns the hit surface's diffuse colour times the dome in that direction times `path_bounce`
+  (default 0.3, fitted to RTX; 1.0 is one full bounce).
+- **Edges**: `path_aa - 1` extra primary rays on a ring around the pixel centre, mirrored on every other pixel.
+  Each adds its surface colour and coverage and takes the pixel's filtered light, scaled by the share of the sky
+  its normal faces relative to the centre ray's surface. They trace no lighting rays: shading inside that loop
+  makes the OptiX program spill registers and run 3 to 9 times slower.
+- **Interleaved sampling**: the pixels of an 8x8 tile take the 64 cells of a stratification of the sample square.
+  `postprocess.filter_path_lighting` (a separable 15-tap tent that weights every cell equally, then a 5-tap B-spline
+  at `path_filter_step` pixels, both stopped at normal and depth edges) turns them into a smooth image. The diffuse
+  light is filtered before it is multiplied by the surface colour, so textures stay sharp. A pixel whose surface
+  fills less than half of the filter window (thin parts, creases) also takes light from nearby geometry at its
+  depth, whatever its normal, in proportion to what is missing.
+
+Per camera this needs six `vec3` and two `float` buffers besides the HDR image (about 92 bytes per pixel).
+`source/uwlab/test/test_newton_path_lighting.py` checks it on analytic scenes.
 
 ## Verification and limits
 

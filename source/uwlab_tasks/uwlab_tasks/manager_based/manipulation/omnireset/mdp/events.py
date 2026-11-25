@@ -1153,6 +1153,7 @@ class MultiResetManager(ManagerTermBase):
         if sgs_cfg:
             self.sgs_async = bool(sgs_cfg.pop("async_outcomes", False))
             self.sgs_monitor_every = int(sgs_cfg.pop("uniform_monitor_every", 0))
+            self.use_holdout_arms = bool(sgs_cfg.pop("holdout_arms", False))
             if self.sgs_monitor_every > 0:
                 monitor_cfg = SuccessMonitorCfg(monitored_history_len=100, num_monitored_data=self.num_tasks, device=env.device)
                 self.monitor_success = monitor_cfg.class_type(monitor_cfg)
@@ -1172,10 +1173,20 @@ class MultiResetManager(ManagerTermBase):
         # SGS monitors: every k-th policy env (expert envs neither feed nor monitor the sampler)
         if self.sgs is not None and getattr(self, "sgs_monitor_every", 0) > 0:
             self.sgs_monitor[(~self.expert_mask).nonzero().flatten()[:: self.sgs_monitor_every]] = True
+        # holdout_arms: the monitor envs become eval-only (FlashSACRGB keeps them out of the replay buffer) and act, by
+        # thirds, with a plain policy sample (0), the critic's best of N (1) or its worst of N (2); -1 = not a holdout
+        self.holdout_arm = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        if getattr(self, "use_holdout_arms", False):
+            ids = self.sgs_monitor.nonzero().flatten()
+            self.holdout_arm[ids] = torch.arange(len(ids), device=self.device) % 3
         self.split_success = {
             name: RollingMean(int(m.sum()), self.device)
-            for name, m in (("policy_env", ~self.expert_mask), ("expert_env", self.expert_mask))
+            for name, m in (("policy_env", ~self.expert_mask & (self.holdout_arm < 0)), ("expert_env", self.expert_mask))
         } if every > 0 else {}
+        if self.split_success:
+            for k, name in enumerate(("plain", "best", "worst")):
+                if bool((self.holdout_arm == k).any()):
+                    self.split_success[f"holdout_{name}_env"] = RollingMean(int((self.holdout_arm == k).sum()), self.device)
         if self.split_success and bool(self.sgs_monitor.any()):  # uniform-reset policy envs: unbiased under SGS
             self.split_success["monitor_env"] = RollingMean(int(self.sgs_monitor.sum()), self.device)
 
@@ -1349,7 +1360,10 @@ class MultiResetManager(ManagerTermBase):
         values = cmd.metrics["end_of_episode_success_rate"][env_ids]
         is_expert = self.expert_mask[env_ids]
         log = {}
-        groups = [("policy_env", finished & ~is_expert), ("expert_env", finished & is_expert)]
+        arm = self.holdout_arm[env_ids]
+        groups = [("policy_env", finished & ~is_expert & (arm < 0)), ("expert_env", finished & is_expert)]
+        groups += [(f"holdout_{n}_env", finished & (arm == k)) for k, n in enumerate(("plain", "best", "worst"))
+                   if f"holdout_{n}_env" in self.split_success]
         if "monitor_env" in self.split_success:
             groups.append(("monitor_env", finished & self.sgs_monitor[env_ids]))
         for name, sel in groups:

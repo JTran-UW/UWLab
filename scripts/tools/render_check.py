@@ -23,6 +23,8 @@ parser.add_argument("--count_black", action="store_true", help="Report, per came
 parser.add_argument("--rtx_aa", type=str, default="", help="Override RTX anti-aliasing after startup (Off, FXAA, DLSS, TAA, DLAA).")
 parser.add_argument("--no_dlssg", action="store_true", help="Disable DLSS frame generation after startup.")
 parser.add_argument("--every", type=int, default=0, help="Also save env 0's first camera every N steps as a strip.")
+parser.add_argument("--uwlab_renderer", action="store_true",
+                    help="Swap cameras on Isaac Lab's NewtonWarpRendererCfg to UWLabNewtonWarpRendererCfg (for backend=optix).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 args_cli.enable_cameras = True
@@ -45,6 +47,15 @@ from uwlab_tasks.utils.hydra import hydra_task_config
 def main(env_cfg, agent_cfg):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
+    if args_cli.uwlab_renderer:
+        from isaaclab_newton.renderers import NewtonWarpRendererCfg
+        from uwlab.utils.newton_warp_renderer_cfg import UWLabNewtonWarpRendererCfg
+
+        for name, cfg in vars(env_cfg.scene).items():
+            if type(getattr(cfg, "renderer_cfg", None)) is NewtonWarpRendererCfg:
+                fields = {k: v for k, v in cfg.renderer_cfg.to_dict().items() if k != "class_type"}
+                cfg.renderer_cfg = UWLabNewtonWarpRendererCfg(**fields)
+                print(f"[render_check] {name}: UWLabNewtonWarpRendererCfg", flush=True)
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
     env.reset()
     try:

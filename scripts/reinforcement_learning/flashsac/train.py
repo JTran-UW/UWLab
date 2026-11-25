@@ -39,6 +39,10 @@ parser.add_argument(
     help="With --resume_path: re-apply the env's current action bounds to the loaded actor (finetune with new bounds).",
 )
 parser.add_argument(
+    "--reset_lr_schedule", action="store_true", default=False,
+    help="With --resume_path: restart every LR schedule from step 0 (optimizer moments are kept).",
+)
+parser.add_argument(
     "--freeze_policy", action="store_true", default=False,
     help="Diagnostic: collect rollouts and log metrics without any update (weights and BatchNorm stats stay fixed).",
 )
@@ -162,8 +166,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: FlashSACRunnerCfg):
             runner.alg.actor.set_action_scaling(env.action_bias.to(runner.alg.actor.action_scale.device),
                                                 env.action_scale.to(runner.alg.actor.action_scale.device))
             print(f"[INFO] Actor action scaling reset: {old_scale.tolist()} -> {runner.alg.actor.action_scale.tolist()}")
+        if args_cli.reset_lr_schedule:
+            for name in ("actor_scheduler", "critic_scheduler", "temperature_scheduler", "encoder_scheduler"):
+                sched = getattr(runner.alg, name, None)
+                if sched is None:
+                    continue
+                sched.last_epoch = 0
+                sched._last_lr = [base * fn(0) for base, fn in zip(sched.base_lrs, sched.lr_lambdas)]
+                for group, lr in zip(sched.optimizer.param_groups, sched._last_lr):
+                    group["lr"] = lr
+                print(f"[INFO] {name} reset to step 0: lr {sched._last_lr}")
     # expert envs: a state expert drives the reset event's expert_env_every subset (agent.algorithm.expert_policy_checkpoint)
     attach_expert_envs(runner, env, args_cli.task, agent_cfg.device)
+    if hasattr(runner.alg, "replay_audit_dir"):
+        runner.alg.replay_audit_dir = os.path.join(log_dir, "replay_audit")
+        runner.alg._audit_num_envs = env.num_envs
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)

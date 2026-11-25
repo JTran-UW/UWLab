@@ -36,6 +36,7 @@ parser.add_argument("--warmup_renders", type=int, default=0, help="Render N fram
 parser.add_argument("--rtx_aa", type=str, default="", help="Override RTX anti-aliasing after startup (Off, FXAA, DLSS, TAA, DLAA).")
 parser.add_argument("--image_cams", type=str, default="", help="Comma list of cameras for the image obs (e.g. side_camera), so one camera can be rendered at a different resolution; only for --expert / viewing.")
 parser.add_argument("--per_env_videos", type=str, default="", help="Write one mp4 per filmed env into this dir (plus index.csv) instead of one long video.")
+parser.add_argument("--paired", action="store_true", help="Reset with --seed after the policy is built and reseed every step, so different policies get the same starting states and looks.")
 parser.add_argument("--tf32", action="store_true", help="Use train.py's TF32 / matmul-precision settings.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -94,7 +95,8 @@ def main(env_cfg, agent_cfg):
     image_term = getattr(getattr(env_cfg.observations, "image", None), "image", None)
     if args_cli.image_cams and image_term is not None:
         image_term.params["sensor_cfgs"] = [SceneEntityCfg(c) for c in args_cli.image_cams.split(",")]
-    dino_term = getattr(getattr(env_cfg.observations, "dino", None), "features", None)
+    dino_term = (getattr(getattr(env_cfg.observations, "dino", None), "features", None)
+                 or getattr(getattr(env_cfg.observations, "dino_tokens", None), "tokens", None))
     cam_term = image_term if image_term is not None else dino_term
     cam_names = [c.name for c in cam_term.params["sensor_cfgs"]] if cam_term is not None else ["front_camera", "wrist_camera"]
     # eval only: no expert buffer, a token replay buffer
@@ -154,6 +156,8 @@ def main(env_cfg, agent_cfg):
         overview.set_world_poses_from_view(origins + vec(args_cli.overview_eye), origins + vec(args_cli.overview_target))
     extra_cams = [overview] if overview is not None else []
     reset_cfg = base.event_manager.get_term_cfg("reset_from_reset_states")
+    if args_cli.paired:
+        base.reset(seed=args_cli.seed)
     obs = env.get_observations()
     for _ in range(args_cli.warmup_renders):
         base.sim.render()
@@ -169,7 +173,7 @@ def main(env_cfg, agent_cfg):
 
     def policy_views(o):
         """(N, cams, H, W, 3) uint8: the pixel agent's own image obs, else the rendered RGB (e.g. DINO input)."""
-        if image_group is not None and image_group in o.keys():
+        if image_group is not None and image_group in o.keys() and o[image_group].ndim == 4:
             img = o[image_group][:n_vid].to(torch.uint8)
             if img.shape[1] == 3 * len(cam_names):  # RGB: 3 channels per camera
                 return img.view(img.shape[0], len(cam_names), 3, *img.shape[2:]).permute(0, 1, 3, 4, 2).cpu().numpy()
@@ -220,7 +224,10 @@ def main(env_cfg, agent_cfg):
                 recorded.append(object_state())
             if not args_cli.no_video:
                 cam_frames.append(policy_views(obs))
-            obs, _, dones, _ = env.step(policy(obs))
+            action = policy(obs)
+            if args_cli.paired:
+                torch.manual_seed(1000 * args_cli.seed + t)
+            obs, _, dones, _ = env.step(action)
             # envs that terminate on this step were already auto-reset: their state and frame belong to the next episode
             live_now = ~(done_once | dones.bool())
             live.append(live_now.cpu().numpy())

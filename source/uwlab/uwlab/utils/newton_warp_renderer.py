@@ -9,13 +9,18 @@ from __future__ import annotations
 
 from pathlib import Path
 import dataclasses
+import logging
+import os
 import re
 
 import newton
 import torch
 import warp as wp
 
+from isaaclab_newton.physics.newton_manager import NewtonManager
 from isaaclab_newton.renderers.newton_warp_renderer import NewtonWarpRenderer, RenderData
+
+logger = logging.getLogger(__name__)
 
 
 @wp.kernel
@@ -76,6 +81,18 @@ class _PatchedRenderData(_IntrinsicsRenderData):
                     dtype=wp.vec3f,
                     device=self.newton_sensor.model.device,
                 )
+        if self._renderer_cfg.path_samples > 0:
+            if self._renderer_cfg.tone_mapper == "none":
+                raise ValueError("path lighting is resolved after rendering and requires a tone mapper")
+            # lighting buffers of the render kernel, the filter's scratch pair, and its guides
+            shape = (self.newton_sensor.model.world_count, 1, self.height, self.width)
+            device = self.newton_sensor.model.device
+            self.uw_path = {
+                name: wp.zeros(shape, dtype=wp.vec3f, device=device)
+                for name in ("light", "gloss", "tint", "light_scratch", "gloss_scratch", "normal")
+            }
+            for name in ("depth", "cover"):
+                self.uw_path[name] = wp.zeros(shape, dtype=wp.float32, device=device)
 
     def _convert_plane_depth(self):
         from uwlab.render.postprocess import planar_depth
@@ -109,6 +126,7 @@ class UWLabNewtonWarpRenderer(NewtonWarpRenderer):
         # version-specific access here rather than spreading it through event terms.
         self._context = sensor._SensorTiledCamera__render_context
         self._patches = bool(getattr(self.cfg, "enable_patches", False))
+        self._backend = self._resolve_backend()
         if self._patches:
             self._initialize_patches()
             self.texture_banks = {}
@@ -121,6 +139,9 @@ class UWLabNewtonWarpRenderer(NewtonWarpRenderer):
             }
             self.matched_texture_ids = [self._context.add_texture(path) for path in self.cfg.texture_paths]
             return
+        if self._backend == "optix":
+            # OptiX traces through the UWLab kernel; these settings give it the stock Newton look.
+            self._install_context(per_world_lights=False, per_world_intrinsics=False)
         device = self._context.device
         self._context.lights_active = wp.array([True, False, False], dtype=wp.bool, device=device)
         self._context.lights_type = wp.array([1, 2, 2], dtype=wp.int32, device=device)
@@ -135,42 +156,74 @@ class UWLabNewtonWarpRenderer(NewtonWarpRenderer):
         if self.cfg.enable_textures and self.cfg.load_texture_banks:
             self._load_texture_banks()
 
-    def _initialize_patches(self):
+    def _resolve_backend(self) -> str:
+        backend = os.environ.get("UWLAB_NEWTON_RENDER_BACKEND") or getattr(self.cfg, "backend", "warp")
+        if backend not in ("warp", "optix"):
+            raise ValueError(f"renderer backend must be 'warp' or 'optix', got {backend!r}")
+        if backend == "optix":
+            try:
+                from uwlab.render import optix
+            except ImportError as exc:
+                raise RuntimeError(
+                    f"backend='optix' needs warp-optix (Warp >= 1.17) and an OptiX-capable driver: {exc}"
+                ) from exc
+            available, reason = optix.is_available(self._newton_model.device)
+            if not available:
+                raise RuntimeError(f"backend='optix' is not usable on {self._newton_model.device}: {reason}")
+            logger.info("UWLabNewtonWarpRenderer: OptiX shape traversal on %s", self._newton_model.device)
+        return backend
+
+    def _install_context(self, **overrides):
+        """Swap the sensor's render context for the UWLab one, configured from the renderer cfg."""
         from newton._src.sensors.warp_raytrace.types import RenderConfig as NewtonRenderConfig
         from newton._src.sensors.warp_raytrace.utils import Utils
         from uwlab.render.context import RenderContext
         from uwlab.render.types import RenderConfig
-        from uwlab.render.postprocess import create_tone_mapper, create_camera_mapper
 
         if newton.__version__.split("+")[0] != "1.5.2":
-            raise RuntimeError("UWLab renderer patches require Newton 1.5.2; revalidate before upgrading")
+            raise RuntimeError("the UWLab render context requires Newton 1.5.2; revalidate before upgrading")
         sensor = self.newton_sensor
         base = sensor.default_render_config
         base_fields = {f.name for f in dataclasses.fields(NewtonRenderConfig)}
         params = {name: getattr(base, name) for name in base_fields}
-        params.update(
-            {f.name: getattr(self.cfg, f.name) for f in dataclasses.fields(RenderConfig) if f.name not in base_fields}
-        )
+        if self._patches:
+            params.update(
+                {f.name: getattr(self.cfg, f.name) for f in dataclasses.fields(RenderConfig) if f.name not in base_fields}
+            )
+        params.update(overrides)
+        params["path_outputs"] = params.get("path_samples", 0) > 0
         config = RenderConfig(**params)
         config.validate()
         context = RenderContext(
-            world_count=self._newton_model.world_count, device=self._newton_model.device, config=config
+            world_count=self._newton_model.world_count,
+            device=self._newton_model.device,
+            config=config,
+            backend=self._backend,
+            optix_extent=getattr(self.cfg, "optix_extent", None),
+            optix_rebuild_interval=getattr(self.cfg, "optix_rebuild_interval", 0),
         )
         context.init_from_model(self._newton_model, load_textures=self.cfg.enable_textures)
-        if self.cfg.environment_paths:
+        if self._patches and self.cfg.environment_paths:
             context.load_environment_maps(self.cfg.environment_paths)
         sensor._SensorTiledCamera__render_context = context
         sensor._SensorTiledCamera__default_render_config = config
         sensor._SensorTiledCamera__utils = Utils(context, config)
         self._context = context
+        return context
+
+    def _initialize_patches(self):
+        from uwlab.render.postprocess import create_tone_mapper, create_camera_mapper
+
+        context = self._install_context()
         self._exposure = wp.zeros(context.world_count, dtype=wp.float32, device=context.device)
-        self._tone_mapper = None if self.cfg.tone_mapper == "none" else create_tone_mapper(self.cfg.tone_mapper)
+        blur = float(self.cfg.tone_blur)
+        self._tone_mapper = None if self.cfg.tone_mapper == "none" else create_tone_mapper(self.cfg.tone_mapper, blur)
         self._white_balance = wp.full(context.world_count, wp.vec3f(1.0), dtype=wp.vec3f, device=context.device)
         self._camera_response = wp.full(context.world_count, wp.vec4f(1.0, 0.0, 0.0, 17.0), dtype=wp.vec4f, device=context.device)
         self._response_frame = 0
         if self.cfg.enable_camera_response:
             assert self.cfg.tone_mapper != "none", 'Camera response requires tone mapping'
-            self._tone_mapper = create_camera_mapper(self.cfg.tone_mapper)
+            self._tone_mapper = create_camera_mapper(self.cfg.tone_mapper, blur)
         lo, hi = self.cfg.exposure_range
         if lo > hi or (self._tone_mapper is None and (lo != 0.0 or hi != 0.0)):
             raise ValueError("exposure_range requires an ordered range and an enabled tone mapper")
@@ -281,19 +334,88 @@ class UWLabNewtonWarpRenderer(NewtonWarpRenderer):
         wp.to_torch(self._context.lights_orientation).copy_(orientations.to(dtype=torch.float32))
         wp.to_torch(self._context.lights_active).copy_(active.to(dtype=torch.bool))
 
+    def load_texture_bank(self, paths) -> torch.Tensor:
+        """Preload albedo images for appearance randomization (before the first render); texture ids, shape
+        ``(image, mip level)`` with the levels of ``uwlab.render.bank.TEXTURE_SIZES``."""
+        from uwlab.render.bank import load_texture_bank
+
+        bank = load_texture_bank(paths)
+        ids = self._context.add_textures([bank[i, level] for i in range(bank.shape[0]) for level in range(bank.shape[1])])
+        return torch.tensor(ids, device=wp.device_to_torch(self._context.device)).reshape(bank.shape)
+
+    def load_environment_bank(self, paths) -> int:
+        """Preload lat-long environment maps for path lighting (before the first render); map ids are their order."""
+        from uwlab.render.bank import load_environment_bank
+
+        maps = load_environment_bank(paths)
+        self._context.load_environment_maps(list(maps), precompute=False)
+        return int(maps.shape[0])
+
+    def set_environment(self, env_ids, *, ambient=None, map_ids=None, intensity=None, rotation=None, orientation=None) -> None:
+        """Per-world dome for path lighting: uniform radiance ``ambient`` (n, 3) plus the environment map
+        ``map_ids`` scaled by ``intensity``, rotated by ``rotation`` [turns] about its up axis and then by
+        ``orientation`` (n, 4) quaternions (x, y, z, w; map frame -> world)."""
+        if not self._patches:
+            raise RuntimeError("per-world environments require renderer patches")
+        for name, value in (
+            ("environment_ambient", ambient),
+            ("environment_ids", map_ids),
+            ("environment_intensity", intensity),
+            ("environment_rotation", rotation),
+            ("environment_orientation", orientation),
+        ):
+            if value is not None:
+                dest = wp.to_torch(getattr(self._context, name))
+                dest[env_ids] = torch.as_tensor(value, device=dest.device, dtype=dest.dtype)
+
     def set_exposure(self, env_ids, stops):
         if not self._patches:
             raise RuntimeError("per-world exposure requires renderer patches")
         wp.to_torch(self._exposure)[env_ids] = stops
 
+    def resolve_path_lighting(self, path: dict, hdr) -> None:
+        """Filter the interleaved lighting samples of ``path`` (separable and edge-aware: a tent, then a dilated
+        B-spline) and add the result to ``hdr``, which the render kernel left without them."""
+        from uwlab.render.postprocess import filter_path_lighting, resolve_path_lighting
+
+        normal, depth = path["guides"]
+        front, back = (path["light"], path["gloss"]), (path["light_scratch"], path["gloss_scratch"])
+        step = int(self.cfg.path_filter_step)
+        passes = [(1, 0), (0, 0)] + ([(1, step), (0, step)] if step > 0 else [])
+        for axis, spacing in passes[:-1]:
+            wp.launch(
+                filter_path_lighting,
+                dim=hdr.shape,
+                inputs=[*front, normal, depth, axis, spacing, *back],
+                device=self._context.device,
+            )
+            front, back = back, front
+        axis, spacing = passes[-1]
+        wp.launch(
+            resolve_path_lighting,
+            dim=hdr.shape,
+            inputs=[*front, normal, depth, axis, spacing, path["tint"], path["cover"], hdr],
+            device=self._context.device,
+        )
+
     def _launch_render(self, render_data):
         if self._patches:
             self._context.camera_intrinsics = render_data._intrinsics
             self._context.previous_camera_transforms = render_data._previous_transforms
+            self._context.path_images = getattr(render_data, "uw_path", None)
         super()._launch_render(render_data)
 
     def render(self, render_data):
+        if self._backend == "optix" and render_data.sensor_task_name is None:
+            # OptiX launches cannot be recorded into the sensor CUDA graph: register the task as eager.
+            render_data.sensor_task_name = f"newton_warp_render:{id(render_data)}"
+            NewtonManager._register_sensor_task(
+                render_data.sensor_task_name, lambda: self._launch_render(render_data), graph_capturable=False
+            )
         super().render(render_data)
+        path = getattr(render_data, "uw_path", None) if self._patches else None
+        if path is not None:
+            self.resolve_path_lighting(path, render_data.outputs.hdr_color_image)
         if self._patches and self._tone_mapper is not None:
             # per-camera exposure / white balance when set on this camera's render data (several cameras share a renderer)
             exposure = getattr(render_data, "uw_exposure", self._exposure)

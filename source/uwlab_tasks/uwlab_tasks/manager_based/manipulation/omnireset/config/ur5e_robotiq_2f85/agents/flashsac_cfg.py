@@ -104,3 +104,34 @@ class OmniReset_FlashSACRGB4096SysidAuxRunnerCfg(OmniReset_FlashSACRGB4096SysidR
     def __post_init__(self):
         super().__post_init__()
         self.algorithm.aux_group = "aux_state"
+
+
+@configclass
+class OmniReset_FlashSACDino3MAPRunnerCfg(OmniReset_FlashSACRGB4096SysidAuxRunnerCfg):
+    """The max-sysid aux pixel recipe on frozen DINOv3 ViT-S/16 patch tokens (``dino_tokens``, fp16 in the buffer)
+    through a trained MAP head (8 queries per camera); images are augmented in the env, so no update-time augmentation."""
+
+    obs_groups = {"actor": ["dino_tokens", "vision_state"], "critic": ["dino_tokens", "vision_state"]}
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.image_group = "dino_tokens"
+        self.algorithm.buffer_obs_dtype = {"dino_tokens": "float16"}
+        self.algorithm.encoder_type = "map"
+        self.algorithm.encoder_num_cameras = 2
+        self.algorithm.map_queries = 8
+        self.algorithm.image_aug = False
+        self.algorithm.replay_audit_every = 0
+        self.algorithm.replay_buffer_size = 300_000
+
+
+@configclass
+class OmniReset_FlashSACDino3TailRunnerCfg(OmniReset_FlashSACDino3MAPRunnerCfg):
+    """The Dino3MAP recipe with DINOv3's last 2 blocks trainable (``dino_tail`` on cached block-10 tokens, LR x0.1)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.encoder_type = "dino_tail"
+        self.algorithm.encoder_weights = "/workspace/uwlab/checkpoints/dinov3/vit_small_patch16_dinov3.lvd1689m"
+        self.algorithm.dino_split_block = 10
+        self.algorithm.encoder_backbone_lr_scale = 0.1

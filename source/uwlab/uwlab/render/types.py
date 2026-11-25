@@ -12,6 +12,7 @@ from newton._src.sensors.warp_raytrace.types import MeshData, RenderConfig as Ne
 ENV_SAMPLE_WIDTH = 128
 ENV_SAMPLE_HEIGHT = 64
 ENV_SAMPLE_BINS = ENV_SAMPLE_WIDTH * ENV_SAMPLE_HEIGHT
+SUN_SLOTS = 2
 IBL_ROUGHNESS_LEVELS = 6
 
 
@@ -37,6 +38,12 @@ class RenderConfig(NewtonRenderConfig):
     focus_distance: float = 1.0
     shutter_fraction: float = 0.0
     sample_seed: int = 17
+    path_samples: int = 0
+    path_bounce: float = 0.3
+    path_sky_clamp: float = 0.0
+    path_sun: bool = False
+    path_outputs: bool = False
+    path_aa: int = 1
 
     def validate(self):
         if any(
@@ -44,6 +51,8 @@ class RenderConfig(NewtonRenderConfig):
             for n in (self.samples_per_pixel, self.shadow_samples, self.dome_samples)
         ):
             raise ValueError("sample counts must be in [1, 64]")
+        if not isinstance(self.path_samples, Integral) or not 0 <= self.path_samples <= 64:
+            raise ValueError("path_samples must be in [0, 64]")
         if not -1.0 <= self.spot_outer < self.spot_inner <= 1.0:
             raise ValueError("spot cones require -1 <= outer < inner <= 1")
         if not 0.0 <= self.shadow_floor <= 1.0 or not 0.0 <= self.shutter_fraction <= 1.0:
@@ -56,6 +65,10 @@ class RenderConfig(NewtonRenderConfig):
             raise ValueError("precomputed IBL and sampled dome lighting are mutually exclusive")
         if self.enable_precomputed_ibl and not self.enable_pbr:
             raise ValueError("precomputed IBL requires enable_pbr=True")
+        if self.path_samples > 0 and (self.enable_precomputed_ibl or self.enable_dome_light or self.enable_reflections):
+            raise ValueError("path lighting replaces precomputed IBL, sampled dome lighting and reflections")
+        if self.path_outputs and self.path_samples == 0:
+            raise ValueError("path_outputs requires path_samples > 0")
         if (self.aperture_radius > 0 or self.shutter_fraction > 0) and self.samples_per_pixel < 2:
             raise ValueError("depth of field and motion blur require multiple samples")
         if len(self.ambient_sky) != 3 or len(self.ambient_ground) != 3:
@@ -83,12 +96,15 @@ class Material:
     normal_map: int
     emissive_map: int
     normal_strength: float
+    uv_scale: float
 
 
 @wp.struct
 class SceneData:
     world_count: int
     light_count: int
+    path_samples: int
+    path_aa: int
     bvh_shapes_size: int
     bvh_shapes_id: wp.uint64
     bvh_shapes_group_roots: wp.array[wp.int32]
@@ -123,12 +139,21 @@ class SceneData:
     environment_data: wp.array[TextureData]
     environment_ids: wp.array[wp.int32]
     environment_rotation: wp.array[wp.float32]
+    environment_orientation: wp.array[wp.quatf]
     environment_intensity: wp.array[wp.float32]
     environment_cdf: wp.array[wp.float32]
     environment_probability: wp.array[wp.float32]
+    environment_ambient: wp.array[wp.vec3f]
+    environment_mean: wp.array[wp.vec3f]
+    environment_sun_direction: wp.array[wp.vec4f]
+    environment_sun_color: wp.array[wp.vec3f]
     ibl_diffuse_data: wp.array[TextureData]
     ibl_specular_data: wp.array[TextureData]
     ibl_brdf_data: wp.array[TextureData]
+    optix_id: wp.uint64
+    optix_global_id: wp.uint64
+    optix_world_planes: wp.array[wp.int32]
+    optix_world_centers: wp.array[wp.vec3f]
 
 
 @wp.struct
@@ -140,6 +165,7 @@ class FrameData:
     intrinsics: wp.array[wp.mat33f]
     transforms: wp.array2d[wp.transformf]
     previous_transforms: wp.array2d[wp.transformf]
+    seed: int
 
 
 @wp.struct
@@ -151,3 +177,7 @@ class Outputs:
     normal: wp.array[wp.vec3f]
     albedo: wp.array[wp.uint32]
     hdr: wp.array[wp.vec3f]
+    light: wp.array[wp.vec3f]
+    gloss: wp.array[wp.vec3f]
+    tint: wp.array[wp.vec3f]
+    cover: wp.array[wp.float32]
